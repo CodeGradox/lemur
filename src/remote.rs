@@ -110,6 +110,23 @@ impl<'a> Remote<'a> {
         check(&out, &format!("scp to {}", self.host.name))
     }
 
+    /// Copies a file at an absolute path on the host to a local file.
+    pub fn copy_from(&self, remote_path: &str, local: &Path) -> Result<()> {
+        if self.is_local() {
+            std::fs::copy(remote_path, local).with_context(|| format!("copying {remote_path}"))?;
+            return Ok(());
+        }
+        let out = Command::new("scp")
+            .args(SSH_OPTS)
+            .args(BATCH_OPTS)
+            .arg("-q")
+            .arg(format!("{}:{}", self.host.ssh, remote_path))
+            .arg(local)
+            .output()
+            .context("starting scp")?;
+        check(&out, &format!("scp from {}", self.host.name))
+    }
+
     /// argv for an interactive terminal that runs `script` on the host.
     pub fn interactive(&self, script: &str) -> Vec<String> {
         if self.is_local() {

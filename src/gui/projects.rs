@@ -105,6 +105,29 @@ impl Lemur {
         self.save_look(index, cx);
     }
 
+    /// Unfolds what keeps a thread's row out of sight: its project, its
+    /// worktree, and the Hidden row the worktree is under.
+    pub(super) fn reveal(&mut self, host: &str, session: &str, cx: &mut Context<Self>) {
+        let Some((index, worktree)) = self
+            .project_of(host, session)
+            .map(|(index, w)| (index, w.path.clone()))
+        else {
+            return;
+        };
+        let base = &mut self.cfg.bases[index];
+        let hidden = base.hidden_worktrees.contains(&worktree);
+        if !base.collapsed
+            && !base.collapsed_worktrees.contains(&worktree)
+            && (base.hidden_open || !hidden)
+        {
+            return;
+        }
+        base.collapsed = false;
+        base.collapsed_worktrees.retain(|p| *p != worktree);
+        base.hidden_open |= hidden;
+        self.save_look(index, cx);
+    }
+
     /// Colors a worktree's folder icon, or with `None` takes its color off.
     pub(super) fn set_worktree_color(
         &mut self,

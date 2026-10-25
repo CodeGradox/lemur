@@ -191,6 +191,7 @@ struct Lemur {
     focus: FocusHandle,
     _appearance: Subscription,
     _sidebar_follows: Subscription,
+    _back: Subscription,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -313,6 +314,15 @@ impl Lemur {
                 Theme::sync_system_appearance(Some(window), cx);
             }
         });
+        // Back in the window, the shown session's popup has had its say, as
+        // in Zed.
+        let back = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active()
+                && let Some(key) = this.active.clone()
+            {
+                this.close_popup(&key, cx);
+            }
+        });
         let sidebar_width = cfg.sidebar_width.map_or(SIDEBAR_WIDTH, px).max(MIN_SIDEBAR);
         let notes_width = cfg.notes_width.map_or(NOTES_WIDTH, px).max(MIN_NOTES);
         Lemur {
@@ -344,6 +354,7 @@ impl Lemur {
             focus,
             _appearance: appearance,
             _sidebar_follows: sidebar_follows,
+            _back: back,
         }
     }
 
@@ -457,7 +468,7 @@ impl Lemur {
                 return;
             };
             let host = &key.0;
-            let session = actions::label(&key.1);
+            let (place, session) = self.titles(host, &key.1);
             let (title, caption, icon) = match activity {
                 Activity::NeedsInput => (
                     format!("{session} needs input"),
@@ -470,12 +481,18 @@ impl Lemur {
                     IconName::CircleCheck,
                 ),
             };
+            let caption = match place {
+                Some(place) => format!("{place}  ·  {caption}"),
+                None => caption,
+            };
             // A newer event for the same session replaces its popup.
             self.close_popup(&key, cx);
             let slot = self.popups.len();
-            let Ok(popup) = cx.open_window(Notification::window_options(screen, slot), |_, cx| {
-                cx.new(|_| Notification::new(title, caption, icon))
-            }) else {
+            let Ok(popup) = cx
+                .open_window(Notification::window_options(screen, slot), |window, cx| {
+                    cx.new(|cx| Notification::new(title, caption, icon, window, cx))
+                })
+            else {
                 continue;
             };
             let Ok(entity) = popup.entity(cx) else {
@@ -486,6 +503,12 @@ impl Lemur {
                 &entity,
                 window,
                 move |this, _, event: &NotificationEvent, window, cx| {
+                    if let NotificationEvent::Focused = event {
+                        // The keyboard goes back to the main window; the
+                        // popup stays until it's answered.
+                        window.activate_window();
+                        return;
+                    }
                     if let NotificationEvent::Show = event {
                         cx.activate(true);
                         window.activate_window();
@@ -520,6 +543,7 @@ impl Lemur {
         }
         self.done.remove(&key);
         self.close_popup(&key, cx);
+        self.reveal(&host, &session, cx);
         // ⌃Tab keeps the order it started with until ⌃ comes up.
         if self.cycling.is_none() {
             self.touch(key.clone());
@@ -533,6 +557,40 @@ impl Lemur {
         self.remember(host, session);
         view.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
+    }
+
+    /// The project (its place in the config) and worktree a session runs in.
+    fn project_of(&self, host: &str, session: &str) -> Option<(usize, &Worktree)> {
+        self.snap
+            .hosts
+            .iter()
+            .filter(|h| h.name == host)
+            .flat_map(|h| &h.bases)
+            .find_map(|b| {
+                let w = b
+                    .worktrees
+                    .iter()
+                    .find(|w| w.sessions.iter().any(|s| s.name == session))?;
+                Some((b.index, w))
+            })
+    }
+
+    /// A session as the sidebar shows it: `project › worktree`, none outside
+    /// every project, and the thread's name there.
+    fn titles(&self, host: &str, session: &str) -> (Option<String>, String) {
+        match self.project_of(host, session) {
+            Some((index, w)) => {
+                let project = self.cfg.bases[index].name();
+                let thread = session
+                    .strip_prefix(&format!("{project}/"))
+                    .unwrap_or(session);
+                (
+                    Some(format!("{project} › {}", worktree_label(w))),
+                    actions::label(thread).to_string(),
+                )
+            }
+            None => (None, actions::label(session).to_string()),
+        }
     }
 
     /// The worktree a session runs in, and its label.
@@ -707,7 +765,10 @@ impl Lemur {
             .tooltip("Toggle sidebar (⌘B)")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
         let title = match &self.active {
-            Some((host, session)) => format!("{}  ·  {host}", actions::label(session)),
+            Some((host, session)) => match self.titles(host, session) {
+                (Some(place), thread) => format!("{place} › {thread}  ·  {host}"),
+                (None, thread) => format!("{thread}  ·  {host}"),
+            },
             None => String::new(),
         };
         let mut bar = h_flex()
@@ -974,7 +1035,10 @@ mod tests {
     use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
     use gpui::VisualTestContext;
     use gpui_kit::component::WindowExt;
-    use gpui_kit::{AppContext, Entity, Modifiers, MouseButton, Pixels, point, px, size};
+    use gpui_kit::{
+        AppContext, Entity, Modifiers, MouseButton, MouseExitEvent, MouseMoveEvent, Pixels,
+        PlatformInput, point, px, size,
+    };
     use std::time::Duration;
 
     fn key(s: &str) -> Key {
@@ -2451,6 +2515,117 @@ mod tests {
             app.read_with(cx, |app, cx| {
                 app.terminals.values().all(|t| t.read(cx).exited())
             })
+        });
+    }
+
+    /// A popup that takes the keyboard without a click, as ⌘Tab back to
+    /// lemur can make it, hands it to the main window; back there, the
+    /// shown session's popup closes, as Zed's do, and the others wait.
+    #[gpui::test]
+    fn popups_hand_the_keyboard_back(cx: &mut gpui::TestAppContext) {
+        let cfg: Config = toml::from_str("").unwrap();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| Lemur::new(cfg, None, window, cx));
+        app.update(cx, |app, _| app.active = Some(key("shown")));
+        apply(
+            &app,
+            &[("shown", Activity::Working), ("a", Activity::Working)],
+            cx,
+        );
+        apply(
+            &app,
+            &[("shown", Activity::Idle), ("a", Activity::Idle)],
+            cx,
+        );
+        let popup = app.read_with(cx, |app, _| app.popups[&key("a")].0);
+        // The test pointer starts at the popup's corner.
+        let pointer = |event: PlatformInput, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                cx.update_window(popup.into(), |_, window, cx| {
+                    window.dispatch_event(event, cx)
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+        let key_to_popup = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| popup.update(cx, |_, window, _| window.activate_window()))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let main_active =
+            |cx: &mut VisualTestContext| cx.update(|window, _| window.is_window_active());
+
+        pointer(
+            PlatformInput::MouseExited(MouseExitEvent {
+                position: point(px(-5.0), px(-5.0)),
+                pressed_button: None,
+                modifiers: Modifiers::none(),
+            }),
+            cx,
+        );
+        key_to_popup(cx);
+        assert!(main_active(cx));
+        app.read_with(cx, |app, _| {
+            assert!(!app.popups.contains_key(&key("shown")), "you're back");
+            assert!(app.popups.contains_key(&key("a")), "not answered yet");
+        });
+
+        // A click has the pointer over it, and the popup keeps the keyboard.
+        pointer(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: point(px(10.0), px(10.0)),
+                pressed_button: None,
+                modifiers: Modifiers::none(),
+            }),
+            cx,
+        );
+        key_to_popup(cx);
+        assert!(!main_active(cx));
+    }
+
+    /// Opening a thread unfolds its project, its worktree and the Hidden row
+    /// it's under, for good; the header names all three.
+    #[gpui::test]
+    fn opening_a_thread_unfolds_its_way(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("reveal");
+        let dir = TempDir::new("reveal");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        let thread = "api/t--calm-heron";
+        let wt = repo.join("wt/a").to_string_lossy().into_owned();
+        server.tmux(&["new-session", "-d", "-s", thread, "-c", &wt, "sleep 600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let a = app.read_with(cx, |app, _| {
+            app.snap.hosts[0].bases[0].worktrees[1].path.clone()
+        });
+        app.update(cx, |app, cx| {
+            app.set_worktree_hidden(0, &a, true, cx);
+            app.toggle_worktree(0, &a, cx);
+            app.toggle_project(0, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("buttons a").is_none());
+
+        open(&app, thread, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("buttons a").is_some());
+        assert!(cx.debug_bounds("thread-0").is_some());
+        app.read_with(cx, |app, _| {
+            let base = &app.cfg.bases[0];
+            assert!(!base.collapsed && base.collapsed_worktrees.is_empty() && base.hidden_open);
+            assert_eq!(
+                app.titles("local", thread),
+                (Some("api › a".to_string()), "t".to_string())
+            );
         });
     }
 }

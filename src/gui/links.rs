@@ -1,5 +1,5 @@
 //! Links in the terminal, found where the pointer is: an OSC 8 hyperlink's
-//! URI, or else a URL written out in the text.
+//! URI, or else a URL or a file path written out in the text.
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
@@ -10,13 +10,16 @@ use alacritty_terminal::term::cell::Flags;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link {
     pub url: String,
+    /// `url` is a path on the session's host, as programs print them,
+    /// rather than a web link.
+    pub file: bool,
     /// Where it's drawn: one (screen line, first column, end column) a row.
     pub spans: Vec<(usize, usize, usize)>,
 }
 
 /// The link at screen column `col` of screen line `line`, if any. A URL
-/// can run on across rows the terminal wrapped, though not across rows
-/// a program broke itself.
+/// or path can run on across rows the terminal wrapped, though not across
+/// rows a program broke itself.
 pub fn link_at<T>(term: &Term<T>, col: usize, line: usize) -> Option<Link> {
     let grid = term.grid();
     let offset = grid.display_offset() as i32;
@@ -58,7 +61,7 @@ pub fn link_at<T>(term: &Term<T>, col: usize, line: usize) -> Option<Link> {
     }
     let pointer = Point::new(at, Column(col));
     let here = cells.iter().rposition(|(_, point, _)| *point <= pointer)?;
-    let (start, stop, url) = match grid[cells[here].1].hyperlink() {
+    let (start, stop, url, file) = match grid[cells[here].1].hyperlink() {
         // Any program's output sets these, with text that needn't match:
         // only web links open, as for a URL written out.
         Some(link) if !is_web(link.uri()) => return None,
@@ -66,12 +69,17 @@ pub fn link_at<T>(term: &Term<T>, col: usize, line: usize) -> Option<Link> {
             let same = |i: &usize| grid[cells[*i].1].hyperlink().as_ref() == Some(&link);
             let start = (0..here).rev().take_while(same).last().unwrap_or(here);
             let stop = (here..cells.len()).take_while(same).last()? + 1;
-            (start, stop, link.uri().to_string())
+            (start, stop, link.uri().to_string(), false)
         }
         None => {
             let text: Vec<char> = cells.iter().map(|(c, _, _)| *c).collect();
-            let (start, stop) = url_at(&text, here)?;
-            (start, stop, text[start..stop].iter().collect())
+            match url_at(&text, here) {
+                Some((start, stop)) => (start, stop, text[start..stop].iter().collect(), false),
+                None => {
+                    let (start, end, stop) = path_at(&text, here)?;
+                    (start, stop, text[start..end].iter().collect(), true)
+                }
+            }
         }
     };
     let mut spans: Vec<(usize, usize, usize)> = vec![];
@@ -88,7 +96,7 @@ pub fn link_at<T>(term: &Term<T>, col: usize, line: usize) -> Option<Link> {
             _ => spans.push((screen, column, until)),
         }
     }
-    Some(Link { url, spans })
+    Some(Link { url, file, spans })
 }
 
 const SCHEMES: [&str; 2] = ["https://", "http://"];
@@ -138,6 +146,75 @@ fn ends_url(c: char) -> bool {
         || c.is_control()
         || "<>\"'`{}|\\^".contains(c)
         || ('\u{2500}'..='\u{257f}').contains(&c)
+}
+
+/// The file path written out in `text` over the character at `at`, as
+/// programs print them: `src/main.rs`, `/etc/hosts`, `~/notes.md` or
+/// `Cargo.toml`, maybe with `:line` or `:line:column` after it. Its first
+/// character, the one after the path, and the one after its line and
+/// column.
+pub(super) fn path_at(text: &[char], at: usize) -> Option<(usize, usize, usize)> {
+    if ends_path(*text.get(at)?) {
+        return None;
+    }
+    let start = (0..at)
+        .rev()
+        .take_while(|&i| !ends_path(text[i]))
+        .last()
+        .unwrap_or(at);
+    let mut stop = (at..text.len())
+        .take_while(|&i| !ends_path(text[i]))
+        .last()?
+        + 1;
+    while stop > start && ".,:;!?".contains(text[stop - 1]) {
+        stop -= 1;
+    }
+    // `:line`, then `:column`, from the end.
+    let mut end = stop;
+    for _ in 0..2 {
+        let digits = text[start..end]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digits == 0 || end - digits <= start + 1 || text[end - digits - 1] != ':' {
+            break;
+        }
+        end -= digits + 1;
+    }
+    let path: String = text[start..end].iter().collect();
+    (at < stop && looks_like_path(&path)).then_some((start, end, stop))
+}
+
+/// Whether `c` can't be in a path written out: what `ends_url` says, and
+/// the brackets and separators prose puts around one, as in `Read(a.rs)`.
+fn ends_path(c: char) -> bool {
+    ends_url(c) || "()[],;".contains(c)
+}
+
+/// Whether `word` reads as a file's path: folders and a name (`src/a.rs`,
+/// `/etc/hosts`), or a name with an extension that has a letter in it
+/// (`Cargo.toml`, not `1.5.0`).
+fn looks_like_path(word: &str) -> bool {
+    if word.contains("://") {
+        return false;
+    }
+    let name = word.rsplit('/').next().unwrap_or(word);
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if word.contains('/') {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && ext.len() <= 10
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
 }
 
 /// How much of `url` is left without what trails it in prose: a full stop
@@ -190,6 +267,48 @@ mod tests {
             Some("https://a.b/c")
         );
         assert_eq!(url("https:// nothing", "https"), None);
+    }
+
+    /// The path in `text` at the first character of `at`, and how much of
+    /// the text it underlines.
+    fn path(text: &str, at: &str) -> Option<(String, String)> {
+        let chars: Vec<char> = text.chars().collect();
+        let at = text[..text.find(at).expect(at)].chars().count();
+        path_at(&chars, at).map(|(start, end, stop)| {
+            (
+                chars[start..end].iter().collect(),
+                chars[start..stop].iter().collect(),
+            )
+        })
+    }
+
+    #[test]
+    fn paths_end_where_prose_does() {
+        let both = |p: &str| Some((p.to_string(), p.to_string()));
+        assert_eq!(
+            path("Read(src/gui/links.rs)", "links"),
+            both("src/gui/links.rs")
+        );
+        assert_eq!(
+            path("see src/main.rs:42:7, then", "main"),
+            Some(("src/main.rs".into(), "src/main.rs:42:7".into()))
+        );
+        assert_eq!(path("Edit Cargo.toml.", "Cargo"), both("Cargo.toml"));
+        assert_eq!(
+            path("in `~/notes/todo.md`", "todo"),
+            both("~/notes/todo.md")
+        );
+        assert_eq!(path("at /etc/hosts:", "hosts"), both("/etc/hosts"));
+        // Words, versions and folders aren't files.
+        assert_eq!(path("a word here", "word"), None);
+        assert_eq!(path("version 1.5.0 is out", "1.5"), None);
+        assert_eq!(path("look in src/ first", "src"), None);
+        // Nor is the full stop after one.
+        assert_eq!(
+            path("Edit Cargo.toml.", "."),
+            Some(("Cargo.toml".into(), "Cargo.toml".into()))
+        );
+        assert_eq!(path("Edit a.rs. Then", ". Then"), None);
     }
 
     /// A shell printing `script` in a 30-column terminal, once `shown` shows.
@@ -245,6 +364,18 @@ mod tests {
         assert_eq!(link.url, "https://lemur.dev/docs");
         assert_eq!(link.spans, [(0, 5, 13)]);
         assert_eq!(link_at(&term, 14, 0), None);
+    }
+
+    #[test]
+    fn a_path_written_out_links_to_its_file() {
+        let pty = printed("printf 'edit src/gui/links.rs:42 now'; sleep 5", "now");
+        let term = pty.term.lock();
+        let link = link_at(&term, 8, 0).expect("on the path");
+        assert_eq!(link.url, "src/gui/links.rs");
+        assert!(link.file);
+        assert_eq!(link.spans, [(0, 5, 24)]);
+        let web = link_at(&term, 26, 0);
+        assert_eq!(web, None, "now");
     }
 
     /// Text can hide any URI; only a web link's opens.

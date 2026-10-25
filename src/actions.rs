@@ -2,7 +2,8 @@ use crate::attach::Active;
 use crate::config::{ClaudeThread, Config, Host};
 use crate::remote::{Remote, quote, sh_path, target};
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -572,6 +573,51 @@ pub fn upload(host: &Host, files: &[PathBuf]) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Copies a file a session printed the path of from the host, into a
+/// temporary folder that mirrors the host's, and returns where it went. A
+/// relative path is from the session's current folder, as Claude prints
+/// them.
+pub fn download(host: &Host, session: &str, path: &str) -> Result<PathBuf> {
+    let r = Remote::new(host);
+    let remote = r.run(&format!(
+        "set -e\np={}\ncase $p in /*) ;; *) p=\"$({} display-message -p -t {}: '#{{pane_current_path}}')/$p\" ;; esac\n[ -f \"$p\" ] || {{ echo \"no file at $p\" >&2; exit 1; }}\ncd \"$(dirname \"$p\")\"\nprintf '%s/%s\\n' \"$(pwd -P)\" \"$(basename \"$p\")\"\n",
+        sh_path(path),
+        r.tmux(),
+        target(session)
+    ))?;
+    let remote = remote.trim_end_matches('\n');
+    // Only the folders' names: `..` can't climb out.
+    let mirrored: PathBuf = Path::new(remote)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    let local = std::env::temp_dir()
+        .join("lemur-files")
+        .join(&host.name)
+        .join(mirrored);
+    let dir = local.parent().expect("has parent");
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    r.copy_from(remote, &local)?;
+    Ok(local)
+}
+
+/// Shows a file with Quick Look, which previews it and never runs it.
+pub fn quick_look(file: &Path) -> Result<()> {
+    let mut child = Command::new("qlmanage")
+        .arg("-p")
+        .arg(file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting Quick Look")?;
+    // It runs until the preview closes.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// What a session gets typed after an upload: the remote paths, then a
 /// space so you can keep writing.
 pub fn paste_line(paths: &[String]) -> String {
@@ -630,6 +676,40 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::Duration;
+
+    /// A path a session printed comes over from its folder, or from where an
+    /// absolute one says; a folder or a missing file doesn't.
+    #[test]
+    fn downloading_a_printed_path_fetches_the_file() {
+        let server = TmuxServer::new("dl");
+        let dir = TempDir::new("dl");
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/a.rs"), "fn a() {}\n").unwrap();
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "t",
+            "-c",
+            &work.to_string_lossy(),
+        ]);
+        let cfg = server.config();
+        let host = cfg.host("local").unwrap();
+
+        let got = download(host, "t", "src/a.rs").unwrap();
+        assert_eq!(std::fs::read_to_string(&got).unwrap(), "fn a() {}\n");
+        assert!(got.ends_with("work/src/a.rs"), "{}", got.display());
+        let absolute = work.join("src/a.rs");
+        assert_eq!(
+            download(host, "t", &absolute.to_string_lossy()).unwrap(),
+            got
+        );
+        let folder = download(host, "t", "src").unwrap_err();
+        assert!(format!("{folder:#}").contains("no file at"), "{folder:#}");
+        assert!(download(host, "t", "missing.rs").is_err());
+        std::fs::remove_file(got).unwrap();
+    }
 
     /// Removing a worktree closes its threads and then deletes it. A thread
     /// it wasn't asked to close, even one that only has a pane in it, keeps

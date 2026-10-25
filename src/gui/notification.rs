@@ -9,12 +9,18 @@ use std::rc::Rc;
 pub enum NotificationEvent {
     Show,
     Dismiss,
+    /// It took the keyboard without a click, as ⌘Tab back to lemur can make
+    /// it do; the main window should have it.
+    Focused,
 }
 
 pub struct Notification {
     title: SharedString,
     caption: SharedString,
     icon: IconName,
+    /// The pointer is over it, as it is for a click on its buttons.
+    hovered: bool,
+    _activation: Subscription,
 }
 
 impl EventEmitter<NotificationEvent> for Notification {}
@@ -24,11 +30,23 @@ impl Notification {
         title: impl Into<SharedString>,
         caption: impl Into<SharedString>,
         icon: IconName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
+        // A click on its buttons has the pointer over it; anything else
+        // that makes it key leaves you typing into a popup. (GPUI's
+        // `is_window_hovered` is `is_window_active` on macOS.)
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && !this.hovered {
+                cx.emit(NotificationEvent::Focused);
+            }
+        });
         Notification {
             title: title.into(),
             caption: caption.into(),
             icon,
+            hovered: false,
+            _activation: activation,
         }
     }
 
@@ -58,6 +76,7 @@ impl Render for Notification {
         let theme = cx.theme();
         h_flex()
             .id("notification")
+            .on_hover(cx.listener(|this, hovered: &bool, _, _| this.hovered = *hovered))
             .size_full()
             .p_3()
             .gap_4()

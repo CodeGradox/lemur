@@ -268,6 +268,31 @@ impl TerminalView {
         .detach();
     }
 
+    /// Copies a file the session printed the path of from the host, then
+    /// shows it with Quick Look.
+    fn preview(&mut self, path: String, cx: &mut Context<Self>) {
+        let (host, session) = (self.host.clone(), self.session.clone());
+        self.status = Some(format!("downloading {path}…"));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let file = actions::download(&host, &session, &path)?;
+                    actions::quick_look(&file)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.status = None,
+                    Err(e) => this.status = Some(format!("download failed: {e:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
         let b = self.bounds;
         let col = ((position.x - b.origin.x) / px(self.cell.cell_width as f32)).max(0.0) as usize;
@@ -315,7 +340,11 @@ impl TerminalView {
         if event.modifiers.platform
             && let Some(link) = self.link_at(event.position)
         {
-            cx.open_url(&link.url);
+            if link.file {
+                self.preview(link.url, cx);
+            } else {
+                cx.open_url(&link.url);
+            }
             return;
         }
         if Self::reports_mouse(self.mode()) {
