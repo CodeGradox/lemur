@@ -332,12 +332,19 @@ fn refuse_existing(tmux: &str, session: &str) -> String {
 
 /// Tags the session as Claude's and types the Claude command into its shell,
 /// so a login shell has set up PATH first.
+///
+/// Inside tmux, Claude Code draws in 256 colors, which turn its colors pale,
+/// unless `CLAUDE_CODE_TMUX_TRUECOLOR` says tmux passes 24-bit color on, and
+/// `COLORTERM` says there is 24-bit color at all (tmux sets it only from
+/// 3.6). tmux brings it down to 256 for a terminal that can't show it.
 fn launch(tmux: &str, session: &str, command: &str) -> String {
     let t = target(session);
     format!(
         "{}\n{tmux} send-keys -t {t}: -l {}\n{tmux} send-keys -t {t}: Enter",
         tag(tmux, session, "claude"),
-        quote(command)
+        quote(&format!(
+            "COLORTERM=truecolor CLAUDE_CODE_TMUX_TRUECOLOR=1 {command}"
+        ))
     )
 }
 
@@ -986,7 +993,8 @@ mod tests {
         let server = TmuxServer::new("resume");
         let (dir, mut cfg) = cloned("resume", &server);
         // Prints what Claude would get.
-        cfg.hosts[0].claude = "echo claude".into();
+        cfg.hosts[0].claude =
+            r#"sh -c 'echo "claude truecolor=$CLAUDE_CODE_TMUX_TRUECOLOR $*"' claude"#.into();
         let typed = |session: &str, text: &str| {
             wait_until(Duration::from_secs(5), || {
                 server
@@ -1003,7 +1011,7 @@ mod tests {
             (claude.host.as_str(), claude.path.as_str()),
             ("local", path.as_str())
         );
-        let first = format!("claude --session-id {}", claude.claude_session);
+        let first = format!("claude truecolor=1 --session-id {}", claude.claude_session);
         assert!(typed(&started.session, &first), "{first} never ran");
         assert!(
             new_thread_in(&cfg, 0, &path, "shell--a", true)
@@ -1016,7 +1024,7 @@ mod tests {
         assert!(resume_thread(&cfg, &claude).is_err());
         server.tmux(&["kill-session", "-t", &format!("={}", started.session)]);
         resume_thread(&cfg, &claude).unwrap();
-        let again = format!("claude --resume {}", claude.claude_session);
+        let again = format!("claude truecolor=1 --resume {}", claude.claude_session);
         assert!(typed(&started.session, &again), "{again} never ran");
         let at = |option: &str| {
             server.tmux(&[

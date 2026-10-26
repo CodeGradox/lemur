@@ -554,12 +554,60 @@ impl Style {
     }
 }
 
-/// One screen row: its text, styled runs (style, byte length), and
-/// background spans (first column, end column, color).
+/// One screen row: its text, styled runs (style, byte length), background
+/// spans (first column, end column, color), and block elements (column,
+/// character, color), which are painted rather than left in the text.
 struct Row {
     text: String,
     runs: Vec<(Style, usize)>,
     backgrounds: Vec<(usize, usize, Rgb)>,
+    blocks: Vec<(usize, char, Rgb)>,
+}
+
+/// What a block element (U+2580–U+259F) covers of its cell, as (left, top,
+/// right, bottom) fractions, and how opaque it is. The font's glyphs don't
+/// fill the cell, so neighbors would show seams between them.
+fn block(c: char) -> Option<(Vec<[f32; 4]>, f32)> {
+    // Upper left, upper right, lower left, lower right.
+    let quadrants = |on: [bool; 4]| -> Vec<[f32; 4]> {
+        [
+            [0.0, 0.0, 0.5, 0.5],
+            [0.5, 0.0, 1.0, 0.5],
+            [0.0, 0.5, 0.5, 1.0],
+            [0.5, 0.5, 1.0, 1.0],
+        ]
+        .into_iter()
+        .zip(on)
+        .filter_map(|(rect, on)| on.then_some(rect))
+        .collect()
+    };
+    let eighths = |n: u32| n as f32 / 8.0;
+    let full = vec![[0.0, 0.0, 1.0, 1.0]];
+    let rects = match c {
+        '▀' => vec![[0.0, 0.0, 1.0, 0.5]],
+        // Lower one eighth up to the full block.
+        '▁'..='█' => vec![[0.0, 1.0 - eighths(c as u32 - 0x2580), 1.0, 1.0]],
+        // Left seven eighths down to one eighth.
+        '▉'..='▏' => vec![[0.0, 0.0, eighths(0x2590 - c as u32), 1.0]],
+        '▐' => vec![[0.5, 0.0, 1.0, 1.0]],
+        '░' => return Some((full, 0.25)),
+        '▒' => return Some((full, 0.5)),
+        '▓' => return Some((full, 0.75)),
+        '▔' => vec![[0.0, 0.0, 1.0, 0.125]],
+        '▕' => vec![[0.875, 0.0, 1.0, 1.0]],
+        '▖' => quadrants([false, false, true, false]),
+        '▗' => quadrants([false, false, false, true]),
+        '▘' => quadrants([true, false, false, false]),
+        '▙' => quadrants([true, false, true, true]),
+        '▚' => quadrants([true, false, false, true]),
+        '▛' => quadrants([true, true, true, false]),
+        '▜' => quadrants([true, true, false, true]),
+        '▝' => quadrants([false, true, false, false]),
+        '▞' => quadrants([false, true, true, false]),
+        '▟' => quadrants([false, true, true, true]),
+        _ => return None,
+    };
+    Some((rects, 1.0))
 }
 
 struct Frame {
@@ -581,6 +629,7 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
             text: String::with_capacity(cols),
             runs: vec![],
             backgrounds: vec![],
+            blocks: vec![],
         })
         .collect();
     for cell in content.display_iter {
@@ -611,6 +660,12 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
             ' '
         } else {
             cell.c
+        };
+        let c = if block(c).is_some() {
+            row.blocks.push((col, c, fg));
+            ' '
+        } else {
+            c
         };
         let style = Style {
             fg,
@@ -674,6 +729,10 @@ fn paint(
 ) {
     let (w, h) = (metrics.cell_width, metrics.line_height);
     window.paint_quad(fill(bounds, frame.background));
+    // Block elements' edges go to whole device pixels: neighbors then share
+    // them instead of each half covering the pixel between them.
+    let scale = window.scale_factor();
+    let snap = |v: Pixels| px((f32::from(v) * scale).round() / scale);
     for (i, row) in frame.rows.iter().enumerate() {
         let y = bounds.origin.y + h * i as f32;
         for &(start, end, color) in &row.backgrounds {
@@ -682,6 +741,19 @@ fn paint(
                 Bounds::new(origin, size(w * (end - start) as f32, h)),
                 hsla(color),
             ));
+        }
+        for &(col, c, color) in &row.blocks {
+            let Some((rects, alpha)) = block(c) else {
+                continue;
+            };
+            let x = bounds.origin.x + w * col as f32;
+            let corner = |fx: f32, fy: f32| point(snap(x + w * fx), snap(y + h * fy));
+            for [left, top, right, bottom] in rects {
+                window.paint_quad(fill(
+                    Bounds::from_corners(corner(left, top), corner(right, bottom)),
+                    hsla(color).opacity(alpha),
+                ));
+            }
         }
     }
     if let Some((col, line, shape, color)) = frame.cursor {
@@ -811,7 +883,7 @@ impl Render for TerminalView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{TerminalView, snapshot};
+    use super::{TerminalView, block, snapshot};
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Pty, Size};
     use crate::test_support::{TmuxServer, wait_until};
@@ -886,6 +958,38 @@ mod tests {
             2
         );
         assert_eq!(frame.rows[1].text, "");
+    }
+
+    /// Block elements reach the painter as rectangles of their cell, not as
+    /// glyphs, so Claude's mascot has no seams.
+    #[test]
+    fn block_elements_are_painted_not_typed() {
+        let argv: Vec<String> = ["sh", "-c", "printf 'a▐▛x'; sleep 5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let size = Size {
+            cols: 40,
+            lines: 3,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let (pty, _events) = Pty::spawn(&argv, size).unwrap();
+        let shown = || snapshot(&pty, &DARK).rows[0].text.clone();
+        assert!(
+            wait_until(Duration::from_secs(5), || shown() == "a  x"),
+            "{:?}",
+            shown()
+        );
+        let frame = snapshot(&pty, &DARK);
+        let blocks: Vec<_> = frame.rows[0].blocks.iter().map(|b| (b.0, b.1)).collect();
+        assert_eq!(blocks, [(1, '▐'), (2, '▛')]);
+
+        assert_eq!(block('▁'), Some((vec![[0.0, 0.875, 1.0, 1.0]], 1.0)));
+        assert_eq!(block('█'), Some((vec![[0.0, 0.0, 1.0, 1.0]], 1.0)));
+        assert_eq!(block('▉'), Some((vec![[0.0, 0.0, 0.875, 1.0]], 1.0)));
+        assert_eq!(block('▏'), Some((vec![[0.0, 0.0, 0.125, 1.0]], 1.0)));
+        assert_eq!(block('a'), None);
     }
 
     /// A real `tmux attach` in a headless window: resizing the window must
