@@ -3,6 +3,7 @@
 
 use super::folder_picker::{FolderPicker, HostChoice, PickerEvent};
 use super::settings::Prefs;
+use super::snackbar::Kind;
 use super::{Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
@@ -53,8 +54,7 @@ impl Lemur {
             .iter()
             .any(|b| b.host == host.name && b.path == path)
         {
-            self.status = Some((format!("{path} is in the sidebar already"), false));
-            cx.notify();
+            self.note(format!("{path} is in the sidebar already"), cx);
             return;
         }
         let new_host = self.cfg.host(&host.name).is_none();
@@ -422,7 +422,7 @@ impl Lemur {
         force: bool,
         cx: &mut Context<Self>,
     ) {
-        self.status = Some((format!("removing {}…", removal.label), false));
+        self.status = Some((format!("removing {}…", removal.label), Kind::Progress));
         cx.notify();
         let cfg = self.cfg.clone();
         let Removal {

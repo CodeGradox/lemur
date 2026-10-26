@@ -3,6 +3,7 @@
 //! Each starts with an ID of lemur's, and refreshes keep it current.
 
 use super::settings::Prefs;
+use super::snackbar::Kind;
 use super::{Lemur, sessions};
 use crate::actions;
 use crate::config::{ClaudeThread, Config, leaf};
@@ -94,7 +95,7 @@ impl Lemur {
             [one] => actions::label(leaf(&one.session)).to_string(),
             many => format!("{} threads", many.len()),
         };
-        self.status = Some((format!("resuming {what}…"), false));
+        self.status = Some((format!("resuming {what}…"), Kind::Progress));
         cx.notify();
         let cfg = self.cfg.clone();
         self.in_background(

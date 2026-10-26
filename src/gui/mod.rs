@@ -15,6 +15,7 @@ mod resume;
 mod rows;
 mod settings;
 mod sidebar;
+mod snackbar;
 mod spotlight;
 mod terminal;
 mod terminal_view;
@@ -34,10 +35,11 @@ use notes::NotesPanel;
 use notification::{Notification, NotificationEvent};
 use settings::Prefs;
 use sidebar::{SIDEBAR_WIDTH, SidebarView};
+use snackbar::Kind;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use terminal_view::TerminalView;
+use terminal_view::{StatusChanged, TerminalView};
 
 actions!(
     lemur,
@@ -167,7 +169,8 @@ struct Lemur {
     renaming: Option<Key>,
     /// Sessions that finished while you were looking at another one.
     done: HashSet<Key>,
-    status: Option<(String, bool)>,
+    /// Shown in a snackbar over the terminal.
+    status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
     restore: Option<Key>,
     /// The main window, for background work that ends in UI changes.
@@ -378,10 +381,28 @@ impl Lemur {
         })
     }
 
-    /// Shows what went wrong in the header.
+    /// Shows what went wrong, until it's closed.
     fn fail(&mut self, e: anyhow::Error, cx: &mut Context<Self>) {
-        self.status = Some((format!("{e:#}"), true));
+        self.status = Some((format!("{e:#}"), Kind::Error));
         cx.notify();
+    }
+
+    /// Shows `text` for a while.
+    fn note(&mut self, text: String, cx: &mut Context<Self>) {
+        let shown = Some((text, Kind::Note));
+        self.status = shown.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(snackbar::NOTE_TIME).await;
+            this.update(cx, |this, cx| {
+                if this.status == shown {
+                    this.status = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Fetches a snapshot in the background and applies it.
@@ -536,7 +557,13 @@ impl Lemur {
         let view = self
             .terminals
             .entry(key.clone())
-            .or_insert_with(|| cx.new(|cx| TerminalView::new(h, session.clone(), cx)))
+            .or_insert_with(|| {
+                let view = cx.new(|cx| TerminalView::new(h, session.clone(), cx));
+                // Its message shows in the window's snackbars.
+                cx.subscribe(&view, |_, _, _: &StatusChanged, cx| cx.notify())
+                    .detach();
+                view
+            })
             .clone();
         if view.read(cx).exited() {
             view.update(cx, |v, cx| v.connect(cx));
@@ -771,7 +798,7 @@ impl Lemur {
             },
             None => String::new(),
         };
-        let mut bar = h_flex()
+        h_flex()
             .h_10()
             .px_2()
             .gap_2()
@@ -784,31 +811,58 @@ impl Lemur {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(title),
-            );
-        if let Some((message, error)) = &self.status {
-            let color = if *error {
-                cx.theme().danger
-            } else {
-                cx.theme().muted_foreground
-            };
-            bar = bar
-                .child(div().flex_1())
-                .child(div().text_sm().text_color(color).child(message.clone()));
-        } else {
-            bar = bar.child(div().flex_1());
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("toggle-notes")
+                    .icon(if self.notes_open {
+                        IconName::PanelRightClose
+                    } else {
+                        IconName::PanelRightOpen
+                    })
+                    .ghost()
+                    .small()
+                    .tooltip("Toggle notes (⌘R)")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
+            )
+    }
+
+    /// The window's message above the shown terminal's, at the bottom of
+    /// the terminal.
+    fn snackbars(&self, cx: &mut Context<Self>) -> Div {
+        let mut snacks = vec![];
+        if let Some((text, kind)) = &self.status {
+            let this = cx.entity().downgrade();
+            snacks.push(snackbar::snackbar(
+                "status",
+                text.clone(),
+                *kind,
+                move |_, cx| {
+                    this.update(cx, |this, cx| {
+                        this.status = None;
+                        cx.notify();
+                    })
+                    .ok();
+                },
+                cx,
+            ));
         }
-        bar.child(
-            Button::new("toggle-notes")
-                .icon(if self.notes_open {
-                    IconName::PanelRightClose
-                } else {
-                    IconName::PanelRightOpen
-                })
-                .ghost()
-                .small()
-                .tooltip("Toggle notes (⌘R)")
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
-        )
+        let terminal = self.active.as_ref().and_then(|k| self.terminals.get(k));
+        if let Some(terminal) = terminal
+            && let Some((text, kind)) = terminal.read(cx).status()
+        {
+            let view = terminal.downgrade();
+            snacks.push(snackbar::snackbar(
+                "terminal-status",
+                text.clone(),
+                *kind,
+                move |_, cx| {
+                    view.update(cx, |view, cx| view.dismiss_status(cx)).ok();
+                },
+                cx,
+            ));
+        }
+        snackbar::stack(snacks)
     }
 }
 
@@ -918,7 +972,15 @@ impl Render for Lemur {
                         h_flex()
                             .flex_1()
                             .min_h_0()
-                            .child(div().flex_1().min_w_0().h_full().child(main))
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(main)
+                                    .child(self.snackbars(cx)),
+                            )
                             .when(self.notes_open, |this| {
                                 this.child(
                                     div()
@@ -1026,6 +1088,7 @@ fn key(host: &str, s: &Session) -> Key {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::folder_picker::HostChoice;
+    use super::snackbar::Kind;
     use super::{
         Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
         SIDEBAR_WIDTH, move_item, moved_to,
@@ -1437,6 +1500,30 @@ mod tests {
             let status = app.status.as_ref().map(|(s, _)| s.as_str());
             assert_eq!(status, Some("/srv/api is in the sidebar already"));
         });
+    }
+
+    /// A note closes itself; an error stays until its × is clicked.
+    #[gpui::test]
+    fn notes_fade_and_errors_wait_to_be_closed(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        let status = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.status.clone());
+        let wait = |time: Duration, cx: &mut VisualTestContext| {
+            cx.executor().advance_clock(time);
+            cx.run_until_parked();
+        };
+
+        app.update(cx, |app, cx| app.note("saved".into(), cx));
+        wait(super::snackbar::NOTE_TIME / 2, cx);
+        assert_eq!(status(cx), Some(("saved".into(), Kind::Note)));
+        wait(super::snackbar::NOTE_TIME / 2, cx);
+        assert_eq!(status(cx), None);
+
+        app.update(cx, |app, cx| app.fail(anyhow::anyhow!("broke"), cx));
+        wait(super::snackbar::NOTE_TIME * 2, cx);
+        assert_eq!(status(cx), Some(("broke".into(), Kind::Error)));
+        let close = cx.debug_bounds("close status").expect("its ×").center();
+        cx.simulate_click(close, Modifiers::none());
+        assert_eq!(status(cx), None);
     }
 
     /// Drags one element onto another, by their debug selectors, as a mouse

@@ -2,6 +2,7 @@
 //! a rename, and what happens once one is given.
 
 use super::sidebar::claude_icon;
+use super::snackbar::Kind;
 use super::{Ask, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
 use crate::config::{ClaudeThread, leaf};
@@ -321,7 +322,7 @@ impl Lemur {
             }
             _ => "starting",
         };
-        self.status = Some((format!("{doing} {name}…"), false));
+        self.status = Some((format!("{doing} {name}…"), Kind::Progress));
         cx.notify();
         self.in_background(
             cx,
@@ -353,7 +354,7 @@ impl Lemur {
                 this.renaming = None;
                 match done {
                     Ok(Done::Started(started, note)) => {
-                        this.status = note.map(|note| (note, false));
+                        this.status = note.map(|note| (note, Kind::Warning));
                         if let Some(claude) = started.claude {
                             this.keep_thread(claude, cx);
                         }

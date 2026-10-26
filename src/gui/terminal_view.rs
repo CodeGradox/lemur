@@ -4,6 +4,7 @@
 use super::keys::{self, Key};
 use super::links::{Link, link_at};
 use super::settings::Prefs;
+use super::snackbar::Kind;
 use super::terminal::{Palette, Pty, Size};
 use crate::actions;
 use crate::attach::attach_argv;
@@ -38,10 +39,16 @@ pub struct TerminalView {
     pointer: Option<Point<Pixels>>,
     link: Option<Link>,
     scroll_lines: f32,
-    status: Option<String>,
+    /// Shown in the window's snackbars while this terminal is.
+    status: Option<(String, Kind)>,
     _reader: Option<Task<()>>,
     _prefs: Subscription,
 }
+
+/// The terminal's message came or went.
+pub struct StatusChanged;
+
+impl EventEmitter<StatusChanged> for TerminalView {}
 
 /// The terminal font and the size of one cell in it.
 #[derive(Clone)]
@@ -97,13 +104,30 @@ impl TerminalView {
         self.pty.is_none()
     }
 
+    pub fn status(&self) -> Option<&(String, Kind)> {
+        self.status.as_ref()
+    }
+
+    /// Closes the message, as its × does.
+    pub fn dismiss_status(&mut self, cx: &mut Context<Self>) {
+        self.set_status(None, cx);
+        cx.notify();
+    }
+
+    fn set_status(&mut self, status: Option<(String, Kind)>, cx: &mut Context<Self>) {
+        if self.status != status {
+            self.status = status;
+            cx.emit(StatusChanged);
+        }
+    }
+
     /// (Re)starts `tmux attach` for this session, e.g. after the laptop slept.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         let argv = attach_argv(&self.host, &self.session);
         match Pty::spawn(&argv, self.cell) {
             Ok((pty, mut events)) => {
                 self.pty = Some(pty);
-                self.status = None;
+                self.set_status(None, cx);
                 self._reader = Some(cx.spawn(async move |this, cx| {
                     while let Some(event) = events.next().await {
                         if this
@@ -117,7 +141,7 @@ impl TerminalView {
             }
             Err(e) => {
                 self.pty = None;
-                self.status = Some(format!("{e:#}"));
+                self.set_status(Some((format!("{e:#}"), Kind::Error)), cx);
             }
         }
         cx.notify();
@@ -149,7 +173,10 @@ impl TerminalView {
             TermEvent::ChildExit(_) | TermEvent::Exit => {
                 self.pty = None;
                 self._reader = None;
-                self.status = Some("disconnected · click to reconnect".into());
+                self.set_status(
+                    Some(("disconnected · click to reconnect".into(), Kind::Warning)),
+                    cx,
+                );
                 cx.notify();
             }
             _ => {}
@@ -238,7 +265,10 @@ impl TerminalView {
     fn upload(&mut self, mut files: Vec<PathBuf>, image: Option<Image>, cx: &mut Context<Self>) {
         let host = self.host.clone();
         let count = files.len() + usize::from(image.is_some());
-        self.status = Some(format!("uploading {count} file(s)…"));
+        self.set_status(
+            Some((format!("uploading {count} file(s)…"), Kind::Progress)),
+            cx,
+        );
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -256,10 +286,12 @@ impl TerminalView {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(paths) => {
-                        this.status = None;
+                        this.set_status(None, cx);
                         this.paste_text(&actions::paste_line(&paths));
                     }
-                    Err(e) => this.status = Some(format!("upload failed: {e:#}")),
+                    Err(e) => {
+                        this.set_status(Some((format!("upload failed: {e:#}"), Kind::Error)), cx)
+                    }
                 }
                 cx.notify();
             })
@@ -272,7 +304,7 @@ impl TerminalView {
     /// shows it with Quick Look.
     fn preview(&mut self, path: String, cx: &mut Context<Self>) {
         let (host, session) = (self.host.clone(), self.session.clone());
-        self.status = Some(format!("downloading {path}…"));
+        self.set_status(Some((format!("downloading {path}…"), Kind::Progress)), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -283,8 +315,10 @@ impl TerminalView {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => this.status = None,
-                    Err(e) => this.status = Some(format!("download failed: {e:#}")),
+                    Ok(()) => this.set_status(None, cx),
+                    Err(e) => {
+                        this.set_status(Some((format!("download failed: {e:#}"), Kind::Error)), cx)
+                    }
                 }
                 cx.notify();
             })
@@ -771,21 +805,6 @@ impl Render for TerminalView {
                 this.upload(paths.paths().to_vec(), None, cx)
             }))
             .child(grid)
-            .when_some(self.status.clone(), |this, status| {
-                this.child(
-                    div()
-                        .absolute()
-                        .bottom_2()
-                        .right_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(hsla(palette.foreground).opacity(0.15))
-                        .text_color(hsla(palette.foreground))
-                        .text_sm()
-                        .child(status),
-                )
-            })
     }
 }
 
