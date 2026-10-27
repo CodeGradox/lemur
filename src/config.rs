@@ -32,6 +32,8 @@ pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
 pub struct Config {
     #[serde(default)]
     pub theme: ThemeChoice,
+    #[serde(default)]
+    pub dictation_language: Language,
     /// The sidebar's width in pixels, as last dragged; unset is lemur's own.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
@@ -69,6 +71,28 @@ impl ThemeChoice {
             ThemeChoice::System => "system",
             ThemeChoice::Light => "light",
             ThemeChoice::Dark => "dark",
+        }
+    }
+}
+
+/// The language dictation listens for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub enum Language {
+    #[default]
+    #[serde(rename = "en-US")]
+    English,
+    #[serde(rename = "nb-NO")]
+    Norwegian,
+}
+
+impl Language {
+    pub const ALL: [Language; 2] = [Language::English, Language::Norwegian];
+
+    /// Its locale, as the config file names it and lemur-dictate takes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Language::English => "en-US",
+            Language::Norwegian => "nb-NO",
         }
     }
 }
@@ -304,9 +328,20 @@ impl Config {
 
     /// Writes the settings the Settings window changes into the config file
     /// at `path`, leaving everything else in it, comments included, as is.
-    pub fn save_settings(path: &Path, theme: ThemeChoice, terminal: &Terminal) -> Result<()> {
+    /// The default dictation language is left out of it.
+    pub fn save_settings(
+        path: &Path,
+        theme: ThemeChoice,
+        language: Language,
+        terminal: &Terminal,
+    ) -> Result<()> {
         edit(path, |doc| {
             doc["theme"] = toml_edit::value(theme.as_str());
+            if language == Language::default() {
+                doc.remove("dictation_language");
+            } else {
+                doc["dictation_language"] = toml_edit::value(language.as_str());
+            }
             let table = doc
                 .entry("terminal")
                 .or_insert_with(toml_edit::table)
@@ -622,6 +657,15 @@ mod tests {
     }
 
     #[test]
+    fn dictation_language_defaults_to_english() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.dictation_language, Language::English);
+        let cfg: Config = toml::from_str("dictation_language = \"nb-NO\"").unwrap();
+        assert_eq!(cfg.dictation_language, Language::Norwegian);
+        assert!(toml::from_str::<Config>("dictation_language = \"xx\"").is_err());
+    }
+
+    #[test]
     fn terminal_font_defaults_and_whole_sizes() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.terminal, Terminal::default());
@@ -675,7 +719,7 @@ path = \"~/projects/api\"
             },
             ..Default::default()
         };
-        Config::save_settings(&path, ThemeChoice::Dark, &terminal).unwrap();
+        Config::save_settings(&path, ThemeChoice::Dark, Language::Norwegian, &terminal).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
             saved.contains("# my hosts") && saved.contains("# the box"),
@@ -684,6 +728,7 @@ path = \"~/projects/api\"
         assert!(saved.contains("font_size = 14\n"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::Dark);
+        assert_eq!(cfg.dictation_language, Language::Norwegian);
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
 
@@ -692,9 +737,10 @@ path = \"~/projects/api\"
             font_size: 12.5,
             ..terminal
         };
-        Config::save_settings(&path, ThemeChoice::System, &terminal).unwrap();
+        Config::save_settings(&path, ThemeChoice::System, Language::English, &terminal).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved.matches("font_size").count(), 1, "{saved}");
+        assert!(!saved.contains("dictation_language"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::System);
         assert_eq!(cfg.terminal.font_size, 12.5);

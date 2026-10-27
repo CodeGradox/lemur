@@ -18,6 +18,8 @@
     <string>NSApplication</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>lemur listens while you dictate (⌘D) and writes down what you say, on this Mac.</string>
     <key>NSHumanReadableCopyright</key>
     <string>lemur</string>
 </dict>

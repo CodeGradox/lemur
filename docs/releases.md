@@ -16,7 +16,20 @@ on the Mac that built it; a copy downloaded elsewhere would be blocked by
 Gatekeeper, which is what signed releases are for. `BUILD_DIR` moves the
 output. `LEMEN_SIGNING_IDENTITY` signs with another identity; a
 `Developer ID Application: …` identity also turns on the hardened runtime and
-a secure timestamp, as notarization requires. lemur needs no entitlements.
+a secure timestamp, as notarization requires. lemur's one entitlement,
+`com.apple.security.device.audio-input` (`Resources/lemur.entitlements`),
+lets dictation use the microphone under the hardened runtime.
+
+The app holds a second program, `lemur-dictate`: dictation's helper, in Swift
+(`src/dictate.swift`), which listens to the microphone and transcribes with
+macOS 26's SpeechAnalyzer. `scripts/build-dictate.sh` builds it, into the
+app beside `lemur` for the app build, and for `cargo build` into Cargo's
+output, where a `lemur` run from `target/` finds it. It's signed before the
+app, with the same identity and entitlement. Building it needs Xcode 26 or
+newer, and it runs on macOS 26 or newer; on older macOS, dictating says so.
+macOS asks for the microphone for the app a program was started from, so a
+`lemur` run from `target/` asks as your terminal, and run in a lemur thread,
+as that lemur: one without the entitlement can't have it, and macOS won't ask.
 
 The build turns `Resources/lemur.png` (square, at least 1024×1024) into the
 app icon with `scripts/build-icon.sh`; without it the app has the default

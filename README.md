@@ -6,7 +6,7 @@ A macOS app for Claude Code sessions that live in tmux on a remote host: a sideb
 
 ## Install
 
-Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 11 or newer.
+Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 11 or newer (dictation, macOS 26).
 
 lemur was called lemen up to 1.0.0. Coming from lemen, move `~/.config/lemen` to `~/.config/lemur` (lemur won't start without its config) and `~/.lemen` to `~/.lemur` (your notes). lemur still reads the tags lemen put on tmux sessions, and `lemen.app` can go once lemur runs.
 
@@ -17,7 +17,7 @@ sh scripts/build-app.sh  # build/lemur.app; drag it into Applications
 cargo install --path .   # the lemur command, for `lemur ls`, `lemur paste` and the rest
 ```
 
-Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `git`. [docs/releases.md](docs/releases.md) covers the disk image and signed releases.
+Building needs Xcode 26 or newer (GPUI compiles Metal shaders, and dictation's helper is Swift for macOS 26). The host needs `tmux` and `git`. [docs/releases.md](docs/releases.md) covers the disk image and signed releases.
 
 ## Config
 
@@ -25,6 +25,7 @@ Building needs Xcode (GPUI compiles Metal shaders). The host needs `tmux` and `g
 
 ```toml
 # theme = "system"                # or "light" / "dark"; must come before the tables
+# dictation_language = "en-US"    # or "nb-NO", what ⌘D listens for; before the tables too
 # sidebar_width = 255             # pixels; dragging the sidebar's edge sets it
 # notes_width = 360               # pixels; dragging the notes panel's edge sets it
 
@@ -60,7 +61,7 @@ path = "~/projects/api"
 # hidden_open = true              # the Hidden section is open
 ```
 
-Settings (`⌘,`) writes `theme`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, tmux `session`, `path` and `claude_session` ID) to resume it. The rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `dictation_language`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, tmux `session`, `path` and `claude_session` ID) to resume it. The rest of the file, comments included, stays as it is.
 
 New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): lemur runs `git worktree add` there, then starts Claude in it.
 
@@ -84,11 +85,13 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the 
 - Drag a thread onto another in the same worktree to move it to that place. The order is stored on the tmux sessions (`@lemur_order`), so it survives restarts and is the same from any Mac; new threads start at the bottom.
 - `⌃Tab` shows the worktree's next thread: the one you opened before this one. Hold `⌃` and press `Tab` again to go further back, as `⌘Tab` does with apps; letting go of `⌃` stays there. `⌃⇧Tab` goes the other way.
 - `⌘B` or the header button collapses the sidebar. `⌘Q` quits; sessions keep running.
-- The menu bar has them too: **File** → **Add Project…** (`⌘O`), **New Thread in Worktree…** (`⌘J`) and **Refresh**; **View** → **Toggle Sidebar** (`⌘B`), **Toggle Notes** (`⌘R`, as Zed's right dock), and **Next** and **Previous Thread in Worktree** (`⌃Tab`, `⌃⇧Tab`).
-- `⌘,` (**lemur → Settings…**) opens Settings: the theme (System, Light or Dark), the terminal's font and size, and its colors for a dark and a light lemur (One Half Dark and Light to start). Changes apply at once and are saved to the config. **Shortcuts** lists every shortcut.
+- The menu bar has them too: **File** → **Add Project…** (`⌘O`), **New Thread in Worktree…** (`⌘J`), **Dictate** (`⌘D`) and **Refresh**; **View** → **Toggle Sidebar** (`⌘B`), **Toggle Notes** (`⌘R`, as Zed's right dock), and **Next** and **Previous Thread in Worktree** (`⌃Tab`, `⌃⇧Tab`).
+- `⌘,` (**lemur → Settings…**) opens Settings: the theme (System, Light or Dark), the terminal's font and size, its colors for a dark and a light lemur (One Half Dark and Light to start), and the language dictation listens for. Changes apply at once and are saved to the config. **Shortcuts** lists every shortcut.
 - A terminal whose connection dropped (laptop slept) says so; click it to reconnect.
 
 **Notes:** every worktree has a notepad. `⌘R` or the button at the right of the header opens it beside the terminal, on the worktree of the thread you opened last; a worktree's notes icon opens that one's. Type straight into it: it's Markdown, highlighted as you go. `⌘`-click a URL to open it; holding `⌘` underlines it first. Pasting a URL over selected text makes it a link, `[text](url)`, and so does `⌘K`, with the URL on the clipboard; `⌘K` in a link selects its URL. The two buttons at the top of the notes, or `⇧⌘L` for the checklist, make the cursor's line, or the selected lines, a bullet list or a checklist, and plain lines again when they are one already. `- [ ] ` starts an item with a box: `⌘`-click the box, or press `⌘↩` or `⇧⌘U` on its line, to tick it, and again to untick it; ticked items fade and are struck through. Enter at the end of a list item starts the next, and Enter on an empty one ends the list; Tab and `⇧Tab` indent and outdent an item, and `⌃⌘↑` and `⌃⌘↓` move it, with its nested items. These are Apple Notes' keys. Notes are saved as you type, on this Mac, in `~/.lemur/notes/<host>/<worktree path>.md`.
+
+**Dictation:** `⌘D` opens a bar under the terminal and listens: what you say shows there as you say it, transcribed on your Mac by macOS's own speech recognition, so no audio leaves it. `⌘D` again stops listening; the text is then yours to correct, and `⌘D` once more adds to it. `⌘⏎` or **Paste** pastes it into the thread on show without sending it, and closes the bar; pressed while lemur listens, it waits for your last words. The bar stays while you switch threads, so you can dictate first and pick the thread after: open it, then `⌘⏎`. Esc or **×** throws the text away. The button named after the language switches between English and Norwegian Bokmål from the next recording on, as Settings does. The first time, macOS asks whether lemur may use the microphone. Dictation needs macOS 26 or newer.
 
 **Images:** drop files on the terminal, or `⌘V` with an image or copied files on the clipboard. lemur uploads them to the host's `upload_dir` and pastes the remote paths. Text pastes as text.
 

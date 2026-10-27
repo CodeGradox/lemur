@@ -1,9 +1,9 @@
-//! Settings (lemur → Settings…, ⌘,): the theme, and the terminal's font
-//! and colors. Changes apply at once in every window and are saved to the
-//! config file.
+//! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font and
+//! colors, and the language dictation listens for. Changes apply at once in
+//! every window and are saved to the config file.
 
 use super::terminal::{Palette, SLOTS, Slot, set_color};
-use crate::config::{Config, FONT_SIZES, Terminal, ThemeChoice};
+use crate::config::{Config, FONT_SIZES, Language, Terminal, ThemeChoice};
 use alacritty_terminal::vte::ansi::Rgb;
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::kbd::Kbd;
@@ -25,6 +25,7 @@ pub const CONTEXT: &str = "Settings";
 #[derive(Clone, Default)]
 pub struct Prefs {
     pub theme: ThemeChoice,
+    pub dictation_language: Language,
     pub terminal: Terminal,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
@@ -38,6 +39,7 @@ impl Prefs {
     pub fn new(cfg: &Config, file: Option<PathBuf>) -> Self {
         Prefs {
             theme: cfg.theme,
+            dictation_language: cfg.dictation_language,
             terminal: cfg.terminal.clone(),
             file,
             error: None,
@@ -61,7 +63,7 @@ impl Prefs {
         let theme = prefs.theme;
         change(&mut prefs);
         prefs.error = prefs.file.as_deref().and_then(|path| {
-            Config::save_settings(path, prefs.theme, &prefs.terminal)
+            Config::save_settings(path, prefs.theme, prefs.dictation_language, &prefs.terminal)
                 .err()
                 .map(|e| format!("{e:#}"))
         });
@@ -254,6 +256,21 @@ impl Render for SettingsView {
             |size, cx| Prefs::update(cx, |p| p.terminal.font_size = size),
         )
         .default_value(defaults.font_size);
+        let languages = Language::ALL
+            .map(|l| (l.as_str().into(), language_label(l).into()))
+            .to_vec();
+        let language = SettingField::dropdown(
+            languages,
+            |cx| Prefs::get(cx).dictation_language.as_str().into(),
+            |value: SharedString, cx| {
+                let language = Language::ALL
+                    .into_iter()
+                    .find(|l| l.as_str() == value.as_ref())
+                    .unwrap_or_default();
+                Prefs::update(cx, |p| p.dictation_language = language);
+            },
+        )
+        .default_value(Language::default().as_str());
         let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
             SettingPage::new("Appearance").icon(IconName::Sun).group(
                 SettingGroup::new().item(
@@ -274,6 +291,14 @@ impl Render for SettingsView {
             SettingPage::new("Terminal colors")
                 .icon(IconName::Palette)
                 .groups([self.color_group(true), self.color_group(false)]),
+            SettingPage::new("Dictation")
+                .icon(gpui_kit::assets::IconName::Mic)
+                .group(
+                    SettingGroup::new()
+                        .item(SettingItem::new("Language", language).description(
+                            "What ⌘D listens for. The dictation bar switches it too.",
+                        )),
+                ),
             SettingPage::new("Shortcuts")
                 // Not among gpui-component's own icons; the full set has it.
                 .icon(gpui_kit::assets::IconName::Keyboard)
@@ -388,6 +413,24 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         ],
     ),
     (
+        "Dictation",
+        &[
+            Shortcut {
+                what: "Dictate",
+                how: Press::Keys(&["cmd-d"]),
+                more: Some(
+                    "Opens a bar under the terminal that writes down what you say; again stops listening, and once more adds to it.",
+                ),
+            },
+            Shortcut {
+                what: "Paste it into the thread on show",
+                how: Press::Keys(&["cmd-enter"]),
+                more: Some("Without sending it. From the terminal too, after switching threads."),
+            },
+            keys("Throw it away", &["escape"]),
+        ],
+    ),
+    (
         "Terminal",
         &[
             Shortcut {
@@ -480,6 +523,13 @@ fn to_rgb(c: Hsla) -> Rgb {
     }
 }
 
+pub fn language_label(language: Language) -> &'static str {
+    match language {
+        Language::English => "English",
+        Language::Norwegian => "Norwegian Bokmål",
+    }
+}
+
 fn theme_label(theme: ThemeChoice) -> &'static str {
     match theme {
         ThemeChoice::System => "System",
@@ -559,8 +609,8 @@ mod tests {
         });
     }
 
-    /// The Shortcuts page's keys parse, and the window's and the threads'
-    /// are the ones bound.
+    /// The Shortcuts page's keys parse, and the window's, the threads' and
+    /// dictation's are the ones bound.
     #[gpui::test]
     fn the_shortcuts_page_shows_bound_keys(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -574,7 +624,7 @@ mod tests {
                     };
                     for key in keys {
                         let stroke = Keystroke::parse(key).unwrap();
-                        if ["Window", "Threads"].contains(group) {
+                        if ["Window", "Threads", "Dictation"].contains(group) {
                             let bound = keymap.bindings().any(|b| {
                                 b.keystrokes().len() == 1
                                     && b.keystrokes()[0].to_string() == stroke.to_string()

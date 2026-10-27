@@ -19,6 +19,7 @@ target_directory="$(printf '%s\n' "$metadata" | sed -n 2p)"
 app="$build_directory/lemur.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$target_directory/release/lemur" "$app/Contents/MacOS/lemur"
+sh scripts/build-dictate.sh "$app/Contents/MacOS/lemur-dictate"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy \
     -c "Add :CFBundleShortVersionString string $version" \
@@ -29,7 +30,7 @@ if [ -f Resources/lemur.png ]; then
     sh scripts/build-icon.sh Resources/lemur.png "$app/Contents/Resources/lemur.icns"
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string lemur" "$app/Contents/Info.plist"
 fi
-set -- --force --sign "$signing_identity"
+set -- --force --sign "$signing_identity" --entitlements Resources/lemur.entitlements
 case "$signing_identity" in
     "Developer ID Application:"*)
         set -- "$@" --options runtime --timestamp
@@ -39,6 +40,8 @@ if [ -n "${LEMEN_SIGNING_KEYCHAIN:-}" ]; then
     set -- "$@" --keychain "$LEMEN_SIGNING_KEYCHAIN"
 fi
 printf 'Signing with %s\n' "$signing_identity"
+# Inside out: the helper first, then the app around it.
+codesign "$@" "$app/Contents/MacOS/lemur-dictate"
 codesign "$@" "$app"
 codesign --verify --strict "$app"
 printf '\nBuilt %s (version %s)\nLaunch with: open "%s"\n' "$app" "$version" "$app"

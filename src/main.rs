@@ -3,6 +3,7 @@ mod attach;
 mod browse;
 mod clip;
 mod config;
+mod dictate;
 mod gui;
 mod login_path;
 mod notes;

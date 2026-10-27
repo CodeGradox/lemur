@@ -88,6 +88,16 @@ pub fn git_in(dir: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
+/// A stand-in for lemur-dictate in `dir` that runs the shell `script`.
+pub fn fake_dictate(dir: &Path, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("lemur-dictate");
+    std::fs::write(&path, format!("#!/bin/sh\n{script}")).expect("writing the stand-in");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("making the stand-in runnable");
+    path
+}
+
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.
 pub fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;

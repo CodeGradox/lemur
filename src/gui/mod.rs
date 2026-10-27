@@ -4,6 +4,7 @@
 //! so switching is instant and scrollback survives.
 
 mod cycle;
+mod dictation;
 mod folder_picker;
 mod keys;
 mod links;
@@ -23,7 +24,9 @@ mod terminal_view;
 use crate::actions;
 use crate::attach::Active;
 use crate::config::{Config, ThemeChoice, leaf};
+use crate::dictate;
 use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
+use dictation::DictationBar;
 use folder_picker::FolderPicker;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::InputState;
@@ -55,7 +58,9 @@ actions!(
         ShowAll,
         NextThread,
         PreviousThread,
-        NewThreadHere
+        NewThreadHere,
+        Dictate,
+        PasteDictation
     ]
 );
 
@@ -73,11 +78,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
         KeyBinding::new("cmd-j", NewThreadHere, None),
+        KeyBinding::new("cmd-d", Dictate, None),
+        // Text fields take ⌘⏎ themselves: the notes tick a box with it, and
+        // the dictation bar pastes too.
+        KeyBinding::new("cmd-enter", PasteDictation, None),
         KeyBinding::new("cmd-w", settings::CloseWindow, Some(settings::CONTEXT)),
         // gpui-component's Root moves focus on Tab; in a terminal it belongs to the program.
         KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
         KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
     ]);
+    dictation::bind_keys(cx);
     folder_picker::bind_keys(cx);
     notes::bind_keys(cx);
     prompt::bind_keys(cx);
@@ -185,6 +195,10 @@ struct Lemur {
     notes_open: bool,
     /// Adding a folder, over the window.
     picker: Option<(Entity<FolderPicker>, Subscription)>,
+    /// Dictating, under the terminal.
+    dictation: Option<(Entity<DictationBar>, Subscription)>,
+    /// lemur-dictate, which dictation runs; tests have a stand-in.
+    helper: PathBuf,
     /// The sidebar, drawn by `sidebar()` but as a view of its own, so a
     /// terminal's output doesn't redraw it.
     sidebar: Entity<SidebarView>,
@@ -228,6 +242,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 Menu::new("File").items([
                     MenuItem::action("Add Project…", AddProject),
                     MenuItem::action("New Thread in Worktree…", NewThreadHere),
+                    MenuItem::action("Dictate", Dictate),
                     MenuItem::separator(),
                     MenuItem::action("Refresh", Refresh),
                 ]),
@@ -352,6 +367,8 @@ impl Lemur {
             notes,
             notes_open: false,
             picker: None,
+            dictation: None,
+            helper: dictate::helper(),
             sidebar,
             _refresh: refresh,
             focus,
@@ -913,6 +930,8 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &NewThreadHere, window, cx| this.new_thread_here(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &Dictate, window, cx| this.dictate(window, cx)))
+            .on_action(cx.listener(|this, _: &PasteDictation, _, cx| this.paste_dictation(cx)))
             .on_action(
                 cx.listener(|this, _: &NextThread, window, cx| {
                     this.cycle_threads(false, window, cx)
@@ -973,13 +992,19 @@ impl Render for Lemur {
                             .flex_1()
                             .min_h_0()
                             .child(
-                                div()
-                                    .relative()
+                                v_flex()
                                     .flex_1()
                                     .min_w_0()
                                     .h_full()
-                                    .child(main)
-                                    .child(self.snackbars(cx)),
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .child(main)
+                                            .child(self.snackbars(cx)),
+                                    )
+                                    .children(self.dictation.as_ref().map(|(bar, _)| bar.clone())),
                             )
                             .when(self.notes_open, |this| {
                                 this.child(
@@ -1095,7 +1120,7 @@ mod tests {
     };
     use crate::config::{Base, Config, Host};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
-    use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
+    use crate::test_support::{TempDir, TmuxServer, fake_dictate, git_in, wait_until};
     use gpui::VisualTestContext;
     use gpui_kit::component::WindowExt;
     use gpui_kit::{
@@ -2714,5 +2739,118 @@ mod tests {
                 (Some("api › a".to_string()), "t".to_string())
             );
         });
+    }
+
+    /// What the stand-in for lemur-dictate hears: two words while it
+    /// listens, and two more once stopped.
+    const HEARS: &str = r#"echo '{"listening": true}'
+echo '{"finalized": "", "volatile": "Hello"}'
+echo '{"finalized": "Hello world.", "volatile": ""}'
+cat >/dev/null
+echo '{"finalized": "Hello world. Bye.", "volatile": ""}'
+echo '{"done": true}'
+"#;
+
+    /// Dictation with `HEARS` for lemur-dictate, in threads `a` and `b`
+    /// that echo what's pasted into them.
+    fn dictating<'a>(
+        server: &TmuxServer,
+        dir: &TempDir,
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (Entity<Lemur>, &'a mut VisualTestContext) {
+        for name in ["a", "b"] {
+            server.tmux(&["new-session", "-d", "-s", name, "cat"]);
+        }
+        cx.update(super::bind_keys);
+        let (app, cx) = rooted(server.config(), cx);
+        let helper = fake_dictate(dir, HEARS);
+        app.update(cx, |app, _| app.helper = helper);
+        (app, cx)
+    }
+
+    fn dictated(app: &Entity<Lemur>, cx: &mut VisualTestContext) -> Option<(String, bool)> {
+        app.read_with(cx, |app, cx| {
+            let (bar, _) = app.dictation.as_ref()?;
+            let bar = bar.read(cx);
+            Some((bar.text(cx), bar.is_listening()))
+        })
+    }
+
+    fn shows(server: &TmuxServer, session: &str, text: &str) -> bool {
+        wait_until(Duration::from_secs(5), || {
+            server
+                .tmux(&["capture-pane", "-p", "-t", session])
+                .contains(text)
+        })
+    }
+
+    /// ⌘D listens and shows what's heard; ⌘⏎ from another thread stops,
+    /// waits for the rest, and pastes it all there.
+    #[gpui::test]
+    fn dictation_pastes_into_the_thread_on_show(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("dictate");
+        let dir = TempDir::new("dictate");
+        let (app, cx) = dictating(&server, &dir, cx);
+        open(&app, "a", cx);
+        cx.simulate_keystrokes("cmd-d");
+        let heard = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            dictated(&app, cx) == Some(("Hello world.".into(), true))
+        });
+        assert!(heard, "{:?}", dictated(&app, cx));
+
+        open(&app, "b", cx);
+        cx.simulate_keystrokes("cmd-enter");
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            dictated(&app, cx).is_none()
+        }));
+        assert!(shows(&server, "b", "Hello world. Bye."));
+        assert!(
+            !server
+                .tmux(&["capture-pane", "-p", "-t", "a"])
+                .contains("Hello")
+        );
+    }
+
+    /// Stopped, the text can be changed before ⌘⏎ pastes it, and ⌘D adds
+    /// to it; Esc throws it away.
+    #[gpui::test]
+    fn dictation_can_be_corrected_or_thrown_away(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("dictate-edit");
+        let dir = TempDir::new("dictate-edit");
+        let (app, cx) = dictating(&server, &dir, cx);
+        open(&app, "a", cx);
+        let wait_for = |text: &str, listening: bool, cx: &mut VisualTestContext| {
+            let done = wait_until(Duration::from_secs(5), || {
+                cx.run_until_parked();
+                dictated(&app, cx) == Some((text.into(), listening))
+            });
+            assert!(done, "{:?}", dictated(&app, cx));
+        };
+
+        cx.simulate_keystrokes("cmd-d");
+        wait_for("Hello world.", true, cx);
+        // Words typed while it listens would be overwritten, so they aren't taken.
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("cmd-d");
+        wait_for("Hello world. Bye.", false, cx);
+        cx.simulate_input(" Ciao.");
+        cx.simulate_keystrokes("cmd-d");
+        wait_for("Hello world. Bye. Ciao. Hello world.", true, cx);
+        cx.simulate_keystrokes("cmd-d");
+        wait_for("Hello world. Bye. Ciao. Hello world. Bye.", false, cx);
+        cx.simulate_keystrokes("cmd-enter");
+        assert!(shows(
+            &server,
+            "a",
+            "Hello world. Bye. Ciao. Hello world. Bye."
+        ));
+        assert_eq!(dictated(&app, cx), None);
+
+        cx.simulate_keystrokes("cmd-d");
+        wait_for("Hello world.", true, cx);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(dictated(&app, cx), None);
     }
 }

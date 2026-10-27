@@ -196,7 +196,7 @@ impl TerminalView {
         }
     }
 
-    fn paste_text(&self, text: &str) {
+    pub fn paste_text(&self, text: &str) {
         self.write(keys::paste(
             text,
             self.mode().contains(TermMode::BRACKETED_PASTE),
