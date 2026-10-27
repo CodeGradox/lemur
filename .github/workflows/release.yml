@@ -195,6 +195,6 @@ jobs:
           test "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF" --jq .sha)" = "$RELEASE_COMMIT"
           gh release create "$tag" --verify-tag --target "$RELEASE_COMMIT" \
             --draft --title "lemur $RELEASE_VERSION" \
-            --notes "Requires Apple Silicon and macOS 11 or newer. Open the DMG, drag lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
+            --notes "Requires Apple Silicon and macOS 11 or newer; dictation needs macOS 26 or newer. Open the DMG, drag lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
           gh release upload "$tag" lemur-macos-arm64.dmg SHA256SUMS.txt
           gh release edit "$tag" --draft=false --latest
