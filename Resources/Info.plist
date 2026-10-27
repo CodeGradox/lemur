@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>lemur</string>
+    <string>Lemur</string>
     <key>CFBundleDisplayName</key>
-    <string>lemur</string>
+    <string>Lemur</string>
     <key>CFBundleIdentifier</key>
     <string>com.codegradox.lemur</string>
     <key>CFBundleExecutable</key>
@@ -19,8 +19,8 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>lemur listens while you dictate (⌘D) and writes down what you say, on this Mac.</string>
+    <string>Lemur listens while you dictate (⌘D) and writes down what you say, on this Mac.</string>
     <key>NSHumanReadableCopyright</key>
-    <string>lemur</string>
+    <string>Lemur</string>
 </dict>
 </plist>

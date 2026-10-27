@@ -1,5 +1,5 @@
 //! Builds lemur-dictate, the Swift helper dictation runs, for `cargo run`
-//! and the tests; scripts/build-app.sh puts its own build in lemur.app.
+//! and the tests; scripts/build-app.sh puts its own build in Lemur.app.
 
 use std::path::PathBuf;
 use std::process::Command;

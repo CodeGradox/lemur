@@ -663,11 +663,11 @@ pub fn resolve_target(
         return Ok((h.clone(), s.clone()));
     }
     let active = Active::load()
-        .context("no active session: open one in lemur, or pass --host and --session")?;
+        .context("no active session: open one in Lemur, or pass --host and --session")?;
     // The last session lemur showed is only the right one on its own host.
     if session.is_none() && host.as_ref().is_some_and(|h| *h != active.host) {
         bail!(
-            "pass --session too: lemur last showed a session on {}",
+            "pass --session too: Lemur last showed a session on {}",
             active.host
         );
     }

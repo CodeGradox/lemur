@@ -25,7 +25,7 @@ pub enum Heard {
     Done { done: bool },
 }
 
-/// lemur-dictate: beside lemur in lemur.app, or where the build put it.
+/// lemur-dictate: beside lemur in Lemur.app, or where the build put it.
 pub fn helper() -> PathBuf {
     std::env::current_exe()
         .map(|exe| exe.with_file_name("lemur-dictate"))

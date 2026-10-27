@@ -7,7 +7,7 @@ mkdir -p "$directory"
 temporary=$(mktemp -d "$directory/dmg-test.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT
 trap 'exit 1' HUP INT TERM
-app="$temporary/lemur.app"
+app="$temporary/Lemur.app"
 mkdir -p "$app/Contents/MacOS"
 cp "$ROOT/Resources/Info.plist" "$app/Contents/Info.plist"
 xcrun swiftc -o "$app/Contents/MacOS/lemur" - <<'SWIFT'

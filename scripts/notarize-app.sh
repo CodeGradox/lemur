@@ -77,7 +77,7 @@ set_keychain_search_list "$LEMEN_SIGNING_KEYCHAIN"
 # Public app/image contents must remain readable when installed by another user.
 umask 022
 CONFIGURATION=release sh scripts/build-app.sh
-app="$BUILD_DIR/lemur.app"
+app="$BUILD_DIR/Lemur.app"
 codesign --verify --deep --strict --verbose=2 "$app"
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Authority=Developer ID Application:'
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'runtime'

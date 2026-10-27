@@ -209,9 +209,9 @@ impl SettingsView {
             SettingItem::new(p.label, field)
         });
         let (title, description) = if dark {
-            ("Dark", "While lemur is dark. Starts as One Half Dark.")
+            ("Dark", "While Lemur is dark. Starts as One Half Dark.")
         } else {
-            ("Light", "While lemur is light. Starts as One Half Light.")
+            ("Light", "While Lemur is light. Starts as One Half Light.")
         };
         SettingGroup::new()
             .title(title)
@@ -389,9 +389,9 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             keys("Add a project", &["cmd-o"]),
             keys("Settings", &["cmd-,"]),
             keys("Close Settings", &["cmd-w"]),
-            keys("Hide lemur", &["cmd-h"]),
+            keys("Hide Lemur", &["cmd-h"]),
             keys("Hide the other apps", &["alt-cmd-h"]),
-            keys("Quit lemur", &["cmd-q"]),
+            keys("Quit Lemur", &["cmd-q"]),
         ],
     ),
     (

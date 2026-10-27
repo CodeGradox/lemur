@@ -1,6 +1,6 @@
 # Building the app and signed releases
 
-lemur ships as `lemur.app` in a disk image: open it, drag lemur onto the
+Lemur ships as `Lemur.app` in a disk image: open it, drag Lemur onto the
 Applications shortcut, eject it. Releases are Apple Silicon (arm64) only and
 need macOS 11 or newer. The version lives in one place, `Cargo.toml`; the app
 build writes it into `Info.plist`.
@@ -11,12 +11,12 @@ build writes it into `Info.plist`.
 sh scripts/build-app.sh
 ```
 
-builds `build/lemur.app` from a release build and signs it ad hoc. That runs
+builds `build/Lemur.app` from a release build and signs it ad hoc. That runs
 on the Mac that built it; a copy downloaded elsewhere would be blocked by
 Gatekeeper, which is what signed releases are for. `BUILD_DIR` moves the
 output. `LEMEN_SIGNING_IDENTITY` signs with another identity; a
 `Developer ID Application: …` identity also turns on the hardened runtime and
-a secure timestamp, as notarization requires. lemur's one entitlement,
+a secure timestamp, as notarization requires. Lemur's one entitlement,
 `com.apple.security.device.audio-input` (`Resources/lemur.entitlements`),
 lets dictation use the microphone under the hardened runtime.
 
@@ -28,8 +28,8 @@ output, where a `lemur` run from `target/` finds it. It's signed before the
 app, with the same identity and entitlement. Building it needs Xcode 26 or
 newer, and it runs on macOS 26 or newer; on older macOS, dictating says so.
 macOS asks for the microphone for the app a program was started from, so a
-`lemur` run from `target/` asks as your terminal, and run in a lemur thread,
-as that lemur: one without the entitlement can't have it, and macOS won't ask.
+`lemur` run from `target/` asks as your terminal, and run in a Lemur thread,
+as that Lemur: one without the entitlement can't have it, and macOS won't ask.
 
 The build turns `Resources/lemur.png` (square, at least 1024×1024) into the
 app icon with `scripts/build-icon.sh`; without it the app has the default
@@ -40,7 +40,7 @@ gradients don't band, and strips metadata.
 
 ## Disk image
 
-The image opens with `lemur.app` on the left and a shortcut to
+The image opens with `Lemur.app` on the left and a shortcut to
 `/Applications` on the right, with an arrow between them. Packaging uses
 [dmgbuild](https://dmgbuild.readthedocs.io/), with hash-locked dependencies
 installed into a private virtual environment (`build/dmg-tools`). It needs
@@ -48,7 +48,7 @@ Python 3.10 or newer; macOS's own `python3` is older, so name another:
 
 ```sh
 PYTHON=python3.13 sh scripts/prepare-dmg-tools.sh   # once
-sh scripts/build-dmg.sh build/lemur.app build/lemur.dmg
+sh scripts/build-dmg.sh build/Lemur.app build/lemur.dmg
 ```
 
 The packager never signs or changes the app, refuses to replace an existing
@@ -58,7 +58,7 @@ fixture app the same way, without credentials.
 
 ## Tests on main
 
-Every push to `main` runs **Build lemur** (`.github/workflows/release.yml`)
+Every push to `main` runs **Build Lemur** (`.github/workflows/release.yml`)
 for the tests only: it installs the Rust version from `mise.toml`, Xcode's
 Metal toolchain and tmux, and runs the tests. It gets no secrets and
 publishes nothing. A newer push cancels a run still going for an older one.
@@ -72,7 +72,7 @@ Bump `version` in `Cargo.toml`, commit and push to `main`, then tag that
 commit with the same version:
 
 ```sh
-GIT_EDITOR=true git tag -a v0.1.0 -m "lemur v0.1.0"
+GIT_EDITOR=true git tag -a v0.1.0 -m "Lemur v0.1.0"
 git push origin refs/tags/v0.1.0
 ```
 
@@ -87,7 +87,7 @@ each release; updating or deleting a tag doesn't rebuild it.
 
 ## Apple credentials
 
-lemur uses the same credentials as any other app of the team: the
+Lemur uses the same credentials as any other app of the team: the
 **Developer ID Application** certificate (exported with its private key as a
 password-protected `.p12`) and an App Store Connect **team API key** allowed
 to notarize (its `.p8`, key ID and issuer ID). No new certificate or App ID
@@ -121,7 +121,7 @@ An app started from Finder or the Dock gets a short `PATH`
 (`/usr/bin:/bin:/usr/sbin:/sbin`). Remote hosts are unaffected: `ssh` and
 `scp` live in `/usr/bin`, and commands on the host use the host's own
 `PATH`. A host with `ssh = "local"` runs tmux on this Mac, often from
-Homebrew's `/opt/homebrew/bin`, so at startup lemur asks your login shell
+Homebrew's `/opt/homebrew/bin`, so at startup Lemur asks your login shell
 (`$SHELL -l`) for its `PATH` and adds the folders its own lacks, after its
 own. A shell that takes longer than 2 seconds leaves the `PATH` as it was;
-start lemur from a shell then.
+start Lemur from a shell then.

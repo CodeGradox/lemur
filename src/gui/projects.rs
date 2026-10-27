@@ -245,13 +245,13 @@ impl Lemur {
     ) {
         let this = cx.entity().downgrade();
         let description = format!(
-            "Only lemur forgets it. {} on {}, its worktrees and running threads stay as they are.",
+            "Only Lemur forgets it. {} on {}, its worktrees and running threads stay as they are.",
             project.path, project.host
         );
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, project) = (this.clone(), project.clone());
             alert
-                .title(format!("Remove {} from lemur?", project.name()))
+                .title(format!("Remove {} from Lemur?", project.name()))
                 .description(description.clone())
                 .show_cancel(true)
                 .ok_text("Remove")

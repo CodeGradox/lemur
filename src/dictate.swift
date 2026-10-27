@@ -150,12 +150,12 @@ func allowMicrophone() async throws {
         // Still undecided: macOS didn't ask, so Settings doesn't list lemur.
         if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
             throw Failure(
-                "macOS wouldn't ask for the microphone, as the app that started lemur can't use it; open lemur.app itself")
+                "macOS wouldn't ask for the microphone, as the app that started Lemur can't use it; open Lemur.app itself")
         }
     default: break
     }
     throw Failure(
-        "lemur may not use the microphone; allow it in System Settings → Privacy & Security → Microphone")
+        "Lemur may not use the microphone; allow it in System Settings → Privacy & Security → Microphone")
 }
 
 /// The words heard so far: finalized ones stay, the volatile rest is a

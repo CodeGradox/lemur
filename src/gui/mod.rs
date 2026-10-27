@@ -228,16 +228,16 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             // File and View items act on the main window, and are greyed out
             // while another window, like Settings, is in front.
             cx.set_menus([
-                Menu::new("lemur").items([
+                Menu::new("Lemur").items([
                     MenuItem::action("Settings…", OpenSettings),
                     MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),
                     MenuItem::separator(),
-                    MenuItem::action("Hide lemur", Hide),
+                    MenuItem::action("Hide Lemur", Hide),
                     MenuItem::action("Hide Others", HideOthers),
                     MenuItem::action("Show All", ShowAll),
                     MenuItem::separator(),
-                    MenuItem::action("Quit lemur", Quit),
+                    MenuItem::action("Quit Lemur", Quit),
                 ]),
                 Menu::new("File").items([
                     MenuItem::action("Add Project…", AddProject),
@@ -256,7 +256,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             ]);
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some("lemur".into()),
+                    title: Some("Lemur".into()),
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

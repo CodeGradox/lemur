@@ -4,7 +4,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TOOLS=${DMG_TOOLS_DIR:-${BUILD_DIR:-"$ROOT/build"}/dmg-tools}
 if [ "$#" -ne 2 ]; then
-    echo "Usage: sh scripts/build-dmg.sh /path/to/lemur.app /path/to/output.dmg" >&2
+    echo "Usage: sh scripts/build-dmg.sh /path/to/Lemur.app /path/to/output.dmg" >&2
     exit 1
 fi
 if [ ! -x "$TOOLS/bin/dmgbuild" ]; then
@@ -13,7 +13,7 @@ if [ ! -x "$TOOLS/bin/dmgbuild" ]; then
 fi
 app=$(CDPATH= cd -- "$1" && pwd)
 output="$(CDPATH= cd -- "$(dirname -- "$2")" && pwd)/$(basename -- "$2")"
-test "$(basename -- "$app")" = lemur.app
+test "$(basename -- "$app")" = Lemur.app
 case "$output" in
     "$app"/*) echo "Output must not be inside the app." >&2; exit 1 ;;
     *.dmg) ;;
@@ -25,7 +25,7 @@ if [ -e "$output" ] || [ -L "$output" ]; then
 fi
 codesign --verify --deep --strict "$app"
 umask 022
-"$TOOLS/bin/dmgbuild" -s "$ROOT/scripts/dmg-settings.py" -D "app=$app" lemur "$output"
+"$TOOLS/bin/dmgbuild" -s "$ROOT/scripts/dmg-settings.py" -D "app=$app" Lemur "$output"
 hdiutil verify "$output"
 
 # Check the actual image rather than trusting the packaging tool's exit status.
@@ -45,5 +45,5 @@ trap 'exit 1' HUP INT TERM
 hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mount" "$output" >/dev/null
 test "$(readlink "$mount/Applications")" = /Applications
 test -f "$mount/.DS_Store"
-codesign --verify --deep --strict "$mount/lemur.app"
+codesign --verify --deep --strict "$mount/Lemur.app"
 printf 'Created and verified %s\n' "$output"

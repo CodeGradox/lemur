@@ -189,7 +189,7 @@ impl Lemur {
                     h_flex()
                         .w_full()
                         .justify_between()
-                        .child(div().font_semibold().child("lemur"))
+                        .child(div().font_semibold().child("Lemur"))
                         .child(h_flex().gap_1().child(add).child(refresh)),
                 ),
             )

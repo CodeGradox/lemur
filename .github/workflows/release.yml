@@ -1,4 +1,4 @@
-name: Build lemur
+name: Build Lemur
 
 # Every push to main only runs the tests; a new v* tag builds a signed,
 # notarized disk image and publishes that version.
@@ -128,7 +128,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          app="$BUILD_DIR/lemur.app"
+          app="$BUILD_DIR/Lemur.app"
           binary="$app/Contents/MacOS/lemur"
           dmg="$BUILD_DIR/lemur.dmg"
           test "$(lipo -archs "$binary")" = "$ARCH"
@@ -194,7 +194,7 @@ jobs:
           # Refuse a tag that moved while the signed build was running.
           test "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF" --jq .sha)" = "$RELEASE_COMMIT"
           gh release create "$tag" --verify-tag --target "$RELEASE_COMMIT" \
-            --draft --title "lemur $RELEASE_VERSION" \
-            --notes "Requires Apple Silicon and macOS 11 or newer; dictation needs macOS 26 or newer. Open the DMG, drag lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
+            --draft --title "Lemur $RELEASE_VERSION" \
+            --notes "Requires Apple Silicon and macOS 11 or newer; dictation needs macOS 26 or newer. Open the DMG, drag Lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
           gh release upload "$tag" lemur-macos-arm64.dmg SHA256SUMS.txt
           gh release edit "$tag" --draft=false --latest

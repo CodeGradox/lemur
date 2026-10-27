@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds build/lemur.app. Signed ad hoc unless LEMEN_SIGNING_IDENTITY names
+# Builds build/Lemur.app. Signed ad hoc unless LEMEN_SIGNING_IDENTITY names
 # a Developer ID, which also gets the hardened runtime notarization needs.
 set -eu
 cd "$(dirname "$0")/.."
@@ -16,7 +16,7 @@ print(m["target_directory"])
 ')"
 version="$(printf '%s\n' "$metadata" | sed -n 1p)"
 target_directory="$(printf '%s\n' "$metadata" | sed -n 2p)"
-app="$build_directory/lemur.app"
+app="$build_directory/Lemur.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$target_directory/release/lemur" "$app/Contents/MacOS/lemur"
 sh scripts/build-dictate.sh "$app/Contents/MacOS/lemur-dictate"
