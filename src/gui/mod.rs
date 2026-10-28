@@ -1295,7 +1295,8 @@ mod tests {
 
     /// Dropping a project's name on another's moves it to that place,
     /// whatever its host: in the sidebar, the config and the snapshot's
-    /// views, before and after a refresh.
+    /// views, before and after a refresh. A project's rows are part of it:
+    /// dropped on one, it moves too.
     #[gpui::test]
     fn dragging_a_project_reorders_the_sidebar(cx: &mut gpui::TestAppContext) {
         let server = TmuxServer::new("move-project");
@@ -1342,6 +1343,18 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert_eq!(consistent(cx), ["/srv/three", "/srv/one", "/srv/two"]);
+
+        // Its New worktree row, under its name.
+        let from = cx.debug_bounds("project two · local").unwrap().center();
+        let three = cx.debug_bounds("project three · mac").unwrap();
+        let to = point(three.center().x, three.bottom() + px(20.0));
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + point(px(0.0), px(6.0)), MouseButton::Left, none);
+        cx.simulate_mouse_move(to, MouseButton::Left, none);
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(consistent(cx), ["/srv/two", "/srv/three", "/srv/one"]);
     }
 
     /// ⌃Tab goes through the threads, the one opened last first: holding ⌃
@@ -2318,7 +2331,8 @@ mod tests {
     }
 
     /// Dropping a worktree on another moves it there, and the next refresh
-    /// keeps that order; the main checkout stays known wherever it is.
+    /// keeps that order; the main checkout stays known wherever it is. A
+    /// worktree's threads are part of it: dropped on one, it moves too.
     #[gpui::test]
     fn dragging_a_worktree_reorders_its_project(cx: &mut gpui::TestAppContext) {
         let server = TmuxServer::new("drag-wt");
@@ -2330,6 +2344,8 @@ mod tests {
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
         git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
+        let wt = repo.join("wt/a").to_string_lossy().into_owned();
+        server.tmux(&["new-session", "-d", "-s", "api/t", "-c", &wt, "sleep 600"]);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
         let (app, cx) = rooted(cfg, cx);
@@ -2362,6 +2378,9 @@ mod tests {
                 ("main".to_string(), true)
             ]
         );
+
+        drag("worktree-2", "thread-0", cx);
+        assert_eq!(names(cx), ["main", "a", "b"]);
     }
 
     /// Hiding a worktree moves it to its project's Hidden row, folded until

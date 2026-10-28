@@ -11,6 +11,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 pub type OnClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -190,7 +191,7 @@ impl Group {
         self
     }
 
-    /// Lets its name be dragged onto another group's in the list `key`,
+    /// Lets its name be dragged onto another group in the list `key`,
     /// where it's at `index`, to take that one's place.
     pub fn draggable(
         mut self,
@@ -281,9 +282,9 @@ impl SidebarItem for Group {
                 this.cursor_pointer()
                     .on_click(move |_, window, cx| toggle(window, cx))
             });
-        let header = match self.drag {
-            Some((key, index, reorder)) => {
-                draggable(header, key, index, dragged_label, reorder, cx)
+        let header = match &self.drag {
+            Some((key, index, _)) => {
+                drag_handle::<ProjectRow>(header, key.clone(), *index, dragged_label)
             }
             None => header,
         };
@@ -319,19 +320,36 @@ impl SidebarItem for Group {
             .when(!self.folded, |this| {
                 this.child(self.rows.render(format!("{id}-rows"), window, cx))
             })
+            // Its rows go where it goes, so all of it takes the drop, and the
+            // line showing where it lands goes above or below all of it.
+            .when_some(self.drag, |this, (key, index, reorder)| {
+                drop_target::<ProjectRow>(this, key, index, reorder, cx)
+            })
     }
 }
 
-/// What a dragged thread or worktree carries; it also draws the label
-/// under the pointer.
+/// What a dragged thread, worktree or project carries; it also draws the
+/// label under the pointer. `Kind` is which: a project or worktree takes
+/// its drop on all of it, the rows under it too, and gpui hands a drop to
+/// the innermost row under the pointer that takes its type, which loses it
+/// if it's another list's.
 #[derive(Clone)]
-struct Dragged {
+struct Dragged<Kind> {
     list: SharedString,
     index: usize,
     label: SharedString,
+    kind: PhantomData<Kind>,
 }
 
-impl Render for Dragged {
+/// The kinds of row that drag.
+#[derive(Clone)]
+struct ThreadRow;
+#[derive(Clone)]
+struct WorktreeRow;
+#[derive(Clone)]
+struct ProjectRow;
+
+impl<Kind: 'static> Render for Dragged<Kind> {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_2()
@@ -446,9 +464,12 @@ fn worktree(
                 .on_click(fold),
         )
     });
-    let header = match look.drag {
-        Some((key, index, reorder)) => draggable(header, key, index, label, reorder, cx)
-            .debug_selector(move || format!("worktree-{index}")),
+    let header = match &look.drag {
+        Some((key, index, _)) => {
+            let index = *index;
+            drag_handle::<WorktreeRow>(header, key.clone(), index, label)
+                .debug_selector(move || format!("worktree-{index}"))
+        }
         None => header,
     };
     let header = header
@@ -469,6 +490,11 @@ fn worktree(
                     .py_0p5()
                     .child(thread_list(threads, window, cx)),
             )
+        })
+        // Its threads go where it goes, so the whole tree takes the drop,
+        // and the line showing where it lands goes above or below all of it.
+        .when_some(look.drag, |this, (key, index, reorder)| {
+            drop_target::<WorktreeRow>(this, key, index, reorder, cx)
         })
         .into_any_element()
 }
@@ -539,7 +565,7 @@ fn hidden(
 
 /// Makes a row draggable within the list `key`: dropped on another row of
 /// it, it takes that row's place.
-fn draggable(
+fn draggable<Kind: Clone + 'static>(
     row: Stateful<Div>,
     key: SharedString,
     index: usize,
@@ -547,20 +573,44 @@ fn draggable(
     reorder: Reorder,
     cx: &App,
 ) -> Stateful<Div> {
-    let line = cx.theme().drag_border;
-    let dragged = Dragged {
-        list: key.clone(),
+    let row = drag_handle::<Kind>(row, key.clone(), index, label);
+    drop_target::<Kind>(row, key, index, reorder, cx)
+}
+
+/// Lets `handle` drag the row at `index` of the list `key`.
+fn drag_handle<Kind: Clone + 'static>(
+    handle: Stateful<Div>,
+    key: SharedString,
+    index: usize,
+    label: SharedString,
+) -> Stateful<Div> {
+    let dragged = Dragged::<Kind> {
+        list: key,
         index,
         label,
+        kind: PhantomData,
     };
-    row.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+    handle.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+}
+
+/// Makes `target` the row at `index` of the list `key`: another row of it
+/// dropped there takes its place.
+fn drop_target<Kind: 'static>(
+    target: Stateful<Div>,
+    key: SharedString,
+    index: usize,
+    reorder: Reorder,
+    cx: &App,
+) -> Stateful<Div> {
+    let line = cx.theme().drag_border;
+    target
         .can_drop(move |value, _, _| {
             value
-                .downcast_ref::<Dragged>()
+                .downcast_ref::<Dragged<Kind>>()
                 .is_some_and(|d| d.list == key)
         })
         // A line on the side the row will land.
-        .drag_over::<Dragged>(move |style, dragged, _, _| {
+        .drag_over::<Dragged<Kind>>(move |style, dragged, _, _| {
             if dragged.index > index {
                 style.border_t_2().border_color(line)
             } else if dragged.index < index {
@@ -569,7 +619,7 @@ fn draggable(
                 style
             }
         })
-        .on_drop(move |dragged: &Dragged, window, cx| {
+        .on_drop(move |dragged: &Dragged<Kind>, window, cx| {
             if dragged.index != index {
                 reorder(dragged.index, index, window, cx);
             }
@@ -618,7 +668,7 @@ fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElemen
             )
             .debug_selector(move || format!("thread-{ix}"))
             .on_click(move |event, window, cx| on_click(event, window, cx));
-            draggable(row, key.clone(), ix, t.label, reorder.clone(), cx)
+            draggable::<ThreadRow>(row, key.clone(), ix, t.label, reorder.clone(), cx)
                 .context_menu(move |m, window, cx| menu(m, window, cx))
         }))
         .children(gone)
