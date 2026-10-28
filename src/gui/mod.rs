@@ -60,7 +60,8 @@ actions!(
         PreviousThread,
         NewThreadHere,
         Dictate,
-        PasteDictation
+        PasteDictation,
+        About
     ]
 );
 
@@ -224,11 +225,14 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             cx.on_action(|_: &Hide, cx| cx.hide());
             cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
             cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+            cx.on_action(|_: &About, cx| about(cx));
             // Menus as macOS apps have them; shortcuts come from bind_keys. The
             // File and View items act on the main window, and are greyed out
             // while another window, like Settings, is in front.
             cx.set_menus([
                 Menu::new("Lemur").items([
+                    MenuItem::action("About Lemur", About),
+                    MenuItem::separator(),
                     MenuItem::action("Settings…", OpenSettings),
                     MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -281,6 +285,20 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
             cx.activate(true);
         });
     Ok(())
+}
+
+/// Says which version this is, in an alert over the window in front.
+fn about(cx: &mut App) {
+    let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    let version = format!("Lemur {}", env!("CARGO_PKG_VERSION"));
+    window
+        .update(cx, |_, window, cx| {
+            // OK is the only answer; nothing waits for it.
+            drop(window.prompt(PromptLevel::Info, &version, None, &["OK"], cx));
+        })
+        .ok();
 }
 
 impl Lemur {
@@ -1355,6 +1373,16 @@ mod tests {
         cx.simulate_mouse_up(to, MouseButton::Left, none);
         cx.run_until_parked();
         assert_eq!(consistent(cx), ["/srv/two", "/srv/three", "/srv/one"]);
+    }
+
+    /// About Lemur says which version this is.
+    #[gpui::test]
+    fn about_says_the_version(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("about");
+        let (_, cx) = rooted(server.config(), cx);
+        cx.cx.update(super::about);
+        let version = format!("Lemur {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(cx.pending_prompt(), Some((version, String::new())));
     }
 
     /// ⌃Tab goes through the threads, the one opened last first: holding ⌃
