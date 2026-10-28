@@ -36,7 +36,9 @@ app icon with `scripts/build-icon.sh`; without it the app has the default
 icon. To replace the logo, prepare the new original once with libvips (`brew
 install vips`): `sh scripts/optimize-icon.sh /path/to/original.png
 Resources/lemur.png` scales it to 1024×1024 sRGB, keeps full transparency so
-gradients don't band, and strips metadata.
+gradients don't band, and strips metadata. It also makes nearly opaque pixels
+fully opaque: macOS 26 shows an icon whose tile is even slightly see-through
+smaller, on a grey plate.
 
 ## Disk image
 

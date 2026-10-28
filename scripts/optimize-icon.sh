@@ -25,7 +25,15 @@ trap 'exit 1' HUP INT TERM
 # quantized palette, so the gradient and transparent edges do not gain banding.
 vips thumbnail "$source_image" "$temporary/resized.v" 1024 \
     --height 1024 --size down --output-profile srgb
-vips pngsave "$temporary/resized.v" "$temporary/optimized.png" \
+icon="$temporary/resized.v"
+if [ "$(vipsheader -f bands "$icon")" -eq 4 ]; then
+    # macOS 26 shrinks an icon whose tile lets anything through onto a grey
+    # plate, so nearly opaque pixels (alpha 240 and up) become fully opaque.
+    vips relational_const "$icon" "$temporary/solid.v" moreeq "256 256 256 240"
+    vips boolean "$icon" "$temporary/solid.v" "$temporary/opaque.v" or
+    icon="$temporary/opaque.v"
+fi
+vips pngsave "$icon" "$temporary/optimized.png" \
     --compression 9 --filter all --keep none
 mv "$temporary/optimized.png" "$destination"
 printf 'Optimized 1024 × 1024 icon: %s\n' "$destination"
