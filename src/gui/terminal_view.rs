@@ -28,8 +28,10 @@ pub struct TerminalView {
     pub session: String,
     pty: Option<Pty>,
     focus: FocusHandle,
-    /// Where the grid was last painted, for mapping mouse positions to cells.
+    /// Where the grid was last painted, and the size of its cells, for
+    /// mapping mouse positions to cells. `cell` rounds that size for the PTY.
     bounds: Bounds<Pixels>,
+    cell_size: gpui_kit::Size<Pixels>,
     cell: Size,
     /// Measured on the next render after Settings change the font.
     metrics: Option<Metrics>,
@@ -73,6 +75,7 @@ impl TerminalView {
             pty: None,
             focus: cx.focus_handle(),
             bounds: Bounds::default(),
+            cell_size: size(px(8.0), px(16.0)),
             cell: Size {
                 cols: 80,
                 lines: 24,
@@ -330,8 +333,8 @@ impl TerminalView {
 
     fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
         let b = self.bounds;
-        let col = ((position.x - b.origin.x) / px(self.cell.cell_width as f32)).max(0.0) as usize;
-        let line = ((position.y - b.origin.y) / px(self.cell.cell_height as f32)).max(0.0) as usize;
+        let col = ((position.x - b.origin.x) / self.cell_size.width).max(0.0) as usize;
+        let line = ((position.y - b.origin.y) / self.cell_size.height).max(0.0) as usize;
         (
             col.min(self.cell.cols.saturating_sub(1) as usize),
             line.min(self.cell.lines.saturating_sub(1) as usize),
@@ -837,6 +840,7 @@ impl Render for TerminalView {
                 };
                 view.update(cx, |view, _| {
                     view.bounds = bounds;
+                    view.cell_size = gpui_kit::size(w, h);
                     view.cell = size;
                     if let Some(pty) = &mut view.pty {
                         pty.resize(size);
@@ -931,6 +935,31 @@ mod tests {
         assert_eq!(hovered.as_deref(), Some("https://example.com/x"));
         cx.simulate_click(at, Modifiers::command());
         assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/x"));
+    }
+
+    /// The mouse lands on the cell drawn under it all the way across, though
+    /// cells are rarely a whole number of pixels wide.
+    #[gpui::test]
+    fn the_mouse_lands_on_the_cell_under_it(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("mouse");
+        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
+        let host = server.config().hosts.remove(0);
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        cx.simulate_resize(size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            let m = v.metrics.as_ref().expect("measured");
+            let (cols, lines) = (v.cell.cols as usize, v.cell.lines as usize);
+            // The middle of the last cell, as painted.
+            let at = point(
+                v.bounds.origin.x + m.cell_width * (cols as f32 - 0.5),
+                v.bounds.origin.y + m.line_height * (lines as f32 - 0.5),
+            );
+            assert_eq!(v.cell_at(at), (cols - 1, lines - 1), "{:?}", m.cell_width);
+        });
     }
 
     /// Rows reach the painter without the blanks after their text.
