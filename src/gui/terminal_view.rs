@@ -203,7 +203,7 @@ impl TerminalView {
         ));
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         let m = &ks.modifiers;
         if m.platform {
@@ -219,6 +219,7 @@ impl TerminalView {
             ctrl: m.control,
             alt: m.alt,
             shift: m.shift,
+            caps_lock: window.capslock().on,
         };
         let mut term = self.pty.as_ref().map(|p| p.term.lock());
         let app_cursor = term

@@ -8,6 +8,7 @@ pub struct Key<'a> {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    pub caps_lock: bool,
 }
 
 /// Bytes for a keystroke, or None if it types nothing the terminal knows.
@@ -81,6 +82,9 @@ pub fn encode(k: &Key, app_cursor: bool) -> Option<Vec<u8>> {
         "f12" => tilde(24),
         "space" if k.ctrl => vec![0],
         key if k.ctrl => meta(&[control_byte(key)?]),
+        // GPUI's key_char ignores Caps Lock, which on a Mac capitalizes
+        // letters only, Shift or not.
+        _ if k.caps_lock && !k.alt => k.key_char?.to_uppercase().into_bytes(),
         // Option on macOS composes characters (on many layouts @, |, [, ]),
         // so send what it typed rather than treating it as Meta.
         _ => k.key_char?.as_bytes().to_vec(),
@@ -158,6 +162,7 @@ mod tests {
             ctrl: false,
             alt: false,
             shift: false,
+            caps_lock: false,
         }
     }
 
@@ -176,6 +181,37 @@ mod tests {
             )
             .unwrap(),
             b"|"
+        );
+    }
+
+    #[test]
+    fn caps_lock_capitalizes_letters() {
+        let caps = |key: Key<'static>| {
+            encode(
+                &Key {
+                    caps_lock: true,
+                    ..key
+                },
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(caps(key("a", Some("a"))), b"A");
+        assert_eq!(caps(key("å", Some("å"))), "Å".as_bytes());
+        assert_eq!(
+            caps(Key {
+                shift: true,
+                ..key("a", Some("A"))
+            }),
+            b"A"
+        );
+        assert_eq!(caps(key("1", Some("1"))), b"1");
+        assert_eq!(
+            caps(Key {
+                ctrl: true,
+                ..key("c", Some("c"))
+            }),
+            [3]
         );
     }
 
