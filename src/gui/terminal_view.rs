@@ -18,6 +18,7 @@ use futures::StreamExt;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::ops::Range;
 use std::path::PathBuf;
 
 /// Key context for terminal-only key bindings.
@@ -36,6 +37,9 @@ pub struct TerminalView {
     /// Measured on the next render after Settings change the font.
     metrics: Option<Metrics>,
     mouse_cell: Option<(usize, usize)>,
+    /// Text an input method is still composing (a dead key's accent, or
+    /// Japanese before it's converted), shown at the cursor until it's typed.
+    marked: Option<String>,
     /// Where the pointer is over the terminal, and the link under it while
     /// ⌘ is held: underlined, and opened by a ⌘-click.
     pointer: Option<Point<Pixels>>,
@@ -84,6 +88,7 @@ impl TerminalView {
             },
             metrics: None,
             mouse_cell: None,
+            marked: None,
             pointer: None,
             link: None,
             scroll_lines: 0.0,
@@ -224,18 +229,30 @@ impl TerminalView {
             shift: m.shift,
             caps_lock: window.capslock().on,
         };
-        let mut term = self.pty.as_ref().map(|p| p.term.lock());
-        let app_cursor = term
-            .as_ref()
-            .is_some_and(|t| t.mode().contains(TermMode::APP_CURSOR));
-        if let Some(bytes) = keys::encode(&key, app_cursor) {
-            if let Some(term) = term.as_mut() {
-                term.scroll_display(Scroll::Bottom);
-            }
-            drop(term);
-            self.write(bytes);
+        let app_cursor = self.mode().contains(TermMode::APP_CURSOR);
+        // Text is left to the input method (`TerminalInput`), which composes
+        // accents and other scripts; a held key repeats here instead.
+        let bytes = keys::encode(&key, app_cursor)
+            .or_else(|| event.is_held.then(|| keys::typed(&key)).flatten());
+        if let Some(bytes) = bytes {
+            self.send(bytes);
             cx.stop_propagation();
         }
+    }
+
+    /// Sends what the user typed, and shows the bottom of the scrollback.
+    fn send(&self, bytes: Vec<u8>) {
+        if let Some(pty) = &self.pty {
+            pty.term.lock().scroll_display(Scroll::Bottom);
+            pty.write(bytes);
+        }
+    }
+
+    /// Text from the input method, which ends any composing.
+    fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.marked = None;
+        self.send(text.as_bytes().to_vec());
+        cx.notify();
     }
 
     /// Cmd+V: files and images are uploaded and pasted as remote paths;
@@ -623,6 +640,9 @@ struct Frame {
     rows: Vec<Row>,
     background: Hsla,
     cursor: Option<(usize, usize, CursorShape, Hsla)>,
+    /// The cursor's cell even while it's hidden, where text an input
+    /// method composes shows.
+    caret: Option<(usize, usize)>,
 }
 
 /// Snapshots the grid under the lock so painting doesn't block the reader.
@@ -720,10 +740,15 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
             ))
         })
         .flatten();
+    let caret = usize::try_from(content.cursor.point.line.0 + offset)
+        .ok()
+        .filter(|&line| line < rows.len())
+        .map(|line| (content.cursor.point.column.0, line));
     Frame {
         rows,
         background: hsla(default_bg),
         cursor,
+        caret,
     }
 }
 
@@ -820,6 +845,131 @@ fn paint(
     }
 }
 
+/// Text an input method is composing, underlined over the cursor's cell
+/// and those after it, as macOS shows it in text fields.
+fn paint_marked(
+    text: &str,
+    at: Bounds<Pixels>,
+    metrics: &Metrics,
+    fg: Rgb,
+    bg: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let style = Style {
+        fg,
+        flags: Flags::UNDERLINE,
+    };
+    let runs = [style.text_run(text.len(), &metrics.font)];
+    let line = window
+        .text_system()
+        .shape_line(text.to_string().into(), metrics.size, &runs, None);
+    let width = line.width().max(at.size.width);
+    window.paint_quad(fill(
+        Bounds::new(at.origin, size(width, at.size.height)),
+        bg,
+    ));
+    let _ = line.paint(at.origin, at.size.height, TextAlign::Left, None, window, cx);
+}
+
+/// Text from macOS's input methods: dead keys' accents, the emoji picker,
+/// and scripts typed through an IME. The terminal has no text of its own to
+/// offer them, only what's being composed.
+struct TerminalInput {
+    view: Entity<TerminalView>,
+    /// The cursor's cell, where composing shows and an IME's candidates open.
+    caret: Option<Bounds<Pixels>>,
+}
+
+impl InputHandler for TerminalInput {
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        let end = self.marked(cx).map_or(0, |r| r.end);
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&mut self, _: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.marked(cx)
+    }
+
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<String> {
+        None
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, cx| view.type_text(text, cx));
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, cx| {
+            view.marked = (!text.is_empty()).then(|| text.to_string());
+            cx.notify();
+        });
+    }
+
+    /// macOS asks to keep what was composed as it stands.
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| {
+            if let Some(text) = view.marked.take() {
+                view.type_text(&text, cx);
+            }
+        });
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let mut at = self.caret?;
+        at.origin.x += at.size.width * range.start as f32;
+        Some(at)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl TerminalInput {
+    fn marked(&self, cx: &App) -> Option<Range<usize>> {
+        let marked = self.view.read(cx).marked.as_ref()?;
+        Some(0..marked.encode_utf16().count())
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = self
@@ -829,13 +979,16 @@ impl Render for TerminalView {
         let (w, h) = (metrics.cell_width, metrics.line_height);
         let focused = self.focus.is_focused(window);
         let view = cx.entity().downgrade();
-        let dragged = view.clone();
+        let this = cx.entity();
+        let focus = self.focus.clone();
         let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
         let frame = self.pty.as_ref().map(|pty| snapshot(pty, &palette));
         let link = self
             .link
             .clone()
             .map(|link| (link, hsla(palette.foreground)));
+        let marked = self.marked.clone();
+        let (fg, bg) = (palette.foreground, hsla(palette.background));
         let grid = canvas(
             move |bounds, _, cx| {
                 let size = Size {
@@ -855,13 +1008,28 @@ impl Render for TerminalView {
                 .ok();
             },
             move |bounds, (), window, cx| {
+                let caret = frame.as_ref().and_then(|f| f.caret).map(|(col, line)| {
+                    let origin = point(
+                        bounds.origin.x + w * col as f32,
+                        bounds.origin.y + h * line as f32,
+                    );
+                    Bounds::new(origin, size(w, h))
+                });
                 if let Some(frame) = frame {
                     paint(frame, bounds, &metrics, focused, link, window, cx);
                 }
+                if let (Some(text), Some(at)) = (marked, caret) {
+                    paint_marked(&text, at, &metrics, fg, bg, window, cx);
+                }
+                let input = TerminalInput {
+                    view: this.clone(),
+                    caret,
+                };
+                window.handle_input(&focus, input, cx);
                 // The element's own move listener only hears the pointer over it.
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                     if phase == DispatchPhase::Bubble {
-                        dragged.update(cx, |view, _| view.drag(event)).ok();
+                        this.update(cx, |view, _| view.drag(event));
                     }
                 });
             },
@@ -901,11 +1069,14 @@ impl Render for TerminalView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{TerminalView, block, snapshot};
+    use super::{TerminalInput, TerminalView, block, snapshot};
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Pty, Size};
     use crate::test_support::{TmuxServer, wait_until};
-    use gpui_kit::{Modifiers, MouseButton, point, px, size};
+    use gpui_kit::{
+        Capslock, InputHandler, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+        MouseButton, point, px, size,
+    };
     use std::time::Duration;
 
     /// Holding ⌘ over a URL shows it, and ⌘-clicking opens it; a plain
@@ -1016,6 +1187,86 @@ mod tests {
             wait_until(Duration::from_secs(5), || copied() == "hello world"),
             "tmux copied {:?}",
             copied()
+        );
+    }
+
+    /// A focused terminal on the session `t`, once tmux has attached it.
+    fn attach<'a>(
+        server: &TmuxServer,
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (gpui::Entity<TerminalView>, &'a mut gpui::VisualTestContext) {
+        let host = server.config().hosts.remove(0);
+        // The PTY reader is a real thread, so these tests can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        cx.simulate_resize(size(px(600.0), px(400.0)));
+        let focus = view.read_with(cx, |v, _| v.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.run_until_parked();
+        let attached = wait_until(Duration::from_secs(5), || {
+            !server.tmux(&["list-clients"]).is_empty()
+        });
+        assert!(attached, "tmux never attached");
+        (view, cx)
+    }
+
+    /// Text reaches the session through macOS's input method, which is what
+    /// composes accents: keys typed, and what it composed once it's done.
+    #[gpui::test]
+    fn text_comes_through_the_input_method(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("input");
+        server.tmux(&["new-session", "-d", "-s", "t", "cat"]);
+        let (view, cx) = attach(&server, cx);
+        let input = || TerminalInput {
+            view: view.clone(),
+            caret: None,
+        };
+
+        cx.simulate_keystrokes("h i");
+        // A dead key's accent shows, unsent, until the next key completes it.
+        cx.update(|window, cx| input().replace_and_mark_text_in_range(None, "´", None, window, cx));
+        let marked = view.read_with(cx, |v, _| v.marked.clone());
+        assert_eq!(marked.as_deref(), Some("´"));
+        cx.update(|window, cx| input().replace_text_in_range(None, "é", window, cx));
+        // What macOS asks to keep as it stands is sent as it stands.
+        cx.update(|window, cx| {
+            input().replace_and_mark_text_in_range(None, "~", None, window, cx);
+            input().unmark_text(window, cx);
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.marked.clone()), None);
+        let pane = || server.tmux(&["capture-pane", "-p", "-t", "t"]);
+        assert!(
+            wait_until(Duration::from_secs(5), || pane() == "hié~"),
+            "the pane shows {:?}",
+            pane()
+        );
+    }
+
+    /// A held key repeats from here, not the input method, which only sees
+    /// the first press; Caps Lock still capitalizes it.
+    #[gpui::test]
+    fn a_held_key_repeats_with_caps_lock(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("held");
+        server.tmux(&["new-session", "-d", "-s", "t", "cat"]);
+        let (_view, cx) = attach(&server, cx);
+
+        cx.simulate_event(ModifiersChangedEvent {
+            modifiers: Modifiers::none(),
+            capslock: Capslock { on: true },
+        });
+        for _ in 0..2 {
+            cx.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse("a").unwrap().with_simulated_ime(),
+                is_held: true,
+                prefer_character_input: false,
+            });
+        }
+        let pane = || server.tmux(&["capture-pane", "-p", "-t", "t"]);
+        assert!(
+            wait_until(Duration::from_secs(5), || pane() == "AA"),
+            "the pane shows {:?}",
+            pane()
         );
     }
 

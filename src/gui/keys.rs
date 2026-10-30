@@ -11,7 +11,8 @@ pub struct Key<'a> {
     pub caps_lock: bool,
 }
 
-/// Bytes for a keystroke, or None if it types nothing the terminal knows.
+/// Bytes for a keystroke, or None if it types nothing the terminal knows
+/// or only text, which is the input method's to type (see `typed`).
 /// Cmd shortcuts never get here: they belong to the app.
 pub fn encode(k: &Key, app_cursor: bool) -> Option<Vec<u8>> {
     // xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
@@ -82,14 +83,26 @@ pub fn encode(k: &Key, app_cursor: bool) -> Option<Vec<u8>> {
         "f12" => tilde(24),
         "space" if k.ctrl => vec![0],
         key if k.ctrl => meta(&[control_byte(key)?]),
-        // GPUI's key_char ignores Caps Lock, which on a Mac capitalizes
-        // letters only, Shift or not.
-        _ if k.caps_lock && !k.alt => k.key_char?.to_uppercase().into_bytes(),
-        // Option on macOS composes characters (on many layouts @, |, [, ]),
-        // so send what it typed rather than treating it as Meta.
-        _ => k.key_char?.as_bytes().to_vec(),
+        _ => return None,
     };
     Some(bytes)
+}
+
+/// The text a key types by itself, for a held key's repeats: macOS's input
+/// method, which types everything else, only sees the first press.
+pub fn typed(k: &Key) -> Option<Vec<u8>> {
+    if k.ctrl {
+        return None;
+    }
+    let text = k.key_char?;
+    // GPUI's key_char ignores Caps Lock, which on a Mac capitalizes
+    // letters only, Shift or not. Option on macOS composes characters (on
+    // many layouts @, |, [, ]), so that's sent rather than treated as Meta.
+    Some(if k.caps_lock && !k.alt {
+        text.to_uppercase().into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    })
 }
 
 fn control_byte(key: &str) -> Option<u8> {
@@ -167,10 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn printable_keys_send_what_they_type() {
-        assert_eq!(encode(&key("a", Some("a")), false).unwrap(), b"a");
-        assert_eq!(encode(&key("å", Some("å")), false).unwrap(), "å".as_bytes());
-        // Option+7 on a Norwegian layout types |.
+    fn text_is_left_to_the_input_method() {
+        assert_eq!(encode(&key("a", Some("a")), false), None);
+        assert_eq!(encode(&key("space", Some(" ")), false), None);
         assert_eq!(
             encode(
                 &Key {
@@ -178,23 +190,41 @@ mod tests {
                     ..key("7", Some("|"))
                 },
                 false
-            )
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn held_keys_type_what_they_type() {
+        assert_eq!(typed(&key("a", Some("a"))).unwrap(), b"a");
+        assert_eq!(typed(&key("å", Some("å"))).unwrap(), "å".as_bytes());
+        // Option+7 on a Norwegian layout types |.
+        assert_eq!(
+            typed(&Key {
+                alt: true,
+                ..key("7", Some("|"))
+            })
             .unwrap(),
             b"|"
+        );
+        assert_eq!(
+            typed(&Key {
+                ctrl: true,
+                ..key("c", Some("c"))
+            }),
+            None
         );
     }
 
     #[test]
     fn caps_lock_capitalizes_letters() {
         let caps = |key: Key<'static>| {
-            encode(
-                &Key {
-                    caps_lock: true,
-                    ..key
-                },
-                false,
-            )
-            .unwrap()
+            let key = Key {
+                caps_lock: true,
+                ..key
+            };
+            encode(&key, false).or_else(|| typed(&key)).unwrap()
         };
         assert_eq!(caps(key("a", Some("a"))), b"A");
         assert_eq!(caps(key("å", Some("å"))), "Å".as_bytes());
