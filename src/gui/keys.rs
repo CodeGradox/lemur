@@ -124,22 +124,37 @@ fn control_byte(key: &str) -> Option<u8> {
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MouseButton {
     Left = 0,
+    Middle = 1,
+    Right = 2,
     WheelUp = 64,
     WheelDown = 65,
+}
+
+/// Modifiers held during a mouse event, which its report carries.
+#[derive(Clone, Copy, Default)]
+pub struct Mods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
 }
 
 /// An SGR (1006) mouse report; `col` and `line` are 0-based cells.
 pub fn sgr_mouse(
     button: MouseButton,
     drag: bool,
+    mods: Mods,
     col: usize,
     line: usize,
     pressed: bool,
 ) -> Vec<u8> {
-    let code = button as u8 + if drag { 32 } else { 0 };
+    let code = button as u8
+        + 4 * mods.shift as u8
+        + 8 * mods.alt as u8
+        + 16 * mods.ctrl as u8
+        + if drag { 32 } else { 0 };
     format!(
         "\x1b[<{code};{};{}{}",
         col + 1,
@@ -312,17 +327,35 @@ mod tests {
 
     #[test]
     fn mouse_and_paste() {
+        let none = Mods::default();
         assert_eq!(
-            sgr_mouse(MouseButton::WheelUp, false, 0, 4, true),
+            sgr_mouse(MouseButton::WheelUp, false, none, 0, 4, true),
             b"\x1b[<64;1;5M"
         );
         assert_eq!(
-            sgr_mouse(MouseButton::Left, true, 9, 0, true),
+            sgr_mouse(MouseButton::Left, true, none, 9, 0, true),
             b"\x1b[<32;10;1M"
         );
         assert_eq!(
-            sgr_mouse(MouseButton::Left, false, 9, 0, false),
+            sgr_mouse(MouseButton::Left, false, none, 9, 0, false),
             b"\x1b[<0;10;1m"
+        );
+        assert_eq!(
+            sgr_mouse(MouseButton::Middle, false, none, 0, 0, true),
+            b"\x1b[<1;1;1M"
+        );
+        assert_eq!(
+            sgr_mouse(MouseButton::Right, true, none, 0, 0, true),
+            b"\x1b[<34;1;1M"
+        );
+        let all = Mods {
+            shift: true,
+            alt: true,
+            ctrl: true,
+        };
+        assert_eq!(
+            sgr_mouse(MouseButton::WheelDown, false, all, 0, 0, true),
+            b"\x1b[<93;1;1M"
         );
         assert_eq!(paste("/a.png ", true), b"\x1b[200~/a.png \x1b[201~");
         assert_eq!(paste("a\nb", false), b"a\rb");

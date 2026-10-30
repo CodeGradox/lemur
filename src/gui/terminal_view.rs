@@ -36,7 +36,8 @@ pub struct TerminalView {
     cell: Size,
     /// Measured on the next render after Settings change the font.
     metrics: Option<Metrics>,
-    mouse_cell: Option<(usize, usize)>,
+    /// The button tmux was told is down, and the cell it was last at.
+    pressed: Option<(keys::MouseButton, (usize, usize))>,
     /// Text an input method is still composing (a dead key's accent, or
     /// Japanese before it's converted), shown at the cursor until it's typed.
     marked: Option<String>,
@@ -87,7 +88,7 @@ impl TerminalView {
                 cell_height: 16,
             },
             metrics: None,
-            mouse_cell: None,
+            pressed: None,
             marked: None,
             pointer: None,
             link: None,
@@ -392,7 +393,8 @@ impl TerminalView {
             return;
         }
         // ⌘-click opens a link; tmux never sees that click.
-        if event.modifiers.platform
+        if event.button == MouseButton::Left
+            && event.modifiers.platform
             && let Some(link) = self.link_at(event.position)
         {
             if link.file {
@@ -402,12 +404,15 @@ impl TerminalView {
             }
             return;
         }
-        if Self::reports_mouse(self.mode()) {
+        if let Some(button) = button(event.button)
+            && Self::reports_mouse(self.mode())
+        {
             let (col, line) = self.cell_at(event.position);
-            self.mouse_cell = Some((col, line));
+            self.pressed = Some((button, (col, line)));
             self.write(keys::sgr_mouse(
-                keys::MouseButton::Left,
+                button,
                 false,
+                mods(event.modifiers),
                 col,
                 line,
                 true,
@@ -415,12 +420,21 @@ impl TerminalView {
         }
     }
 
-    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        if self.mouse_cell.take().is_some() && Self::reports_mouse(self.mode()) {
+    /// The press tmux was told about comes up, wherever the pointer is.
+    fn mouse_up(&mut self, event: &MouseUpEvent) {
+        let Some((pressed, _)) = self.pressed else {
+            return;
+        };
+        if button(event.button) != Some(pressed) {
+            return;
+        }
+        self.pressed = None;
+        if Self::reports_mouse(self.mode()) {
             let (col, line) = self.cell_at(event.position);
             self.write(keys::sgr_mouse(
-                keys::MouseButton::Left,
+                pressed,
                 false,
+                mods(event.modifiers),
                 col,
                 line,
                 false,
@@ -436,18 +450,21 @@ impl TerminalView {
     /// A press that reached tmux reports its moves wherever the pointer
     /// goes, off the terminal too; positions there land on the nearest cell.
     fn drag(&mut self, event: &MouseMoveEvent) {
-        if event.pressed_button != Some(MouseButton::Left)
-            || self.mouse_cell.is_none()
+        let Some((pressed, at)) = self.pressed else {
+            return;
+        };
+        if event.pressed_button.and_then(button) != Some(pressed)
             || !Self::reports_mouse(self.mode())
         {
             return;
         }
         let cell = self.cell_at(event.position);
-        if Some(cell) != self.mouse_cell {
-            self.mouse_cell = Some(cell);
+        if cell != at {
+            self.pressed = Some((pressed, cell));
             self.write(keys::sgr_mouse(
-                keys::MouseButton::Left,
+                pressed,
                 true,
+                mods(event.modifiers),
                 cell.0,
                 cell.1,
                 true,
@@ -474,7 +491,8 @@ impl TerminalView {
             } else {
                 keys::MouseButton::WheelDown
             };
-            self.write(keys::sgr_mouse(button, false, col, line, true).repeat(notches));
+            let report = keys::sgr_mouse(button, false, mods(event.modifiers), col, line, true);
+            self.write(report.repeat(notches));
         } else if mode.contains(TermMode::ALT_SCREEN) {
             let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
             self.write(arrow.repeat(notches));
@@ -501,6 +519,24 @@ impl TerminalView {
             cell_width,
             line_height: px((size * 1.3).round()),
         }
+    }
+}
+
+/// The buttons a mouse report can name.
+fn button(button: MouseButton) -> Option<keys::MouseButton> {
+    match button {
+        MouseButton::Left => Some(keys::MouseButton::Left),
+        MouseButton::Middle => Some(keys::MouseButton::Middle),
+        MouseButton::Right => Some(keys::MouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
+}
+
+fn mods(m: Modifiers) -> keys::Mods {
+    keys::Mods {
+        shift: m.shift,
+        alt: m.alt,
+        ctrl: m.control,
     }
 }
 
@@ -1026,10 +1062,17 @@ impl Render for TerminalView {
                     caret,
                 };
                 window.handle_input(&focus, input, cx);
-                // The element's own move listener only hears the pointer over it.
+                // A press that reached tmux is followed off the terminal too,
+                // where the element's own listeners don't hear it.
+                let dragged = this.clone();
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                    if phase == DispatchPhase::Bubble {
-                        this.update(cx, |view, _| view.drag(event));
+                    if phase == DispatchPhase::Capture {
+                        dragged.update(cx, |view, _| view.drag(event));
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture {
+                        this.update(cx, |view, _| view.mouse_up(event));
                     }
                 });
             },
@@ -1044,9 +1087,7 @@ impl Render for TerminalView {
             .size_full()
             .bg(hsla(palette.background))
             .on_key_down(cx.listener(Self::key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_any_mouse_down(cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, cx| {
                 this.hover(e.modifiers.platform, cx)
@@ -1268,6 +1309,48 @@ mod tests {
             "the pane shows {:?}",
             pane()
         );
+    }
+
+    /// The middle and right buttons reach tmux too: a middle-click pastes
+    /// tmux's buffer, and a right-click opens its menu.
+    #[gpui::test]
+    fn middle_and_right_clicks_reach_tmux(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("buttons");
+        server.tmux(&["new-session", "-d", "-s", "t", "cat"]);
+        server.tmux(&["set-option", "-g", "mouse", "on"]);
+        server.tmux(&["set-buffer", "xyz"]);
+        let (view, cx) = attach(&server, cx);
+        let reporting = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
+        });
+        assert!(reporting, "tmux never asked for mouse reports");
+
+        let at = view.read_with(cx, |v, _| {
+            v.bounds.origin + point(v.cell_size.width * 2.5, v.cell_size.height * 2.5)
+        });
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(at, MouseButton::Middle, none);
+        let pane = || server.tmux(&["capture-pane", "-p", "-t", "t"]);
+        assert!(
+            wait_until(Duration::from_secs(5), || pane() == "xyz"),
+            "the pane shows {:?}",
+            pane()
+        );
+
+        // The menu is up while the button is; letting go off its items closes it.
+        cx.simulate_mouse_down(at, MouseButton::Right, none);
+        let shown = || {
+            view.read_with(cx, |v, _| {
+                snapshot(v.pty.as_ref().unwrap(), &DARK)
+                    .rows
+                    .iter()
+                    .any(|row| row.text.contains("Respawn"))
+            })
+        };
+        assert!(wait_until(Duration::from_secs(5), shown), "no menu");
+        cx.simulate_mouse_up(at, MouseButton::Right, none);
     }
 
     /// Rows reach the painter without the blanks after their text.
