@@ -414,6 +414,11 @@ impl TerminalView {
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.pointer = Some(event.position);
         self.hover(event.modifiers.platform, cx);
+    }
+
+    /// A press that reached tmux reports its moves wherever the pointer
+    /// goes, off the terminal too; positions there land on the nearest cell.
+    fn drag(&mut self, event: &MouseMoveEvent) {
         if event.pressed_button != Some(MouseButton::Left)
             || self.mouse_cell.is_none()
             || !Self::reports_mouse(self.mode())
@@ -824,6 +829,7 @@ impl Render for TerminalView {
         let (w, h) = (metrics.cell_width, metrics.line_height);
         let focused = self.focus.is_focused(window);
         let view = cx.entity().downgrade();
+        let dragged = view.clone();
         let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
         let frame = self.pty.as_ref().map(|pty| snapshot(pty, &palette));
         let link = self
@@ -852,6 +858,12 @@ impl Render for TerminalView {
                 if let Some(frame) = frame {
                     paint(frame, bounds, &metrics, focused, link, window, cx);
                 }
+                // The element's own move listener only hears the pointer over it.
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        dragged.update(cx, |view, _| view.drag(event)).ok();
+                    }
+                });
             },
         )
         .size_full();
@@ -866,6 +878,7 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, cx| {
                 this.hover(e.modifiers.platform, cx)
@@ -892,7 +905,7 @@ mod tests {
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Pty, Size};
     use crate::test_support::{TmuxServer, wait_until};
-    use gpui_kit::{Modifiers, point, px, size};
+    use gpui_kit::{Modifiers, MouseButton, point, px, size};
     use std::time::Duration;
 
     /// Holding ⌘ over a URL shows it, and ⌘-clicking opens it; a plain
@@ -960,6 +973,50 @@ mod tests {
             );
             assert_eq!(v.cell_at(at), (cols - 1, lines - 1), "{:?}", m.cell_width);
         });
+    }
+
+    /// A selection dragged off the terminal follows the pointer to the
+    /// edge, and tmux copies it when the button comes up out there.
+    #[gpui::test]
+    fn a_drag_off_the_terminal_still_selects(cx: &mut gpui::TestAppContext) {
+        let server = TmuxServer::new("drag");
+        server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "t",
+            "printf 'hello world'; sleep 600",
+        ]);
+        server.tmux(&["set-option", "-g", "mouse", "on"]);
+        let host = server.config().hosts.remove(0);
+        // The PTY reader is a real thread, so this test can't be deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        cx.simulate_resize(size(px(600.0), px(400.0)));
+        cx.run_until_parked();
+        let reporting = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
+        });
+        assert!(reporting, "tmux never asked for mouse reports");
+
+        // Press on the first character, drag over two more, then leave the
+        // window to the right of the row and let go there.
+        let (origin, cell) = view.read_with(cx, |v, _| (v.bounds.origin, v.cell_size));
+        let at = |col: f32| point(origin.x + cell.width * col, origin.y + cell.height * 0.5);
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(at(0.5), MouseButton::Left, none);
+        cx.simulate_mouse_move(at(2.5), MouseButton::Left, none);
+        let off = point(px(700.0), at(0.0).y);
+        cx.simulate_mouse_move(off, MouseButton::Left, none);
+        cx.simulate_mouse_up(off, MouseButton::Left, none);
+        let copied = || server.tmux(&["show-buffer"]);
+        assert!(
+            wait_until(Duration::from_secs(5), || copied() == "hello world"),
+            "tmux copied {:?}",
+            copied()
+        );
     }
 
     /// Rows reach the painter without the blanks after their text.
