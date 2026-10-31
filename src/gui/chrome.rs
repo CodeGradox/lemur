@@ -195,7 +195,7 @@ impl Lemur {
                     None => menu,
                 };
                 menu.separator().item(
-                    PopupMenuItem::new("Close…")
+                    PopupMenuItem::new("Close")
                         .action(Box::new(CloseThread))
                         .on_click(close),
                 )

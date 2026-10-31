@@ -79,6 +79,9 @@ pub enum Entry {
         label: SharedString,
         /// This Mac, with a screen for its icon; another host has a server.
         local: bool,
+        /// What starts a thread there: its buttons, and its right-click
+        /// menu.
+        new: Option<(Suffix, MenuBuilder)>,
         threads: Threads,
     },
     /// A project's hidden worktrees, under a Hidden row of their own, shown
@@ -166,8 +169,9 @@ impl SidebarItem for Menu {
                     Entry::Host {
                         label,
                         local,
+                        new,
                         threads,
-                    } => host(id, label, local, threads, window, cx),
+                    } => host(id, label, local, new, threads, window, cx),
                     Entry::Hidden {
                         entries,
                         open,
@@ -587,31 +591,56 @@ fn host(
     id: SharedString,
     label: SharedString,
     local: bool,
+    new: Option<(Suffix, MenuBuilder)>,
     threads: Threads,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let has_threads = !threads.rows.is_empty() || !threads.gone.is_empty();
     let icon = match local {
         true => super::icons::monitor(),
         false => super::icons::server(),
     };
     let selector = format!("host {label}");
-    let header = row("host", icon, label, false, Empty.into_any_element(), cx)
-        .debug_selector(move || selector);
+    // Its buttons show while the pointer is on it, as a worktree's do.
+    let hovered = SharedString::from(format!("{id}-row"));
+    let buttons = format!("buttons {label}");
+    let suffix = match &new {
+        Some((suffix, _)) => h_flex()
+            .id("suffix")
+            .debug_selector(move || buttons)
+            .invisible()
+            .group_hover(hovered.clone(), |style| style.visible())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(suffix(window, cx))
+            .into_any_element(),
+        None => Empty.into_any_element(),
+    };
+    let header = row("host", icon, label, false, suffix, cx)
+        .debug_selector(move || selector)
+        .group(hovered);
+    let header = match new {
+        Some((_, menu)) => header
+            .context_menu(move |m, window, cx| menu(m, window, cx))
+            .into_any_element(),
+        None => header.into_any_element(),
+    };
     let border = cx.theme().sidebar_border;
     div()
         .id(id)
         .w_full()
         .child(header)
-        .child(
-            div()
-                .border_l_1()
-                .border_color(border)
-                .ml_3p5()
-                .pl_2p5()
-                .py_0p5()
-                .child(thread_list(threads, window, cx)),
-        )
+        .when(has_threads, |this| {
+            this.child(
+                div()
+                    .border_l_1()
+                    .border_color(border)
+                    .ml_3p5()
+                    .pl_2p5()
+                    .py_0p5()
+                    .child(thread_list(threads, window, cx)),
+            )
+        })
         .into_any_element()
 }
 

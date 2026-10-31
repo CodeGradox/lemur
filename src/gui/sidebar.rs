@@ -144,8 +144,8 @@ impl Lemur {
                     .menu(self.project_menu(index, cx)),
             );
         }
-        // Then one section for the threads outside every project, each
-        // host's under its name.
+        // Then one section for every host, each with its threads outside
+        // every project, to start more there.
         let mut other = rows::Menu::default();
         let mut hosts = 0;
         for h in &self.snap.hosts {
@@ -158,14 +158,31 @@ impl Lemur {
                             .disable(true),
                     ))),
                 ));
-            } else if !h.other.is_empty() || !h.gone.is_empty() {
+            } else {
                 let local = self
                     .cfg
                     .host(&h.name)
                     .is_some_and(|c| crate::remote::Remote::new(c).is_local());
+                // In its home, once its script has said where that is.
+                let new = (!h.home.is_empty()).then(|| {
+                    let menu = self.new_menu(&h.name, &h.home, None, cx);
+                    let add = menu.clone();
+                    let suffix: rows::Suffix = Rc::new(move |_, _| {
+                        let add = add.clone();
+                        Button::new("add")
+                            .icon(IconName::Plus)
+                            .ghost()
+                            .xsmall()
+                            .tooltip("New terminal or Claude here")
+                            .dropdown_menu(move |m, window, cx| add(m, window, cx))
+                            .into_any_element()
+                    });
+                    (suffix, menu)
+                });
                 other = other.child(rows::Entry::Host {
                     label: h.name.clone().into(),
                     local,
+                    new,
                     threads: self.threads(&h.name, None, &h.other, &h.gone, cx),
                 });
                 hosts += 1;

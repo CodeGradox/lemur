@@ -276,7 +276,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("New Terminal", NewTerminal),
                     MenuItem::action("New Thread in Worktree…", NewThreadHere),
                     MenuItem::action("Go to Thread…", GoToThread),
-                    MenuItem::action("Close Thread…", CloseThread),
+                    MenuItem::action("Close Thread", CloseThread),
                     MenuItem::action("Dictate", Dictate),
                     MenuItem::separator(),
                     MenuItem::action("Refresh", Refresh),
@@ -878,7 +878,8 @@ impl Lemur {
         }
     }
 
-    /// Asks whether to close the thread `key`.
+    /// Closes the thread `key`, asking first while something other than
+    /// its shell runs in it.
     pub(super) fn confirm_close_of(
         &mut self,
         key: Key,
@@ -886,6 +887,7 @@ impl Lemur {
         cx: &mut Context<Self>,
     ) {
         let (label, claude) = match self.session_of(&key) {
+            Some(s) if !s.busy => return self.close_thread(key, cx),
             Some(s) => (s.label.clone(), s.runs_claude()),
             None => (self.label_of(&key.0, &key.1), false),
         };
@@ -1346,12 +1348,14 @@ mod tests {
                 order: None,
                 started: 0,
                 claude: None,
+                busy: false,
             })
             .collect();
         Snapshot {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                home: String::new(),
                 machine: Default::default(),
                 bases: vec![],
                 other,
@@ -1684,6 +1688,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                home: String::new(),
                 machine: Default::default(),
                 bases: vec![BaseView {
                     index: 0,
@@ -2331,6 +2336,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                home: String::new(),
                 machine: Default::default(),
                 bases: vec![BaseView {
                     index: 0,
@@ -3080,6 +3086,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                home: String::new(),
                 machine,
                 bases: vec![BaseView {
                     index: 0,
@@ -3267,6 +3274,99 @@ mod tests {
         cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
         app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘J answered"));
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘W closes a shell at its prompt without asking, and the thread shown
+    /// instead has the keyboard.
+    #[gpui::test]
+    fn an_idle_shell_closes_without_asking(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("close-idle");
+        let a = server.run("/", &["lemur.label=a"], &["sleep", "600"]);
+        let b = server.run("/", &["lemur.label=b"], &["sh"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        open(&app, &b, cx);
+        // Once herdr-core has read what runs in it.
+        let idle = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&b)).is_some_and(|s| !s.busy)
+            })
+        });
+        assert!(idle);
+
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&b)));
+        let switched = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(super::BURST);
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active == Some(key(&a)))
+        });
+        assert!(switched);
+        let focused = cx.update(|window, cx| {
+            let app = app.read(cx);
+            let view = app.active.as_ref().and_then(|k| app.terminals.get(k));
+            view.is_some_and(|v| {
+                gpui_kit::Focusable::focus_handle(v.read(cx), cx).is_focused(window)
+            })
+        });
+        assert!(focused, "a has the keyboard");
+
+        // a runs a program of its own: ⌘W asks.
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let_attaches_end(&app, cx);
+    }
+
+    /// Every host is listed in Other, threads or none, and its + starts a
+    /// terminal in its home there.
+    #[gpui::test]
+    fn every_host_starts_threads_from_other(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("host-new");
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let listed = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            cx.debug_bounds("host local").is_some()
+        });
+        assert!(listed, "no threads, still listed");
+        let home = std::env::var("HOME").unwrap();
+        app.read_with(cx, |app, _| assert_eq!(app.snap.hosts[0].home, home));
+
+        let buttons = cx.debug_bounds("buttons local").expect("its buttons");
+        let add = point(buttons.right() - px(4.0), buttons.center().y);
+        cx.simulate_mouse_move(add, None, Modifiers::none());
+        cx.simulate_click(add, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        let mut started = None;
+        assert!(wait_until(Duration::from_secs(5), || {
+            started = server.core().terminals().into_iter().next();
+            started.is_some()
+        }));
+        let started = started.unwrap();
+        assert_eq!(started.cwd, home);
+        assert_eq!(
+            started.labels.get("lemur.kind").map(String::as_str),
+            Some("shell")
+        );
+        let shown = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active == Some(key(&started.address)))
+        });
+        assert!(shown, "the new terminal shows");
         let_attaches_end(&app, cx);
     }
 

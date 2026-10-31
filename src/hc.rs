@@ -77,6 +77,9 @@ pub struct Status {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Foreground {
+    /// Its process group's leader: the terminal's own program while that
+    /// is a shell at its prompt.
+    pub pid: u32,
     pub name: String,
     pub cwd: String,
 }

@@ -40,6 +40,9 @@ impl Snapshot {
 pub struct HostView {
     pub name: String,
     pub error: Option<String>,
+    /// Its user's home folder, where threads outside every project start;
+    /// empty until its script has said.
+    pub home: String,
     /// How busy it is, and the servers listening on it.
     pub machine: Reading,
     pub bases: Vec<BaseView>,
@@ -101,6 +104,9 @@ pub struct Session {
     pub started: u64,
     /// The Claude conversation running in it, as `claude agents` reports.
     pub claude: Option<ClaudeRun>,
+    /// Something other than its shell at its prompt runs in it, as Claude
+    /// or a server, or herdr-core hasn't said what does yet.
+    pub busy: bool,
 }
 
 /// A Claude conversation running in a session: its ID, and the folder it
@@ -169,6 +175,7 @@ fi
 pub struct HostData {
     pub name: String,
     pub error: Option<String>,
+    pub home: String,
     pub machine: Reading,
     bases: Vec<BaseView>,
     agents: String,
@@ -224,6 +231,7 @@ fn failed(host: &Host, error: String) -> HostView {
     HostView {
         name: host.name.clone(),
         error: Some(error),
+        home: String::new(),
         machine: Reading::default(),
         bases: vec![],
         other: vec![],
@@ -260,6 +268,7 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostData {
         Err(e) => HostData {
             name: host.name.clone(),
             error: Some(format!("{e:#}")),
+            home: String::new(),
             machine: Reading::default(),
             bases: vec![],
             agents: String::new(),
@@ -269,7 +278,7 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostData {
 }
 
 fn script(cfg: &Config, host: &Host) -> String {
-    let mut s = String::new();
+    let mut s = String::from("printf '@@home %s\\n' \"$HOME\"\n");
     for (i, b) in cfg
         .bases
         .iter()
@@ -293,8 +302,14 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
     let mut parents: HashMap<u32, u32> = HashMap::new();
     let mut agents = String::new();
     let mut reading = Reading::default();
+    let mut home = String::new();
     let mut section = "";
     for line in out.lines() {
+        if let Some(h) = line.strip_prefix("@@home ") {
+            home = h.to_string();
+            section = "";
+            continue;
+        }
         if let Some(i) = line.strip_prefix("@@base ") {
             if let Ok(index) = i.trim().parse::<usize>()
                 && index < cfg.bases.len()
@@ -347,6 +362,7 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
     HostData {
         name: host.name.clone(),
         error: None,
+        home,
         machine: reading,
         bases,
         agents,
@@ -412,6 +428,7 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
     HostView {
         name: host.name.clone(),
         error: None,
+        home: data.home.clone(),
         machine: data.machine.clone(),
         bases,
         other,
@@ -447,6 +464,24 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         order: label(ORDER).and_then(|o| o.parse().ok()),
         started: t.created_ms,
         claude: None,
+        busy: busy(t),
+    }
+}
+
+/// The shells a terminal can idle in at their prompt, as the OS names
+/// their processes.
+const SHELLS: [&str; 12] = [
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
+];
+
+/// Whether anything but a shell at its prompt runs in `t`: in the
+/// foreground is something other than its own program, or that program
+/// isn't a shell. herdr-core reads that about twice a second; until it
+/// has, a live terminal counts as busy.
+fn busy(t: &Terminal) -> bool {
+    match &t.foreground {
+        Some(f) => t.pid != Some(f.pid) || !SHELLS.contains(&f.name.trim_start_matches('-')),
+        None => t.state != "finished",
     }
 }
 
@@ -781,7 +816,7 @@ mod tests {
                 title: title.into(),
                 foreground: Some(Foreground {
                     name: program.into(),
-                    cwd: String::new(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
@@ -947,5 +982,45 @@ mod tests {
         crate::actions::set_order(&cfg, "local", &[d.clone(), b.clone()]).unwrap();
         let placed = [d, b, a, c].map(String::clone);
         assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == placed));
+    }
+
+    /// Only a shell at its prompt is idle: what it runs is busy, and so
+    /// is a program in a terminal of its own, or one not yet read.
+    #[test]
+    fn only_a_shell_at_its_prompt_is_idle() {
+        let live = Terminal {
+            state: "live".into(),
+            ..Default::default()
+        };
+        assert!(busy(&live), "not read yet");
+        let finished = Terminal {
+            state: "finished".into(),
+            ..Default::default()
+        };
+        assert!(!busy(&finished));
+
+        let server = HcServer::new("busy");
+        let shell = server.run("/", &[], &["sh"]);
+        let own = server.run("/", &[], &["sleep", "600"]);
+        let core = server.core();
+        let read = |address: &str| {
+            core.terminals()
+                .into_iter()
+                .find(|t| t.address == address && t.foreground.is_some())
+        };
+        let busy_now = |address: &str| read(address).map(|t| busy(&t));
+        assert!(
+            wait_until(Duration::from_secs(5), || busy_now(&shell) == Some(false)),
+            "{:?}",
+            read(&shell)
+        );
+        assert!(wait_until(Duration::from_secs(5), || read(&own).is_some()));
+        assert_eq!(busy_now(&own), Some(true), "{:?}", read(&own));
+        core.type_line(&shell, "sleep 600").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || busy_now(&shell) == Some(true)),
+            "{:?}",
+            read(&shell)
+        );
     }
 }
