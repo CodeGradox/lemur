@@ -5,14 +5,16 @@
 use super::settings::Prefs;
 use super::sidebar::{status_dot, thread_icon};
 use super::terminal::Palette;
-use super::{Ask, Key, Lemur, icons, sessions};
+use super::{Ask, CloseThread, Key, Lemur, NewTerminal, icons, rows, sessions};
 use crate::machine::{self, Load};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::rc::Rc;
 
 /// The status bar's height, and the terminal header's.
 const STATUS_HEIGHT: Pixels = px(28.0);
@@ -33,8 +35,17 @@ impl Lemur {
         Some((host, w))
     }
 
+    /// Where a thread runs, for what starts beside it: its worktree and the
+    /// project it's in, or its folder outside every worktree.
+    fn place_of(&self, key: &Key) -> Option<(String, Option<usize>)> {
+        match self.project_of(&key.0, &key.1) {
+            Some((base, w)) => Some((w.path.clone(), Some(base))),
+            None => Some((self.session_of(key)?.path.clone(), None)),
+        }
+    }
+
     /// The tabs of the threads where the one on show runs: its worktree's,
-    /// or its host's outside every worktree. + starts another there.
+    /// or its host's outside every worktree. + offers what starts there.
     pub(super) fn tabs(&self, cx: &mut Context<Self>) -> Div {
         let Some(active) = self.active.clone() else {
             return h_flex().flex_1();
@@ -48,12 +59,15 @@ impl Lemur {
                 Some(self.tab(i, key, &s, cx))
             })
             .collect();
-        let add = Button::new("new-tab")
-            .icon(IconName::Plus)
-            .ghost()
-            .xsmall()
-            .tooltip("New thread here (⌘T)")
-            .on_click(cx.listener(|this, _, window, cx| this.new_thread_here(window, cx)));
+        let add = self.place_of(&active).map(|(dir, base)| {
+            let new = self.new_menu(&active.0, &dir, base, cx);
+            Button::new("new-tab")
+                .icon(IconName::Plus)
+                .ghost()
+                .xsmall()
+                .tooltip("New terminal or Claude here")
+                .dropdown_menu(move |m, window, cx| new(m, window, cx))
+        });
         h_flex()
             .flex_1()
             .min_w_0()
@@ -66,12 +80,11 @@ impl Lemur {
                     .overflow_x_scroll()
                     .children(tabs),
             )
-            .when(self.worktree_of(&active.0, &active.1).is_some(), |bar| {
-                bar.child(add)
-            })
+            .children(add)
     }
 
     fn tab(&self, i: usize, key: Key, s: &Session, cx: &mut Context<Self>) -> AnyElement {
+        let menu = self.tab_menu(&key, cx);
         let theme = cx.theme();
         let shown = self.active.as_ref() == Some(&key);
         let arming = self.confirm_kill.as_ref() == Some(&key);
@@ -132,7 +145,62 @@ impl Lemur {
             .child(div().max_w(px(200.0)).truncate().child(s.label.clone()))
             .child(status_dot(&key, dot, working, tip))
             .child(close)
+            .context_menu(move |m, window, cx| menu(m, window, cx))
             .into_any_element()
+    }
+
+    /// A tab's right-click menu, as Herdr's: rename it, start a terminal
+    /// beside it, close it; with the keys that do so for the one on show.
+    fn tab_menu(&self, key: &Key, cx: &mut Context<Self>) -> rows::MenuBuilder {
+        let this = cx.entity().downgrade();
+        let key = key.clone();
+        let dir = self.place_of(&key).map(|(dir, _)| dir);
+        Rc::new(
+            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+                let rename = {
+                    let (this, (host, session)) = (this.clone(), key.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let ask = Ask::Rename {
+                            host: host.clone(),
+                            session: session.clone(),
+                        };
+                        this.update(cx, |this, cx| this.ask_name(ask, window, cx))
+                            .ok();
+                    }
+                };
+                let close = {
+                    let (this, key) = (this.clone(), key.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        this.update(cx, |this, cx| {
+                            this.confirm_close_of(key.clone(), window, cx)
+                        })
+                        .ok();
+                    }
+                };
+                let menu = menu.item(PopupMenuItem::new("Rename…").on_click(rename));
+                let menu = match &dir {
+                    Some(dir) => {
+                        let (this, host, dir) = (this.clone(), key.0.clone(), dir.clone());
+                        menu.item(
+                            PopupMenuItem::new("New terminal")
+                                .action(Box::new(NewTerminal))
+                                .on_click(move |_, _, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.start_now(host.clone(), dir.clone(), true, cx)
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    }
+                    None => menu,
+                };
+                menu.separator().item(
+                    PopupMenuItem::new("Close…")
+                        .action(Box::new(CloseThread))
+                        .on_click(close),
+                )
+            },
+        )
     }
 
     /// Over the terminal: what runs in it, and where.

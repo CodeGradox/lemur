@@ -11,6 +11,7 @@ mod goto;
 mod icons;
 pub(crate) mod keys;
 mod links;
+mod new;
 mod notes;
 mod notification;
 mod projects;
@@ -64,6 +65,7 @@ actions!(
         NextThread,
         PreviousThread,
         NewThreadHere,
+        NewTerminal,
         GoToThread,
         CloseThread,
         Dictate,
@@ -85,8 +87,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", ToggleNotes, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
-        // A new tab, as in a browser; ⌘W closes the one on show.
-        KeyBinding::new("cmd-t", NewThreadHere, None),
+        // A new tab, as in a terminal app; ⌘W closes the one on show.
+        KeyBinding::new("cmd-t", NewTerminal, None),
+        KeyBinding::new("cmd-j", NewThreadHere, None),
         KeyBinding::new("cmd-w", CloseThread, None),
         KeyBinding::new("cmd-p", GoToThread, None),
         KeyBinding::new("cmd-d", Dictate, None),
@@ -270,6 +273,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ]),
                 Menu::new("File").items([
                     MenuItem::action("Add Project…", AddProject),
+                    MenuItem::action("New Terminal", NewTerminal),
                     MenuItem::action("New Thread in Worktree…", NewThreadHere),
                     MenuItem::action("Go to Thread…", GoToThread),
                     MenuItem::action("Close Thread…", CloseThread),
@@ -869,9 +873,18 @@ impl Lemur {
         if self.prompt.is_some() || self.picker.is_some() {
             return;
         }
-        let Some(key) = self.active.clone() else {
-            return;
-        };
+        if let Some(key) = self.active.clone() {
+            self.confirm_close_of(key, window, cx);
+        }
+    }
+
+    /// Asks whether to close the thread `key`.
+    pub(super) fn confirm_close_of(
+        &mut self,
+        key: Key,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (label, claude) = match self.session_of(&key) {
             Some(s) => (s.label.clone(), s.runs_claude()),
             None => (self.label_of(&key.0, &key.1), false),
@@ -1097,6 +1110,7 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &NewThreadHere, window, cx| this.new_thread_here(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &NewTerminal, _, cx| this.new_terminal_here(cx)))
             .on_action(cx.listener(|this, _: &GoToThread, window, cx| this.find_thread(window, cx)))
             .on_action(
                 cx.listener(|this, _: &CloseThread, window, cx| this.confirm_close(window, cx)),
@@ -2301,11 +2315,11 @@ mod tests {
         assert_eq!(kept(cx), [("c".into(), id(2))], "renamed by hand");
     }
 
-    /// ⌘T asks for a new thread in the worktree on show: Claude or Shell,
+    /// ⌘J asks for a new thread in the worktree on show: Claude or Shell,
     /// picked with ↑↓ or a click, and its name, which follows the pick until
     /// you type one.
     #[gpui::test]
-    fn cmd_t_asks_for_claude_or_a_shell_here(cx: &mut gpui::TestAppContext) {
+    fn cmd_j_asks_for_claude_or_a_shell_here(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("cmd-j");
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", "/srv/api"));
@@ -2337,7 +2351,7 @@ mod tests {
         };
         cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
         // Nothing on show, nowhere to start.
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("cmd-j");
         app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
         open(&app, "api/t", cx);
         cx.run_until_parked();
@@ -2355,7 +2369,7 @@ mod tests {
             })
         };
 
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
         assert_eq!(asked(cx), (false, "claude".into()));
         cx.simulate_keystrokes("down");
@@ -2482,20 +2496,85 @@ mod tests {
             .debug_bounds("worktree-0")
             .expect("the worktree")
             .center();
+        assert!(
+            cx.debug_bounds("counts main").is_none(),
+            "open, it shows them"
+        );
         cx.simulate_click(row, Modifiers::none());
         cx.run_until_parked();
         assert!(!shown(cx));
+        // Folded, it says what runs in it.
+        assert!(cx.debug_bounds("counts main").is_some());
         cx.simulate_click(row, Modifiers::none());
         cx.run_until_parked();
         assert!(shown(cx));
 
-        // + is the last of its buttons.
+        // + is the last of its buttons; its menu's first item starts a
+        // terminal there.
+        let before = server.addresses().len();
         let buttons = cx.debug_bounds("buttons main").expect("its buttons");
         let add = point(buttons.right() - px(4.0), buttons.center().y);
+        cx.simulate_mouse_move(add, None, Modifiers::none());
         cx.simulate_click(add, Modifiers::none());
         cx.run_until_parked();
-        app.read_with(cx, |app, _| assert!(app.prompt.is_some()));
+        cx.simulate_keystrokes("down enter");
+        assert!(
+            wait_until(Duration::from_secs(5), || server.addresses().len() > before),
+            "no terminal started"
+        );
+        let started = server.core().terminals();
+        let t = started.last().unwrap();
+        assert_eq!(t.cwd, path);
+        assert_eq!(
+            t.labels.get("lemur.kind").map(String::as_str),
+            Some("shell")
+        );
         assert!(shown(cx));
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘T starts a terminal where the thread on show runs, and shows it.
+    #[gpui::test]
+    fn cmd_t_opens_a_terminal_beside_the_thread(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("cmd-t");
+        let dir = TempDir::new("cmd-t");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["worktree", "add", "-q", "-b", "a", "wt/a"]);
+        let wt = repo.join("wt/a").to_string_lossy().into_owned();
+        let t = server.run(&wt, &["lemur.label=claude"], &["sleep", "600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &t, cx);
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-t");
+        let mut started = None;
+        assert!(wait_until(Duration::from_secs(5), || {
+            started = server
+                .core()
+                .terminals()
+                .into_iter()
+                .find(|x| x.address != t);
+            started.is_some()
+        }));
+        let started = started.unwrap();
+        assert_eq!(started.cwd, wt);
+        assert_eq!(
+            started.labels.get("lemur.label").map(String::as_str),
+            Some("shell")
+        );
+        let shown = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active == Some(key(&started.address)))
+        });
+        assert!(shown, "the new terminal shows");
+        let_attaches_end(&app, cx);
     }
 
     /// A folded worktree stays folded, and an open Hidden row open, while
@@ -3120,7 +3199,7 @@ mod tests {
         // terminal it took it from, which is gone.
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
-        // It has the keyboard: ⌘T works at once.
+        // It has the keyboard: ⌘J works at once.
         let focused = |cx: &mut VisualTestContext| {
             cx.update(|window, cx| {
                 let app = app.read(cx);
@@ -3131,9 +3210,9 @@ mod tests {
             })
         };
         assert!(focused(cx), "the terminal shown instead has the keyboard");
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
-        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘T answered"));
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘J answered"));
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
 
@@ -3151,7 +3230,7 @@ mod tests {
     }
 
     /// A tab closed with its ×, as herdr-core tells of it, hands the
-    /// keyboard to the one shown instead: ⌘T works at once.
+    /// keyboard to the one shown instead: ⌘J works at once.
     #[gpui::test]
     fn the_tab_shown_after_a_close_has_the_keyboard(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("close-x");
@@ -3185,9 +3264,9 @@ mod tests {
             })
         });
         assert!(focused, "b has the keyboard");
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
-        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘T answered"));
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘J answered"));
         let_attaches_end(&app, cx);
     }
 
@@ -3310,11 +3389,11 @@ mod tests {
         assert_eq!(cpu(cx), Some(25.0));
     }
 
-    /// ⌘T lists the threads to go to under the new one's name: typing
+    /// ⌘J lists the threads to go to under the new one's name: typing
     /// narrows them, ↓ goes past Claude and Shell to them, and ⏎ opens the
     /// one picked. ⌘P lists them all.
     #[gpui::test]
-    fn cmd_t_and_cmd_p_go_to_threads(cx: &mut gpui::TestAppContext) {
+    fn cmd_j_and_cmd_p_go_to_threads(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("goto");
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", "/srv/api"));
@@ -3334,7 +3413,7 @@ mod tests {
         };
         let shown = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
 
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
         // The worktree's own first, untouched by the name it starts with.
         assert_eq!(listed(cx), ["review", "build", "main-shell"]);

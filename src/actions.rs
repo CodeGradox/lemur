@@ -250,13 +250,19 @@ pub fn new_thread_in(
     label: &str,
     shell: bool,
 ) -> Result<Started> {
-    let host = cfg.host_or_err(&cfg.bases[base].host)?;
+    start_in(cfg, &cfg.bases[base].host, worktree, label, shell)
+}
+
+/// Starts a thread labelled `label` in `dir` on `host`, a project's
+/// worktree or any folder: Claude, or with `shell` just a shell.
+pub fn start_in(cfg: &Config, host: &str, dir: &str, label: &str, shell: bool) -> Result<Started> {
+    let host = cfg.host_or_err(host)?;
     if !shell {
-        return start_claude(host, worktree, label);
+        return start_claude(host, dir, label);
     }
     Ok(Started {
         host: host.name.clone(),
-        session: start_thread(host, worktree, label, None)?,
+        session: start_thread(host, dir, label, None)?,
         claude: None,
     })
 }

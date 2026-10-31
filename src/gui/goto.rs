@@ -1,4 +1,4 @@
-//! Going to a thread from the spotlight: ⌘T lists the threads under the
+//! Going to a thread from the spotlight: ⌘J lists the threads under the
 //! new thread's name, the worktree's first, and ⌘P lists them all. What's
 //! typed narrows them down; ↑↓ picks one and ⏎ opens it.
 
@@ -21,7 +21,7 @@ pub(super) struct Match {
 
 impl Lemur {
     /// The threads to go to for what's typed in `prompt`: each word of it
-    /// is in a thread's name, place or host. ⌘T lists the threads of its
+    /// is in a thread's name, place or host. ⌘J lists the threads of its
     /// worktree first, then its project's; ⌘P those opened last, the one
     /// on show at the end.
     pub(super) fn matches(&self, prompt: &Prompt, cx: &App) -> Vec<Match> {

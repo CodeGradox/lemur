@@ -5,7 +5,7 @@ use super::{Ask, Key, Lemur, List, key, rows, worktree_label};
 use crate::config::{Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex};
@@ -214,7 +214,8 @@ impl Lemur {
             .children(groups)
     }
 
-    /// A worktree with its sessions; + offers a Claude thread or a shell.
+    /// A worktree with its sessions; + and its right-click menu start a
+    /// terminal or Claude there.
     fn worktree_item(
         &self,
         host: &str,
@@ -225,13 +226,16 @@ impl Lemur {
     ) -> rows::Entry {
         let label = worktree_label(w);
         let hidden = self.cfg.bases[base].hidden_worktrees.contains(&w.path);
-        // Color and hiding for every worktree; removing only for linked ones.
+        let new = self.new_menu(host, &w.path, Some(base), cx);
+        // What starts here; then color and hiding for every worktree, and
+        // removing for linked ones.
         let menu: rows::MenuBuilder = {
             let this = cx.entity().downgrade();
             let colors = Rc::new(self.color_menu(base, &w.path, cx));
-            let (worktree, label) = (w.path.clone(), label.clone());
+            let (worktree, label, new) = (w.path.clone(), label.clone(), new.clone());
             Rc::new(
                 move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+                    let menu = new(menu, window, cx).separator();
                     let colors = colors.clone();
                     let menu = menu.submenu("Color", window, cx, move |m, w, cx| colors(m, w, cx));
                     let hide = {
@@ -296,18 +300,13 @@ impl Lemur {
                         .ok();
                     })
             };
-            let (this, worktree) = (this.clone(), worktree.clone());
-            // The spotlight asks Claude or Shell, as ⌘T does.
+            let new = new.clone();
             let add = Button::new("add")
                 .icon(IconName::Plus)
                 .ghost()
                 .xsmall()
-                .tooltip("New Claude thread or shell here")
-                .on_click(ask_on_click(&this, move || Ask::NewThread {
-                    base,
-                    worktree: worktree.clone(),
-                    shell: false,
-                }));
+                .tooltip("New terminal or Claude here")
+                .dropdown_menu(move |m, window, cx| new(m, window, cx));
             h_flex().gap_1().child(notes).child(add)
         };
         rows::Entry::Worktree {
@@ -316,6 +315,14 @@ impl Lemur {
             menu,
             color,
             main: w.main,
+            counts: rows::Counts {
+                agents: w.sessions.iter().filter(|s| s.runs_claude()).count(),
+                shells: w.sessions.iter().filter(|s| !s.runs_claude()).count(),
+                needs_input: w
+                    .sessions
+                    .iter()
+                    .any(|s| s.activity == Activity::NeedsInput),
+            },
             threads: self.threads(host, Some(&w.path), &w.sessions, &w.gone, cx),
             folded,
             toggle,

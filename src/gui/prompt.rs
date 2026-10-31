@@ -289,7 +289,7 @@ impl Lemur {
         cx.notify();
     }
 
-    /// ⌘T: asks for a new Claude thread or shell in the worktree of the one
+    /// ⌘J: asks for a new Claude thread or shell in the worktree of the one
     /// on show.
     pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.prompt.is_some() || self.picker.is_some() {

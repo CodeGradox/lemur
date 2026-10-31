@@ -43,6 +43,15 @@ pub struct Threads {
     pub reorder: Reorder,
 }
 
+/// How many agents and shells run in a worktree, and whether one of them
+/// needs you.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Counts {
+    pub agents: usize,
+    pub shells: usize,
+    pub needs_input: bool,
+}
+
 #[derive(Clone)]
 pub enum Entry {
     /// One of gpui-component's own rows, such as "New worktree".
@@ -58,6 +67,8 @@ pub enum Entry {
         /// The project's own checkout, with a folder for its icon; a linked
         /// worktree has a branch.
         main: bool,
+        /// What runs in it, shown while it's folded.
+        counts: Counts,
         threads: Threads,
         /// Its threads are folded away; clicking it calls `toggle`.
         folded: bool,
@@ -134,6 +145,7 @@ impl SidebarItem for Menu {
                         menu,
                         color,
                         main,
+                        counts,
                         threads,
                         folded,
                         toggle,
@@ -141,6 +153,7 @@ impl SidebarItem for Menu {
                         let look = WorktreeLook {
                             color,
                             main,
+                            counts,
                             folded,
                             toggle,
                             drag: order
@@ -426,6 +439,7 @@ fn row(
 struct WorktreeLook {
     color: Option<Hsla>,
     main: bool,
+    counts: Counts,
     folded: bool,
     toggle: Toggle,
     drag: Option<(SharedString, usize, Reorder)>,
@@ -455,13 +469,32 @@ fn worktree(
         false => super::icons::git_branch(),
     };
     let icon = icon.when_some(look.color, |i, c| i.text_color(c));
-    // Its buttons do what they say without folding it.
+    // Its buttons do what they say without folding it. They show while
+    // the pointer is on it; the rest of the time a folded worktree says
+    // what runs in it there instead.
+    let hovered = SharedString::from(format!("{id}-row"));
     let buttons = format!("buttons {label}");
-    let suffix = h_flex()
-        .id("suffix")
-        .debug_selector(move || buttons)
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(suffix(window, cx));
+    let suffix = div()
+        .relative()
+        .child(
+            h_flex()
+                .id("suffix")
+                .debug_selector(move || buttons)
+                .invisible()
+                .group_hover(hovered.clone(), |style| style.visible())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(suffix(window, cx)),
+        )
+        .when(look.folded && has_threads, |this| {
+            this.child(
+                counts(look.counts, &label, cx)
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .group_hover(hovered.clone(), |style| style.invisible()),
+            )
+        });
     let header = row(
         "worktree",
         icon,
@@ -492,6 +525,7 @@ fn worktree(
         None => header,
     };
     let header = header
+        .group(hovered)
         .context_menu(move |m, window, cx| menu(m, window, cx))
         .into_any_element();
     let border = cx.theme().sidebar_border;
@@ -516,6 +550,36 @@ fn worktree(
             drop_target::<WorktreeRow>(this, key, index, reorder, cx)
         })
         .into_any_element()
+}
+
+/// What runs in a folded worktree: its agents' and shells' counts, each
+/// with its icon, and a dot when one needs you.
+fn counts(c: Counts, label: &SharedString, cx: &App) -> Div {
+    let theme = cx.theme();
+    let selector = format!("counts {label}");
+    let count = |icon: Icon, n: usize| {
+        h_flex()
+            .gap_0p5()
+            .items_center()
+            .child(icon.xsmall())
+            .child(n.to_string())
+    };
+    h_flex()
+        .debug_selector(move || selector)
+        .gap_1p5()
+        .items_center()
+        .justify_end()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .when(c.agents > 0, |this| {
+            this.child(count(super::sidebar::claude_icon(), c.agents))
+        })
+        .when(c.shells > 0, |this| {
+            this.child(count(Icon::new(IconName::SquareTerminal), c.shells))
+        })
+        .when(c.needs_input, |this| {
+            this.child(div().size_1p5().rounded_full().bg(theme.warning))
+        })
 }
 
 /// A host's row in Other, and its threads under it.
