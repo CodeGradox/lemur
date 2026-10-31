@@ -5,7 +5,7 @@
 use super::settings::Prefs;
 use super::sidebar::{status_dot, thread_icon};
 use super::terminal::Palette;
-use super::{Ask, CloseThread, Key, Lemur, NewTerminal, icons, rows, sessions};
+use super::{Ask, CloseThread, Key, Lemur, List, NewTerminal, icons, rows, sessions};
 use crate::machine::{self, Load};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -46,9 +46,28 @@ impl Lemur {
 
     /// The tabs of the threads where the one on show runs: its worktree's,
     /// or its host's outside every worktree. + offers what starts there.
+    /// Dragged, they move in the sidebar too: it's one order.
     pub(super) fn tabs(&self, cx: &mut Context<Self>) -> Div {
         let Some(active) = self.active.clone() else {
             return h_flex().flex_1();
+        };
+        let list: List = (
+            active.0.clone(),
+            self.project_of(&active.0, &active.1)
+                .map(|(_, w)| w.path.clone()),
+        );
+        let drag: SharedString = format!(
+            "tabs\n{}\n{}",
+            list.0,
+            list.1.as_deref().unwrap_or_default()
+        )
+        .into();
+        let reorder: rows::Reorder = {
+            let this = cx.entity().downgrade();
+            Rc::new(move |from, to, _, cx| {
+                this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
+                    .ok();
+            })
         };
         let tabs: Vec<AnyElement> = self
             .siblings(&active)
@@ -56,7 +75,7 @@ impl Lemur {
             .enumerate()
             .filter_map(|(i, key)| {
                 let s = self.session_of(&key)?.clone();
-                Some(self.tab(i, key, &s, cx))
+                Some(self.tab(i, key, &s, (drag.clone(), reorder.clone()), cx))
             })
             .collect();
         let add = self.place_of(&active).map(|(dir, base)| {
@@ -83,7 +102,15 @@ impl Lemur {
             .children(add)
     }
 
-    fn tab(&self, i: usize, key: Key, s: &Session, cx: &mut Context<Self>) -> AnyElement {
+    /// The tab at `i` of the tab bar `drag`, which a drop reorders.
+    fn tab(
+        &self,
+        i: usize,
+        key: Key,
+        s: &Session,
+        (drag, reorder): (SharedString, rows::Reorder),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let menu = self.tab_menu(&key, cx);
         let theme = cx.theme();
         let shown = self.active.as_ref() == Some(&key);
@@ -116,7 +143,7 @@ impl Lemur {
         } else {
             close.icon(IconName::Close).tooltip("Kill thread")
         };
-        h_flex()
+        let tab = h_flex()
             .id(SharedString::from(format!("tab-{i}")))
             .debug_selector(move || format!("tab-{i}"))
             .flex_shrink_0()
@@ -144,7 +171,8 @@ impl Lemur {
             .child(thread_icon(s).small())
             .child(div().max_w(px(200.0)).truncate().child(s.label.clone()))
             .child(status_dot(&key, dot, working, tip))
-            .child(close)
+            .child(close);
+        rows::draggable_tab(tab, drag, i, s.label.clone().into(), reorder, cx)
             .context_menu(move |m, window, cx| menu(m, window, cx))
             .into_any_element()
     }

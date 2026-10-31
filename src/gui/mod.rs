@@ -1443,6 +1443,43 @@ mod tests {
         );
     }
 
+    /// Dropping a tab on another moves it to that one's place, and its
+    /// thread in the sidebar with it: in herdr-core for good.
+    #[gpui::test]
+    fn dragging_a_tab_reorders_its_threads(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("drag-tab");
+        let [a, b, c] = ["a", "b", "c"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                let other = &app.snap.hosts[0].other;
+                other.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(shown(cx), [a.as_str(), &b, &c]);
+
+        drag("tab-0", "tab-2", cx);
+        assert_eq!(shown(cx), [b.as_str(), &c, &a]);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active.clone()),
+            Some(key(&a)),
+            "dragging it doesn't open another"
+        );
+
+        cx.run_until_parked();
+        let kept: Vec<String> = snapshot::fetch(&server.config()).hosts[0]
+            .other
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(kept, [b.as_str(), &c, &a]);
+        let_attaches_end(&app, cx);
+    }
+
     /// A terminal started elsewhere joins the sidebar as herdr-core tells
     /// of it, well before the next refresh; one that ends leaves it.
     #[gpui::test]
@@ -1656,7 +1693,7 @@ mod tests {
     }
 
     /// Opening a thread points the notes at its worktree without opening
-    /// the panel; a worktree's notes icon opens it.
+    /// the panel; Notes in a worktree's menu opens it.
     #[gpui::test]
     fn notes_follow_the_opened_thread(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("notes");
@@ -2477,8 +2514,8 @@ mod tests {
         });
     }
 
-    /// Clicking a worktree folds its threads away and back; clicking one of
-    /// its buttons does what the button says and leaves it open.
+    /// Clicking a worktree folds its threads away and back; its + starts
+    /// a terminal there, or opens its notes, and leaves it open.
     #[gpui::test]
     fn clicking_a_worktree_folds_its_threads(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("fold-wt");
@@ -2536,6 +2573,17 @@ mod tests {
             Some("shell")
         );
         assert!(shown(cx));
+
+        // Its last item opens its notes.
+        cx.simulate_mouse_move(add, None, Modifiers::none());
+        cx.simulate_click(add, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("up enter");
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            assert!(app.notes_open);
+            assert_eq!(app.notes.read(cx).worktree(), Some(path.as_str()));
+        });
         let_attaches_end(&app, cx);
     }
 

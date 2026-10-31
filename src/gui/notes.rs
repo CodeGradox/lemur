@@ -349,7 +349,7 @@ impl Render for NotesPanel {
                 .p_3()
                 .text_sm()
                 .text_color(muted)
-                .child("Open a thread, or a worktree's notes icon, to see its notes.")
+                .child("Open a thread, or Notes in a worktree's + menu, to see its notes.")
                 .into_any_element()
         } else {
             div()

@@ -379,6 +379,8 @@ struct ThreadRow;
 struct WorktreeRow;
 #[derive(Clone)]
 struct ProjectRow;
+#[derive(Clone)]
+struct TabRow;
 
 impl<Kind: 'static> Render for Dragged<Kind> {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -765,6 +767,44 @@ fn drop_target<Kind: 'static>(
             }
         })
         .on_drop(move |dragged: &Dragged<Kind>, window, cx| {
+            if dragged.index != index {
+                reorder(dragged.index, index, window, cx);
+            }
+        })
+}
+
+/// Makes `tab` draggable along the tab bar `key`, where it's at `index`:
+/// dropped on another tab, it takes that one's place. The line on the side
+/// it will land is on a slot around the tab, whose own border is its look.
+pub fn draggable_tab(
+    tab: Stateful<Div>,
+    key: SharedString,
+    index: usize,
+    label: SharedString,
+    reorder: Reorder,
+    cx: &App,
+) -> Stateful<Div> {
+    let line = cx.theme().drag_border;
+    let tab = drag_handle::<TabRow>(tab, key.clone(), index, label);
+    div()
+        .id(SharedString::from(format!("tab-slot-{index}")))
+        .flex_shrink_0()
+        .child(tab)
+        .can_drop(move |value, _, _| {
+            value
+                .downcast_ref::<Dragged<TabRow>>()
+                .is_some_and(|d| d.list == key)
+        })
+        .drag_over::<Dragged<TabRow>>(move |style, dragged, _, _| {
+            if dragged.index > index {
+                style.border_l_2().border_color(line)
+            } else if dragged.index < index {
+                style.border_r_2().border_color(line)
+            } else {
+                style
+            }
+        })
+        .on_drop(move |dragged: &Dragged<TabRow>, window, cx| {
             if dragged.index != index {
                 reorder(dragged.index, index, window, cx);
             }

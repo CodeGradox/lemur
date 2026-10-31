@@ -1,7 +1,7 @@
 //! The sidebar: each project's worktrees and their threads, as rows to
 //! open, fold, drag into order and right-click.
 
-use super::{Ask, Key, Lemur, List, key, rows, worktree_label};
+use super::{Ask, Key, Lemur, List, ToggleNotes, key, rows, worktree_label};
 use crate::config::{Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -232,7 +232,7 @@ impl Lemur {
     }
 
     /// A worktree with its sessions; + and its right-click menu start a
-    /// terminal or Claude there.
+    /// terminal or Claude there, and open its notes.
     fn worktree_item(
         &self,
         host: &str,
@@ -243,7 +243,26 @@ impl Lemur {
     ) -> rows::Entry {
         let label = worktree_label(w);
         let hidden = self.cfg.bases[base].hidden_worktrees.contains(&w.path);
-        let new = self.new_menu(host, &w.path, Some(base), cx);
+        let start = self.new_menu(host, &w.path, Some(base), cx);
+        let new: rows::MenuBuilder = {
+            let this = cx.entity().downgrade();
+            let (host, worktree, label) = (host.to_string(), w.path.clone(), label.clone());
+            Rc::new(move |menu, window, cx| {
+                let (this, host, worktree, label) =
+                    (this.clone(), host.clone(), worktree.clone(), label.clone());
+                start(menu, window, cx).separator().item(
+                    PopupMenuItem::new("Notes")
+                        .icon(IconName::FileText)
+                        .action(Box::new(ToggleNotes))
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.open_notes(&host, &worktree, &label, window, cx)
+                            })
+                            .ok();
+                        }),
+                )
+            })
+        };
         // What starts here; then color and hiding for every worktree, and
         // removing for linked ones.
         let menu: rows::MenuBuilder = {
@@ -295,36 +314,14 @@ impl Lemur {
                     .ok();
             })
         };
-        let worktree = w.path.clone();
-        let (host_name, notes_label) = (host.to_string(), label.clone());
         let add = move |_: &mut Window, _: &mut App| {
-            let notes = {
-                let (this, host, worktree, label) = (
-                    this.clone(),
-                    host_name.clone(),
-                    worktree.clone(),
-                    notes_label.clone(),
-                );
-                Button::new("notes")
-                    .icon(IconName::FileText)
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Notes")
-                    .on_click(move |_, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.open_notes(&host, &worktree, &label, window, cx)
-                        })
-                        .ok();
-                    })
-            };
             let new = new.clone();
-            let add = Button::new("add")
+            Button::new("add")
                 .icon(IconName::Plus)
                 .ghost()
                 .xsmall()
-                .tooltip("New terminal or Claude here")
-                .dropdown_menu(move |m, window, cx| new(m, window, cx));
-            h_flex().gap_1().child(notes).child(add)
+                .tooltip("New terminal or Claude here, or notes")
+                .dropdown_menu(move |m, window, cx| new(m, window, cx))
         };
         rows::Entry::Worktree {
             label: label.into(),
