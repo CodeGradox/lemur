@@ -1,12 +1,15 @@
 //! The window: a sidebar of sessions next to a live terminal.
 //!
-//! Every session you open keeps its own terminal (`tmux attach` over SSH),
-//! so switching is instant and scrollback survives.
+//! Every session you open keeps its own terminal, attached through
+//! herdr-core, so switching is instant and scrollback survives.
 
+mod chrome;
 mod cycle;
 mod dictation;
 mod folder_picker;
-mod keys;
+mod goto;
+mod icons;
+pub(crate) mod keys;
 mod links;
 mod notes;
 mod notification;
@@ -25,13 +28,15 @@ use crate::actions;
 use crate::attach::Active;
 use crate::config::{Config, ThemeChoice, leaf};
 use crate::dictate;
-use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
+use crate::hc;
+use crate::snapshot::{self, Activity, HostData, Session, Snapshot, Worktree};
 use dictation::DictationBar;
 use folder_picker::FolderPicker;
+use futures::{FutureExt, StreamExt};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::resizable::{HandleEdge, resize_handle};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use notes::NotesPanel;
@@ -59,6 +64,8 @@ actions!(
         NextThread,
         PreviousThread,
         NewThreadHere,
+        GoToThread,
+        CloseThread,
         Dictate,
         PasteDictation,
         About
@@ -78,7 +85,10 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", ToggleNotes, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
-        KeyBinding::new("cmd-j", NewThreadHere, None),
+        // A new tab, as in a browser; ⌘W closes the one on show.
+        KeyBinding::new("cmd-t", NewThreadHere, None),
+        KeyBinding::new("cmd-w", CloseThread, None),
+        KeyBinding::new("cmd-p", GoToThread, None),
         KeyBinding::new("cmd-d", Dictate, None),
         // Text fields take ⌘⏎ themselves: the notes tick a box with it, and
         // the dictation bar pastes too.
@@ -95,6 +105,8 @@ fn bind_keys(cx: &mut App) {
 }
 
 const REFRESH: Duration = Duration::from_secs(3);
+/// How long changes herdr-core tells of are gathered into one snapshot.
+const BURST: Duration = Duration::from_millis(30);
 /// Out of sight, the sidebar refreshes every this many REFRESH ticks.
 const AWAY: u32 = 5;
 
@@ -144,6 +156,8 @@ enum Ask {
         host: String,
         session: String,
     },
+    /// Nothing new: a thread to go to.
+    Find,
 }
 
 /// A name being asked for, in the spotlight.
@@ -154,6 +168,8 @@ struct Prompt {
     worktree: Option<prompt::WorktreeFields>,
     /// Why the name typed can't be used, and that name.
     error: Option<(String, String)>,
+    /// The thread picked to go to, among those listed.
+    go: Option<usize>,
     _events: Subscription,
 }
 
@@ -162,6 +178,9 @@ struct Lemur {
     /// Where to remember the session you last opened; tests have none.
     state_file: Option<PathBuf>,
     snap: Snapshot,
+    /// What the last refresh found on each host, which terminals are filed
+    /// under as they change.
+    data: Vec<HostData>,
     loaded: bool,
     terminals: HashMap<Key, Entity<TerminalView>>,
     active: Option<Key>,
@@ -176,8 +195,9 @@ struct Lemur {
     notes_width: Pixels,
     prompt: Option<Prompt>,
     confirm_kill: Option<Key>,
-    /// A session being renamed keeps its terminal while its old name disappears.
-    renaming: Option<Key>,
+    /// Threads just started and opened, kept open until a snapshot lists
+    /// them, by how many more snapshots may leave them out.
+    fresh: HashMap<Key, u8>,
     /// Sessions that finished while you were looking at another one.
     done: HashSet<Key>,
     /// Shown in a snackbar over the terminal.
@@ -186,6 +206,9 @@ struct Lemur {
     restore: Option<Key>,
     /// The main window, for background work that ends in UI changes.
     window: AnyWindowHandle,
+    /// Each host's last load, and the CPU share between it and the one
+    /// before.
+    loads: HashMap<String, (crate::machine::Load, Option<f32>)>,
     /// Notification popups that are showing, one per session.
     popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
     /// Counts changes a snapshot fetched across one would undo (the thread
@@ -204,12 +227,14 @@ struct Lemur {
     /// terminal's output doesn't redraw it.
     sidebar: Entity<SidebarView>,
     _refresh: Task<()>,
+    _watch: Task<()>,
     /// Focused when no terminal is, so keys and menu actions reach the
     /// window.
     focus: FocusHandle,
     _appearance: Subscription,
     _sidebar_follows: Subscription,
     _back: Subscription,
+    _lost: Subscription,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -246,6 +271,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 Menu::new("File").items([
                     MenuItem::action("Add Project…", AddProject),
                     MenuItem::action("New Thread in Worktree…", NewThreadHere),
+                    MenuItem::action("Go to Thread…", GoToThread),
+                    MenuItem::action("Close Thread…", CloseThread),
                     MenuItem::action("Dictate", Dictate),
                     MenuItem::separator(),
                     MenuItem::action("Refresh", Refresh),
@@ -344,6 +371,32 @@ impl Lemur {
                 since += 1;
             }
         });
+        // herdr-core tells of every change to a terminal as it happens:
+        // started, ended, relabelled, what Claude says it's doing.
+        let watch = cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(cfg) = this.read_with(cx, |this, _| this.cfg.clone()) else {
+                    break;
+                };
+                let cores = cx.background_spawn(async move { watched(&cfg) }).await;
+                if cores.is_empty() {
+                    cx.background_executor().timer(REFRESH).await;
+                    continue;
+                }
+                let mut changes = futures::stream::select_all(cores.iter().map(|c| c.changes()));
+                while changes.next().await.is_some() {
+                    // A burst of changes makes one new snapshot.
+                    cx.background_executor().timer(BURST).await;
+                    while let Some(Some(())) = changes.next().now_or_never() {}
+                    let Ok(recomposed) = this.update(cx, |this, cx| this.recompose(cx)) else {
+                        return;
+                    };
+                    recomposed.await;
+                }
+                // Lost the core: connect again in a while.
+                cx.background_executor().timer(REFRESH).await;
+            }
+        });
         // Follow macOS when it switches between light and dark.
         let appearance = cx.observe_window_appearance(window, |_, window, cx| {
             if Prefs::get(cx).theme == ThemeChoice::System {
@@ -359,12 +412,17 @@ impl Lemur {
                 this.close_popup(&key, cx);
             }
         });
+        // Whatever had the keyboard went from the window, as a closed
+        // thread's terminal does, which a closing dialog hands it back to:
+        // it goes to the thread on show.
+        let lost = cx.on_focus_lost(window, |this, window, cx| this.focus_terminal(window, cx));
         let sidebar_width = cfg.sidebar_width.map_or(SIDEBAR_WIDTH, px).max(MIN_SIDEBAR);
         let notes_width = cfg.notes_width.map_or(NOTES_WIDTH, px).max(MIN_NOTES);
         Lemur {
             cfg,
             state_file,
             snap: Snapshot::default(),
+            data: vec![],
             loaded: false,
             terminals: HashMap::new(),
             active: None,
@@ -375,12 +433,13 @@ impl Lemur {
             notes_width,
             prompt: None,
             confirm_kill: None,
-            renaming: None,
+            fresh: HashMap::new(),
             done: HashSet::new(),
             status: None,
             restore,
             window: window.window_handle(),
             popups: HashMap::new(),
+            loads: HashMap::new(),
             changes: 0,
             notes,
             notes_open: false,
@@ -389,10 +448,12 @@ impl Lemur {
             helper: dictate::helper(),
             sidebar,
             _refresh: refresh,
+            _watch: watch,
             focus,
             _appearance: appearance,
             _sidebar_follows: sidebar_follows,
             _back: back,
+            _lost: lost,
         }
     }
 
@@ -446,7 +507,31 @@ impl Lemur {
         let changes = self.changes;
         self.in_background(
             cx,
-            move || snapshot::fetch(&cfg),
+            move || {
+                let data = snapshot::fetch_data(&cfg);
+                let snap = snapshot::compose(&cfg, &data);
+                (data, snap)
+            },
+            move |this, (data, snap), window, cx| {
+                if this.changes == changes {
+                    this.data = data;
+                    this.set_snapshot(snap, window, cx)
+                }
+            },
+        )
+    }
+
+    /// Files the terminals as they are now under what the last refresh
+    /// found, as herdr-core tells of a change.
+    fn recompose(&self, cx: &mut Context<Self>) -> Task<()> {
+        if !self.loaded {
+            return Task::ready(());
+        }
+        let (cfg, data) = (self.cfg.clone(), self.data.clone());
+        let changes = self.changes;
+        self.in_background(
+            cx,
+            move || snapshot::compose(&cfg, &data),
             move |this, snap, window, cx| {
                 if this.changes == changes {
                     this.set_snapshot(snap, window, cx)
@@ -460,12 +545,20 @@ impl Lemur {
             .map(|(h, s)| (key(h, s), s.activity))
             .collect();
         let now: HashMap<Key, &Session> = sessions(&snap).map(|(h, s)| (key(h, s), s)).collect();
+        // A thread just started may not be listed yet.
+        self.fresh.retain(|k, left| {
+            *left = left.saturating_sub(1);
+            !now.contains_key(k) && *left > 0
+        });
         // Forget terminals whose session is gone (killed, or ended elsewhere).
-        let renaming = self.renaming.clone();
-        let live = |k: &Key| now.contains_key(k) || renaming.as_ref() == Some(k);
+        let fresh = &self.fresh;
+        let live = |k: &Key| now.contains_key(k) || fresh.contains_key(k);
         self.terminals.retain(|k, _| live(k));
-        if self.active.as_ref().is_some_and(|a| !live(a)) {
+        // The thread on show ended: another takes its place.
+        let mut instead = None;
+        if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
             self.active = None;
+            instead = self.successor(&gone, live);
         }
         // Working -> idle is "finished"; anything -> waiting is "needs input".
         let mut news = vec![];
@@ -497,13 +590,32 @@ impl Lemur {
             self.close_popup(&k, cx);
         }
         self.snap = snap;
+        self.follow_loads();
         self.loaded = true;
         self.keep_claude_ids(cx);
         self.notify_news(news, window, cx);
-        if let Some((host, session)) = restore {
+        if let Some((host, session)) = restore.or(instead) {
             self.open(host, session, window, cx);
         }
         cx.notify();
+    }
+
+    /// What shows once `gone`, the thread on show, has ended: the one opened
+    /// last among the threads it was with (its worktree's, or its host's
+    /// outside every worktree), else its neighbour there, else the one
+    /// opened last anywhere. `live` says what still runs.
+    fn successor(&self, gone: &Key, live: impl Fn(&Key) -> bool) -> Option<Key> {
+        let with = self.siblings(gone);
+        let at = with.iter().position(|k| k == gone).unwrap_or(with.len());
+        let after = with.iter().skip(at + 1);
+        let before = with.iter().take(at).rev();
+        self.recent
+            .iter()
+            .filter(|k| *k != gone && live(k))
+            .find(|k| with.contains(k))
+            .or_else(|| after.chain(before).find(|k| live(k)))
+            .or_else(|| self.recent.iter().find(|k| *k != gone && live(k)))
+            .cloned()
     }
 
     /// Pops up a notification for each session that finished or needs input,
@@ -584,6 +696,18 @@ impl Lemur {
         }
     }
 
+    /// Opens a thread just started, which the sidebar may not list yet.
+    fn open_fresh(
+        &mut self,
+        host: String,
+        session: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fresh.insert((host.clone(), session.clone()), 3);
+        self.open(host, session, window, cx);
+    }
+
     fn open(&mut self, host: String, session: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(h) = self.cfg.host(&host).cloned() else {
             return;
@@ -640,18 +764,13 @@ impl Lemur {
     /// A session as the sidebar shows it: `project › worktree`, none outside
     /// every project, and the thread's name there.
     fn titles(&self, host: &str, session: &str) -> (Option<String>, String) {
+        let thread = self.label_of(host, session);
         match self.project_of(host, session) {
             Some((index, w)) => {
                 let project = self.cfg.bases[index].name();
-                let thread = session
-                    .strip_prefix(&format!("{project}/"))
-                    .unwrap_or(session);
-                (
-                    Some(format!("{project} › {}", worktree_label(w))),
-                    actions::label(thread).to_string(),
-                )
+                (Some(format!("{project} › {}", worktree_label(w))), thread)
             }
-            None => (None, actions::label(session).to_string()),
+            None => (None, thread),
         }
     }
 
@@ -694,7 +813,7 @@ impl Lemur {
     }
 
     /// Moves a thread within its list: the sidebar shows the new order at
-    /// once, and tmux keeps it.
+    /// once, and herdr-core keeps it.
     fn reorder(&mut self, list: List, from: usize, to: usize, cx: &mut Context<Self>) {
         let Some(sessions) = self.list_mut(&list) else {
             return;
@@ -711,7 +830,7 @@ impl Lemur {
             cx,
             move || actions::set_order(&cfg, &host, &names),
             |this, saved, _, cx| {
-                // Refreshes that started before tmux had the order are stale too.
+                // Refreshes that started before herdr-core had the order are stale too.
                 this.changes += 1;
                 if let Err(e) = saved {
                     this.fail(e, cx);
@@ -742,6 +861,44 @@ impl Lemur {
             cx.notify();
             return;
         }
+        self.close_thread(key, cx);
+    }
+
+    /// ⌘W: asks whether to close the thread on show.
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt.is_some() || self.picker.is_some() {
+            return;
+        }
+        let Some(key) = self.active.clone() else {
+            return;
+        };
+        let (label, claude) = match self.session_of(&key) {
+            Some(s) => (s.label.clone(), s.runs_claude()),
+            None => (self.label_of(&key.0, &key.1), false),
+        };
+        let description = if claude {
+            "Claude quits, and its terminal ends. Lemur forgets the conversation, as it does for a thread killed."
+        } else {
+            "The terminal ends, and whatever runs in it."
+        };
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, key) = (this.clone(), key.clone());
+            alert
+                .title(format!("Close {label}?"))
+                .description(description)
+                .show_cancel(true)
+                .ok_text("Close")
+                .on_ok(move |_, _, cx| {
+                    this.update(cx, |this, cx| this.close_thread(key.clone(), cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+
+    /// Ends a thread's terminal; the worktree stays.
+    fn close_thread(&mut self, key: Key, cx: &mut Context<Self>) {
         self.confirm_kill = None;
         let cfg = self.cfg.clone();
         let (host, session) = key;
@@ -826,13 +983,6 @@ impl Lemur {
             .small()
             .tooltip("Toggle sidebar (⌘B)")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
-        let title = match &self.active {
-            Some((host, session)) => match self.titles(host, session) {
-                (Some(place), thread) => format!("{place} › {thread}  ·  {host}"),
-                (None, thread) => format!("{thread}  ·  {host}"),
-            },
-            None => String::new(),
-        };
         h_flex()
             .h_10()
             .px_2()
@@ -841,13 +991,7 @@ impl Lemur {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(toggle)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(title),
-            )
-            .child(div().flex_1())
+            .child(self.tabs(cx))
             .child(
                 Button::new("toggle-notes")
                     .icon(if self.notes_open {
@@ -902,13 +1046,18 @@ impl Lemur {
 }
 
 impl Render for Lemur {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
             // Cached: sidebar redraws (the breathing dot) don't re-render the
             // terminal; it re-renders on its own output, size or focus change.
-            Some(view) => div()
-                .size_full()
-                .child(view.clone().cached(StyleRefinement::default().size_full())),
+            Some(view) => {
+                let focused = view.read(cx).focus_handle(cx).is_focused(window);
+                let terminal = view
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element();
+                self.framed(terminal, focused, cx)
+            }
             None => div()
                 .size_full()
                 .flex()
@@ -947,6 +1096,10 @@ impl Render for Lemur {
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx).detach()))
             .on_action(
                 cx.listener(|this, _: &NewThreadHere, window, cx| this.new_thread_here(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &GoToThread, window, cx| this.find_thread(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &CloseThread, window, cx| this.confirm_close(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Dictate, window, cx| this.dictate(window, cx)))
             .on_action(cx.listener(|this, _: &PasteDictation, _, cx| this.paste_dictation(cx)))
@@ -1022,7 +1175,8 @@ impl Render for Lemur {
                                             .child(main)
                                             .child(self.snackbars(cx)),
                                     )
-                                    .children(self.dictation.as_ref().map(|(bar, _)| bar.clone())),
+                                    .children(self.dictation.as_ref().map(|(bar, _)| bar.clone()))
+                                    .child(self.status_bar(cx)),
                             )
                             .when(self.notes_open, |this| {
                                 this.child(
@@ -1095,6 +1249,19 @@ fn moved_to(index: usize, from: usize, to: usize) -> usize {
     }
 }
 
+/// The cores the config's hosts' terminals run in, each once.
+fn watched(cfg: &Config) -> Vec<std::sync::Arc<hc::Core>> {
+    let mut cores: Vec<std::sync::Arc<hc::Core>> = vec![];
+    for host in &cfg.hosts {
+        if let Ok((core, _)) = hc::for_host(host)
+            && !cores.iter().any(|c| std::sync::Arc::ptr_eq(c, &core))
+        {
+            cores.push(core);
+        }
+    }
+    cores
+}
+
 fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
     snap.hosts.iter().flat_map(|h| {
         let in_bases = h
@@ -1138,7 +1305,7 @@ mod tests {
     };
     use crate::config::{Base, Config, Host};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
-    use crate::test_support::{TempDir, TmuxServer, fake_dictate, git_in, wait_until};
+    use crate::test_support::{HcServer, TempDir, fake_dictate, git_in, wait_until};
     use gpui::VisualTestContext;
     use gpui_kit::component::WindowExt;
     use gpui_kit::{
@@ -1156,13 +1323,14 @@ mod tests {
             .iter()
             .map(|(name, activity)| Session {
                 name: name.to_string(),
+                label: name.to_string(),
                 path: "/tmp".into(),
-                attached: false,
                 idle_secs: 0,
                 activity: *activity,
                 waiting_for: None,
                 started_claude: false,
                 order: None,
+                started: 0,
                 claude: None,
             })
             .collect();
@@ -1170,6 +1338,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                machine: Default::default(),
                 bases: vec![],
                 other,
                 gone: vec![],
@@ -1195,19 +1364,24 @@ mod tests {
     /// the window must resize the terminal inside it.
     #[gpui::test]
     fn the_active_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("app");
-        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
-        // The PTY reader is a real thread, so this test can't be deterministic.
+        let server = HcServer::new("app");
+        let t = server.run("/", &[], &["sleep", "600"]);
+        // The core's connection is real threads, so this test can't be
+        // deterministic.
         let (app, cx) = rooted(server.config(), cx);
-        open(&app, "t", cx);
-        let view = app.read_with(cx, |app, _| app.terminals[&key("t")].clone());
+        open(&app, &t, cx);
+        let view = app.read_with(cx, |app, _| app.terminals[&key(&t)].clone());
 
         cx.simulate_resize(size(px(900.0), px(600.0)));
         cx.run_until_parked();
-        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        let small = view
+            .read_with(cx, |v, _| v.screen_size())
+            .expect("attached");
         cx.simulate_resize(size(px(1400.0), px(900.0)));
         cx.run_until_parked();
-        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        let large = view
+            .read_with(cx, |v, _| v.screen_size())
+            .expect("attached");
         assert!(
             large.cols > small.cols && large.lines > small.lines,
             "{small:?} -> {large:?}"
@@ -1215,13 +1389,11 @@ mod tests {
     }
 
     /// Dropping a thread on another moves it to that one's place: in the
-    /// sidebar at once, and in tmux for good.
+    /// sidebar at once, and in herdr-core for good.
     #[gpui::test]
     fn dragging_a_thread_reorders_its_list(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("drag");
-        for name in ["a", "b", "c"] {
-            server.tmux(&["new-session", "-d", "-s", name]);
-        }
+        let server = HcServer::new("drag");
+        let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &[], &["sleep", "600"]));
         let (app, cx) = rooted(server.config(), cx);
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
@@ -1234,10 +1406,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        assert_eq!(shown(cx), ["a", "b", "c"]);
+        assert_eq!(shown(cx), [a.as_str(), &b, &c]);
 
         drag("thread-0", "thread-2", cx);
-        assert_eq!(shown(cx), ["b", "c", "a"]);
+        assert_eq!(shown(cx), [b.as_str(), &c, &a]);
 
         cx.run_until_parked();
         let kept: Vec<String> = snapshot::fetch(&server.config()).hosts[0]
@@ -1245,12 +1417,47 @@ mod tests {
             .iter()
             .map(|s| s.name.clone())
             .collect();
-        assert_eq!(kept, ["b", "c", "a"]);
+        assert_eq!(kept, [b.as_str(), &c, &a]);
         assert_eq!(
             shown(cx),
-            ["b", "c", "a"],
+            [b.as_str(), &c, &a],
             "the refresh after the move agrees"
         );
+    }
+
+    /// A terminal started elsewhere joins the sidebar as herdr-core tells
+    /// of it, well before the next refresh; one that ends leaves it.
+    #[gpui::test]
+    fn the_sidebar_follows_the_core(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("live");
+        let (app, cx) = rooted(server.config(), cx);
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                let other = &app.snap.hosts[0].other;
+                other.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
+            })
+        };
+        // Changes are gathered for BURST; a refresh waits REFRESH.
+        let follows = |want: &[&str], cx: &mut VisualTestContext| {
+            for _ in 0..(super::REFRESH.as_millis() / super::BURST.as_millis() - 1) {
+                cx.executor().advance_clock(super::BURST);
+                cx.run_until_parked();
+                if shown(cx) == want {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(shown(cx).is_empty());
+
+        let t = server.run("/", &["lemur.label=late"], &["sleep", "600"]);
+        assert!(follows(&["late"], cx), "{:?}", shown(cx));
+        server.hc(&["label", &t, "lemur.label=renamed"]);
+        assert!(follows(&["renamed"], cx), "{:?}", shown(cx));
+        server.hc(&["keep", &t, "--off"]);
+        server.hc(&["kill", &t]);
+        assert!(follows(&[], cx), "{:?}", shown(cx));
     }
 
     /// Dragging a side panel's inner edge resizes it: down to its minimum,
@@ -1258,7 +1465,7 @@ mod tests {
     /// widths, but not lemur's own.
     #[gpui::test]
     fn dragging_a_side_panels_edge_resizes_it(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("resize-panels");
+        let server = HcServer::new("resize-panels");
         let (app, cx) = rooted(server.config(), cx);
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
@@ -1317,10 +1524,10 @@ mod tests {
     /// dropped on one, it moves too.
     #[gpui::test]
     fn dragging_a_project_reorders_the_sidebar(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("move-project");
+        let server = HcServer::new("move-project");
         let mut cfg = server.config();
         let mut mac = Host::new("mac", "local");
-        mac.tmux_socket = cfg.hosts[0].tmux_socket.clone();
+        mac.hc_session = cfg.hosts[0].hc_session.clone();
         cfg.hosts.push(mac);
         for (host, path) in [
             ("local", "/srv/one"),
@@ -1378,7 +1585,7 @@ mod tests {
     /// About Lemur says which version this is.
     #[gpui::test]
     fn about_says_the_version(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("about");
+        let server = HcServer::new("about");
         let (_, cx) = rooted(server.config(), cx);
         cx.cx.update(super::about);
         let version = format!("Lemur {}", env!("CARGO_PKG_VERSION"));
@@ -1390,20 +1597,19 @@ mod tests {
     /// the menu, with no ⌃, it goes one and settles.
     #[gpui::test]
     fn ctrl_tab_goes_through_threads_by_when_they_were_opened(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("cycle");
-        for name in ["a", "b", "c"] {
-            server.tmux(&["new-session", "-d", "-s", name]);
-        }
+        let server = HcServer::new("cycle");
+        let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &[], &["sleep", "600"]));
         let (app, cx) = rooted(server.config(), cx);
         cx.update(|_, cx| super::bind_keys(cx));
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
-        for name in ["a", "b", "c"] {
+        for name in [a.as_str(), &b, &c] {
             open(&app, name, cx);
         }
         let shown = |cx: &mut VisualTestContext| {
             app.read_with(cx, |app, _| app.active.clone().map(|(_, s)| s))
         };
+        let (a, b, c) = (Some(a), Some(b), Some(c));
         // ⌃ goes down before Tab, as on a keyboard, and comes up after.
         let hold = |modifiers: Modifiers, cx: &mut VisualTestContext| {
             cx.simulate_modifiers_change(modifiers)
@@ -1412,22 +1618,22 @@ mod tests {
 
         hold(Modifiers::control(), cx);
         cx.simulate_keystrokes("ctrl-tab");
-        assert_eq!(shown(cx).as_deref(), Some("b"));
+        assert_eq!(shown(cx), b);
         cx.simulate_keystrokes("ctrl-tab");
-        assert_eq!(shown(cx).as_deref(), Some("a"));
+        assert_eq!(shown(cx), a);
         let_go(cx);
         // a is the latest now, then c, then b.
         hold(Modifiers::control(), cx);
         cx.simulate_keystrokes("ctrl-tab");
-        assert_eq!(shown(cx).as_deref(), Some("c"));
+        assert_eq!(shown(cx), c);
         let_go(cx);
         hold(Modifiers::control_shift(), cx);
         cx.simulate_keystrokes("ctrl-shift-tab");
-        assert_eq!(shown(cx).as_deref(), Some("b"));
+        assert_eq!(shown(cx), b);
         let_go(cx);
 
         cx.dispatch_action(super::NextThread);
-        assert_eq!(shown(cx).as_deref(), Some("c"));
+        assert_eq!(shown(cx), c);
         app.read_with(cx, |app, _| assert!(app.cycling.is_none(), "settled"));
     }
 
@@ -1435,7 +1641,7 @@ mod tests {
     /// the panel; a worktree's notes icon opens it.
     #[gpui::test]
     fn notes_follow_the_opened_thread(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("notes");
+        let server = HcServer::new("notes");
         let mut cfg = server.config();
         cfg.bases = toml::from_str::<Config>("[[bases]]\nhost = \"local\"\npath = \"/srv/api\"")
             .unwrap()
@@ -1464,6 +1670,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                machine: Default::default(),
                 bases: vec![BaseView {
                     index: 0,
                     error: None,
@@ -1535,7 +1742,7 @@ mod tests {
     /// The picker closes with Esc; a folder it adds joins the sidebar once.
     #[gpui::test]
     fn an_added_folder_joins_the_sidebar_once(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("add");
+        let server = HcServer::new("add");
         let cfg = server.config();
         let local = HostChoice {
             host: cfg.hosts[0].clone(),
@@ -1626,7 +1833,7 @@ mod tests {
     /// fetched before the removal is dropped.
     #[gpui::test]
     fn removing_a_project_keeps_the_sidebar_consistent(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("rm-project");
+        let server = HcServer::new("rm-project");
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", "/srv/one"));
         cfg.bases.push(Base::new("local", "/srv/two"));
@@ -1658,7 +1865,7 @@ mod tests {
     /// thread keeps running until it is.
     #[gpui::test]
     fn removing_a_changed_worktree_asks_again(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("rm-dirty");
+        let server = HcServer::new("rm-dirty");
         let dir = TempDir::new("rm-dirty");
         let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -1669,26 +1876,11 @@ mod tests {
         let wt = repo.join("wt");
         std::fs::write(wt.join("notes.txt"), "unsaved").unwrap();
         let path = wt.to_string_lossy().into_owned();
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "repo/t",
-            "-c",
-            &path,
-            "sleep 600",
-        ]);
-        // Keeps the tmux server up once repo/t is closed.
-        server.tmux(&["new-session", "-d", "-s", "other"]);
+        let t = server.run(&path, &[], &["sleep", "600"]);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
         let (app, cx) = rooted(cfg, cx);
-        let alive = || {
-            server
-                .tmux(&["list-sessions", "-F", "#{session_name}"])
-                .lines()
-                .any(|l| l == "repo/t")
-        };
+        let alive = || server.addresses().contains(&t);
 
         let remove = |force: bool, cx: &mut VisualTestContext| {
             app.update(cx, |app, cx| {
@@ -1703,7 +1895,7 @@ mod tests {
             app.read_with(cx, |app, _| app
                 .removal(0, path.clone(), "draft".into())
                 .sessions),
-            ["repo/t"]
+            std::slice::from_ref(&t)
         );
         remove(false, cx);
         assert!(wt.exists() && alive());
@@ -1716,7 +1908,8 @@ mod tests {
             app.set_worktree_color(0, &path, Some("red"), cx)
         });
         remove(true, cx);
-        assert!(!wt.exists() && !alive());
+        assert!(!wt.exists());
+        assert!(wait_until(Duration::from_secs(5), || !alive()));
         app.read_with(cx, |app, _| {
             assert!(app.cfg.bases[0].worktree_colors.is_empty())
         });
@@ -1726,7 +1919,7 @@ mod tests {
     /// unless its box is ticked; then the folder goes too.
     #[gpui::test]
     fn removing_a_worktree_deletes_its_folder_when_ticked(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("rm-tick");
+        let server = HcServer::new("rm-tick");
         let dir = TempDir::new("rm-tick");
         let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -1781,7 +1974,7 @@ mod tests {
     /// sidebar didn't know of yet keeps it until the host's ask is agreed to.
     #[gpui::test]
     fn removing_a_worktree_closes_its_threads_first(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("rm-threads");
+        let server = HcServer::new("rm-threads");
         let dir = TempDir::new("rm-threads");
         let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -1791,24 +1984,15 @@ mod tests {
         git(&["worktree", "add", "-q", "-b", "busy", "wt/busy"]);
         git(&["worktree", "add", "-q", "-b", "late", "wt/late"]);
         let (busy, late) = (repo.join("wt/busy"), repo.join("wt/late"));
-        let start = |name: &str, dir: &std::path::Path| {
-            let dir = dir.to_string_lossy();
-            server.tmux(&["new-session", "-d", "-s", name, "-c", &dir, "sleep 600"]);
-        };
-        start("repo/claude--calm-heron", &busy);
-        // Keeps the tmux server up once the others are closed.
-        server.tmux(&["new-session", "-d", "-s", "other"]);
+        let start =
+            |dir: &std::path::Path| server.run(&dir.to_string_lossy(), &[], &["sleep", "600"]);
+        let first = start(&busy);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
         let (app, cx) = rooted(cfg, cx);
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
-        let alive = |name: &str| {
-            server
-                .tmux(&["list-sessions", "-F", "#{session_name}"])
-                .lines()
-                .any(|l| l == name)
-        };
+        let alive = |name: &str| server.addresses().iter().any(|a| a == name);
         let listed = || {
             let out = std::process::Command::new("git")
                 .args(["worktree", "list"])
@@ -1833,29 +2017,30 @@ mod tests {
             named
         };
 
-        assert_eq!(confirm(&busy, cx), ["repo/claude--calm-heron"]);
+        assert_eq!(confirm(&busy, cx), std::slice::from_ref(&first));
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-        assert!(alive("repo/claude--calm-heron") && listed().contains("wt/busy"));
+        assert!(alive(&first) && listed().contains("wt/busy"));
 
         confirm(&busy, cx);
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         assert!(wait_until(Duration::from_secs(5), || !listed().contains("wt/busy")));
-        assert!(!alive("repo/claude--calm-heron"));
+        assert!(wait_until(Duration::from_secs(5), || !alive(&first)));
 
         // Started after the sidebar last looked: the host asks about it.
-        start("repo/review--bold-otter", &late);
+        let second = start(&late);
+        assert!(wait_until(Duration::from_secs(5), || alive(&second)));
         assert!(confirm(&late, cx).is_empty());
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        assert!(alive("repo/review--bold-otter") && listed().contains("wt/late"));
+        assert!(alive(&second) && listed().contains("wt/late"));
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         assert!(wait_until(Duration::from_secs(5), || !listed().contains("wt/late")));
-        assert!(!alive("repo/review--bold-otter"));
+        assert!(wait_until(Duration::from_secs(5), || !alive(&second)));
     }
 
     /// A new worktree's prompt offers the host's branches to start from,
@@ -1863,7 +2048,7 @@ mod tests {
     /// none is detached. Picking another branch keeps the prompt open.
     #[gpui::test]
     fn a_new_worktree_gets_the_branch_and_start_asked_for(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("new-wt-ui");
+        let server = HcServer::new("new-wt-ui");
         let dir = TempDir::new("new-wt-ui");
         let origin = dir.join("origin");
         std::fs::create_dir(&origin).unwrap();
@@ -1956,13 +2141,13 @@ mod tests {
         assert_eq!(current("loose"), "", "detached");
     }
 
-    /// A Claude thread lemur starts is kept to resume. Once its session is
-    /// gone, as after the host restarts, it stays under its worktree,
-    /// dimmed: a click resumes it, so does Resume all, Forget drops it, and
-    /// killing a thread forgets it.
+    /// A Claude thread lemur starts is kept to resume. Once its terminal
+    /// is gone, as after the host restarts, it stays under its worktree,
+    /// dimmed: a click resumes it in a new one, so does Resume all, Forget
+    /// drops it, and killing a thread forgets it.
     #[gpui::test]
     fn gone_threads_resume_their_claude(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("gone");
+        let server = HcServer::new("gone");
         let dir = TempDir::new("gone");
         let repo = dir.join("api");
         std::fs::create_dir(&repo).unwrap();
@@ -1982,8 +2167,14 @@ mod tests {
             app.update(cx, |app, cx| app.refresh(cx).detach());
             cx.run_until_parked();
         };
+        // As the host restarting does, without a shell coming back.
         let restart = |cx: &mut VisualTestContext| {
-            server.tmux(&["kill-server"]);
+            let session = kept(cx)[0].session.clone();
+            server.hc(&["keep", &session, "--off"]);
+            server.hc(&["kill", &session]);
+            assert!(wait_until(Duration::from_secs(5), || !server
+                .addresses()
+                .contains(&session)));
             refresh(cx);
         };
         let shown = |selector: &'static str, cx: &mut VisualTestContext| {
@@ -2014,20 +2205,20 @@ mod tests {
             let status = app.read_with(cx, |app, _| app.status.clone());
             panic!("kept {threads:?}, status {status:?}");
         };
+        let thread = thread.clone();
         assert!(crate::actions::is_uuid(&thread.claude_session));
         assert_eq!(thread.path, path);
-        let typed = |text: &str| {
-            let pane = format!("={}:", thread.session);
+        assert_eq!(thread.label.as_deref(), Some("claude"));
+        let typed = |text: &str, cx: &mut VisualTestContext| {
+            let session = kept(cx)[0].session.clone();
             wait_until(Duration::from_secs(5), || {
-                server
-                    .tmux(&["capture-pane", "-p", "-t", &pane])
-                    .contains(text)
+                server.hc(&["read", &session]).contains(text)
             })
         };
-        assert!(typed(&format!(
-            "claude --session-id {}",
-            thread.claude_session
-        )));
+        assert!(typed(
+            &format!("claude --session-id {}", thread.claude_session),
+            cx
+        ));
         let resumed = format!("claude --resume {}", thread.claude_session);
 
         restart(cx);
@@ -2035,7 +2226,8 @@ mod tests {
         let row = cx.debug_bounds("gone-0").unwrap().center();
         cx.simulate_click(row, Modifiers::none());
         cx.run_until_parked();
-        assert!(typed(&resumed), "{resumed} never ran");
+        assert!(typed(&resumed, cx), "{resumed} never ran");
+        assert_ne!(kept(cx)[0].session, thread.session, "in a new terminal");
         refresh(cx);
         assert!(shown("thread-0", cx) && !shown("gone-0", cx));
 
@@ -2046,12 +2238,12 @@ mod tests {
             app.resume(gone, cx)
         });
         cx.run_until_parked();
-        assert!(typed(&resumed), "Resume all never ran it");
+        assert!(typed(&resumed, cx), "Resume all never ran it");
         refresh(cx);
         assert!(shown("thread-0", cx));
 
         // Killed in lemur, it's forgotten.
-        let key: Key = ("local".into(), thread.session.clone());
+        let key: Key = ("local".into(), kept(cx)[0].session.clone());
         for _ in 0..2 {
             app.update(cx, |app, cx| app.kill(key.clone(), cx));
         }
@@ -2077,7 +2269,7 @@ mod tests {
     /// conversation going on under another name moves it there.
     #[gpui::test]
     fn refreshes_keep_claude_ids_current(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("ids");
+        let server = HcServer::new("ids");
         let (app, cx) = rooted(server.config(), cx);
         let id = |n: u8| format!("0fdfabeb-ca80-4916-a103-275bbb5e86{n:02}");
         let running = |runs: &[(&str, String)], cx: &mut VisualTestContext| {
@@ -2109,12 +2301,12 @@ mod tests {
         assert_eq!(kept(cx), [("c".into(), id(2))], "renamed by hand");
     }
 
-    /// ⌘J asks for a new thread in the worktree on show: Claude or Shell,
+    /// ⌘T asks for a new thread in the worktree on show: Claude or Shell,
     /// picked with ↑↓ or a click, and its name, which follows the pick until
     /// you type one.
     #[gpui::test]
-    fn cmd_j_asks_for_claude_or_a_shell_here(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("cmd-j");
+    fn cmd_t_asks_for_claude_or_a_shell_here(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("cmd-j");
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", "/srv/api"));
         let (app, cx) = rooted(cfg, cx);
@@ -2125,6 +2317,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                machine: Default::default(),
                 bases: vec![BaseView {
                     index: 0,
                     error: None,
@@ -2144,7 +2337,7 @@ mod tests {
         };
         cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
         // Nothing on show, nowhere to start.
-        cx.simulate_keystrokes("cmd-j");
+        cx.simulate_keystrokes("cmd-t");
         app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
         open(&app, "api/t", cx);
         cx.run_until_parked();
@@ -2162,7 +2355,7 @@ mod tests {
             })
         };
 
-        cx.simulate_keystrokes("cmd-j");
+        cx.simulate_keystrokes("cmd-t");
         cx.run_until_parked();
         assert_eq!(asked(cx), (false, "claude".into()));
         cx.simulate_keystrokes("down");
@@ -2230,7 +2423,7 @@ mod tests {
     /// folder takes a color and gives it up.
     #[gpui::test]
     fn projects_fold_and_worktrees_take_a_color(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("fold");
+        let server = HcServer::new("fold");
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", "/srv/api"));
         let (app, cx) = rooted(cfg, cx);
@@ -2268,7 +2461,7 @@ mod tests {
     /// its buttons does what the button says and leaves it open.
     #[gpui::test]
     fn clicking_a_worktree_folds_its_threads(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("fold-wt");
+        let server = HcServer::new("fold-wt");
         let dir = TempDir::new("fold-wt");
         let repo = dir.join("api");
         std::fs::create_dir(&repo).unwrap();
@@ -2276,7 +2469,7 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         let path = repo.to_string_lossy().into_owned();
-        server.tmux(&["new-session", "-d", "-s", "api/t", "-c", &path, "sleep 600"]);
+        server.run(&path, &[], &["sleep", "600"]);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &path));
         let (app, cx) = rooted(cfg, cx);
@@ -2309,7 +2502,7 @@ mod tests {
     /// their project is folded away and back, and in the next lemur.
     #[gpui::test]
     fn folds_outlast_their_project_folding(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("fold-keep");
+        let server = HcServer::new("fold-keep");
         let dir = TempDir::new("fold-keep");
         let repo = dir.join("api");
         std::fs::create_dir(&repo).unwrap();
@@ -2318,7 +2511,7 @@ mod tests {
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
         let path = repo.to_string_lossy().into_owned();
-        server.tmux(&["new-session", "-d", "-s", "api/t", "-c", &path, "sleep 600"]);
+        server.run(&path, &[], &["sleep", "600"]);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &path));
         let (app, cx) = rooted(cfg, cx);
@@ -2363,7 +2556,7 @@ mod tests {
     /// worktree's threads are part of it: dropped on one, it moves too.
     #[gpui::test]
     fn dragging_a_worktree_reorders_its_project(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("drag-wt");
+        let server = HcServer::new("drag-wt");
         let dir = TempDir::new("drag-wt");
         let repo = dir.join("api");
         std::fs::create_dir(&repo).unwrap();
@@ -2373,7 +2566,7 @@ mod tests {
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
         git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
         let wt = repo.join("wt/a").to_string_lossy().into_owned();
-        server.tmux(&["new-session", "-d", "-s", "api/t", "-c", &wt, "sleep 600"]);
+        server.run(&wt, &[], &["sleep", "600"]);
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
         let (app, cx) = rooted(cfg, cx);
@@ -2416,7 +2609,7 @@ mod tests {
     /// to its place.
     #[gpui::test]
     fn hidden_worktrees_wait_under_their_project(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("hide-wt");
+        let server = HcServer::new("hide-wt");
         let dir = TempDir::new("hide-wt");
         let repo = dir.join("api");
         std::fs::create_dir(&repo).unwrap();
@@ -2533,18 +2726,18 @@ mod tests {
     /// until the app itself changes.
     #[gpui::test]
     fn terminal_output_leaves_the_sidebar_alone(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("cache");
-        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
+        let server = HcServer::new("cache");
+        let t = server.run("/", &[], &["sleep", "600"]);
         let (app, cx) = rooted(server.config(), cx);
         cx.simulate_resize(size(px(1000.0), px(600.0)));
-        open(&app, "t", cx);
+        open(&app, &t, cx);
         cx.run_until_parked();
         let renders =
             |cx: &mut VisualTestContext| app.read_with(cx, |app, cx| app.sidebar.read(cx).renders);
         let before = renders(cx);
         assert!(before > 0, "drawn at least once");
 
-        let terminal = app.read_with(cx, |app, _| app.terminals[&key("t")].clone());
+        let terminal = app.read_with(cx, |app, _| app.terminals[&key(&t)].clone());
         terminal.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert_eq!(renders(cx), before);
@@ -2595,9 +2788,9 @@ mod tests {
 
     #[gpui::test]
     fn finishing_out_of_sight_pops_up_a_notification(cx: &mut gpui::TestAppContext) {
-        // No tmux runs here: Show still opens a short-lived terminal that
-        // tries to attach, a real process.
-        let server = TmuxServer::new("popup");
+        // No terminal runs here: Show still opens a terminal view that tries
+        // to attach, for real.
+        let server = HcServer::new("popup");
         cx.executor().allow_parking();
         cx.update(gpui_kit::init);
         let (app, cx) =
@@ -2747,7 +2940,7 @@ mod tests {
     /// it's under, for good; the header names all three.
     #[gpui::test]
     fn opening_a_thread_unfolds_its_way(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("reveal");
+        let server = HcServer::new("reveal");
         let dir = TempDir::new("reveal");
         let repo = dir.join("api");
         std::fs::create_dir(&repo).unwrap();
@@ -2755,9 +2948,9 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
-        let thread = "api/t--calm-heron";
         let wt = repo.join("wt/a").to_string_lossy().into_owned();
-        server.tmux(&["new-session", "-d", "-s", thread, "-c", &wt, "sleep 600"]);
+        let thread = server.run(&wt, &["lemur.label=t"], &["sleep", "600"]);
+        let thread = thread.as_str();
         let mut cfg = server.config();
         cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
         let (app, cx) = rooted(cfg, cx);
@@ -2788,6 +2981,385 @@ mod tests {
         });
     }
 
+    /// A snapshot of project 0 on `local`: its main checkout, `/srv/api`,
+    /// and its worktree `auth` on branch `feature/auth`, which has
+    /// `threads`; the host read as `machine`.
+    fn project_snapshot(threads: &[&str], machine: crate::machine::Reading) -> Snapshot {
+        let sessions = |names: &[&str]| -> Vec<Session> {
+            let pairs: Vec<_> = names.iter().map(|n| (*n, Activity::Idle)).collect();
+            snapshot(&pairs).hosts.remove(0).other
+        };
+        let worktree = |path: &str, branch: &str, main: bool, threads: &[&str]| Worktree {
+            path: path.into(),
+            branch: Some(branch.into()),
+            head: None,
+            main,
+            sessions: sessions(threads),
+            gone: vec![],
+        };
+        Snapshot {
+            hosts: vec![HostView {
+                name: "local".into(),
+                error: None,
+                machine,
+                bases: vec![BaseView {
+                    index: 0,
+                    error: None,
+                    plain: false,
+                    worktrees: vec![
+                        worktree("/srv/api", "main", true, &["main-shell"]),
+                        worktree(
+                            "/srv/api/.claude/worktrees/auth",
+                            "feature/auth",
+                            false,
+                            threads,
+                        ),
+                    ],
+                }],
+                other: vec![],
+                gone: vec![],
+            }],
+        }
+    }
+
+    /// Lets the terminals' attach attempts end before the server cleans up.
+    fn let_attaches_end(app: &Entity<Lemur>, cx: &mut VisualTestContext) {
+        wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, cx| {
+                app.terminals.values().all(|t| t.read(cx).exited())
+            })
+        });
+    }
+
+    /// The tabs are the threads of the worktree on show: a click opens one,
+    /// and its × kills it, at the second click.
+    #[gpui::test]
+    fn tabs_are_the_threads_of_the_worktree_on_show(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("tabs");
+        let dir = TempDir::new("tabs");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["worktree", "add", "-q", "-b", "auth", "wt/auth"]);
+        let wt = repo.join("wt/auth").to_string_lossy().into_owned();
+        let a = server.run(&wt, &["lemur.label=a"], &["sleep", "600"]);
+        let b = server.run(&wt, &["lemur.label=b"], &["sleep", "600"]);
+        server.run(
+            &repo.to_string_lossy(),
+            &["lemur.label=c"],
+            &["sleep", "600"],
+        );
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        let tab = |i: usize, cx: &mut VisualTestContext| {
+            cx.debug_bounds(Box::leak(format!("tab-{i}").into_boxed_str()))
+        };
+        assert!(tab(0, cx).is_some() && tab(1, cx).is_some());
+        assert!(tab(2, cx).is_none(), "c runs in another worktree");
+
+        let second = tab(1, cx).unwrap().center();
+        cx.simulate_click(second, Modifiers::none());
+        let shown = app.read_with(cx, |app, _| app.active.clone());
+        assert_eq!(shown, Some(key(&b)));
+
+        // The first tab's ×, at its right end.
+        let first = tab(0, cx).unwrap();
+        let close = point(first.right() - px(10.0), first.center().y);
+        cx.simulate_click(close, Modifiers::none());
+        assert!(server.addresses().contains(&a), "the first click arms it");
+        cx.simulate_click(close, Modifiers::none());
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&a)));
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert!(tab(0, cx).is_some() && tab(1, cx).is_none());
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘W asks before closing the thread on show; closed, or ended any
+    /// other way, the one opened before it in its worktree shows instead,
+    /// else its neighbour there.
+    #[gpui::test]
+    fn closing_a_thread_shows_another(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("close");
+        let [a, b, c] = ["a", "b", "c"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        for t in [&c, &a, &b] {
+            open(&app, t, cx);
+        }
+        let shown = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
+        let refresh = |cx: &mut VisualTestContext| {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+        };
+
+        cx.simulate_keystrokes("cmd-w");
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(server.addresses().contains(&b), "cancelled");
+        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&b)));
+        refresh(cx);
+        assert_eq!(shown(cx), Some(key(&a)), "the one opened before");
+        // As the dialog finishes closing, it gives the keyboard back to the
+        // terminal it took it from, which is gone.
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        // It has the keyboard: ⌘T works at once.
+        let focused = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let app = app.read(cx);
+                let view = app.active.as_ref().and_then(|k| app.terminals.get(k));
+                view.is_some_and(|v| {
+                    gpui_kit::Focusable::focus_handle(v.read(cx), cx).is_focused(window)
+                })
+            })
+        };
+        assert!(focused(cx), "the terminal shown instead has the keyboard");
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘T answered"));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // Ended elsewhere, with none opened before it: its neighbour.
+        app.update(cx, |app, _| app.recent.retain(|k| *k == key(&a)));
+        server.hc(&["keep", &a, "--off"]);
+        server.hc(&["kill", &a]);
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&a)));
+        refresh(cx);
+        assert_eq!(shown(cx), Some(key(&c)));
+        assert!(focused(cx), "the neighbour has the keyboard");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A tab closed with its ×, as herdr-core tells of it, hands the
+    /// keyboard to the one shown instead: ⌘T works at once.
+    #[gpui::test]
+    fn the_tab_shown_after_a_close_has_the_keyboard(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("close-x");
+        let [a, b] =
+            ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
+        // The second tab's ×, clicked twice.
+        let tab = cx.debug_bounds("tab-0").expect("a's tab");
+        let close = point(tab.right() - px(10.0), tab.center().y);
+        cx.simulate_click(close, Modifiers::none());
+        cx.simulate_click(close, Modifiers::none());
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&a)));
+        let switched = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(super::BURST);
+            cx.run_until_parked();
+            shown(cx) == Some(key(&b))
+        });
+        assert!(switched, "{:?}", shown(cx));
+        let focused = cx.update(|window, cx| {
+            let app = app.read(cx);
+            let view = app.active.as_ref().and_then(|k| app.terminals.get(k));
+            view.is_some_and(|v| {
+                gpui_kit::Focusable::focus_handle(v.read(cx), cx).is_focused(window)
+            })
+        });
+        assert!(focused, "b has the keyboard");
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘T answered"));
+        let_attaches_end(&app, cx);
+    }
+
+    /// The threads outside every project are in one Other section, each
+    /// host's under a row naming it.
+    #[gpui::test]
+    fn other_threads_are_one_section_by_host(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("other");
+        // Not `box`, which another test's stand-in host is called.
+        let mut cfg = server.far_config("shed");
+        let mut here = Host::new("local", "local");
+        here.hc_session = Some(server.session.clone());
+        cfg.hosts.insert(0, here);
+        server.run("/", &["lemur.label=here"], &["sleep", "600"]);
+        let far = [
+            "run",
+            "--bg",
+            "--on",
+            "shed",
+            "--label",
+            "lemur.label=there",
+        ];
+        server.hc(&[&far[..], &["--", "sleep", "600"]].concat());
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let listed = wait_until(Duration::from_secs(10), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.snap.hosts.iter().all(|h| h.other.len() == 1)
+            })
+        });
+        assert!(
+            listed,
+            "{:?}",
+            app.read_with(cx, |app, _| app.snap.hosts.clone())
+        );
+        let top = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector).expect(selector).top()
+        };
+        let other = top("project Other", cx);
+        assert!(other < top("host local", cx));
+        assert!(top("host local", cx) < top("host shed", cx));
+        assert!(
+            cx.debug_bounds("project other").is_none(),
+            "no section per host"
+        );
+    }
+
+    /// The status bar says where the thread on show runs: its host, its
+    /// worktree's branch, and the servers running there, as links.
+    #[gpui::test]
+    fn the_status_bar_links_the_worktrees_servers(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("status");
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", "/srv/api"));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let serve = |port, cwd: &str| crate::machine::Server {
+            port,
+            addr: "127.0.0.1".into(),
+            name: "ruby".into(),
+            cwd: cwd.into(),
+        };
+        let machine = crate::machine::Reading {
+            servers: vec![
+                serve(3020, "/srv/api/.claude/worktrees/auth"),
+                serve(3000, "/srv/api"),
+            ],
+            ..Default::default()
+        };
+        let snap = project_snapshot(&["t"], machine);
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        open(&app, "t", cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("port 3020").is_some());
+        assert!(
+            cx.debug_bounds("port 3000").is_none(),
+            "the main checkout's"
+        );
+        let link = cx.debug_bounds("port 3020").unwrap().center();
+        cx.simulate_click(link, Modifiers::none());
+        assert_eq!(cx.opened_url().as_deref(), Some("http://localhost:3020"));
+        let_attaches_end(&app, cx);
+    }
+
+    /// The sidebar's foot shows each host's CPU, from two readings, and its
+    /// memory.
+    #[gpui::test]
+    fn hosts_show_their_load(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("load");
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", "/srv/api"));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let read = |busy, total, cx: &mut VisualTestContext| {
+            let machine = crate::machine::Reading {
+                load: Some(crate::machine::Load {
+                    busy,
+                    total,
+                    mem_total_kb: 4_194_304,
+                    mem_used_kb: 1_048_576,
+                    load: vec!["0.50".into(), "0.40".into(), "0.30".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let snap = project_snapshot(&[], machine);
+            cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+            cx.run_until_parked();
+        };
+        read(100, 1000, cx);
+        assert!(cx.debug_bounds("load local").is_some());
+        let cpu = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.loads["local"].1);
+        assert_eq!(cpu(cx), None, "one reading");
+        read(200, 1400, cx);
+        assert_eq!(cpu(cx), Some(25.0));
+        // The same reading again, as terminals change between refreshes.
+        read(200, 1400, cx);
+        assert_eq!(cpu(cx), Some(25.0));
+    }
+
+    /// ⌘T lists the threads to go to under the new one's name: typing
+    /// narrows them, ↓ goes past Claude and Shell to them, and ⏎ opens the
+    /// one picked. ⌘P lists them all.
+    #[gpui::test]
+    fn cmd_t_and_cmd_p_go_to_threads(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("goto");
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", "/srv/api"));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let snap = project_snapshot(&["review", "build"], Default::default());
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        open(&app, "review", cx);
+        cx.run_until_parked();
+        let listed = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| {
+                let prompt = app.prompt.as_ref().expect("asking");
+                let found = app.matches(prompt, cx);
+                found.into_iter().map(|m| m.key.1).collect::<Vec<_>>()
+            })
+        };
+        let shown = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
+
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+        // The worktree's own first, untouched by the name it starts with.
+        assert_eq!(listed(cx), ["review", "build", "main-shell"]);
+        cx.simulate_input("bui");
+        assert_eq!(listed(cx), ["build"]);
+        cx.simulate_keystrokes("down down");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.prompt.as_ref().unwrap().go, Some(0))
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(shown(cx), Some(key("build")));
+        app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
+
+        cx.simulate_keystrokes("cmd-p");
+        cx.run_until_parked();
+        // Those opened last first, the one on show at the end.
+        assert_eq!(listed(cx), ["review", "main-shell", "build"]);
+        cx.simulate_input("main");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(shown(cx), Some(key("main-shell")));
+        let_attaches_end(&app, cx);
+    }
+
     /// What the stand-in for lemur-dictate hears: two words while it
     /// listens, and two more once stopped.
     const HEARS: &str = r#"echo '{"listening": true}'
@@ -2801,18 +3373,28 @@ echo '{"done": true}'
     /// Dictation with `HEARS` for lemur-dictate, in threads `a` and `b`
     /// that echo what's pasted into them.
     fn dictating<'a>(
-        server: &TmuxServer,
+        server: &HcServer,
         dir: &TempDir,
         cx: &'a mut gpui::TestAppContext,
-    ) -> (Entity<Lemur>, &'a mut VisualTestContext) {
-        for name in ["a", "b"] {
-            server.tmux(&["new-session", "-d", "-s", name, "cat"]);
-        }
+    ) -> ([String; 2], Entity<Lemur>, &'a mut VisualTestContext) {
+        let threads = ["a", "b"].map(|_| server.run("/", &[], &["cat"]));
         cx.update(super::bind_keys);
         let (app, cx) = rooted(server.config(), cx);
         let helper = fake_dictate(dir, HEARS);
         app.update(cx, |app, _| app.helper = helper);
-        (app, cx)
+        (threads, app, cx)
+    }
+
+    /// Opens a thread, and waits for its terminal to attach.
+    fn attached(app: &Entity<Lemur>, session: &str, cx: &mut VisualTestContext) {
+        open(app, session, cx);
+        let attached = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, cx| {
+                app.terminals[&key(session)].read(cx).is_attached()
+            })
+        });
+        assert!(attached, "{session} never attached");
     }
 
     fn dictated(app: &Entity<Lemur>, cx: &mut VisualTestContext) -> Option<(String, bool)> {
@@ -2823,11 +3405,9 @@ echo '{"done": true}'
         })
     }
 
-    fn shows(server: &TmuxServer, session: &str, text: &str) -> bool {
+    fn shows(server: &HcServer, session: &str, text: &str) -> bool {
         wait_until(Duration::from_secs(5), || {
-            server
-                .tmux(&["capture-pane", "-p", "-t", session])
-                .contains(text)
+            server.hc(&["read", session]).contains(text)
         })
     }
 
@@ -2835,10 +3415,10 @@ echo '{"done": true}'
     /// waits for the rest, and pastes it all there.
     #[gpui::test]
     fn dictation_pastes_into_the_thread_on_show(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("dictate");
+        let server = HcServer::new("dictate");
         let dir = TempDir::new("dictate");
-        let (app, cx) = dictating(&server, &dir, cx);
-        open(&app, "a", cx);
+        let ([a, b], app, cx) = dictating(&server, &dir, cx);
+        attached(&app, &a, cx);
         cx.simulate_keystrokes("cmd-d");
         let heard = wait_until(Duration::from_secs(5), || {
             cx.run_until_parked();
@@ -2846,28 +3426,24 @@ echo '{"done": true}'
         });
         assert!(heard, "{:?}", dictated(&app, cx));
 
-        open(&app, "b", cx);
+        attached(&app, &b, cx);
         cx.simulate_keystrokes("cmd-enter");
         assert!(wait_until(Duration::from_secs(5), || {
             cx.run_until_parked();
             dictated(&app, cx).is_none()
         }));
-        assert!(shows(&server, "b", "Hello world. Bye."));
-        assert!(
-            !server
-                .tmux(&["capture-pane", "-p", "-t", "a"])
-                .contains("Hello")
-        );
+        assert!(shows(&server, &b, "Hello world. Bye."));
+        assert!(!server.hc(&["read", &a]).contains("Hello"));
     }
 
     /// Stopped, the text can be changed before ⌘⏎ pastes it, and ⌘D adds
     /// to it; Esc throws it away.
     #[gpui::test]
     fn dictation_can_be_corrected_or_thrown_away(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("dictate-edit");
+        let server = HcServer::new("dictate-edit");
         let dir = TempDir::new("dictate-edit");
-        let (app, cx) = dictating(&server, &dir, cx);
-        open(&app, "a", cx);
+        let ([a, _], app, cx) = dictating(&server, &dir, cx);
+        attached(&app, &a, cx);
         let wait_for = |text: &str, listening: bool, cx: &mut VisualTestContext| {
             let done = wait_until(Duration::from_secs(5), || {
                 cx.run_until_parked();
@@ -2890,7 +3466,7 @@ echo '{"done": true}'
         cx.simulate_keystrokes("cmd-enter");
         assert!(shows(
             &server,
-            "a",
+            &a,
             "Hello world. Bye. Ciao. Hello world. Bye."
         ));
         assert_eq!(dictated(&app, cx), None);

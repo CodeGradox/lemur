@@ -7,7 +7,7 @@ use super::snackbar::Kind;
 use super::{Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
-use crate::config::{Base, Config, Host, home, leaf};
+use crate::config::{Base, Config, Host, home};
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt, v_flex};
@@ -342,14 +342,17 @@ impl Lemur {
         // The first time asks whether to delete the folder too.
         let mut ask_delete = None;
         let mut close = sessions.clone();
+        let host = &self.cfg.bases[*base].host;
+        let named = |list: &[String]| -> Vec<String> {
+            list.iter().map(|s| self.label_of(host, s)).collect()
+        };
         let (title, description, ok) = match kept {
             None => {
-                let host = &self.cfg.bases[*base].host;
                 ask_delete = Some(format!("Also delete {worktree} on {host}"));
-                removing(label, sessions)
+                removing(label, &named(sessions))
             }
             Some(actions::Kept::Threads(found)) => {
-                let asked = removing(label, &found);
+                let asked = removing(label, &named(&found));
                 close = found;
                 asked
             }
@@ -491,9 +494,8 @@ impl Lemur {
 }
 
 /// What removing worktree `label` asks: its title, its description and its
-/// button. Threads running in it, `close`, are named; they close first.
-fn removing(label: &str, close: &[String]) -> (String, String, &'static str) {
-    let names: Vec<&str> = close.iter().map(|s| actions::label(leaf(s))).collect();
+/// button. Threads running in it, `names`, are named; they close first.
+fn removing(label: &str, names: &[String]) -> (String, String, &'static str) {
     let title = match names.len() {
         0 => {
             return (

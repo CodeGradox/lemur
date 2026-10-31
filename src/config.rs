@@ -46,8 +46,8 @@ pub struct Config {
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub bases: Vec<Base>,
-    /// The threads Claude runs in, so they can be resumed once their tmux
-    /// session is gone, as after the host restarts. lemur keeps them.
+    /// The threads Claude runs in, so they can be resumed once their
+    /// terminal is gone, as after the host restarts. lemur keeps them.
     #[serde(default)]
     pub threads: Vec<ClaudeThread>,
 }
@@ -177,8 +177,12 @@ pub struct Host {
     pub ssh: String,
     #[serde(default = "default_upload_dir")]
     pub upload_dir: String,
-    /// tmux socket name (`tmux -L`); unset uses the default server.
-    pub tmux_socket: Option<String>,
+    /// The herdr-core session (`HC_SESSION`) its terminals run in; unset
+    /// uses herdr-core's default, which Herdr uses too.
+    pub hc_session: Option<String>,
+    /// From before herdr-core ran lemur's terminals; read, and ignored.
+    #[allow(dead_code)]
+    tmux_socket: Option<String>,
     /// Command that starts Claude Code in a new session.
     #[serde(default = "default_claude")]
     pub claude: String,
@@ -220,12 +224,26 @@ pub struct Base {
 #[serde(deny_unknown_fields)]
 pub struct ClaudeThread {
     pub host: String,
-    /// Its tmux session.
+    /// Its terminal's address in herdr-core (`agent/t7`); a tmux session's
+    /// name for threads from before.
     pub session: String,
     /// The folder Claude runs in, where it resumes.
     pub path: String,
     /// Claude Code's session ID, as `claude --resume` takes it.
     pub claude_session: String,
+    /// What the sidebar calls it; threads from before had it in `session`.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl ClaudeThread {
+    /// What the sidebar calls it.
+    pub fn shown(&self) -> String {
+        match &self.label {
+            Some(label) => label.clone(),
+            None => crate::actions::label(leaf(&self.session)).to_string(),
+        }
+    }
 }
 
 fn default_upload_dir() -> String {
@@ -247,6 +265,7 @@ impl Host {
             name: name.into(),
             ssh: ssh.into(),
             upload_dir: default_upload_dir(),
+            hc_session: None,
             tmux_socket: None,
             claude: default_claude(),
         }
@@ -274,11 +293,6 @@ impl Base {
         let name = self.name.as_deref().unwrap_or_else(|| leaf(&self.path));
         // tmux reserves `.` and `:` in target names.
         name.replace(['.', ':'], "-")
-    }
-
-    /// The tmux session for thread `thread` of this base: `<base>/<thread>`.
-    pub fn session_name(&self, thread: &str) -> String {
-        format!("{}/{thread}", self.name())
     }
 }
 
@@ -495,16 +509,16 @@ impl Config {
             if let Some(tables) = tables_mut(doc, "threads")? {
                 tables.retain(|t| !is_thread(t, &thread.host, &thread.session));
             }
-            push_table(
-                doc,
-                "threads",
-                &[
-                    ("host", &thread.host),
-                    ("session", &thread.session),
-                    ("path", &thread.path),
-                    ("claude_session", &thread.claude_session),
-                ],
-            )
+            let mut fields = vec![
+                ("host", thread.host.as_str()),
+                ("session", &thread.session),
+                ("path", &thread.path),
+                ("claude_session", &thread.claude_session),
+            ];
+            if let Some(label) = &thread.label {
+                fields.push(("label", label));
+            }
+            push_table(doc, "threads", &fields)
         })
     }
 
@@ -823,6 +837,7 @@ collapsed = true
             session: session.into(),
             path: "/srv/api".into(),
             claude_session: id.into(),
+            label: Some("review".into()),
         };
         let threads = |path: &Path| -> Vec<ClaudeThread> {
             toml::from_str::<Config>(&std::fs::read_to_string(path).unwrap())

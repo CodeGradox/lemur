@@ -41,8 +41,8 @@ jobs:
           rustup toolchain list | awk '{print $1}' | grep -v "^$rust-" |
               xargs -n1 rustup toolchain uninstall
           rustc --version
-          # The tests drive real tmux servers.
-          brew install tmux
+          # The tests drive real herdr-core sessions.
+          sh scripts/install-herdr-core.sh
       # Compiled dependencies from the last runs, keyed on the toolchain
       # installed above. Only these test runs use it; the signed build
       # always starts from scratch.
@@ -108,8 +108,8 @@ jobs:
           rustup toolchain install "$rust" --profile minimal
           rustup default "$rust"
           rustc --version
-          # The tests drive real tmux servers.
-          brew install tmux
+          # The tests drive real herdr-core sessions.
+          sh scripts/install-herdr-core.sh
           cargo test --locked
       - name: Prepare pinned disk image tools before importing secrets
         run: |

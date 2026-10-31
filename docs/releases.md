@@ -62,7 +62,8 @@ fixture app the same way, without credentials.
 
 Every push to `main` runs **Build Lemur** (`.github/workflows/release.yml`)
 for the tests only: it installs the Rust version from `mise.toml`, Xcode's
-Metal toolchain and tmux, and runs the tests. It gets no secrets and
+Metal toolchain and herdr-core (`scripts/install-herdr-core.sh`: a pinned
+version, checked against its checksum), and runs the tests. It gets no secrets and
 publishes nothing. A newer push cancels a run still going for an older one.
 These runs keep the compiled dependencies in GitHub's cache
 ([rust-cache](https://github.com/Swatinem/rust-cache)) for the next one;
@@ -120,10 +121,10 @@ them anywhere else.
 ## Launched from Finder
 
 An app started from Finder or the Dock gets a short `PATH`
-(`/usr/bin:/bin:/usr/sbin:/sbin`). Remote hosts are unaffected: `ssh` and
-`scp` live in `/usr/bin`, and commands on the host use the host's own
-`PATH`. A host with `ssh = "local"` runs tmux on this Mac, often from
-Homebrew's `/opt/homebrew/bin`, so at startup Lemur asks your login shell
-(`$SHELL -l`) for its `PATH` and adds the folders its own lacks, after its
-own. A shell that takes longer than 2 seconds leaves the `PATH` as it was;
+(`/usr/bin:/bin:/usr/sbin:/sbin`). Lemur finds herdr-core in
+`~/.local/bin` either way, and commands on another host use that host's own
+`PATH`. But a herdr-core Lemur starts on this Mac, and what it runs for a
+host with `ssh = "local"`, inherit Lemur's `PATH`, so at startup Lemur asks
+your login shell (`$SHELL -l`) for its `PATH` and adds the folders its own
+lacks, after its own. A shell that takes longer than 2 seconds leaves the `PATH` as it was;
 start Lemur from a shell then.

@@ -1,51 +1,132 @@
-//! Helpers for tests that run real tmux and real processes.
+//! Helpers for tests that run a real herdr-core and real processes.
 
 use crate::config::Config;
+use crate::hc::{self, Core};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A tmux server on a private socket. Dropping it kills the server and
-/// removes the socket file, so a failing test doesn't leave either behind.
-pub struct TmuxServer {
-    pub socket: String,
+/// A herdr-core of the test's own: its own session, with its state and
+/// config in a folder of their own, so the core people use never sees it.
+/// Dropping it stops the core and removes the folder, so a failing test
+/// doesn't leave either behind.
+pub struct HcServer {
+    pub session: String,
+    dir: PathBuf,
+    /// The sessions of the stand-in hosts' cores, to stop too.
+    far: std::cell::RefCell<Vec<String>>,
 }
 
-impl TmuxServer {
-    pub fn new(tag: &str) -> TmuxServer {
-        TmuxServer {
-            socket: format!("lemur-test-{tag}-{}", std::process::id()),
-        }
+impl HcServer {
+    pub fn new(tag: &str) -> HcServer {
+        // The core's socket goes in its state folder, and macOS allows a
+        // socket path only 104 bytes.
+        let dir = PathBuf::from(format!("/tmp/lhc-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creating the core's folder");
+        let server = HcServer {
+            session: tag.to_string(),
+            dir,
+            far: Default::default(),
+        };
+        hc::set_test_env(&server.session, server.env());
+        server
     }
 
-    pub fn tmux(&self, args: &[&str]) -> String {
-        let out = Command::new("tmux")
-            .args(["-u", "-L", &self.socket])
+    fn env(&self) -> Vec<(String, String)> {
+        let at = |sub: &str| self.dir.join(sub).to_string_lossy().into_owned();
+        vec![
+            ("XDG_STATE_HOME".into(), at("state")),
+            ("XDG_CONFIG_HOME".into(), at("config")),
+            ("HC_SESSION".into(), self.session.clone()),
+        ]
+    }
+
+    /// lemur's connection to this core.
+    pub fn core(&self) -> Arc<Core> {
+        hc::core(Some(&self.session)).expect("connecting to the test core")
+    }
+
+    /// Runs `hc` against this core; returns what it printed.
+    pub fn hc(&self, args: &[&str]) -> String {
+        let out = Command::new(hc::binary())
             .args(args)
+            .envs(self.env())
             .output()
-            .expect("running tmux");
+            .expect("running hc");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// A config with one host, `local`, that uses this server.
+    /// Starts `argv` in a terminal in `dir`, with `labels` (`k=v`), and
+    /// returns its address.
+    pub fn run(&self, dir: &str, labels: &[&str], argv: &[&str]) -> String {
+        let mut args = vec!["run", "--bg", "--json", "--keep", "--cwd", dir];
+        for label in labels {
+            args.extend(["--label", label]);
+        }
+        args.push("--");
+        args.extend(argv);
+        let out = self.hc(&args);
+        let started: serde_json::Value = serde_json::from_str(&out).expect("hc run's answer");
+        started["address"].as_str().expect("an address").to_string()
+    }
+
+    /// The addresses of the live terminals.
+    pub fn addresses(&self) -> Vec<String> {
+        self.core()
+            .terminals()
+            .into_iter()
+            .map(|t| t.address)
+            .collect()
+    }
+
+    /// A config with one host, `name`, that this core reaches as another
+    /// machine: a core of its own on this Mac, run through `sh -c` where
+    /// SSH would log in to another.
+    pub fn far_config(&self, name: &str) -> Config {
+        let far = format!("{}-far", self.session);
+        self.hc(&[
+            "machine",
+            "add",
+            "--name",
+            name,
+            "--session",
+            &far,
+            "--via",
+            "sh -c",
+        ]);
+        self.far.borrow_mut().push(far);
+        hc::set_test_route(name, &self.session);
+        toml::from_str(&format!(
+            "[[hosts]]\nname = \"{name}\"\n{} = \"{name}\"\n",
+            "ssh"
+        ))
+        .expect("test config")
+    }
+
+    /// A config with one host, `local`, whose terminals run in this core.
     pub fn config(&self) -> Config {
         toml::from_str(&format!(
-            "[[hosts]]\nname = \"local\"\nssh = \"local\"\ntmux_socket = \"{}\"\n",
-            self.socket
+            "[[hosts]]\nname = \"local\"\nssh = \"local\"\nhc_session = \"{}\"\n",
+            self.session
         ))
         .expect("test config")
     }
 }
 
-impl Drop for TmuxServer {
+impl Drop for HcServer {
     fn drop(&mut self) {
-        self.tmux(&["kill-server"]);
-        // kill-server leaves the socket file; anything that tried to attach
-        // created it even without a server.
-        let uid = Command::new("id").arg("-u").output().expect("running id");
-        let dir = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
-        let uid = String::from_utf8_lossy(&uid.stdout);
-        let _ = std::fs::remove_file(format!("{dir}/tmux-{}/{}", uid.trim(), self.socket));
+        // This core first: it would dial the stand-in hosts' again.
+        self.hc(&["server", "stop"]);
+        for far in self.far.borrow().iter() {
+            let _ = Command::new(hc::binary())
+                .args(["server", "stop"])
+                .envs(self.env())
+                .env("HC_SESSION", far)
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

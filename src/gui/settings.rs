@@ -398,9 +398,17 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         "Threads",
         &[
             Shortcut {
-                what: "New Claude thread or shell",
-                how: Press::Keys(&["cmd-j"]),
-                more: Some("In the worktree of the thread on show."),
+                what: "New Claude thread or shell, or go to one",
+                how: Press::Keys(&["cmd-t"]),
+                more: Some(
+                    "A new tab in the worktree of the thread on show; type to find another thread.",
+                ),
+            },
+            keys("Go to a thread", &["cmd-p"]),
+            Shortcut {
+                what: "Close the thread on show",
+                how: Press::Keys(&["cmd-w"]),
+                more: Some("After asking."),
             },
             Shortcut {
                 what: "Next thread in the worktree",

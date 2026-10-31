@@ -15,7 +15,7 @@ pub(super) fn by_recent(mut threads: Vec<Key>, recent: &[Key]) -> Vec<Key> {
 impl Lemur {
     /// The threads of the worktree `active` runs in, or of its host's
     /// threads outside every worktree.
-    fn siblings(&self, active: &Key) -> Vec<Key> {
+    pub(super) fn siblings(&self, active: &Key) -> Vec<Key> {
         let (host, session) = active;
         let names: Vec<String> = match self
             .snap

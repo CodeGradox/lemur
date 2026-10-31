@@ -1,20 +1,16 @@
-//! A PTY running a command (`tmux attach`, usually over SSH) whose output is
-//! parsed by alacritty_terminal. Knows nothing about drawing.
+//! An attached terminal's screen: the bytes herdr-core relays, parsed by
+//! alacritty_terminal into a grid. Knows nothing about drawing.
 
 use crate::config::{Terminal, TerminalColors, parse_hex};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{Color, Rgb};
-use anyhow::{Context, Result};
+use alacritty_terminal::vte::ansi::{Color, Processor, Rgb, StdSyncHandler};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct Listener(UnboundedSender<Event>);
@@ -59,64 +55,63 @@ impl Dimensions for Size {
     }
 }
 
-pub struct Pty {
+/// A terminal's grid, fed what its program prints.
+pub struct Screen {
     pub term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
+    parser: Processor<StdSyncHandler>,
+    events: UnboundedReceiver<Event>,
     size: Size,
 }
 
-impl Pty {
-    /// Starts `argv` in a new PTY. Terminal events arrive on the receiver.
-    pub fn spawn(argv: &[String], size: Size) -> Result<(Pty, UnboundedReceiver<Event>)> {
-        let (tx, rx) = unbounded();
-        let listener = Listener(tx);
-        let mut env = HashMap::from([
-            ("TERM".into(), "xterm-256color".into()),
-            ("COLORTERM".into(), "truecolor".into()),
-        ]);
-        // Apps started from Finder get no locale; ssh forwards LANG to the host.
-        let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
-            .iter()
-            .any(|v| std::env::var(v).is_ok_and(|s| s.to_uppercase().contains("UTF-8")));
-        if !utf8 {
-            env.insert("LANG".into(), "en_US.UTF-8".into());
-        }
-        let options = tty::Options {
-            shell: Some(tty::Shell::new(argv[0].clone(), argv[1..].to_vec())),
-            working_directory: None,
-            drain_on_exit: true,
-            env,
-        };
-        let pty = tty::new(&options, size.window(), 0).context("opening a pty")?;
-        let term = Term::new(Config::default(), &size, listener.clone());
-        let term = Arc::new(FairMutex::new(term));
-        let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)
-            .context("starting the pty reader")?;
-        let sender = event_loop.channel();
-        event_loop.spawn();
-        Ok((Pty { term, sender, size }, rx))
-    }
-
-    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.sender.send(Msg::Input(bytes.into()));
-    }
-
-    pub fn resize(&mut self, size: Size) {
-        if size != self.size && size.cols > 0 && size.lines > 0 {
-            self.size = size;
-            let _ = self.sender.send(Msg::Resize(size.window()));
-            self.term.lock().resize(size);
+impl Screen {
+    pub fn new(size: Size) -> Screen {
+        let (tx, events) = unbounded();
+        let term = Term::new(Config::default(), &size, Listener(tx));
+        Screen {
+            term: Arc::new(FairMutex::new(term)),
+            parser: Processor::new(),
+            events,
+            size,
         }
     }
 
+    /// Feeds in what the program printed.
+    pub fn advance(&mut self, bytes: &[u8]) {
+        let mut term = self.term.lock();
+        self.parser.advance(&mut *term, bytes);
+    }
+
+    /// When an update the program asked to show all at once (synchronized
+    /// output) has to show, even if it never says it's done.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Shows a synchronized update as it stands.
+    pub fn stop_sync(&mut self) {
+        let mut term = self.term.lock();
+        self.parser.stop_sync(&mut *term);
+    }
+
+    /// What the terminal had to say since last asked: answers for the
+    /// program, text for the clipboard, ...
+    pub fn events(&mut self) -> Vec<Event> {
+        std::iter::from_fn(|| self.events.try_recv().ok()).collect()
+    }
+
+    /// Resizes the grid; false if that's no change.
+    pub fn resize(&mut self, size: Size) -> bool {
+        if size == self.size || size.cols == 0 || size.lines == 0 {
+            return false;
+        }
+        self.size = size;
+        self.term.lock().resize(size);
+        true
+    }
+
+    #[cfg(test)]
     pub fn size(&self) -> Size {
         self.size
-    }
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        let _ = self.sender.send(Msg::Shutdown);
     }
 }
 
@@ -328,6 +323,17 @@ impl Palette {
         }
     }
 
+    /// Behind selected text: a quarter of the way toward the foreground.
+    pub fn selection(&self) -> Rgb {
+        let mix = |a: u8, b: u8| ((a as u16 + b as u16 * 3) / 4) as u8;
+        let (fg, bg) = (self.foreground, self.background);
+        Rgb {
+            r: mix(fg.r, bg.r),
+            g: mix(fg.g, bg.g),
+            b: mix(fg.b, bg.b),
+        }
+    }
+
     /// Resolves a cell color: program overrides first, then the palette.
     pub fn resolve(&self, color: Color, colors: &Colors) -> Rgb {
         match color {
@@ -371,9 +377,7 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::wait_until;
     use alacritty_terminal::vte::ansi::NamedColor;
-    use std::time::Duration;
 
     const SIZE: Size = Size {
         cols: 40,
@@ -381,16 +385,6 @@ mod tests {
         cell_width: 8,
         cell_height: 16,
     };
-
-    /// Starts `sh -c script` in a PTY.
-    fn spawn(script: &str) -> Pty {
-        let argv: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
-        Pty::spawn(&argv, SIZE).unwrap().0
-    }
-
-    fn shows(pty: &Pty, needle: &str) -> bool {
-        wait_until(Duration::from_secs(5), || screen_text(pty).contains(needle))
-    }
 
     #[test]
     fn palette_covers_the_xterm_ranges() {
@@ -464,8 +458,8 @@ mod tests {
         assert_eq!(terminal.dark, TerminalColors::default());
     }
 
-    fn screen_text(pty: &Pty) -> String {
-        let term = pty.term.lock();
+    fn screen_text(screen: &Screen) -> String {
+        let term = screen.term.lock();
         let mut out = String::new();
         let mut last_line = None;
         for cell in term.grid().display_iter() {
@@ -479,23 +473,46 @@ mod tests {
     }
 
     #[test]
-    fn spawned_output_reaches_the_grid_and_input_reaches_the_program() {
-        let pty = spawn("printf 'hello\\n'; read x; printf 'got %s' \"$x\"; sleep 5");
-        assert!(shows(&pty, "hello"), "output: {:?}", screen_text(&pty));
-        pty.write(b"abc\r".as_slice());
-        assert!(shows(&pty, "got abc"), "output: {:?}", screen_text(&pty));
+    fn output_reaches_the_grid_and_answers_reach_the_program() {
+        let mut screen = Screen::new(SIZE);
+        screen.advance(b"hello\r\n\x1b[6n");
+        assert!(screen_text(&screen).starts_with("hello"));
+        // The cursor position the program asked for, to send it.
+        let answers: Vec<String> = screen
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::PtyWrite(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, ["\x1b[2;1R"]);
     }
 
     #[test]
-    fn a_running_program_sees_resizes() {
-        // Prints its size at start and on every SIGWINCH.
-        let mut pty = spawn("trap 'stty size' WINCH; stty size; while :; do sleep 0.05; done");
-        assert!(shows(&pty, "5 40"), "output: {:?}", screen_text(&pty));
-        pty.resize(Size {
+    fn the_grid_follows_resizes() {
+        let mut screen = Screen::new(SIZE);
+        assert!(!screen.resize(SIZE), "no change");
+        let larger = Size {
             cols: 60,
             lines: 8,
             ..SIZE
-        });
-        assert!(shows(&pty, "8 60"), "output: {:?}", screen_text(&pty));
+        };
+        assert!(screen.resize(larger));
+        let term = screen.term.lock();
+        assert_eq!((term.columns(), term.screen_lines()), (60, 8));
+    }
+
+    /// An update the program shows all at once waits for its end, or its
+    /// deadline.
+    #[test]
+    fn synchronized_output_shows_when_done() {
+        let mut screen = Screen::new(SIZE);
+        screen.advance(b"\x1b[?2026hpartial");
+        assert!(!screen_text(&screen).contains("partial"));
+        assert!(screen.sync_deadline().is_some());
+        screen.stop_sync();
+        assert!(screen_text(&screen).contains("partial"));
+        assert_eq!(screen.sync_deadline(), None);
     }
 }

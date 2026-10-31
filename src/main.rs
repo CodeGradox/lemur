@@ -5,7 +5,9 @@ mod clip;
 mod config;
 mod dictate;
 mod gui;
+mod hc;
 mod login_path;
+mod machine;
 mod notes;
 mod remote;
 mod snapshot;
@@ -17,7 +19,7 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use std::path::PathBuf;
 
-/// Sidebar for Claude Code sessions running in tmux on remote hosts.
+/// Sidebar for Claude Code sessions running in herdr-core on remote hosts.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -54,7 +56,7 @@ enum Cmd {
     },
     /// Attach this terminal to a session
     Attach { host: String, session: String },
-    /// Rename a thread; its base prefix stays
+    /// Rename a thread
     Rename {
         host: String,
         session: String,
@@ -102,15 +104,14 @@ fn main() -> Result<()> {
                 .base_by_name(&base)
                 .with_context(|| format!("unknown base {base}"))?;
             actions::validate_name(&name)?;
-            let thread = actions::unique_thread(&name, |_| false);
             let started = match worktree {
-                Some(w) => actions::new_thread_in(&cfg, b, &w, &thread, shell)?,
+                Some(w) => actions::new_thread_in(&cfg, b, &w, &name, shell)?,
                 None => {
                     let (started, note) = actions::new_worktree_thread(
                         &cfg,
                         b,
                         &name,
-                        &thread,
+                        &name,
                         branch.as_deref(),
                         from.as_deref(),
                     )?;
@@ -136,22 +137,20 @@ fn main() -> Result<()> {
             session,
             name,
         } => {
-            let new = actions::rename_session(&cfg, &host, &session, &name)?;
+            actions::rename_session(&cfg, &host, &session, &name)?;
             // The thread kept to resume follows.
             if let Some(thread) = cfg
                 .threads
                 .iter()
                 .find(|t| t.host == host && t.session == session)
             {
-                let path = Config::path()?;
-                Config::remove_threads(&path, &host, std::slice::from_ref(&session))?;
                 let renamed = config::ClaudeThread {
-                    session: new.clone(),
+                    label: Some(name.clone()),
                     ..thread.clone()
                 };
-                Config::save_thread(&path, &renamed)?;
+                Config::save_thread(&Config::path()?, &renamed)?;
             }
-            println!("renamed {session} to {new}");
+            println!("renamed {session} to {name}");
             Ok(())
         }
         Cmd::Upload {
@@ -222,9 +221,8 @@ fn print_session(s: &snapshot::Session, indent: &str) {
         snapshot::Activity::Idle => "idle",
         snapshot::Activity::Unknown => "-",
     };
-    let attached = if s.attached { ", attached" } else { "" };
     println!(
-        "{indent}{}  ({state}, idle {}s{attached})",
-        s.name, s.idle_secs
+        "{indent}{}  {}  ({state}, idle {}s)",
+        s.name, s.label, s.idle_secs
     );
 }

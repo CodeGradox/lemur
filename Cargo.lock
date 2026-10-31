@@ -3637,6 +3637,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "arboard",
+ "base64",
  "clap",
  "futures",
  "gpui-kit",

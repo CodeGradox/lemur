@@ -53,15 +53,23 @@ pub enum Entry {
         suffix: Suffix,
         /// Its right-click menu.
         menu: MenuBuilder,
-        /// Its folder icon's color.
+        /// Its icon's color.
         color: Option<Hsla>,
+        /// The project's own checkout, with a folder for its icon; a linked
+        /// worktree has a branch.
+        main: bool,
         threads: Threads,
         /// Its threads are folded away; clicking it calls `toggle`.
         folded: bool,
         toggle: Toggle,
     },
-    /// Threads with no worktree row above them.
-    Threads(Threads),
+    /// A host's threads outside every project, under a row naming it.
+    Host {
+        label: SharedString,
+        /// This Mac, with a screen for its icon; another host has a server.
+        local: bool,
+        threads: Threads,
+    },
     /// A project's hidden worktrees, under a Hidden row of their own, shown
     /// while it's `open`; clicking it calls `toggle`.
     Hidden {
@@ -125,12 +133,14 @@ impl SidebarItem for Menu {
                         suffix,
                         menu,
                         color,
+                        main,
                         threads,
                         folded,
                         toggle,
                     } => {
                         let look = WorktreeLook {
                             color,
+                            main,
                             folded,
                             toggle,
                             drag: order
@@ -140,7 +150,11 @@ impl SidebarItem for Menu {
                         worktrees += 1;
                         worktree(id, label, suffix, menu, threads, look, window, cx)
                     }
-                    Entry::Threads(threads) => thread_list(threads, window, cx),
+                    Entry::Host {
+                        label,
+                        local,
+                        threads,
+                    } => host(id, label, local, threads, window, cx),
                     Entry::Hidden {
                         entries,
                         open,
@@ -411,6 +425,7 @@ fn row(
 /// key, its place and what moves it.
 struct WorktreeLook {
     color: Option<Hsla>,
+    main: bool,
     folded: bool,
     toggle: Toggle,
     drag: Option<(SharedString, usize, Reorder)>,
@@ -435,7 +450,11 @@ fn worktree(
         cx.stop_propagation();
         toggle(window, cx);
     };
-    let icon = Icon::new(IconName::Folder).when_some(look.color, |i, c| i.text_color(c));
+    let icon = match look.main {
+        true => Icon::new(IconName::Folder),
+        false => super::icons::git_branch(),
+    };
+    let icon = icon.when_some(look.color, |i, c| i.text_color(c));
     // Its buttons do what they say without folding it.
     let buttons = format!("buttons {label}");
     let suffix = h_flex()
@@ -496,6 +515,39 @@ fn worktree(
         .when_some(look.drag, |this, (key, index, reorder)| {
             drop_target::<WorktreeRow>(this, key, index, reorder, cx)
         })
+        .into_any_element()
+}
+
+/// A host's row in Other, and its threads under it.
+fn host(
+    id: SharedString,
+    label: SharedString,
+    local: bool,
+    threads: Threads,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let icon = match local {
+        true => super::icons::monitor(),
+        false => super::icons::server(),
+    };
+    let selector = format!("host {label}");
+    let header = row("host", icon, label, false, Empty.into_any_element(), cx)
+        .debug_selector(move || selector);
+    let border = cx.theme().sidebar_border;
+    div()
+        .id(id)
+        .w_full()
+        .child(header)
+        .child(
+            div()
+                .border_l_1()
+                .border_color(border)
+                .ml_3p5()
+                .pl_2p5()
+                .py_0p5()
+                .child(thread_list(threads, window, cx)),
+        )
         .into_any_element()
 }
 

@@ -1,10 +1,15 @@
-//! One round trip per host: worktrees of every base, all tmux sessions, and
-//! what Claude is doing in each.
+//! What the sidebar shows: each host's worktrees of every base, the
+//! terminals in them, and what Claude is doing in each. Terminals come
+//! from herdr-core as they change; worktrees and Claude's conversations
+//! from one script per host.
 
 use crate::config::{ClaudeThread, Config, Host};
-use crate::remote::{Remote, quote, sh_path};
+use crate::hc::{self, Terminal};
+use crate::machine::{self, Reading};
+use crate::remote::{Remote, sh_path};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -35,6 +40,8 @@ impl Snapshot {
 pub struct HostView {
     pub name: String,
     pub error: Option<String>,
+    /// How busy it is, and the servers listening on it.
+    pub machine: Reading,
     pub bases: Vec<BaseView>,
     /// Sessions that don't belong to any base's worktrees.
     pub other: Vec<Session>,
@@ -70,12 +77,16 @@ pub struct Worktree {
     pub gone: Vec<ClaudeThread>,
 }
 
+/// A thread: a terminal herdr-core runs, Claude's or a shell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
+    /// Its terminal's address in herdr-core (`agent/t7`).
     pub name: String,
+    /// What the sidebar calls it.
+    pub label: String,
     /// The worktree it was started for, or its start directory.
     pub path: String,
-    pub attached: bool,
+    /// Since its program last said what it's doing, or since it started.
     pub idle_secs: u64,
     /// What Claude in this session is doing.
     pub activity: Activity,
@@ -85,6 +96,9 @@ pub struct Session {
     pub started_claude: bool,
     /// Its place in its worktree once threads were dragged into an order.
     pub order: Option<u32>,
+    /// When it started, in ms since the epoch: threads never placed follow
+    /// in that order.
+    pub started: u64,
     /// The Claude conversation running in it, as `claude agents` reports.
     pub claude: Option<ClaudeRun>,
 }
@@ -115,23 +129,19 @@ pub enum Activity {
     NeedsInput,
 }
 
-/// tmux prints control characters such as tabs as `_`, and session names
-/// can't contain `:`, so fields are split on a printable marker instead.
-const SEP: &str = "|::|";
-/// A session without a `@lemur_*` tag is read by its older names, from
-/// before the renames: `@lemen_*`, then `@muxbox_*`. tmux takes an order of
-/// `0` for false, so the old order is a field of its own.
-const FIELDS: &str = "#{session_name}|::|#{session_path}|::|#{session_attached}|::|#{session_activity}|::|#{?@lemur_state,#{@lemur_state},#{?@lemen_state,#{@lemen_state},#{@muxbox_state}}}|::|#{?@lemur_worktree,#{@lemur_worktree},#{?@lemen_worktree,#{@lemen_worktree},#{@muxbox_worktree}}}|::|#{?@lemur_kind,#{@lemur_kind},#{?@lemen_kind,#{@lemen_kind},#{@muxbox_kind}}}|::|#{@lemur_order}|::|#{@lemen_order}";
-/// How many fields `FIELDS` asks tmux for.
-const FIELD_COUNT: usize = 9;
-const PANES: &str = "#{session_name}|::|#{pane_pid}";
+/// The labels lemur puts on the terminals it starts.
+pub const LABEL: &str = "lemur.label";
+pub const KIND: &str = "lemur.kind";
+pub const WORKTREE: &str = "lemur.worktree";
+pub const ORDER: &str = "lemur.order";
 
 /// What Claude is doing. `claude agents` lists every running session with
-/// its pid and status; the process tree (`@@ps`) ties each one to the tmux
-/// pane it runs in. Starting `claude agents` takes a moment of CPU, so it
-/// runs only when a Claude does: a `claude` process, or a live pid in
+/// its pid and status; the process tree (`@@ps`) ties each one to the
+/// terminal it runs in. Starting `claude agents` takes a moment of CPU, so
+/// it runs only when a Claude does: a `claude` process, or a live pid in
 /// Claude's session registry. Without a registry (an older Claude Code,
-/// or none) it runs anyway; no answer leaves the hooks to report.
+/// or none) it runs anyway; no answer leaves the status Claude reports to
+/// herdr-core.
 const CLAUDE: &str = r#"echo '@@agents'
 claude_runs() {
   dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions
@@ -153,9 +163,26 @@ else
 fi
 "#;
 
+/// What a host's script found: its bases' worktrees, and the Claudes
+/// running there. Terminals change more often, and come on their own.
+#[derive(Debug, Clone)]
+pub struct HostData {
+    pub name: String,
+    pub error: Option<String>,
+    pub machine: Reading,
+    bases: Vec<BaseView>,
+    agents: String,
+    parents: HashMap<u32, u32>,
+}
+
 pub fn fetch(cfg: &Config) -> Snapshot {
-    // In parallel: an unreachable host takes the whole SSH connect timeout.
-    let hosts = std::thread::scope(|scope| {
+    compose(cfg, &fetch_data(cfg))
+}
+
+/// Runs each host's script, all at once: an unreachable host takes the
+/// whole connect timeout.
+pub fn fetch_data(cfg: &Config) -> Vec<HostData> {
+    std::thread::scope(|scope| {
         let fetches: Vec<_> = cfg
             .hosts
             .iter()
@@ -165,25 +192,83 @@ pub fn fetch(cfg: &Config) -> Snapshot {
             .into_iter()
             .map(|f| f.join().expect("fetch thread"))
             .collect()
-    });
+    })
+}
+
+/// The snapshot `data` and the terminals herdr-core has now make.
+pub fn compose(cfg: &Config, data: &[HostData]) -> Snapshot {
+    let hosts = data
+        .iter()
+        .filter_map(|d| {
+            let host = cfg.host(&d.name)?;
+            if let Some(e) = &d.error {
+                return Some(failed(host, e.clone()));
+            }
+            Some(match hc::for_host(host) {
+                Ok((core, machine)) => {
+                    let terminals: Vec<Terminal> = core
+                        .terminals()
+                        .into_iter()
+                        .filter(|t| hc::on_host(t, machine.as_deref()))
+                        .collect();
+                    view(cfg, host, d, &terminals)
+                }
+                Err(e) => failed(host, format!("{e:#}")),
+            })
+        })
+        .collect();
     Snapshot { hosts }
 }
 
-fn fetch_host(cfg: &Config, host: &Host) -> HostView {
-    let remote = Remote::new(host);
-    match remote.run(&script(cfg, host, &remote)) {
-        Ok(out) => parse(cfg, host, &out),
-        Err(e) => HostView {
+fn failed(host: &Host, error: String) -> HostView {
+    HostView {
+        name: host.name.clone(),
+        error: Some(error),
+        machine: Reading::default(),
+        bases: vec![],
+        other: vec![],
+        gone: vec![],
+    }
+}
+
+/// Each host's name on its tailnet, asked once.
+static TAILNETS: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
+
+fn fetch_host(cfg: &Config, host: &Host) -> HostData {
+    let known = TAILNETS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(h, _)| *h == host.ssh)
+        .map(|(_, name)| name.clone());
+    let mut script = script(cfg, host);
+    if known.is_none() {
+        script += machine::TAILNET;
+    }
+    match Remote::new(host).run(&script) {
+        Ok(out) => {
+            let mut data = parse(cfg, host, &out);
+            match known {
+                Some(name) => data.machine.tailnet = name,
+                None => TAILNETS
+                    .lock()
+                    .unwrap()
+                    .push((host.ssh.clone(), data.machine.tailnet.clone())),
+            }
+            data
+        }
+        Err(e) => HostData {
             name: host.name.clone(),
             error: Some(format!("{e:#}")),
+            machine: Reading::default(),
             bases: vec![],
-            other: vec![],
-            gone: vec![],
+            agents: String::new(),
+            parents: HashMap::new(),
         },
     }
 }
 
-fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
+fn script(cfg: &Config, host: &Host) -> String {
     let mut s = String::new();
     for (i, b) in cfg
         .bases
@@ -198,23 +283,16 @@ fn script(cfg: &Config, host: &Host, remote: &Remote) -> String {
             sh_path(&b.path)
         );
     }
-    s += &format!(
-        "echo '@@now'\ndate +%s\necho '@@tmux'\n{tmux} list-sessions -F {} 2>/dev/null || true\necho '@@panes'\n{tmux} list-panes -a -F {} 2>/dev/null || true\n",
-        quote(FIELDS),
-        quote(PANES),
-        tmux = remote.tmux(),
-    );
     s += CLAUDE;
+    s += machine::SCRIPT;
     s
 }
 
-fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
+fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
     let mut bases: Vec<BaseView> = vec![];
-    let mut sessions: Vec<Session> = vec![];
-    let mut now = 0u64;
-    let mut panes: HashMap<u32, String> = HashMap::new();
     let mut parents: HashMap<u32, u32> = HashMap::new();
     let mut agents = String::new();
+    let mut reading = Reading::default();
     let mut section = "";
     for line in out.lines() {
         if let Some(i) = line.strip_prefix("@@base ") {
@@ -234,22 +312,13 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
             continue;
         }
         match line {
-            "@@now" => section = "now",
-            "@@tmux" => section = "tmux",
-            "@@panes" => section = "panes",
             "@@ps" => section = "ps",
             "@@agents" => section = "agents",
+            "@@load" => section = "load",
+            "@@ports" => section = "ports",
+            "@@tailnet" => section = "tailnet",
             _ => match section {
                 "base" => parse_worktree_line(bases.last_mut().expect("base section"), line),
-                "now" => now = line.trim().parse().unwrap_or(0),
-                "tmux" => sessions.extend(parse_session(line, now)),
-                "panes" => {
-                    if let Some((name, pid)) = line.split_once(SEP)
-                        && let Ok(pid) = pid.trim().parse()
-                    {
-                        panes.insert(pid, name.to_string());
-                    }
-                }
                 "ps" => {
                     let mut f = line.split_whitespace().map(str::parse::<u32>);
                     if let (Some(Ok(pid)), Some(Ok(ppid))) = (f.next(), f.next()) {
@@ -260,11 +329,11 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
                     agents.push_str(line);
                     agents.push('\n');
                 }
+                "load" | "ports" | "tailnet" => machine::parse_line(&mut reading, section, line),
                 _ => {}
             },
         }
     }
-
     // Worktrees dragged into an order keep it; others follow in git's.
     for b in &mut bases {
         let order = &cfg.bases[b.index].worktree_order;
@@ -275,19 +344,47 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
                 .unwrap_or(usize::MAX)
         });
     }
+    HostData {
+        name: host.name.clone(),
+        error: None,
+        machine: reading,
+        bases,
+        agents,
+        parents,
+    }
+}
 
-    // When `claude agents` answers, it's the whole truth: a session it
-    // doesn't list has no Claude, whatever a hook last recorded.
-    if let Some(claude) = claude_activity(&agents, &panes, &parents) {
+/// `host` as its script found it, with `terminals` filed under its
+/// worktrees.
+fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> HostView {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    // An agent's helpers belong to it, not to the sidebar.
+    let mut sessions: Vec<Session> = terminals
+        .iter()
+        .filter(|t| t.parent.is_none())
+        .map(|t| session(t, now))
+        .collect();
+    let pids: HashMap<u32, String> = terminals
+        .iter()
+        .filter_map(|t| Some((t.pid?, t.address.clone())))
+        .collect();
+    // `claude agents` knows each conversation, for resuming it; what Claude
+    // reports to herdr-core is newer than its status, so that comes first.
+    if let Some(claude) = claude_activity(&data.agents, &pids, &data.parents) {
         for s in &mut sessions {
             let found = claude.get(&s.name);
-            (s.activity, s.waiting_for) = found.map_or((Activity::Unknown, None), |f| {
-                (f.activity, f.waiting_for.clone())
-            });
+            if s.activity == Activity::Unknown
+                && let Some(f) = found
+            {
+                (s.activity, s.waiting_for) = (f.activity, f.waiting_for.clone());
+            }
             s.claude = found.and_then(|f| f.run.clone()).map(|(_, run)| run);
         }
     }
 
+    let mut bases = data.bases.clone();
     let live: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let mut other = vec![];
     for s in sessions {
@@ -315,17 +412,74 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostView {
     HostView {
         name: host.name.clone(),
         error: None,
+        machine: data.machine.clone(),
         bases,
         other,
         gone,
     }
 }
 
+/// A terminal as a thread: what lemur labelled it with, or what it shows.
+fn session(t: &Terminal, now_ms: u64) -> Session {
+    let label = |key: &str| t.labels.get(key).filter(|v| !v.is_empty());
+    let (activity, waiting_for) = match &t.status {
+        Some(status) => {
+            let activity = match status.state.as_str() {
+                "working" => Activity::Working,
+                "blocked" | "error" => Activity::NeedsInput,
+                "idle" | "done" => Activity::Idle,
+                _ => Activity::Unknown,
+            };
+            let asks = activity == Activity::NeedsInput && !status.msg.is_empty();
+            (activity, asks.then(|| status.msg.clone()))
+        }
+        None => (Activity::Unknown, None),
+    };
+    let since = t.status_ms.unwrap_or(t.created_ms);
+    Session {
+        name: t.address.clone(),
+        label: label(LABEL).cloned().unwrap_or_else(|| shown_name(t)),
+        path: label(WORKTREE).cloned().unwrap_or_else(|| t.cwd.clone()),
+        idle_secs: now_ms.saturating_sub(since) / 1000,
+        activity,
+        waiting_for,
+        started_claude: label(KIND).is_some_and(|k| k == "claude"),
+        order: label(ORDER).and_then(|o| o.parse().ok()),
+        started: t.created_ms,
+        claude: None,
+    }
+}
+
+/// What a terminal lemur didn't start is called: the title its program
+/// gives it when that says something, else the program.
+fn shown_name(t: &Terminal) -> String {
+    // A shell's title is often where it is (`~/src`) or who (`me@box`).
+    let title = t.title.trim();
+    let telling = !title.starts_with(['~', '/']) && !title.contains('@');
+    // Claude's starts with its spinner.
+    let title = title.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if telling && !title.is_empty() {
+        return title.to_string();
+    }
+    let program = t
+        .foreground
+        .as_ref()
+        .map(|f| f.name.as_str())
+        .or(t.argv.first().map(|a| crate::config::leaf(a)))
+        .filter(|p| !p.is_empty());
+    program.unwrap_or("terminal").to_string()
+}
+
 /// Threads in the order they were dragged into; ones never placed follow,
-/// by name.
+/// oldest first.
 fn sort(sessions: &mut [Session]) {
     sessions.sort_by(|a, b| {
-        (a.order.is_none(), a.order, &a.name).cmp(&(b.order.is_none(), b.order, &b.name))
+        (a.order.is_none(), a.order, a.started, &a.name).cmp(&(
+            b.order.is_none(),
+            b.order,
+            b.started,
+            &b.name,
+        ))
     });
 }
 
@@ -363,31 +517,6 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
     }
 }
 
-fn parse_session(line: &str, now: u64) -> Option<Session> {
-    let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() != FIELD_COUNT {
-        return None;
-    }
-    let activity: u64 = f[3].parse().unwrap_or(now);
-    Some(Session {
-        name: f[0].to_string(),
-        path: if f[5].is_empty() { f[1] } else { f[5] }.to_string(),
-        attached: f[2] != "0",
-        idle_secs: now.saturating_sub(activity),
-        // What hooks reported; `claude agents`, when available, overrides it.
-        activity: match f[4] {
-            "needs_input" => Activity::NeedsInput,
-            "working" => Activity::Working,
-            "idle" => Activity::Idle,
-            _ => Activity::Unknown,
-        },
-        waiting_for: None,
-        started_claude: f[6] == "claude",
-        order: f[7].parse().or_else(|_| f[8].parse()).ok(),
-        claude: None,
-    })
-}
-
 #[derive(Deserialize)]
 struct Agent {
     kind: Option<String>,
@@ -402,7 +531,7 @@ struct Agent {
     started_at: Option<u64>,
 }
 
-/// What `claude agents` says of the Claudes in one tmux session.
+/// What `claude agents` says of the Claudes in one terminal.
 struct InSession {
     /// The most pressing one's activity, and what it waits on.
     activity: Activity,
@@ -411,14 +540,15 @@ struct InSession {
     run: Option<(u64, ClaudeRun)>,
 }
 
-/// Maps `claude agents --json` output to tmux sessions: each interactive
-/// Claude's pid is walked up the process tree to the pane it runs in.
+/// Maps `claude agents --json` output to terminals: each interactive
+/// Claude's pid is walked up the process tree to the program a terminal
+/// runs (`terminals`, by pid).
 fn claude_activity(
     agents: &str,
-    panes: &HashMap<u32, String>,
+    terminals: &HashMap<u32, String>,
     parents: &HashMap<u32, u32>,
 ) -> Option<HashMap<String, InSession>> {
-    // No answer means an older Claude Code, or none: hooks report instead.
+    // No answer means an older Claude Code, or none.
     let agents: Vec<Agent> = serde_json::from_str(agents.trim()).ok()?;
     let mut found: HashMap<String, InSession> = HashMap::new();
     for agent in agents {
@@ -441,8 +571,8 @@ fn claude_activity(
         };
         let mut p = pid;
         for _ in 0..32 {
-            if let Some(session) = panes.get(&p) {
-                let entry = found.entry(session.clone()).or_insert(InSession {
+            if let Some(address) = terminals.get(&p) {
+                let entry = found.entry(address.clone()).or_insert(InSession {
                     activity: Activity::Unknown,
                     waiting_for: None,
                     run: None,
@@ -468,7 +598,7 @@ fn claude_activity(
 
 /// The worktree containing `path`, preferring the deepest match: linked
 /// worktrees under `.claude/worktrees/` sit inside the main checkout.
-fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
+pub fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize, usize)> = None;
     for (bi, b) in bases.iter().enumerate() {
         for (wi, w) in b.worktrees.iter().enumerate() {
@@ -486,7 +616,10 @@ fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, TmuxServer};
+    use crate::hc::{Foreground, Status};
+    use crate::test_support::{HcServer, TempDir, wait_until};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
 
     /// `claude agents` is asked only when a Claude may run: without a
     /// session registry, or with a live pid in it. Otherwise the answer is
@@ -533,6 +666,20 @@ mod tests {
         .unwrap()
     }
 
+    fn terminal(address: &str, cwd: &str, pid: u32, labels: &[(&str, &str)]) -> Terminal {
+        Terminal {
+            address: address.into(),
+            state: "live".into(),
+            cwd: cwd.into(),
+            pid: Some(pid),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn parses_worktrees_and_assigns_sessions() {
         let cfg = cfg();
@@ -540,11 +687,6 @@ mod tests {
             worktree /home/agent/projects/api\nHEAD abc\nbranch refs/heads/main\n\n\
             worktree /home/agent/projects/api/.claude/worktrees/auth\nHEAD def\nbranch refs/heads/worktree-auth\n\n\
             worktree /home/agent/projects/api/.worktrees/x/api\nHEAD 0123456789abcdef\ndetached\n\n\
-            @@now\n1000\n@@tmux\n\
-            api/auth|::|/home/agent/projects/api|::|1|::|990|::|needs_input|::|/home/agent/projects/api/.claude/worktrees/auth|::|claude|::||::|\n\
-            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::||::|\n\
-            scratch|::|/tmp|::|0|::|1000|::||::||::|shell|::||::|\n\
-            @@panes\napi/auth|::|90\napi/tests|::|100\nscratch|::|110\n\
             @@ps\n  90     1\n 100     1\n 110     1\n 200   100\n 250   100\n 300   250\n 400     1\n\
             @@agents\n[\n\
               {\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\"},\n\
@@ -552,40 +694,102 @@ mod tests {
               {\"kind\":\"interactive\",\"pid\":400,\"status\":\"busy\"},\n\
               {\"kind\":\"background\",\"state\":\"working\"}\n\
             ]\n";
-        let h = parse(&cfg, &cfg.hosts[0], out);
+        let data = parse(&cfg, &cfg.hosts[0], out);
+        let auth = "/home/agent/projects/api/.claude/worktrees/auth";
+        let terminals = [
+            terminal(
+                "agent/t1",
+                "/home/agent/projects/api",
+                90,
+                &[(LABEL, "review"), (KIND, "claude"), (WORKTREE, auth)],
+            ),
+            terminal("agent/t2", "/home/agent/projects/api", 100, &[]),
+            terminal("agent/t3", "/tmp", 110, &[(KIND, "shell")]),
+            // An agent's helper isn't a thread.
+            Terminal {
+                parent: Some("agent/t2".into()),
+                ..terminal("agent/t4", "/tmp", 120, &[])
+            },
+        ];
+        let h = view(&cfg, &cfg.hosts[0], &data, &terminals);
         let wts = &h.bases[0].worktrees;
         assert_eq!(wts.len(), 3);
         assert_eq!(wts[0].branch.as_deref(), Some("main"));
         assert_eq!(wts[2].branch, None);
         assert_eq!(wts[2].head.as_deref(), Some("0123456789abcdef"));
-        assert_eq!(
-            wts[0]
-                .sessions
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>(),
-            ["api/tests"]
-        );
-        assert_eq!(wts[1].sessions[0].name, "api/auth");
-        assert_eq!(wts[1].sessions[0].idle_secs, 10);
-        assert!(wts[1].sessions[0].attached);
-        assert_eq!(h.other[0].name, "scratch");
-        // Two Claudes in one session: the one waiting (two levels below the
-        // pane's shell) outranks the busy one.
+        let names = |list: &[Session]| list.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&wts[0].sessions), ["agent/t2"]);
+        assert_eq!(wts[1].sessions[0].name, "agent/t1");
+        assert_eq!(wts[1].sessions[0].label, "review");
+        assert_eq!(names(&h.other), ["agent/t3"]);
+        // Two Claudes in one terminal: the one waiting (two levels below
+        // the terminal's shell) outranks the busy one.
         let tests = &wts[0].sessions[0];
         assert_eq!(tests.activity, Activity::NeedsInput);
         assert_eq!(
             tests.waiting_for.as_deref(),
             Some("Allow Bash(rm -rf build)?")
         );
-        // `claude agents` answered and doesn't list it: the hook's old state
-        // is stale. pid 400 is in no pane.
+        // pid 400 is in no terminal.
         assert_eq!(wts[1].sessions[0].activity, Activity::Unknown);
         assert_eq!(h.other[0].activity, Activity::Unknown);
         // Claude's icon: started for Claude, or Claude found running.
         assert!(wts[1].sessions[0].runs_claude());
         assert!(tests.runs_claude());
         assert!(!h.other[0].runs_claude());
+    }
+
+    /// What Claude reports to herdr-core is its status, ahead of what
+    /// `claude agents` last said.
+    #[test]
+    fn claudes_own_status_comes_first() {
+        let cfg = cfg();
+        let data = parse(
+            &cfg,
+            &cfg.hosts[0],
+            "@@ps\n 100 1\n 200 100\n@@agents\n[{\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\"}]\n",
+        );
+        let reported = |state: &str, msg: &str| Terminal {
+            status: Some(Status {
+                state: state.into(),
+                msg: msg.into(),
+            }),
+            ..terminal("agent/t1", "/tmp", 100, &[])
+        };
+        let shown = |t: Terminal| {
+            let h = view(&cfg, &cfg.hosts[0], &data, &[t]);
+            let s = &h.other[0];
+            (s.activity, s.waiting_for.clone())
+        };
+        assert_eq!(
+            shown(reported("blocked", "Allow Bash(ls)?")),
+            (Activity::NeedsInput, Some("Allow Bash(ls)?".into()))
+        );
+        assert_eq!(shown(reported("done", "")), (Activity::Idle, None));
+        assert_eq!(
+            shown(terminal("agent/t1", "/tmp", 100, &[])),
+            (Activity::Working, None),
+            "no report: claude agents says"
+        );
+    }
+
+    /// A terminal lemur didn't label is called by what it shows.
+    #[test]
+    fn unlabelled_terminals_are_named_by_their_title_or_program() {
+        let named = |title: &str, program: &str| {
+            shown_name(&Terminal {
+                title: title.into(),
+                foreground: Some(Foreground {
+                    name: program.into(),
+                    cwd: String::new(),
+                }),
+                ..Default::default()
+            })
+        };
+        assert_eq!(named("✳ Fix the login", "claude"), "Fix the login");
+        assert_eq!(named("~/src/app", "fish"), "fish");
+        assert_eq!(named("me@box: ~", "bash"), "bash");
+        assert_eq!(named("", ""), "terminal");
     }
 
     /// Each session learns its Claude's conversation, the newest one's if
@@ -599,11 +803,12 @@ mod tests {
             session: session.into(),
             path: path.into(),
             claude_session: "0fdfabeb-ca80-4916-a103-275bbb5e8614".into(),
+            label: None,
         };
         let auth = "/home/agent/projects/api/.claude/worktrees/auth";
         cfg.threads = vec![
-            thread("api/tests", "/home/agent/projects/api"),
-            thread("api/review--calm-heron", auth),
+            thread("agent/t1", "/home/agent/projects/api"),
+            thread("agent/t5", auth),
             thread("scratch--bold-wren", "/tmp/x"),
             ClaudeThread {
                 host: "other".into(),
@@ -612,15 +817,15 @@ mod tests {
         ];
         let out = format!(
             "@@base 0\nworktree /home/agent/projects/api\nworktree {auth}\n\
-            @@now\n1000\n@@tmux\n\
-            api/tests|::|/home/agent/projects/api|::|0|::|400|::||::||::||::||::|\n\
-            @@panes\napi/tests|::|100\n@@ps\n 100     1\n 200   100\n 300   100\n\
+            @@ps\n 100     1\n 200   100\n 300   100\n\
             @@agents\n[\n\
               {{\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\",\"sessionId\":\"old\",\"cwd\":\"/a\",\"startedAt\":5}},\n\
               {{\"kind\":\"interactive\",\"pid\":300,\"status\":\"idle\",\"sessionId\":\"new\",\"cwd\":\"/b\",\"startedAt\":9}}\n\
             ]\n"
         );
-        let h = parse(&cfg, &cfg.hosts[0], &out);
+        let data = parse(&cfg, &cfg.hosts[0], &out);
+        let terminals = [terminal("agent/t1", "/home/agent/projects/api", 100, &[])];
+        let h = view(&cfg, &cfg.hosts[0], &data, &terminals);
         let tests = &h.bases[0].worktrees[0].sessions[0];
         assert_eq!(tests.activity, Activity::Working);
         assert_eq!(
@@ -633,11 +838,8 @@ mod tests {
         let gone = |list: &[ClaudeThread]| -> Vec<String> {
             list.iter().map(|t| t.session.clone()).collect()
         };
-        assert!(h.bases[0].worktrees[0].gone.is_empty(), "api/tests runs");
-        assert_eq!(
-            gone(&h.bases[0].worktrees[1].gone),
-            ["api/review--calm-heron"]
-        );
+        assert!(h.bases[0].worktrees[0].gone.is_empty(), "agent/t1 runs");
+        assert_eq!(gone(&h.bases[0].worktrees[1].gone), ["agent/t5"]);
         assert_eq!(gone(&h.gone), ["scratch--bold-wren"]);
     }
 
@@ -645,8 +847,8 @@ mod tests {
     fn worktrees_keep_the_order_they_were_put_in() {
         let mut cfg = cfg();
         cfg.bases[0].worktree_order = vec!["/r/c".into(), "/r".into()];
-        let out = "@@base 0\nworktree /r\nworktree /r/a\nworktree /r/b\nworktree /r/c\n@@now\n1\n@@tmux\n";
-        let h = parse(&cfg, &cfg.hosts[0], out);
+        let out = "@@base 0\nworktree /r\nworktree /r/a\nworktree /r/b\nworktree /r/c\n";
+        let h = view(&cfg, &cfg.hosts[0], &parse(&cfg, &cfg.hosts[0], out), &[]);
         let paths: Vec<&str> = h.bases[0]
             .worktrees
             .iter()
@@ -658,106 +860,79 @@ mod tests {
         assert_eq!(main, [false, true, false, false]);
     }
 
-    /// Without `claude agents` (an older Claude Code), hooks report.
-    #[test]
-    fn hooks_report_when_claude_agents_cant() {
-        let cfg = cfg();
-        let out = "@@now\n1000\n@@tmux\n\
-            api/auth|::|/srv|::|0|::|990|::|needs_input|::||::|claude|::||::|\n\
-            @@panes\napi/auth|::|90\n@@ps\n  90     1\n@@agents\n";
-        let h = parse(&cfg, &cfg.hosts[0], out);
-        assert_eq!(h.other[0].activity, Activity::NeedsInput);
-    }
-
-    #[test]
-    fn the_session_format_has_every_field() {
-        assert_eq!(FIELDS.split(SEP).count(), FIELD_COUNT);
-    }
-
     #[test]
     fn reports_base_errors() {
         let cfg = cfg();
-        let h = parse(
-            &cfg,
-            &cfg.hosts[0],
-            "@@base 0\n@@error no such directory\n@@now\n1\n@@tmux\n",
-        );
+        let data = parse(&cfg, &cfg.hosts[0], "@@base 0\n@@error no such directory\n");
+        let h = view(&cfg, &cfg.hosts[0], &data, &[]);
         assert_eq!(h.bases[0].error.as_deref(), Some("no such directory"));
     }
 
-    /// Sessions tagged by muxbox or lemen still read right; the newest
-    /// name wins, even with an order of 0.
+    /// The labels lemur puts on a terminal file it, name it and place it.
     #[test]
-    fn reads_tags_from_before_the_renames() {
-        let server = TmuxServer::new("tags");
-        let tag = |session: &str, option: &str, value: &str| {
-            server.tmux(&["set-option", "-t", &format!("={session}:"), option, value]);
-        };
-        for session in ["muxbox", "lemen", "lemur"] {
-            server.tmux(&["new-session", "-d", "-s", session]);
-        }
-        tag("muxbox", "@muxbox_kind", "claude");
-        tag("muxbox", "@muxbox_worktree", "/srv/a,b");
-        tag("lemen", "@lemen_kind", "claude");
-        tag("lemen", "@lemen_worktree", "/srv/c,d");
-        tag("lemen", "@lemen_order", "0");
-        tag("lemen", "@muxbox_kind", "shell");
-        tag("lemur", "@lemur_kind", "shell");
-        tag("lemur", "@lemen_kind", "claude");
-        tag("lemur", "@lemur_order", "0");
-        tag("lemur", "@lemen_order", "3");
-        let snap = fetch(&server.config());
-        let other = &snap.hosts[0].other;
-        let get = |name| other.iter().find(|s| s.name == name).expect(name);
-        assert!(get("muxbox").started_claude);
-        assert_eq!(get("muxbox").path, "/srv/a,b");
-        assert_eq!(get("muxbox").order, None);
-        assert!(get("lemen").started_claude);
-        assert_eq!(get("lemen").path, "/srv/c,d");
-        assert_eq!(get("lemen").order, Some(0));
-        assert!(!get("lemur").started_claude);
-        assert_eq!(get("lemur").order, Some(0));
+    fn labels_file_and_name_threads() {
+        let server = HcServer::new("labels");
+        let cfg = server.config();
+        server.run(
+            "/",
+            &[
+                "lemur.kind=claude",
+                "lemur.worktree=/srv/a b",
+                "lemur.label=fix",
+                "lemur.order=0",
+            ],
+            &["sleep", "600"],
+        );
+        server.run("/tmp", &[], &["sleep", "600"]);
+        let mut other = vec![];
+        assert!(wait_until(Duration::from_secs(5), || {
+            other = fetch(&cfg).hosts[0].other.clone();
+            other.len() == 2
+        }));
+        assert!(other[0].started_claude);
+        assert_eq!(other[0].path, "/srv/a b");
+        assert_eq!((other[0].label.as_str(), other[0].order), ("fix", Some(0)));
+        assert!(!other[1].started_claude);
+        assert_eq!(other[1].path, "/tmp");
+        assert_eq!(other[1].order, None);
     }
 
     /// A folder without git is one row, holding the threads started in it.
     #[test]
     fn a_folder_without_git_is_a_single_row() {
-        let server = TmuxServer::new("plain");
-        let dir = std::env::temp_dir().join(format!("lemur-plain-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let real = dir.canonicalize().unwrap().to_string_lossy().into_owned();
-        server.tmux(&["new-session", "-d", "-s", "notes/claude--calm-heron"]);
-        server.tmux(&[
-            "set-option",
-            "-t",
-            "=notes/claude--calm-heron:",
-            "@lemur_worktree",
+        let server = HcServer::new("plain");
+        let dir = TempDir::new("plain");
+        let real = dir.to_string_lossy().into_owned();
+        server.run(
             &real,
-        ]);
+            &[&format!("lemur.worktree={real}")],
+            &["sleep", "600"],
+        );
         let mut cfg = server.config();
-        cfg.bases
-            .push(crate::config::Base::new("local", &dir.to_string_lossy()));
+        cfg.bases.push(crate::config::Base::new("local", &real));
 
-        let snap = fetch(&cfg);
+        let mut snap = Snapshot::default();
+        assert!(wait_until(Duration::from_secs(5), || {
+            snap = fetch(&cfg);
+            snap.hosts[0].bases[0]
+                .worktrees
+                .first()
+                .is_some_and(|w| !w.sessions.is_empty())
+        }));
         let base = &snap.hosts[0].bases[0];
         assert!(base.plain);
         assert_eq!(base.error, None);
         assert_eq!(base.worktrees.len(), 1);
         assert_eq!(base.worktrees[0].path, real);
-        assert_eq!(
-            base.worktrees[0].sessions[0].name,
-            "notes/claude--calm-heron"
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn threads_keep_the_order_they_were_put_in() {
-        let server = TmuxServer::new("order");
-        for name in ["a", "b", "c", "d"] {
-            server.tmux(&["new-session", "-d", "-s", name]);
-        }
-        let names = |cfg: &Config| -> Vec<String> {
+        let server = HcServer::new("order");
+        let names: Vec<String> = (0..4)
+            .map(|_| server.run("/", &[], &["sleep", "600"]))
+            .collect();
+        let shown = |cfg: &Config| -> Vec<String> {
             fetch(cfg).hosts[0]
                 .other
                 .iter()
@@ -765,9 +940,12 @@ mod tests {
                 .collect()
         };
         let cfg = server.config();
-        assert_eq!(names(&cfg), ["a", "b", "c", "d"]);
-        // d and b were placed; a and c never were, so they follow by name.
-        crate::actions::set_order(&cfg, "local", &["d".into(), "b".into()]).unwrap();
-        assert_eq!(names(&cfg), ["d", "b", "a", "c"]);
+        assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == names));
+        // d and b were placed; a and c never were, so they follow, oldest
+        // first.
+        let (a, b, c, d) = (&names[0], &names[1], &names[2], &names[3]);
+        crate::actions::set_order(&cfg, "local", &[d.clone(), b.clone()]).unwrap();
+        let placed = [d, b, a, c].map(String::clone);
+        assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == placed));
     }
 }

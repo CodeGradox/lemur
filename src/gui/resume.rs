@@ -1,12 +1,12 @@
 //! Threads Claude runs in, kept with their Claude session ID so they can be
-//! resumed once their tmux session is gone, as after the host restarted.
+//! resumed once their terminal is gone, as after the host restarted.
 //! Each starts with an ID of lemur's, and refreshes keep it current.
 
 use super::settings::Prefs;
 use super::snackbar::Kind;
 use super::{Lemur, sessions};
 use crate::actions;
-use crate::config::{ClaudeThread, Config, leaf};
+use crate::config::{ClaudeThread, Config};
 use gpui_kit::*;
 
 impl Lemur {
@@ -65,6 +65,7 @@ impl Lemur {
                     session: s.name.clone(),
                     path: run.path.clone(),
                     claude_session: run.id.clone(),
+                    label: Some(s.label.clone()),
                 })
             })
             .collect();
@@ -92,7 +93,7 @@ impl Lemur {
     pub(super) fn resume(&mut self, threads: Vec<ClaudeThread>, cx: &mut Context<Self>) {
         let what = match threads.as_slice() {
             [] => return,
-            [one] => actions::label(leaf(&one.session)).to_string(),
+            [one] => one.shown(),
             many => format!("{} threads", many.len()),
         };
         self.status = Some((format!("resuming {what}…"), Kind::Progress));
@@ -114,21 +115,24 @@ impl Lemur {
                 let mut resumed = vec![];
                 for (thread, result) in results {
                     match result {
-                        Ok(()) => resumed.push(thread),
-                        Err(e) => this.fail(
-                            e.context(format!(
-                                "resuming {}",
-                                actions::label(leaf(&thread.session))
-                            )),
-                            cx,
-                        ),
+                        // It goes on in a terminal of its own.
+                        Ok(session) => {
+                            this.forget_threads(
+                                &thread.host,
+                                std::slice::from_ref(&thread.session),
+                                cx,
+                            );
+                            let again = ClaudeThread { session, ..thread };
+                            this.keep_thread(again.clone(), cx);
+                            resumed.push(again);
+                        }
+                        Err(e) => this.fail(e.context(format!("resuming {}", thread.shown())), cx),
                     }
                 }
-                this.snap.retain_gone(|t| !resumed.contains(t));
                 // Refreshes that started before it was back are stale.
                 this.changes += 1;
                 if let [one] = resumed.as_slice() {
-                    this.open(one.host.clone(), one.session.clone(), window, cx);
+                    this.open_fresh(one.host.clone(), one.session.clone(), window, cx);
                 }
                 this.refresh(cx).detach();
                 cx.notify();

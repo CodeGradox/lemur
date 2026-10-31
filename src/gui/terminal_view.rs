@@ -1,16 +1,19 @@
-//! Draws a Pty's grid with GPUI and feeds it keys, mouse, pastes and drops.
-//! Dropped or pasted images go to the host first; the session gets the path.
+//! Draws an attached terminal's grid with GPUI and feeds it keys, mouse,
+//! pastes and drops. Dropped or pasted images go to the host first; the
+//! session gets the path.
 
 use super::keys::{self, Key};
 use super::links::{Link, link_at};
 use super::settings::Prefs;
 use super::snackbar::Kind;
-use super::terminal::{Palette, Pty, Size};
+use super::terminal::{Palette, Screen, Size, hex};
 use crate::actions;
-use crate::attach::attach_argv;
 use crate::config::Host;
+use crate::hc::{self, Core, Stream};
 use alacritty_terminal::event::Event as TermEvent;
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
@@ -20,35 +23,56 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Key context for terminal-only key bindings.
 pub const CONTEXT: &str = "Terminal";
 
+/// Where this view is with its terminal's byte stream.
+enum Attachment {
+    Attaching,
+    /// The core, and the channel the terminal's bytes come on.
+    Attached(Arc<Core>, u32),
+    /// The stream ended: the program exited, or the line dropped.
+    Ended,
+}
+
 pub struct TerminalView {
     pub host: Host,
     pub session: String,
-    pty: Option<Pty>,
+    screen: Option<Screen>,
+    attachment: Attachment,
     focus: FocusHandle,
     /// Where the grid was last painted, and the size of its cells, for
-    /// mapping mouse positions to cells. `cell` rounds that size for the PTY.
+    /// mapping mouse positions to cells. `cell` rounds that size for the
+    /// program.
     bounds: Bounds<Pixels>,
     cell_size: gpui_kit::Size<Pixels>,
     cell: Size,
     /// Measured on the next render after Settings change the font.
     metrics: Option<Metrics>,
-    /// The button tmux was told is down, and the cell it was last at.
+    /// The button the program was told is down, and the cell it was last at.
     pressed: Option<(keys::MouseButton, (usize, usize))>,
+    /// A selection is being dragged out.
+    selecting: bool,
     /// Text an input method is still composing (a dead key's accent, or
     /// Japanese before it's converted), shown at the cursor until it's typed.
     marked: Option<String>,
     /// Where the pointer is over the terminal, and the link under it while
     /// ⌘ is held: underlined, and opened by a ⌘-click.
     pointer: Option<Point<Pixels>>,
-    link: Option<Link>,
+    hovered: Option<Link>,
     scroll_lines: f32,
+    /// What the core was last told: the colors and cell size lemur shows
+    /// the terminal in, and whether it has the keyboard.
+    told_display: Option<serde_json::Value>,
+    told_focus: Option<bool>,
     /// Shown in the window's snackbars while this terminal is.
     status: Option<(String, Kind)>,
     _reader: Option<Task<()>>,
+    /// Shows a synchronized update that never said it was done.
+    _sync: Option<Task<()>>,
     _prefs: Subscription,
 }
 
@@ -66,6 +90,12 @@ struct Metrics {
     line_height: Pixels,
 }
 
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -77,7 +107,8 @@ impl TerminalView {
         let mut view = TerminalView {
             host,
             session,
-            pty: None,
+            screen: None,
+            attachment: Attachment::Ended,
             focus: cx.focus_handle(),
             bounds: Bounds::default(),
             cell_size: size(px(8.0), px(16.0)),
@@ -89,12 +120,16 @@ impl TerminalView {
             },
             metrics: None,
             pressed: None,
+            selecting: false,
             marked: None,
             pointer: None,
-            link: None,
+            hovered: None,
             scroll_lines: 0.0,
+            told_display: None,
+            told_focus: None,
             status: None,
             _reader: None,
+            _sync: None,
             _prefs: cx.observe_global::<Prefs>(|this, cx| {
                 this.metrics = None;
                 cx.notify();
@@ -105,12 +140,18 @@ impl TerminalView {
     }
 
     #[cfg(test)]
-    pub fn pty_size(&self) -> Option<Size> {
-        self.pty.as_ref().map(|p| p.size())
+    pub fn screen_size(&self) -> Option<Size> {
+        self.screen.as_ref().map(|s| s.size())
     }
 
+    #[cfg(test)]
+    pub fn is_attached(&self) -> bool {
+        matches!(self.attachment, Attachment::Attached(..))
+    }
+
+    /// Its stream ended, so it shows what it last had.
     pub fn exited(&self) -> bool {
-        self.pty.is_none()
+        matches!(self.attachment, Attachment::Ended)
     }
 
     pub fn status(&self) -> Option<&(String, Kind)> {
@@ -130,78 +171,180 @@ impl TerminalView {
         }
     }
 
-    /// (Re)starts `tmux attach` for this session, e.g. after the laptop slept.
+    /// The colors and cell size the terminal shows in, as the core answers
+    /// programs that ask (a theme picks light or dark by the background).
+    fn display(&self, cx: &App) -> serde_json::Value {
+        let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
+        let cursor = palette.indexed(NamedColor::Cursor as usize, &Default::default());
+        serde_json::json!({
+            "fg": hex(palette.foreground),
+            "bg": hex(palette.background),
+            "cursor": hex(cursor),
+            "cell": [self.cell.cell_width, self.cell.cell_height],
+        })
+    }
+
+    /// (Re)attaches to this session's terminal, e.g. after the line to its
+    /// host dropped. The core paints its screen and scrollback first.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
-        let argv = attach_argv(&self.host, &self.session);
-        match Pty::spawn(&argv, self.cell) {
-            Ok((pty, mut events)) => {
-                self.pty = Some(pty);
-                self.set_status(None, cx);
-                self._reader = Some(cx.spawn(async move |this, cx| {
-                    while let Some(event) = events.next().await {
-                        if this
-                            .update(cx, |this, cx| this.on_term_event(event, cx))
-                            .is_err()
-                        {
-                            break;
-                        }
+        self.detach();
+        self.screen = Some(Screen::new(self.cell));
+        self.attachment = Attachment::Attaching;
+        self.told_display = None;
+        self.told_focus = None;
+        self.set_status(None, cx);
+        let (host, session) = (self.host.clone(), self.session.clone());
+        let (cols, lines) = (self.cell.cols, self.cell.lines);
+        let display = self.display(cx);
+        self.told_display = Some(display.clone());
+        self._reader = Some(cx.spawn(async move |this, cx| {
+            // A terminal on a host still being reached can take seconds.
+            let attached = cx
+                .background_spawn(async move {
+                    let (core, _) = hc::for_host(&host)?;
+                    let attached = core.attach(&session, cols, lines, display)?;
+                    anyhow::Ok((core, attached))
+                })
+                .await;
+            let mut stream = match attached {
+                Ok((core, attached)) => {
+                    let channel = attached.channel;
+                    let shown = this.update(cx, |this, cx| this.attached(core, channel, cx));
+                    if shown.is_err() {
+                        return;
                     }
-                }));
+                    attached.stream
+                }
+                Err(e) => {
+                    this.update(cx, |this, cx| {
+                        this.attachment = Attachment::Ended;
+                        let error = format!("{e:#}");
+                        this.set_status(Some((error, Kind::Error)), cx);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            while let Some(first) = stream.next().await {
+                let mut batch = vec![first];
+                while let Ok(more) = stream.try_recv() {
+                    batch.push(more);
+                }
+                if !matches!(this.update(cx, |this, cx| this.ingest(batch, cx)), Ok(true)) {
+                    break;
+                }
             }
-            Err(e) => {
-                self.pty = None;
-                self.set_status(Some((format!("{e:#}"), Kind::Error)), cx);
-            }
-        }
+        }));
         cx.notify();
     }
 
-    fn on_term_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
-        let Some(pty) = &self.pty else { return };
-        match event {
-            TermEvent::Wakeup => {
-                // New output may have moved the link under the pointer.
-                if self.link.is_some() {
-                    self.link = self.pointer.and_then(|p| self.link_at(p));
+    /// Lets go of the terminal's stream, so the core stops sending it.
+    fn detach(&mut self) {
+        if let Attachment::Attached(core, channel) = &self.attachment {
+            core.detach(*channel);
+        }
+        self.attachment = Attachment::Ended;
+    }
+
+    fn attached(&mut self, core: Arc<Core>, channel: u32, cx: &mut Context<Self>) {
+        // The terminal takes the size it's shown at. The attach asked for
+        // the size known then, often before the first layout, and the core
+        // goes by a viewer's size only once the viewer says something.
+        core.resize(channel, self.cell.cols, self.cell.lines);
+        self.attachment = Attachment::Attached(core, channel);
+        cx.notify();
+    }
+
+    /// Feeds relayed bytes in; false once the stream is over.
+    fn ingest(&mut self, batch: Vec<Stream>, cx: &mut Context<Self>) -> bool {
+        let Some(screen) = &mut self.screen else {
+            return false;
+        };
+        let mut open = true;
+        // Its program ended: the thread goes from the sidebar, and this with it.
+        let mut over = false;
+        for item in batch {
+            match item {
+                Stream::Data(bytes) => {
+                    screen.advance(&bytes);
+                    if let Attachment::Attached(core, channel) = &self.attachment {
+                        core.credit(*channel, bytes.len());
+                    }
                 }
-                cx.notify()
+                Stream::Closed(why) => {
+                    open = false;
+                    over = matches!(why["reason"].as_str(), Some("exited" | "killed"));
+                }
+                Stream::Lost => open = false,
             }
-            TermEvent::PtyWrite(text) => pty.write(text.into_bytes()),
-            // tmux copies selections with OSC 52.
+        }
+        let events = screen.events();
+        let deadline = screen.sync_deadline();
+        for event in events {
+            self.on_term_event(event, cx);
+        }
+        if let Some(deadline) = deadline
+            && self._sync.is_none()
+        {
+            self._sync = Some(cx.spawn(async move |this, cx| {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |this, cx| {
+                    this._sync = None;
+                    if let Some(screen) = &mut this.screen
+                        && screen.sync_deadline().is_some_and(|d| d <= Instant::now())
+                    {
+                        screen.stop_sync();
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+        // New output may have moved the link under the pointer.
+        if self.hovered.is_some() {
+            self.hovered = self.pointer.and_then(|p| self.link_at(p));
+        }
+        if !open {
+            self.attachment = Attachment::Ended;
+            let note = (!over).then(|| ("disconnected · click to reconnect".into(), Kind::Warning));
+            self.set_status(note, cx);
+        }
+        cx.notify();
+        open
+    }
+
+    fn on_term_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
+        match event {
+            TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
+            // Programs copy with OSC 52.
             TermEvent::ClipboardStore(_, text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text))
             }
             TermEvent::ColorRequest(index, format) => {
+                let Some(screen) = &self.screen else { return };
                 let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
-                let color = palette.indexed(index, pty.term.lock().colors());
-                pty.write(format(color).into_bytes());
+                let color = palette.indexed(index, screen.term.lock().colors());
+                self.write(format(color).into_bytes());
             }
             TermEvent::TextAreaSizeRequest(format) => {
-                pty.write(format(pty.size().window()).into_bytes())
-            }
-            TermEvent::ChildExit(_) | TermEvent::Exit => {
-                self.pty = None;
-                self._reader = None;
-                self.set_status(
-                    Some(("disconnected · click to reconnect".into(), Kind::Warning)),
-                    cx,
-                );
-                cx.notify();
+                self.write(format(self.cell.window()).into_bytes())
             }
             _ => {}
         }
     }
 
     fn mode(&self) -> TermMode {
-        self.pty
+        self.screen
             .as_ref()
-            .map(|p| *p.term.lock().mode())
+            .map(|s| *s.term.lock().mode())
             .unwrap_or(TermMode::NONE)
     }
 
     fn write(&self, bytes: Vec<u8>) {
-        if let Some(pty) = &self.pty {
-            pty.write(bytes);
+        if let Attachment::Attached(core, channel) = &self.attachment {
+            core.input(*channel, &bytes);
         }
     }
 
@@ -218,6 +361,10 @@ impl TerminalView {
         if m.platform {
             if ks.key == "v" && !m.shift && !m.alt && !m.control {
                 self.paste_clipboard(cx);
+                cx.stop_propagation();
+            }
+            if ks.key == "c" && !m.shift && !m.alt && !m.control {
+                self.copy(cx);
                 cx.stop_propagation();
             }
             return;
@@ -243,9 +390,23 @@ impl TerminalView {
 
     /// Sends what the user typed, and shows the bottom of the scrollback.
     fn send(&self, bytes: Vec<u8>) {
-        if let Some(pty) = &self.pty {
-            pty.term.lock().scroll_display(Scroll::Bottom);
-            pty.write(bytes);
+        if let Some(screen) = &self.screen {
+            let mut term = screen.term.lock();
+            term.scroll_display(Scroll::Bottom);
+            term.selection = None;
+        }
+        self.write(bytes);
+    }
+
+    /// ⌘C: the selected text goes to the clipboard.
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        let text = self
+            .screen
+            .as_ref()
+            .and_then(|s| s.term.lock().selection_to_string())
+            .filter(|t| !t.is_empty());
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
@@ -359,13 +520,31 @@ impl TerminalView {
         )
     }
 
+    /// The grid point at `position`, scrollback counted, and which half of
+    /// its cell it's in: where a selection starts or ends.
+    fn grid_point(&self, position: Point<Pixels>) -> (GridPoint, Side) {
+        let (col, line) = self.cell_at(position);
+        let offset = self
+            .screen
+            .as_ref()
+            .map_or(0, |s| s.term.lock().grid().display_offset());
+        let x = (position.x - self.bounds.origin.x) / self.cell_size.width;
+        let side = if x - col as f32 > 0.5 && x >= 0.0 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        let point = GridPoint::new(Line(line as i32 - offset as i32), Column(col));
+        (point, side)
+    }
+
     /// The link at `position`, if it's over the grid.
     fn link_at(&self, position: Point<Pixels>) -> Option<Link> {
         if !self.bounds.contains(&position) {
             return None;
         }
         let (col, line) = self.cell_at(position);
-        link_at(&self.pty.as_ref()?.term.lock(), col, line)
+        link_at(&self.screen.as_ref()?.term.lock(), col, line)
     }
 
     /// Follows the pointer and ⌘ (`platform`): the link under the pointer
@@ -375,24 +554,24 @@ impl TerminalView {
             .pointer
             .filter(|_| platform)
             .and_then(|p| self.link_at(p));
-        if link != self.link {
-            self.link = link;
+        if link != self.hovered {
+            self.hovered = link;
             cx.notify();
         }
     }
 
-    /// tmux in mouse mode wants SGR reports; otherwise clicks only focus.
+    /// A program in mouse mode wants SGR reports; otherwise lemur selects.
     fn reports_mouse(mode: TermMode) -> bool {
         mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE)
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        if self.pty.is_none() {
+        if self.exited() {
             self.connect(cx);
             return;
         }
-        // ⌘-click opens a link; tmux never sees that click.
+        // ⌘-click opens a link; the program never sees that click.
         if event.button == MouseButton::Left
             && event.modifiers.platform
             && let Some(link) = self.link_at(event.position)
@@ -404,8 +583,10 @@ impl TerminalView {
             }
             return;
         }
+        // ⇧ selects even in a program that takes the mouse.
         if let Some(button) = button(event.button)
             && Self::reports_mouse(self.mode())
+            && !event.modifiers.shift
         {
             let (col, line) = self.cell_at(event.position);
             self.pressed = Some((button, (col, line)));
@@ -417,11 +598,37 @@ impl TerminalView {
                 line,
                 true,
             ));
+            return;
+        }
+        if event.button == MouseButton::Left
+            && let Some(screen) = &self.screen
+        {
+            let (point, side) = self.grid_point(event.position);
+            let kind = match event.click_count {
+                2 => SelectionType::Semantic,
+                3.. => SelectionType::Lines,
+                _ => SelectionType::Simple,
+            };
+            screen.term.lock().selection = Some(Selection::new(kind, point, side));
+            self.selecting = true;
+            cx.notify();
         }
     }
 
-    /// The press tmux was told about comes up, wherever the pointer is.
-    fn mouse_up(&mut self, event: &MouseUpEvent) {
+    /// The press the program was told about comes up, wherever the pointer
+    /// is; a selection being dragged out ends.
+    fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.selecting && event.button == MouseButton::Left {
+            self.selecting = false;
+            if let Some(screen) = &self.screen {
+                let mut term = screen.term.lock();
+                // A click that selected nothing clears what was selected.
+                if term.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                    term.selection = None;
+                }
+            }
+            cx.notify();
+        }
         let Some((pressed, _)) = self.pressed else {
             return;
         };
@@ -447,9 +654,23 @@ impl TerminalView {
         self.hover(event.modifiers.platform, cx);
     }
 
-    /// A press that reached tmux reports its moves wherever the pointer
-    /// goes, off the terminal too; positions there land on the nearest cell.
-    fn drag(&mut self, event: &MouseMoveEvent) {
+    /// A press follows the pointer wherever it goes, off the terminal too;
+    /// positions there land on the nearest cell. A selection grows with it,
+    /// and a press the program was told about reports its moves.
+    fn drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.selecting {
+            if event.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            let (point, side) = self.grid_point(event.position);
+            if let Some(screen) = &self.screen
+                && let Some(selection) = &mut screen.term.lock().selection
+            {
+                selection.update(point, side);
+            }
+            cx.notify();
+            return;
+        }
         let Some((pressed, at)) = self.pressed else {
             return;
         };
@@ -496,8 +717,8 @@ impl TerminalView {
         } else if mode.contains(TermMode::ALT_SCREEN) {
             let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
             self.write(arrow.repeat(notches));
-        } else if let Some(pty) = &self.pty {
-            pty.term.lock().scroll_display(Scroll::Delta(lines));
+        } else if let Some(screen) = &self.screen {
+            screen.term.lock().scroll_display(Scroll::Delta(lines));
             cx.notify();
         }
     }
@@ -682,11 +903,13 @@ struct Frame {
 }
 
 /// Snapshots the grid under the lock so painting doesn't block the reader.
-fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
-    let term = pty.term.lock();
+fn snapshot(screen: &Screen, palette: &Palette) -> Frame {
+    let term = screen.term.lock();
     let content = term.renderable_content();
     let colors = content.colors;
     let default_bg = palette.indexed(NamedColor::Background as usize, colors);
+    let selection = content.selection;
+    let selected_bg = palette.selection();
     let offset = content.display_offset as i32;
     let cols = term.columns();
     let mut rows: Vec<Row> = (0..term.screen_lines())
@@ -712,6 +935,9 @@ fn snapshot(pty: &Pty, palette: &Palette) -> Frame {
         }
         if flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
+        }
+        if selection.is_some_and(|s| s.contains(cell.point)) {
+            bg = selected_bg;
         }
         let col = cell.point.column.0;
         if bg != default_bg {
@@ -1018,9 +1244,25 @@ impl Render for TerminalView {
         let this = cx.entity();
         let focus = self.focus.clone();
         let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
-        let frame = self.pty.as_ref().map(|pty| snapshot(pty, &palette));
+        // The core answers programs with the colors and cell size shown,
+        // and hands the terminal to whoever has the keyboard.
+        if let Attachment::Attached(core, channel) = &self.attachment {
+            let display = self.display(cx);
+            if self.told_display.as_ref() != Some(&display) {
+                core.facts(*channel, &display);
+                self.told_display = Some(display);
+            }
+            if self.told_focus != Some(focused) {
+                core.focus(*channel, focused);
+                self.told_focus = Some(focused);
+            }
+        }
+        let frame = self
+            .screen
+            .as_ref()
+            .map(|screen| snapshot(screen, &palette));
         let link = self
-            .link
+            .hovered
             .clone()
             .map(|link| (link, hsla(palette.foreground)));
         let marked = self.marked.clone();
@@ -1037,8 +1279,11 @@ impl Render for TerminalView {
                     view.bounds = bounds;
                     view.cell_size = gpui_kit::size(w, h);
                     view.cell = size;
-                    if let Some(pty) = &mut view.pty {
-                        pty.resize(size);
+                    if let Some(screen) = &mut view.screen
+                        && screen.resize(size)
+                        && let Attachment::Attached(core, channel) = &view.attachment
+                    {
+                        core.resize(*channel, size.cols, size.lines);
                     }
                 })
                 .ok();
@@ -1062,17 +1307,17 @@ impl Render for TerminalView {
                     caret,
                 };
                 window.handle_input(&focus, input, cx);
-                // A press that reached tmux is followed off the terminal too,
-                // where the element's own listeners don't hear it.
+                // A press is followed off the terminal too, where the
+                // element's own listeners don't hear it.
                 let dragged = this.clone();
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                     if phase == DispatchPhase::Capture {
-                        dragged.update(cx, |view, _| view.drag(event));
+                        dragged.update(cx, |view, cx| view.drag(event, cx));
                     }
                 });
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                     if phase == DispatchPhase::Capture {
-                        this.update(cx, |view, _| view.mouse_up(event));
+                        this.update(cx, |view, cx| view.mouse_up(event, cx));
                     }
                 });
             },
@@ -1085,6 +1330,9 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .relative()
             .size_full()
+            // Room between the text and the frame around it.
+            .px(px(12.0))
+            .py(px(8.0))
             .bg(hsla(palette.background))
             .on_key_down(cx.listener(Self::key_down))
             .on_any_mouse_down(cx.listener(Self::mouse_down))
@@ -1098,7 +1346,7 @@ impl Render for TerminalView {
                     this.hover(false, cx);
                 }
             }))
-            .when(self.link.is_some(), |this| this.cursor_pointer())
+            .when(self.hovered.is_some(), |this| this.cursor_pointer())
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.upload(paths.paths().to_vec(), None, cx)
@@ -1112,33 +1360,61 @@ mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::{TerminalInput, TerminalView, block, snapshot};
     use crate::gui::settings::Prefs;
-    use crate::gui::terminal::{DARK, Pty, Size};
-    use crate::test_support::{TmuxServer, wait_until};
+    use crate::gui::terminal::{DARK, Screen, Size};
+    use crate::test_support::{HcServer, wait_until};
     use gpui_kit::{
         Capslock, InputHandler, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
         MouseButton, point, px, size,
     };
     use std::time::Duration;
 
+    /// A terminal view of a new terminal running `argv`, in a 600×400
+    /// window, once it's attached; it has the keyboard.
+    fn attach<'a>(
+        server: &HcServer,
+        argv: &[&str],
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<TerminalView>,
+        String,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let t = server.run("/", &[], argv);
+        let host = server.config().hosts.remove(0);
+        // The core's connection is real threads, so these tests can't be
+        // deterministic.
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let session = t.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, session, cx));
+        cx.simulate_resize(size(px(600.0), px(400.0)));
+        let focus = view.read_with(cx, |v, _| v.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let attached = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.is_attached())
+        });
+        assert!(attached, "never attached");
+        (view, t, cx)
+    }
+
+    /// What `view` shows, row by row, without trailing blanks.
+    fn shown(view: &gpui::Entity<TerminalView>, cx: &mut gpui::VisualTestContext) -> String {
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            let frame = snapshot(v.screen.as_ref().unwrap(), &DARK);
+            let rows: Vec<String> = frame.rows.into_iter().map(|r| r.text).collect();
+            rows.join("\n").trim_end().to_string()
+        })
+    }
+
     /// Holding ⌘ over a URL shows it, and ⌘-clicking opens it; a plain
     /// click doesn't.
     #[gpui::test]
     fn cmd_click_opens_a_link(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("links");
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "t",
-            "printf 'see https://example.com/x ok'; sleep 600",
-        ]);
-        let host = server.config().hosts.remove(0);
-        // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
-        cx.simulate_resize(size(px(600.0), px(400.0)));
-        cx.run_until_parked();
+        let server = HcServer::new("links");
+        let script = "printf 'see https://example.com/x ok'; sleep 600";
+        let (view, _, cx) = attach(&server, &["sh", "-c", script], cx);
         // The middle of the URL's third character, on the first row.
         let at = view.read_with(cx, |v, _| {
             let (w, h) = (v.cell.cell_width as f32, v.cell.cell_height as f32);
@@ -1147,16 +1423,16 @@ mod tests {
                 v.bounds.origin.y + px(h * 0.5),
             )
         });
-        let shown = wait_until(Duration::from_secs(5), || {
+        let showed = wait_until(Duration::from_secs(5), || {
             cx.run_until_parked();
             view.read_with(cx, |v, _| v.link_at(at)).is_some()
         });
-        assert!(shown, "the URL never showed");
+        assert!(showed, "the URL never showed");
 
         cx.simulate_click(at, Modifiers::none());
         assert_eq!(cx.opened_url(), None);
         cx.simulate_mouse_move(at, None, Modifiers::command());
-        let hovered = view.read_with(cx, |v, _| v.link.as_ref().map(|l| l.url.clone()));
+        let hovered = view.read_with(cx, |v, _| v.hovered.as_ref().map(|l| l.url.clone()));
         assert_eq!(hovered.as_deref(), Some("https://example.com/x"));
         cx.simulate_click(at, Modifiers::command());
         assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/x"));
@@ -1166,13 +1442,8 @@ mod tests {
     /// cells are rarely a whole number of pixels wide.
     #[gpui::test]
     fn the_mouse_lands_on_the_cell_under_it(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("mouse");
-        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
-        let host = server.config().hosts.remove(0);
-        // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        let server = HcServer::new("mouse");
+        let (view, _, cx) = attach(&server, &["sleep", "600"], cx);
         cx.simulate_resize(size(px(800.0), px(600.0)));
         cx.run_until_parked();
         view.read_with(cx, |v, _| {
@@ -1188,77 +1459,45 @@ mod tests {
     }
 
     /// A selection dragged off the terminal follows the pointer to the
-    /// edge, and tmux copies it when the button comes up out there.
+    /// edge, and ⌘C copies it.
     #[gpui::test]
     fn a_drag_off_the_terminal_still_selects(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("drag");
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "t",
-            "printf 'hello world'; sleep 600",
-        ]);
-        server.tmux(&["set-option", "-g", "mouse", "on"]);
-        let host = server.config().hosts.remove(0);
-        // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
-        cx.simulate_resize(size(px(600.0), px(400.0)));
-        cx.run_until_parked();
-        let reporting = wait_until(Duration::from_secs(5), || {
-            cx.run_until_parked();
-            view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
-        });
-        assert!(reporting, "tmux never asked for mouse reports");
+        let server = HcServer::new("drag");
+        let script = "printf 'hello world'; sleep 600";
+        let (view, _, cx) = attach(&server, &["sh", "-c", script], cx);
+        assert!(
+            wait_until(Duration::from_secs(5), || shown(&view, cx) == "hello world"),
+            "{:?}",
+            shown(&view, cx)
+        );
 
         // Press on the first character, drag over two more, then leave the
         // window to the right of the row and let go there.
         let (origin, cell) = view.read_with(cx, |v, _| (v.bounds.origin, v.cell_size));
         let at = |col: f32| point(origin.x + cell.width * col, origin.y + cell.height * 0.5);
         let none = Modifiers::none();
-        cx.simulate_mouse_down(at(0.5), MouseButton::Left, none);
+        cx.simulate_mouse_down(at(0.2), MouseButton::Left, none);
         cx.simulate_mouse_move(at(2.5), MouseButton::Left, none);
         let off = point(px(700.0), at(0.0).y);
         cx.simulate_mouse_move(off, MouseButton::Left, none);
         cx.simulate_mouse_up(off, MouseButton::Left, none);
-        let copied = || server.tmux(&["show-buffer"]);
-        assert!(
-            wait_until(Duration::from_secs(5), || copied() == "hello world"),
-            "tmux copied {:?}",
-            copied()
-        );
-    }
-
-    /// A focused terminal on the session `t`, once tmux has attached it.
-    fn attach<'a>(
-        server: &TmuxServer,
-        cx: &'a mut gpui::TestAppContext,
-    ) -> (gpui::Entity<TerminalView>, &'a mut gpui::VisualTestContext) {
-        let host = server.config().hosts.remove(0);
-        // The PTY reader is a real thread, so these tests can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
-        cx.simulate_resize(size(px(600.0), px(400.0)));
-        let focus = view.read_with(cx, |v, _| v.focus.clone());
-        cx.update(|window, cx| window.focus(&focus, cx));
-        cx.run_until_parked();
-        let attached = wait_until(Duration::from_secs(5), || {
-            !server.tmux(&["list-clients"]).is_empty()
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(copied.as_deref(), Some("hello world"));
+        // Typing lets go of it.
+        cx.simulate_keystrokes("x");
+        let selected = view.read_with(cx, |v, _| {
+            v.screen.as_ref().unwrap().term.lock().selection.is_some()
         });
-        assert!(attached, "tmux never attached");
-        (view, cx)
+        assert!(!selected);
     }
 
-    /// Text reaches the session through macOS's input method, which is what
+    /// Text reaches the program through macOS's input method, which is what
     /// composes accents: keys typed, and what it composed once it's done.
     #[gpui::test]
     fn text_comes_through_the_input_method(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("input");
-        server.tmux(&["new-session", "-d", "-s", "t", "cat"]);
-        let (view, cx) = attach(&server, cx);
+        let server = HcServer::new("input");
+        let (view, t, cx) = attach(&server, &["cat"], cx);
         let input = || TerminalInput {
             view: view.clone(),
             caret: None,
@@ -1276,11 +1515,11 @@ mod tests {
             input().unmark_text(window, cx);
         });
         assert_eq!(view.read_with(cx, |v, _| v.marked.clone()), None);
-        let pane = || server.tmux(&["capture-pane", "-p", "-t", "t"]);
+        let read = || server.hc(&["read", &t]);
         assert!(
-            wait_until(Duration::from_secs(5), || pane() == "hié~"),
-            "the pane shows {:?}",
-            pane()
+            wait_until(Duration::from_secs(5), || read() == "hié~"),
+            "it shows {:?}",
+            read()
         );
     }
 
@@ -1288,9 +1527,8 @@ mod tests {
     /// the first press; Caps Lock still capitalizes it.
     #[gpui::test]
     fn a_held_key_repeats_with_caps_lock(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("held");
-        server.tmux(&["new-session", "-d", "-s", "t", "cat"]);
-        let (_view, cx) = attach(&server, cx);
+        let server = HcServer::new("held");
+        let (_view, t, cx) = attach(&server, &["cat"], cx);
 
         cx.simulate_event(ModifiersChangedEvent {
             modifiers: Modifiers::none(),
@@ -1303,28 +1541,26 @@ mod tests {
                 prefer_character_input: false,
             });
         }
-        let pane = || server.tmux(&["capture-pane", "-p", "-t", "t"]);
+        let read = || server.hc(&["read", &t]);
         assert!(
-            wait_until(Duration::from_secs(5), || pane() == "AA"),
-            "the pane shows {:?}",
-            pane()
+            wait_until(Duration::from_secs(5), || read() == "AA"),
+            "it shows {:?}",
+            read()
         );
     }
 
-    /// The middle and right buttons reach tmux too: a middle-click pastes
-    /// tmux's buffer, and a right-click opens its menu.
+    /// A program that asks for the mouse gets every button, as SGR reports.
     #[gpui::test]
-    fn middle_and_right_clicks_reach_tmux(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("buttons");
-        server.tmux(&["new-session", "-d", "-s", "t", "cat"]);
-        server.tmux(&["set-option", "-g", "mouse", "on"]);
-        server.tmux(&["set-buffer", "xyz"]);
-        let (view, cx) = attach(&server, cx);
+    fn clicks_reach_a_program_that_asks(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("buttons");
+        // Shows, in hex, the 4 reports it reads.
+        let script = r"printf '\033[?1000h\033[?1006h'; stty raw -echo; head -c 36 | xxd -p -c 64";
+        let (view, t, cx) = attach(&server, &["sh", "-c", script], cx);
         let reporting = wait_until(Duration::from_secs(5), || {
             cx.run_until_parked();
             view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
         });
-        assert!(reporting, "tmux never asked for mouse reports");
+        assert!(reporting, "the program never asked for mouse reports");
 
         let at = view.read_with(cx, |v, _| {
             v.bounds.origin + point(v.cell_size.width * 2.5, v.cell_size.height * 2.5)
@@ -1332,48 +1568,30 @@ mod tests {
         let none = Modifiers::none();
         cx.simulate_mouse_down(at, MouseButton::Middle, none);
         cx.simulate_mouse_up(at, MouseButton::Middle, none);
-        let pane = || server.tmux(&["capture-pane", "-p", "-t", "t"]);
-        assert!(
-            wait_until(Duration::from_secs(5), || pane() == "xyz"),
-            "the pane shows {:?}",
-            pane()
-        );
-
-        // The menu is up while the button is; letting go off its items closes it.
         cx.simulate_mouse_down(at, MouseButton::Right, none);
-        let shown = || {
-            view.read_with(cx, |v, _| {
-                snapshot(v.pty.as_ref().unwrap(), &DARK)
-                    .rows
-                    .iter()
-                    .any(|row| row.text.contains("Respawn"))
-            })
-        };
-        assert!(wait_until(Duration::from_secs(5), shown), "no menu");
         cx.simulate_mouse_up(at, MouseButton::Right, none);
+        let read = || server.hc(&["read", &t]);
+        // ESC [ < button ; column ; row M (pressed) or m (released).
+        let reports = "1b5b3c313b333b334d1b5b3c313b333b336d1b5b3c323b333b334d1b5b3c323b333b336d";
+        assert!(
+            wait_until(Duration::from_secs(5), || read().contains(reports)),
+            "it read {:?}",
+            read()
+        );
     }
 
     /// Rows reach the painter without the blanks after their text.
     #[test]
     fn trailing_blanks_are_not_drawn() {
-        let argv: Vec<String> = ["sh", "-c", "printf 'hi'; sleep 5"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let size = Size {
+        let mut screen = Screen::new(Size {
             cols: 40,
             lines: 3,
             cell_width: 8,
             cell_height: 16,
-        };
-        let (pty, _events) = Pty::spawn(&argv, size).unwrap();
-        let shown = || snapshot(&pty, &DARK).rows[0].text.clone();
-        assert!(
-            wait_until(Duration::from_secs(5), || shown() == "hi"),
-            "{:?}",
-            shown()
-        );
-        let frame = snapshot(&pty, &DARK);
+        });
+        screen.advance(b"hi");
+        let frame = snapshot(&screen, &DARK);
+        assert_eq!(frame.rows[0].text, "hi");
         assert_eq!(
             frame.rows[0].runs.iter().map(|(_, len)| len).sum::<usize>(),
             2
@@ -1385,24 +1603,15 @@ mod tests {
     /// glyphs, so Claude's mascot has no seams.
     #[test]
     fn block_elements_are_painted_not_typed() {
-        let argv: Vec<String> = ["sh", "-c", "printf 'a▐▛x'; sleep 5"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let size = Size {
+        let mut screen = Screen::new(Size {
             cols: 40,
             lines: 3,
             cell_width: 8,
             cell_height: 16,
-        };
-        let (pty, _events) = Pty::spawn(&argv, size).unwrap();
-        let shown = || snapshot(&pty, &DARK).rows[0].text.clone();
-        assert!(
-            wait_until(Duration::from_secs(5), || shown() == "a  x"),
-            "{:?}",
-            shown()
-        );
-        let frame = snapshot(&pty, &DARK);
+        });
+        screen.advance("a▐▛x".as_bytes());
+        let frame = snapshot(&screen, &DARK);
+        assert_eq!(frame.rows[0].text, "a  x");
         let blocks: Vec<_> = frame.rows[0].blocks.iter().map(|b| (b.0, b.1)).collect();
         assert_eq!(blocks, [(1, '▐'), (2, '▛')]);
 
@@ -1413,36 +1622,43 @@ mod tests {
         assert_eq!(block('a'), None);
     }
 
-    /// A real `tmux attach` in a headless window: resizing the window must
-    /// resize the PTY, and tmux must see the new size.
+    /// Resizing the window resizes the grid, and the program sees the new
+    /// size.
     #[gpui::test]
     fn the_terminal_follows_the_window_size(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("resize");
-        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
-        let host = server.config().hosts.remove(0);
-        // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
-
-        cx.simulate_resize(size(px(600.0), px(400.0)));
-        cx.run_until_parked();
-        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        let server = HcServer::new("resize");
+        let (view, t, cx) = attach(&server, &["sleep", "600"], cx);
+        let small = view
+            .read_with(cx, |v, _| v.screen_size())
+            .expect("attached");
+        let core = server.core();
+        let seen = || {
+            core.terminals()
+                .into_iter()
+                .find(|x| x.address == t)
+                .map(|x| (x.cols, x.rows))
+        };
+        // Laid out before it attached: the program gets that size at once.
+        assert!(
+            wait_until(Duration::from_secs(5), || seen()
+                == Some((small.cols, small.lines))),
+            "the core sees {:?} for {small:?}",
+            seen()
+        );
         cx.simulate_resize(size(px(1000.0), px(700.0)));
         cx.run_until_parked();
-        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        let large = view
+            .read_with(cx, |v, _| v.screen_size())
+            .expect("attached");
         assert!(
             large.cols > small.cols && large.lines > small.lines,
             "{small:?} -> {large:?}"
         );
-
-        // tmux runs in real time; give it a moment to see the new size.
-        let want = format!("{}x{}", large.cols, large.lines);
-        let client = || server.tmux(&["list-clients", "-F", "#{client_width}x#{client_height}"]);
         assert!(
-            wait_until(Duration::from_secs(5), || client() == want),
-            "tmux sees {}",
-            client()
+            wait_until(Duration::from_secs(5), || seen()
+                == Some((large.cols, large.lines))),
+            "the core sees {:?}",
+            seen()
         );
     }
 
@@ -1450,20 +1666,19 @@ mod tests {
     /// fewer columns and lines in the same window.
     #[gpui::test]
     fn the_terminal_follows_the_font_size(cx: &mut gpui::TestAppContext) {
-        let server = TmuxServer::new("font");
-        server.tmux(&["new-session", "-d", "-s", "t", "sleep 600"]);
-        let host = server.config().hosts.remove(0);
-        // The PTY reader is a real thread, so this test can't be deterministic.
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, "t".into(), cx));
+        let server = HcServer::new("font");
+        let (view, _, cx) = attach(&server, &["sleep", "600"], cx);
         cx.simulate_resize(size(px(800.0), px(600.0)));
         cx.run_until_parked();
-        let small = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        let small = view
+            .read_with(cx, |v, _| v.screen_size())
+            .expect("attached");
 
         cx.update(|_, cx| Prefs::update(cx, |p| p.terminal.font_size = 26.0));
         cx.run_until_parked();
-        let large = view.read_with(cx, |v, _| v.pty_size()).expect("attached");
+        let large = view
+            .read_with(cx, |v, _| v.screen_size())
+            .expect("attached");
         assert!(
             large.cols < small.cols && large.lines < small.lines,
             "{small:?} -> {large:?}"

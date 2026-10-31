@@ -1,8 +1,9 @@
 //! The login shell's PATH, for an app started from Finder or the Dock.
 //!
-//! Those get only the system's PATH, so a host with `ssh = "local"` wouldn't
-//! find tmux in Homebrew's `/opt/homebrew/bin`. The login shell sets up
-//! where things are installed.
+//! Those get only the system's PATH, which a herdr-core lemur starts, and
+//! what it runs for a host with `ssh = "local"`, would inherit: no
+//! Homebrew's `/opt/homebrew/bin`. The login shell sets up where things are
+//! installed.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
