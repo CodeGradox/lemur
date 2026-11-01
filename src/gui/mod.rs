@@ -534,22 +534,48 @@ impl Lemur {
                 let Ok(cfg) = this.read_with(cx, |this, _| this.cfg.clone()) else {
                     break;
                 };
-                let cores = cx.background_spawn(async move { watched(&cfg) }).await;
+                let (cores, all) = cx.background_spawn(async move { watched(&cfg) }).await;
                 if cores.is_empty() {
                     cx.background_executor().timer(REFRESH).await;
                     continue;
                 }
-                let mut changes = futures::stream::select_all(cores.iter().map(|c| c.changes()));
-                while changes.next().await.is_some() {
+                // Each core's changes, then word that it's lost; with a host
+                // not reached, word to look again in a while. Watching again
+                // connects to them, while the other cores' changes go on.
+                let mut streams: Vec<futures::stream::LocalBoxStream<'static, bool>> = cores
+                    .iter()
+                    .map(|c| {
+                        c.changes()
+                            .map(|()| true)
+                            .chain(futures::stream::once(async { false }))
+                            .boxed_local()
+                    })
+                    .collect();
+                if !all {
+                    let timer = cx.background_executor().timer(REFRESH * AWAY);
+                    let again = async move {
+                        timer.await;
+                        false
+                    };
+                    streams.push(futures::stream::once(again).boxed_local());
+                }
+                let mut changes = futures::stream::select_all(streams);
+                while let Some(true) = changes.next().await {
                     // A burst of changes makes one new snapshot.
                     cx.background_executor().timer(BURST).await;
-                    while let Some(Some(())) = changes.next().now_or_never() {}
+                    let mut lost = false;
+                    while let Some(Some(changed)) = changes.next().now_or_never() {
+                        lost |= !changed;
+                    }
                     let Ok(recomposed) = this.update(cx, |this, cx| this.recompose(cx)) else {
                         return;
                     };
                     recomposed.await;
+                    if lost {
+                        break;
+                    }
                 }
-                // Lost the core: connect again in a while.
+                // Lost a core: connect again in a while.
                 cx.background_executor().timer(REFRESH).await;
             }
         });
@@ -1838,17 +1864,22 @@ fn moved_to(index: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// The cores the config's hosts' terminals run in, each once.
-fn watched(cfg: &Config) -> Vec<std::sync::Arc<hc::Core>> {
+/// The cores the config's hosts' terminals run in, each once, and whether
+/// every host was reached.
+fn watched(cfg: &Config) -> (Vec<std::sync::Arc<hc::Core>>, bool) {
     let mut cores: Vec<std::sync::Arc<hc::Core>> = vec![];
+    let mut all = true;
     for host in &cfg.hosts {
-        if let Ok((core, _)) = hc::for_host(host)
-            && !cores.iter().any(|c| std::sync::Arc::ptr_eq(c, &core))
-        {
-            cores.push(core);
+        match hc::for_host(host) {
+            Ok((core, _)) => {
+                if !cores.iter().any(|c| std::sync::Arc::ptr_eq(c, &core)) {
+                    cores.push(core);
+                }
+            }
+            Err(_) => all = false,
         }
     }
-    cores
+    (cores, all)
 }
 
 fn sessions(snap: &Snapshot) -> impl Iterator<Item = (&str, &Session)> {
@@ -4686,6 +4717,52 @@ mod tests {
         app.update(cx, |app, cx| app.toggle_notes(cx));
         cx.simulate_keystrokes("cmd-r cmd-r");
         assert_eq!(open(cx), (true, false), "the notes again");
+    }
+
+    /// With hosts in two herdr-cores, one lost and back is watched again,
+    /// while the other's changes go on: its new threads show without a
+    /// refresh.
+    #[gpui::test]
+    fn a_core_lost_and_back_is_watched_again(cx: &mut gpui::TestAppContext) {
+        let a = HcServer::new("watch-a");
+        let b = HcServer::new("watch-b");
+        let mut cfg = a.config();
+        let mut mac = Host::new("mac", "local");
+        mac.hc_session = b.config().hosts[0].hc_session.clone();
+        cfg.hosts.push(mac);
+        let (app, cx) = rooted(cfg, cx);
+        let listed = |label: &str, cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                super::sessions(&app.snap).any(|(_, s)| s.label == label)
+            })
+        };
+        let first = b.run("/", &["lemur.label=first"], &["sleep", "600"]);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                cx.executor().advance_clock(super::BURST);
+                cx.run_until_parked();
+                listed("first", cx)
+            }),
+            "b's changes reach Lemur"
+        );
+        assert!(!first.is_empty());
+
+        b.hc(&["server", "stop"]);
+        std::thread::sleep(Duration::from_millis(500));
+        cx.run_until_parked();
+        // Lemur watches again after a while: here one tick, short of the
+        // refresh, which comes every 5 while the window is in the back.
+        cx.executor().advance_clock(super::REFRESH);
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(500));
+        cx.run_until_parked();
+        b.run("/", &["lemur.label=later"], &["sleep", "600"]);
+        let seen = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(super::BURST);
+            cx.run_until_parked();
+            listed("later", cx)
+        });
+        assert!(seen, "b's changes reach Lemur again");
     }
 
     /// A helper's terminal, peeked at from under its thread, attaches again
