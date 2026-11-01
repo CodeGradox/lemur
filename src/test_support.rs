@@ -280,6 +280,40 @@ fn serve(mut stream: std::net::TcpStream, answer: &Answer) -> Option<Request> {
     Some(request)
 }
 
+/// Each test's core has a tag of its own: two tests running at once with
+/// one would share its folder and socket, and stop each other's core.
+#[test]
+fn test_cores_have_tags_of_their_own() {
+    fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = vec![];
+    sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let mut seen = std::collections::HashMap::new();
+    let call = concat!("HcServer::new", "(\"");
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (at, _) in text.match_indices(call) {
+            let rest = &text[at + call.len()..];
+            let tag = &rest[..rest.find('"').unwrap()];
+            if let Some(other) = seen.insert(tag.to_string(), file.clone()) {
+                panic!("tag {tag:?} in {} and {}", other.display(), file.display());
+            }
+        }
+    }
+    assert!(seen.len() > 50, "found {} tags", seen.len());
+}
+
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.
 pub fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;

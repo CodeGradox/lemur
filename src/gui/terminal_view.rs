@@ -1680,7 +1680,7 @@ mod tests {
     /// edge, and ⌘C copies it.
     #[gpui::test]
     fn a_drag_off_the_terminal_still_selects(cx: &mut gpui::TestAppContext) {
-        let server = HcServer::new("drag");
+        let server = HcServer::new("drag-select");
         let script = "printf 'hello world'; sleep 600";
         let (view, _, cx) = attach(&server, &["sh", "-c", script], cx);
         assert!(
