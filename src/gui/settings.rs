@@ -422,7 +422,12 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         "Window",
         &[
             keys("Toggle the sidebar", &["cmd-b"]),
-            keys("Toggle the notes", &["cmd-r"]),
+            Shortcut {
+                what: "Toggle the right panel",
+                how: Press::Keys(&["cmd-r"]),
+                more: Some("The notes, or the agents if they showed last."),
+            },
+            keys("Toggle the agents", &["cmd-shift-a"]),
             keys("Add a project", &["cmd-o"]),
             keys("Settings", &["cmd-,"]),
             keys("Close Settings", &["cmd-w"]),

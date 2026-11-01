@@ -3,6 +3,7 @@
 //! Every session you open keeps its own terminal, attached through
 //! herdr-core, so switching is instant and scrollback survives.
 
+mod agents;
 mod changes;
 mod chrome;
 mod cycle;
@@ -39,7 +40,9 @@ use futures::{FutureExt, StreamExt};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::resizable::{HandleEdge, resize_handle};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, WindowExt, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, IconName, Selectable, Sizable, Theme, WindowExt, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use notes::NotesPanel;
@@ -58,6 +61,8 @@ actions!(
         Quit,
         ToggleSidebar,
         ToggleNotes,
+        ToggleAgents,
+        ToggleRightPanel,
         OpenSettings,
         AddProject,
         Refresh,
@@ -86,7 +91,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-o", AddProject, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         // As Zed's right dock; Refresh does without a key.
-        KeyBinding::new("cmd-r", ToggleNotes, None),
+        KeyBinding::new("cmd-r", ToggleRightPanel, None),
+        KeyBinding::new("cmd-shift-a", ToggleAgents, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
         // A new tab, as in a terminal app; ⌘W closes the one on show.
@@ -225,6 +231,13 @@ struct Lemur {
     /// The notes of the last worktree opened, beside the terminal.
     notes: Entity<NotesPanel>,
     notes_open: bool,
+    /// Every Claude thread and what it runs, where the notes are; one or
+    /// the other shows.
+    agents: Entity<agents::AgentsView>,
+    agents_open: bool,
+    /// The agents were on the right last, rather than the notes: ⌘R
+    /// brings back whichever was.
+    agents_last: bool,
     /// Adding a folder, over the window.
     picker: Option<(Entity<FolderPicker>, Subscription)>,
     /// Dictating, under the terminal.
@@ -291,7 +304,9 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ]),
                 Menu::new("View").items([
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Toggle Right Panel", ToggleRightPanel),
                     MenuItem::action("Toggle Notes", ToggleNotes),
+                    MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::separator(),
                     MenuItem::action("Next Thread in Worktree", NextThread),
                     MenuItem::action("Previous Thread in Worktree", PreviousThread),
@@ -359,9 +374,14 @@ impl Lemur {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let lemur = cx.weak_entity();
-        let sidebar = cx.new(|_| SidebarView::new(lemur));
-        let sidebar_follows =
-            cx.observe_self(|this, cx| this.sidebar.update(cx, |_, cx| cx.notify()));
+        let sidebar = cx.new(|_| SidebarView::new(lemur.clone()));
+        let agents = cx.new(|_| agents::AgentsView::new(lemur));
+        let sidebar_follows = cx.observe_self(|this, cx| {
+            this.sidebar.update(cx, |_, cx| cx.notify());
+            if this.agents_open {
+                this.agents.update(cx, |_, cx| cx.notify());
+            }
+        });
         let restore = state_file
             .as_deref()
             .and_then(|p| Active::load_from(p).ok())
@@ -501,6 +521,9 @@ impl Lemur {
             changes: 0,
             notes,
             notes_open: false,
+            agents,
+            agents_open: false,
+            agents_last: false,
             picker: None,
             dictation: None,
             helper: dictate::helper(),
@@ -636,8 +659,20 @@ impl Lemur {
             .filter(|h| h.error.is_some())
             .map(|h| h.name.as_str())
             .collect();
+        // A helper's terminal opened from under its thread.
+        let helpers: HashSet<Key> = sessions(&snap)
+            .flat_map(|(h, s)| {
+                s.helpers
+                    .iter()
+                    .filter(|x| x.terminal)
+                    .map(move |x| (h.to_string(), x.id.clone()))
+            })
+            .collect();
         let live = |k: &Key| {
-            now.contains_key(k) || fresh.contains_key(k) || unreached.contains(k.0.as_str())
+            now.contains_key(k)
+                || fresh.contains_key(k)
+                || helpers.contains(k)
+                || unreached.contains(k.0.as_str())
         };
         self.terminals.retain(|k, _| live(k));
         // The thread on show ended: another takes its place.
@@ -888,6 +923,8 @@ impl Lemur {
         self.notes
             .update(cx, |n, cx| n.show(host, worktree, label, window, cx));
         self.notes_open = true;
+        self.agents_open = false;
+        self.agents_last = false;
         cx.notify();
     }
 
@@ -1017,9 +1054,34 @@ impl Lemur {
         cx.notify();
     }
 
+    /// The notes and the agents take turns on the right, as Herdr's Files
+    /// and Changes do: showing one hides the other.
     fn toggle_notes(&mut self, cx: &mut Context<Self>) {
         self.notes_open = !self.notes_open;
+        self.agents_open &= !self.notes_open;
+        self.agents_last &= !self.notes_open;
         cx.notify();
+    }
+
+    fn toggle_agents(&mut self, cx: &mut Context<Self>) {
+        self.agents_open = !self.agents_open;
+        self.notes_open &= !self.agents_open;
+        self.agents_last |= self.agents_open;
+        cx.notify();
+    }
+
+    /// ⌘R: hides the right panel, or brings back the one shown last; the
+    /// notes the first time.
+    fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+        if self.notes_open || self.agents_open {
+            self.notes_open = false;
+            self.agents_open = false;
+            cx.notify();
+        } else if self.agents_last {
+            self.toggle_agents(cx);
+        } else {
+            self.toggle_notes(cx);
+        }
     }
 
     /// Follows the pointer (`x`) dragging a side panel's edge across the
@@ -1034,8 +1096,8 @@ impl Lemur {
         let shown = |open: bool, width: Pixels| if open { width } else { px(0.0) };
         match panel {
             Panel::Sidebar => {
-                let room =
-                    bounds.size.width - shown(self.notes_open, self.notes_width) - MIN_TERMINAL;
+                let right = self.notes_open || self.agents_open;
+                let room = bounds.size.width - shown(right, self.notes_width) - MIN_TERMINAL;
                 self.sidebar_width = panel_width(x - bounds.left(), MIN_SIDEBAR, room);
             }
             Panel::Notes => {
@@ -1089,17 +1151,26 @@ impl Lemur {
             .border_color(cx.theme().border)
             .child(toggle)
             .child(self.tabs(cx))
+            // As Herdr's Files and Changes: each shows its panel, or hides it.
             .child(
                 Button::new("toggle-notes")
-                    .icon(if self.notes_open {
-                        IconName::PanelRightClose
-                    } else {
-                        IconName::PanelRightOpen
-                    })
+                    .icon(IconName::FileText)
+                    .label("Notes")
                     .ghost()
                     .small()
-                    .tooltip("Toggle notes (⌘R)")
+                    .selected(self.notes_open)
+                    .tooltip("Toggle notes")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
+            )
+            .child(
+                Button::new("toggle-agents")
+                    .icon(gpui_kit::assets::IconName::Bot)
+                    .label("Agents")
+                    .ghost()
+                    .small()
+                    .selected(self.agents_open)
+                    .tooltip("Toggle agents (⌘⇧A)")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_agents(cx))),
             )
     }
 
@@ -1189,6 +1260,8 @@ impl Render for Lemur {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleNotes, _, cx| this.toggle_notes(cx)))
+            .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAgents, _, cx| this.toggle_agents(cx)))
             .on_action(cx.listener(|this, _: &AddProject, window, cx| this.open_picker(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx).detach()))
             .on_action(
@@ -1276,19 +1349,20 @@ impl Render for Lemur {
                                     .children(self.dictation.as_ref().map(|(bar, _)| bar.clone()))
                                     .child(self.status_bar(cx)),
                             )
-                            .when(self.notes_open, |this| {
+                            .when(self.notes_open || self.agents_open, |this| {
+                                // Cached like the terminal; each redraws on its own changes.
+                                let panel: AnyView = if self.agents_open {
+                                    self.agents.clone().into()
+                                } else {
+                                    self.notes.clone().into()
+                                };
                                 this.child(
                                     div()
                                         .relative()
                                         .w(self.notes_width)
                                         .h_full()
                                         .flex_shrink_0()
-                                        // Cached like the terminal; it redraws on its own changes.
-                                        .child(
-                                            self.notes
-                                                .clone()
-                                                .cached(StyleRefinement::default().size_full()),
-                                        )
+                                        .child(panel.cached(StyleRefinement::default().size_full()))
                                         // Its line is the panel's left border.
                                         .child(panel_edge(
                                             "notes-edge",
@@ -1433,6 +1507,7 @@ mod tests {
                 claude: None,
                 busy: false,
                 running: true,
+                helpers: vec![],
             })
             .collect();
         Snapshot {
@@ -2936,7 +3011,8 @@ mod tests {
     }
 
     /// The menus' actions and keys reach the main window: ⌘O opens the
-    /// folder picker, ⌘R toggles the notes, Refresh refreshes.
+    /// folder picker, ⌘R toggles the right panel (the notes at first),
+    /// Refresh refreshes.
     #[gpui::test]
     fn menu_actions_reach_the_main_window(cx: &mut gpui::TestAppContext) {
         let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
@@ -3472,6 +3548,129 @@ mod tests {
         assert_eq!(shown(cx), Some(key(&c)));
         assert!(focused(cx), "the neighbour has the keyboard");
         let_attaches_end(&app, cx);
+    }
+
+    /// The agents panel lists each Claude thread with what it runs under
+    /// it: Claude's subagents as it reports them (OSC 7501 records), and
+    /// terminals its agent started (`hc run`, parent and all). A click opens
+    /// a helper's terminal, which stays open across refreshes; a subagent's
+    /// shows its thread. The sidebar only counts them.
+    #[gpui::test]
+    fn the_agents_panel_shows_what_threads_run(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("helpers");
+        // Reports a subagent, its task in base64 as Claude Code sends it.
+        let report = r#"t=$(printf 'Explore code' | base64); printf '\033]7501;state=working:app=claude-code:id=sub1:title=%s\033\\' "$t"; exec sleep 600"#;
+        let a = server.run("/", &["lemur.label=main"], &["sh", "-c", report]);
+        let out = server.hc(&[
+            "run",
+            "--bg",
+            "--json",
+            "--parent",
+            &a,
+            "--label",
+            "lemur.label=helper",
+            "--",
+            "sleep",
+            "600",
+        ]);
+        let started: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let b = started["address"].as_str().unwrap().to_string();
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let helpers = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                let threads = &app.snap.hosts[0].other;
+                let names: Vec<String> = threads.iter().map(|s| s.name.clone()).collect();
+                let helpers: Vec<(String, bool)> = threads
+                    .iter()
+                    .flat_map(|s| s.helpers.iter().map(|h| (h.label.clone(), h.terminal)))
+                    .collect();
+                (names, helpers)
+            })
+        };
+        let shown = wait_until(Duration::from_secs(10), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            helpers(cx).1.len() == 2
+        });
+        assert!(shown, "{:?}", helpers(cx));
+        assert_eq!(
+            helpers(cx),
+            (
+                vec![a.clone()],
+                vec![("Explore code".into(), false), ("helper".into(), true)]
+            ),
+            "the helper's terminal isn't a thread of its own"
+        );
+        assert!(
+            cx.debug_bounds("helpers main").is_some(),
+            "the sidebar counts them"
+        );
+        assert!(
+            cx.debug_bounds("agent-0-0").is_none(),
+            "the panel starts hidden"
+        );
+
+        cx.simulate_keystrokes("cmd-shift-a");
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        let active = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
+        click("agent-0-1", cx);
+        assert_eq!(active(cx), Some(key(&b)));
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(active(cx), Some(key(&b)), "kept across a refresh");
+        click("agent-0-0", cx);
+        assert_eq!(active(cx), Some(key(&a)), "a subagent shows its thread");
+        let_attaches_end(&app, cx);
+    }
+
+    /// The agents panel lists Claude threads, the most urgent first, and
+    /// takes turns with the notes on the right.
+    #[gpui::test]
+    fn agents_come_most_urgent_first(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        apply(
+            &app,
+            &[
+                ("idle", Activity::Idle),
+                ("asks", Activity::NeedsInput),
+                ("works", Activity::Working),
+                ("shell", Activity::Unknown),
+            ],
+            cx,
+        );
+        let listed = app.read_with(cx, |app, _| {
+            app.agents()
+                .iter()
+                .map(|(_, s)| s.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(listed, ["asks", "works", "idle"], "a plain shell isn't one");
+
+        let open = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| (app.notes_open, app.agents_open))
+        };
+        cx.simulate_keystrokes("cmd-r");
+        assert_eq!(open(cx), (true, false), "⌘R: the notes first");
+        cx.simulate_keystrokes("cmd-shift-a");
+        assert_eq!(open(cx), (false, true), "one or the other");
+        cx.simulate_keystrokes("cmd-shift-a");
+        assert_eq!(open(cx), (false, false));
+        // ⌘R brings back the one shown last, and hides whichever shows.
+        cx.simulate_keystrokes("cmd-r");
+        assert_eq!(open(cx), (false, true));
+        cx.simulate_keystrokes("cmd-r");
+        assert_eq!(open(cx), (false, false));
+        app.update(cx, |app, cx| app.toggle_notes(cx));
+        cx.simulate_keystrokes("cmd-r cmd-r");
+        assert_eq!(open(cx), (true, false), "the notes again");
     }
 
     /// A terminal whose stream dropped while its program may still run

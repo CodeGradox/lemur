@@ -110,6 +110,25 @@ pub struct Session {
     /// Its program runs: herdr-core knows its pid. A kept terminal whose
     /// program was lost has none until its new shell starts.
     pub running: bool,
+    /// What it runs to help it, as a tree in order: Claude Code's subagents
+    /// while they work, and terminals its agent started with `hc run`.
+    pub helpers: Vec<Helper>,
+}
+
+/// Something a thread runs to help it: one of Claude Code's subagents, as
+/// Claude reports it (a status record), or a terminal of its own that its
+/// agent started (`hc run`, which records the starter as its parent).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Helper {
+    /// The record's id, or the terminal's address.
+    pub id: String,
+    /// The subagent's task, or the terminal's label.
+    pub label: String,
+    pub activity: Activity,
+    /// A terminal of its own, which opens; a subagent runs inside Claude.
+    pub terminal: bool,
+    /// How many helpers up it is from the thread: 0 is the thread's own.
+    pub depth: usize,
 }
 
 /// A Claude conversation running in a session: its ID, and the folder it
@@ -379,11 +398,17 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
-    // An agent's helpers belong to it, not to the sidebar.
+    // An agent's helpers go under it, not in the sidebar's lists; one whose
+    // agent is gone is a thread of its own.
+    let addresses: HashSet<&str> = terminals.iter().map(|t| t.address.as_str()).collect();
     let mut sessions: Vec<Session> = terminals
         .iter()
-        .filter(|t| t.parent.is_none())
-        .map(|t| session(t, now))
+        .filter(|t| parent_of(t).is_none_or(|p| !addresses.contains(p.as_str())))
+        .map(|t| {
+            let mut s = session(t, now);
+            s.helpers = helpers(t, terminals, 0);
+            s
+        })
         .collect();
     let pids: HashMap<u32, String> = terminals
         .iter()
@@ -444,12 +469,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
     let label = |key: &str| t.labels.get(key).filter(|v| !v.is_empty());
     let (activity, waiting_for) = match &t.status {
         Some(status) => {
-            let activity = match status.state.as_str() {
-                "working" => Activity::Working,
-                "blocked" | "error" => Activity::NeedsInput,
-                "idle" | "done" => Activity::Idle,
-                _ => Activity::Unknown,
-            };
+            let activity = activity(&status.state);
             let asks = activity == Activity::NeedsInput && !status.msg.is_empty();
             (activity, asks.then(|| status.msg.clone()))
         }
@@ -469,7 +489,74 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         claude: None,
         busy: busy(t),
         running: t.pid.is_some(),
+        helpers: vec![],
     }
+}
+
+/// What a program's status word (OSC 7501) says it's doing.
+fn activity(state: &str) -> Activity {
+    match state {
+        "working" => Activity::Working,
+        "blocked" | "error" => Activity::NeedsInput,
+        "idle" | "done" => Activity::Idle,
+        _ => Activity::Unknown,
+    }
+}
+
+/// What `t` runs to help it, among `all`, as a tree in order: its own
+/// subagents first, then each terminal it started, with what that one
+/// runs under it.
+fn helpers(t: &Terminal, all: &[Terminal], depth: usize) -> Vec<Helper> {
+    // Deeper than an agent's helpers' helpers' helpers is a loop.
+    if depth > 3 {
+        return vec![];
+    }
+    let mut out: Vec<Helper> = t
+        .records
+        .iter()
+        .flatten()
+        .map(|(id, r)| Helper {
+            id: id.clone(),
+            label: [&r.title, &r.msg]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Subagent".into()),
+            activity: activity(&r.state),
+            terminal: false,
+            depth,
+        })
+        .collect();
+    let mut children: Vec<&Terminal> = all
+        .iter()
+        .filter(|c| parent_of(c).as_deref() == Some(t.address.as_str()))
+        .collect();
+    children.sort_by_key(|c| c.created_ms);
+    for c in children {
+        let label = c.labels.get(LABEL).filter(|v| !v.is_empty());
+        out.push(Helper {
+            id: c.address.clone(),
+            label: label.cloned().unwrap_or_else(|| shown_name(c)),
+            activity: c
+                .status
+                .as_ref()
+                .map_or(Activity::Unknown, |s| activity(&s.state)),
+            terminal: true,
+            depth,
+        });
+        out.extend(helpers(c, all, depth + 1));
+    }
+    out
+}
+
+/// The address of the terminal that started `t`, as this core calls it:
+/// on another machine, a parent's bare `t3` is that machine's.
+fn parent_of(t: &Terminal) -> Option<String> {
+    let parent = t.parent.as_deref().filter(|p| !p.is_empty())?;
+    Some(match (parent.contains('/'), t.machine()) {
+        (false, Some(machine)) => format!("{machine}/{parent}"),
+        _ => parent.to_string(),
+    })
 }
 
 /// The shells a terminal can idle in at their prompt, as the OS names
@@ -719,6 +806,75 @@ mod tests {
         }
     }
 
+    /// A thread's helpers go under it as a tree: Claude's subagents as it
+    /// reports them, then the terminals its agent started, each with its
+    /// own under it. A helper whose agent is gone is a thread again.
+    #[test]
+    fn helpers_go_under_their_thread() {
+        let cfg = cfg();
+        let data = parse(&cfg, &cfg.hosts[0], "");
+        let record = |state: &str, title: &str| Status {
+            state: state.into(),
+            title: title.into(),
+            ..Default::default()
+        };
+        // Started at `at`, as its pid is.
+        let child = |address: &str, parent: &str, at: u32, label: &str| Terminal {
+            parent: Some(parent.into()),
+            status: Some(record("working", "")),
+            created_ms: at.into(),
+            ..terminal(address, "/tmp", at, &[(LABEL, label)])
+        };
+        let terminals = [
+            Terminal {
+                records: Some(BTreeMap::from([
+                    ("a1".to_string(), record("working", "Explore the parser")),
+                    ("a2".to_string(), record("blocked", "")),
+                ])),
+                ..terminal("agent/t1", "/tmp", 100, &[(LABEL, "main")])
+            },
+            // As the host's core calls its parent, and as this one does.
+            child("agent/t3", "t1", 130, "fix"),
+            child("agent/t2", "agent/t1", 120, "review"),
+            Terminal {
+                records: Some(BTreeMap::from([(
+                    "b1".to_string(),
+                    record("working", "Read the tests"),
+                )])),
+                ..child("agent/t4", "t2", 140, "deeper")
+            },
+            child("agent/t5", "agent/t9", 150, "orphan"),
+        ];
+        let h = view(&cfg, &cfg.hosts[0], &data, &terminals);
+        let names: Vec<&str> = h.other.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["agent/t1", "agent/t5"]);
+        let tree: Vec<(&str, &str, bool, usize, Activity)> = h.other[0]
+            .helpers
+            .iter()
+            .map(|x| {
+                (
+                    x.id.as_str(),
+                    x.label.as_str(),
+                    x.terminal,
+                    x.depth,
+                    x.activity,
+                )
+            })
+            .collect();
+        assert_eq!(
+            tree,
+            [
+                ("a1", "Explore the parser", false, 0, Activity::Working),
+                ("a2", "Subagent", false, 0, Activity::NeedsInput),
+                ("agent/t2", "review", true, 0, Activity::Working),
+                ("agent/t4", "deeper", true, 1, Activity::Working),
+                ("b1", "Read the tests", false, 2, Activity::Working),
+                ("agent/t3", "fix", true, 0, Activity::Working),
+            ]
+        );
+        assert!(h.other[1].helpers.is_empty());
+    }
+
     #[test]
     fn parses_worktrees_and_assigns_sessions() {
         let cfg = cfg();
@@ -792,6 +948,7 @@ mod tests {
             status: Some(Status {
                 state: state.into(),
                 msg: msg.into(),
+                ..Default::default()
             }),
             ..terminal("agent/t1", "/tmp", 100, &[])
         };

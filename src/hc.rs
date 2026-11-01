@@ -55,6 +55,9 @@ pub struct Terminal {
     pub parent: Option<String>,
     /// What its program last reported (OSC 7501), as Claude Code does.
     pub status: Option<Status>,
+    /// What it reports of its own helpers, by id: Claude Code reports each
+    /// subagent it runs, its task as the title, until it's done.
+    pub records: Option<BTreeMap<String, Status>>,
     /// What runs in it now, and where.
     pub foreground: Option<Foreground>,
     pub cols: u16,
@@ -72,6 +75,7 @@ pub struct Terminal {
 pub struct Status {
     pub state: String,
     pub msg: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

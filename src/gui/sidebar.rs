@@ -435,10 +435,32 @@ impl Lemur {
                 )
             }
         };
+        // How many it runs to help it, Claude's subagents above all; the
+        // agents panel shows them. A count, so rows don't shift as they come
+        // and go.
+        let helpers = (!s.helpers.is_empty()).then(|| {
+            let mut names: Vec<String> = s.helpers.iter().map(|h| h.label.clone()).collect();
+            names.push("The agents panel (⌘⇧A) shows them.".into());
+            (s.helpers.len(), SharedString::from(names.join("\n")))
+        });
+        let selector = format!("helpers {label}");
         let suffix = move |_: &mut Window, _: &mut App| {
             let this = this.clone();
             let key = key.clone();
             let status = status_dot(&key, dot, working, tip.clone());
+            let helpers = helpers.clone().map(|(n, names)| {
+                let selector = selector.clone();
+                h_flex()
+                    .id("helpers")
+                    .debug_selector(move || selector)
+                    .gap_0p5()
+                    .items_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .tooltip(move |window, cx| Tooltip::new(names.clone()).build(window, cx))
+                    .child(Icon::new(gpui_kit::assets::IconName::Bot).xsmall())
+                    .child(n.to_string())
+            });
             let close = Button::new("close")
                 .ghost()
                 .xsmall()
@@ -455,6 +477,7 @@ impl Lemur {
             h_flex()
                 .gap_1()
                 .items_center()
+                .children(helpers)
                 .child(div().text_xs().text_color(muted).child(detail.clone()))
                 .child(status)
                 .child(close)
