@@ -191,13 +191,22 @@ pub fn update(targets: &[Target], cores: &Cores) -> Result<String> {
     Ok(format!("Updated herdr-core on {}", done.join(" and ")))
 }
 
-/// Whether version `a` is newer than `b`: `0.1.16` over `0.1.9`.
+/// Whether version `a` is newer than `b`: `0.1.16` over `0.1.9`, and over
+/// `0.1.16-rc.1`. What follows a `+` (a build's) doesn't count, and `0.2`
+/// is `0.2.0`.
 pub fn newer(a: &str, b: &str) -> bool {
-    let parts = |v: &str| -> Vec<u64> {
-        v.trim_start_matches("hc ")
-            .split(['.', '-'])
-            .map(|p| p.parse().unwrap_or(0))
-            .collect()
+    let parts = |v: &str| -> (Vec<u64>, bool) {
+        let v = v.trim_start_matches("hc ");
+        let v = v.split('+').next().unwrap_or(v);
+        let (numbers, release) = match v.split_once('-') {
+            Some((numbers, _)) => (numbers, false),
+            None => (v, true),
+        };
+        let mut numbers: Vec<u64> = numbers.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        if numbers.len() < 3 {
+            numbers.resize(3, 0);
+        }
+        (numbers, release)
     };
     parts(a) > parts(b)
 }
@@ -242,6 +251,10 @@ mod tests {
         assert!(newer("0.2.0", "0.1.99"));
         assert!(!newer("0.1.16", "0.1.16"));
         assert!(!newer("0.1.15", "0.1.16"));
+        assert!(newer("0.1.17", "0.1.17-rc.1"));
+        assert!(!newer("0.1.17-rc.1", "0.1.17"));
+        assert!(!newer("0.1.1", "0.1.16+abc"));
+        assert!(!newer("0.2.0", "0.2"));
     }
 
     #[test]
