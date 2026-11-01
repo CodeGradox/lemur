@@ -7,7 +7,10 @@ use super::meter::ClaudeFound;
 use super::sidebar::claude_icon;
 use super::terminal::{Palette, SLOTS, Slot, set_color};
 use crate::config::{Config, FONT_SIZES, Language, Terminal, ThemeChoice};
+use crate::core_update::{self, Versions};
 use alacritty_terminal::vte::ansi::Rgb;
+use gpui_kit::component::Disableable;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::setting::{
@@ -136,6 +139,11 @@ struct SettingsView {
     focus: FocusHandle,
     _prefs: Subscription,
     _found: Subscription,
+    /// herdr-core's versions here and on each machine, once asked.
+    core: Option<Result<Versions, String>>,
+    /// Updating it, and then what that did, or why it didn't.
+    updating: bool,
+    core_note: Option<(String, bool)>,
     _pickers: Vec<Subscription>,
 }
 
@@ -179,6 +187,10 @@ impl SettingsView {
                 });
             }
         }
+        // Tests don't ask the release site.
+        if !cfg!(test) {
+            cx.defer_in(window, |this: &mut Self, _, cx| this.check_core(cx));
+        }
         SettingsView {
             fonts,
             pickers,
@@ -188,6 +200,9 @@ impl SettingsView {
                 cx.notify();
             }),
             _found: cx.observe_global::<ClaudeFound>(|_, cx| cx.notify()),
+            core: None,
+            updating: false,
+            core_note: None,
             _pickers: subscriptions,
         }
     }
@@ -336,6 +351,9 @@ impl Render for SettingsView {
             SettingPage::new("Claude")
                 .icon(claude_icon())
                 .group(SettingGroup::new().item(usage)),
+            SettingPage::new("herdr-core")
+                .icon(super::icons::server())
+                .group(self.core_group(cx)),
             SettingPage::new("Shortcuts")
                 // Not among gpui-component's own icons; the full set has it.
                 .icon(gpui_kit::assets::IconName::Keyboard)
@@ -374,6 +392,138 @@ impl Render for SettingsView {
                         .child(format!("Couldn't save: {error}")),
                 )
             })
+    }
+}
+
+impl SettingsView {
+    /// Asks which herdr-core runs here and on each machine, and the latest.
+    fn check_core(&mut self, cx: &mut Context<Self>) {
+        self.core = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let versions = cx.background_spawn(async { core_update::check() }).await;
+            this.update(cx, |this, cx| {
+                this.core = Some(versions.map_err(|e| format!("{e:#}")));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Brings what's behind up to the latest: here first, then the machines.
+    fn update_core(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(versions)) = &self.core else {
+            return;
+        };
+        let outdated = versions.outdated();
+        if outdated.is_empty() || self.updating {
+            return;
+        }
+        self.updating = true;
+        self.core_note = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_spawn(async move { core_update::update(&outdated) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.updating = false;
+                this.core_note = Some(match done {
+                    Ok(note) => (note, false),
+                    Err(e) => (format!("{e:#}"), true),
+                });
+                this.check_core(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Each herdr-core's version, the latest, and Update.
+    fn core_group(&self, cx: &mut Context<Self>) -> SettingGroup {
+        let text =
+            |s: String| SettingField::render(move |_, _, _| div().text_sm().child(s.clone()));
+        let group = SettingGroup::new().description(
+            "herdr-core runs Lemur's terminals, here and on each host. An update keeps them running.",
+        );
+        let versions = match &self.core {
+            None => return group.item(SettingItem::new("Versions", text("Asking…".into()))),
+            Some(Err(e)) => {
+                return group.item(SettingItem::new(
+                    "Versions",
+                    text(format!("Couldn't ask: {e}")),
+                ));
+            }
+            Some(Ok(v)) => v.clone(),
+        };
+        let latest = versions.latest.clone();
+        let shown = |v: &Option<String>| {
+            let v = v.clone().unwrap_or_else(|| "unknown".into());
+            match &latest {
+                Some(l) if core_update::newer(l, &v) => format!("{v} · {l} is out"),
+                Some(_) => format!("{v} · up to date"),
+                None => v,
+            }
+        };
+        let mut here = shown(&versions.here);
+        if let Some(by) = &versions.managed {
+            here += &format!(" · {by} updates it");
+        }
+        let mut group = group.item(SettingItem::new("This Mac", text(here)));
+        for (name, v) in &versions.machines {
+            group = group.item(SettingItem::new(name.clone(), text(shown(v))));
+        }
+        let outdated = versions.outdated();
+        let what = if latest.is_none() {
+            "Couldn't ask for the latest release.".to_string()
+        } else if outdated.is_empty() {
+            "Everything is up to date.".to_string()
+        } else {
+            format!("Updates {}.", versions.describe(&outdated))
+        };
+        let this = cx.entity().downgrade();
+        let updating = self.updating;
+        let can = !outdated.is_empty() && !updating;
+        let buttons = SettingField::render(move |_, _, _| {
+            let (update, check) = (this.clone(), this.clone());
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("update-core")
+                        .small()
+                        .primary()
+                        .label(if updating { "Updating…" } else { "Update" })
+                        .disabled(!can)
+                        .on_click(move |_, _, cx| {
+                            update.update(cx, |v, cx| v.update_core(cx)).ok();
+                        }),
+                )
+                .child(
+                    Button::new("check-core")
+                        .small()
+                        .label("Check again")
+                        .disabled(updating)
+                        .on_click(move |_, _, cx| {
+                            check.update(cx, |v, cx| v.check_core(cx)).ok();
+                        }),
+                )
+        });
+        let mut group = group.item(SettingItem::new("Update", buttons).description(what));
+        if let Some((note, failed)) = self.core_note.clone() {
+            let color = if failed {
+                cx.theme().danger
+            } else {
+                cx.theme().muted_foreground
+            };
+            group = group.item(SettingItem::new(
+                "",
+                SettingField::render(move |_, _, _| {
+                    div().text_sm().text_color(color).child(note.clone())
+                }),
+            ));
+        }
+        group
     }
 }
 

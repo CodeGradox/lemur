@@ -72,6 +72,7 @@ actions!(
         CommandPalette,
         PutAway,
         ToggleChanges,
+        UpdateCore,
         OpenSettings,
         AddProject,
         Refresh,
@@ -317,6 +318,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("Hide Lemur", Hide),
                     MenuItem::action("Hide Others", HideOthers),
                     MenuItem::action("Show All", ShowAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Update herdr-core", UpdateCore),
                     MenuItem::separator(),
                     MenuItem::action("Quit Lemur", Quit),
                 ]),
@@ -770,6 +773,7 @@ impl Lemur {
         if first {
             self.tick_meter(window.is_window_active(), cx);
             self.ask_changes(cx);
+            self.check_core_updates(cx);
         }
         self.keep_claude_ids(cx);
         self.notify_news(news, window, cx);
@@ -1161,6 +1165,55 @@ impl Lemur {
         self.right == Some(which)
     }
 
+    /// Says so when a newer herdr-core is out than runs here or on a
+    /// machine. Tests don't ask the release site.
+    fn check_core_updates(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        self.in_background(cx, crate::core_update::check, |this, versions, _, cx| {
+            let Ok(versions) = versions else { return };
+            let outdated = versions.outdated();
+            if let (false, Some(latest)) = (outdated.is_empty(), &versions.latest) {
+                let note = format!(
+                    "herdr-core {latest} is out ({}): ⌘⇧P → Update herdr-core, or Settings → herdr-core",
+                    versions.describe(&outdated)
+                );
+                this.note(note, cx);
+            }
+        })
+        .detach();
+    }
+
+    /// Updates herdr-core here, then on each machine behind, as Herdr does;
+    /// terminals keep running.
+    fn update_core(&mut self, cx: &mut Context<Self>) {
+        self.status = Some(("Updating herdr-core…".into(), Kind::Progress));
+        cx.notify();
+        self.in_background(
+            cx,
+            || {
+                let versions = crate::core_update::check()?;
+                if versions.latest.is_none() {
+                    anyhow::bail!("couldn't ask for herdr-core's latest release");
+                }
+                let outdated = versions.outdated();
+                if outdated.is_empty() {
+                    return Ok(format!(
+                        "herdr-core is up to date ({})",
+                        versions.here.unwrap_or_default()
+                    ));
+                }
+                crate::core_update::update(&outdated)
+            },
+            |this, done, _, cx| match done {
+                Ok(note) => this.note(note, cx),
+                Err(e) => this.fail(e, cx),
+            },
+        )
+        .detach();
+    }
+
     /// Points the Changes panel at the worktree on show, and asks it.
     fn show_changes(&mut self, cx: &mut Context<Self>) {
         let place = self.active_worktree().and_then(|(host, w)| {
@@ -1372,6 +1425,7 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &ToggleChanges, _, cx| this.toggle_right(Right::Changes, cx)),
             )
+            .on_action(cx.listener(|this, _: &UpdateCore, _, cx| this.update_core(cx)))
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
             )

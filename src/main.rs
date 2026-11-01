@@ -3,6 +3,7 @@ mod attach;
 mod browse;
 mod clip;
 mod config;
+mod core_update;
 mod dictate;
 mod gui;
 mod hc;
