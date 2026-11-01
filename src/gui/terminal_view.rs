@@ -709,9 +709,32 @@ impl TerminalView {
         }
     }
 
-    /// A program in mouse mode wants SGR reports; otherwise lemur selects.
+    /// A program in mouse mode gets the mouse; otherwise lemur selects.
     fn reports_mouse(mode: TermMode) -> bool {
-        mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE)
+        mode.intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Sends the program a mouse report, encoded as it asked.
+    fn report_mouse(
+        &self,
+        button: keys::MouseButton,
+        drag: bool,
+        mods: keys::Mods,
+        (col, line): (usize, usize),
+        pressed: bool,
+        times: usize,
+    ) {
+        let mode = self.mode();
+        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+            keys::MouseEncoding::Sgr
+        } else if mode.contains(TermMode::UTF8_MOUSE) {
+            keys::MouseEncoding::Utf8
+        } else {
+            keys::MouseEncoding::Normal
+        };
+        if let Some(report) = keys::mouse_report(encoding, button, drag, mods, col, line, pressed) {
+            self.write(report.repeat(times));
+        }
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -737,16 +760,9 @@ impl TerminalView {
             && Self::reports_mouse(self.mode())
             && !event.modifiers.shift
         {
-            let (col, line) = self.cell_at(event.position);
-            self.pressed = Some((button, (col, line)));
-            self.write(keys::sgr_mouse(
-                button,
-                false,
-                mods(event.modifiers),
-                col,
-                line,
-                true,
-            ));
+            let at = self.cell_at(event.position);
+            self.pressed = Some((button, at));
+            self.report_mouse(button, false, mods(event.modifiers), at, true, 1);
             return;
         }
         if event.button == MouseButton::Left
@@ -786,15 +802,8 @@ impl TerminalView {
         }
         self.pressed = None;
         if Self::reports_mouse(self.mode()) {
-            let (col, line) = self.cell_at(event.position);
-            self.write(keys::sgr_mouse(
-                pressed,
-                false,
-                mods(event.modifiers),
-                col,
-                line,
-                false,
-            ));
+            let at = self.cell_at(event.position);
+            self.report_mouse(pressed, false, mods(event.modifiers), at, false, 1);
         }
     }
 
@@ -831,14 +840,7 @@ impl TerminalView {
         let cell = self.cell_at(event.position);
         if cell != at {
             self.pressed = Some((pressed, cell));
-            self.write(keys::sgr_mouse(
-                pressed,
-                true,
-                mods(event.modifiers),
-                cell.0,
-                cell.1,
-                true,
-            ));
+            self.report_mouse(pressed, true, mods(event.modifiers), cell, true, 1);
         }
     }
 
@@ -855,14 +857,13 @@ impl TerminalView {
         let mode = self.mode();
         let notches = lines.unsigned_abs() as usize;
         if Self::reports_mouse(mode) {
-            let (col, line) = self.cell_at(event.position);
+            let at = self.cell_at(event.position);
             let button = if lines > 0 {
                 keys::MouseButton::WheelUp
             } else {
                 keys::MouseButton::WheelDown
             };
-            let report = keys::sgr_mouse(button, false, mods(event.modifiers), col, line, true);
-            self.write(report.repeat(notches));
+            self.report_mouse(button, false, mods(event.modifiers), at, true, notches);
         } else if mode.contains(TermMode::ALT_SCREEN) {
             let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
             self.write(arrow.repeat(notches));
@@ -1795,6 +1796,54 @@ mod tests {
             "it read {:?}",
             read()
         );
+    }
+
+    /// A program that asks for the mouse without SGR (1000 alone, as
+    /// GNU screen or an older curses app) gets the normal reports.
+    #[gpui::test]
+    fn clicks_reach_a_program_without_sgr(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("buttons-x10");
+        let script = r"printf '\033[?1000h'; stty raw -echo; head -c 24 | xxd -p -c 64";
+        let (view, t, cx) = attach(&server, &["sh", "-c", script], cx);
+        let reporting = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
+        });
+        assert!(reporting, "the program never asked for mouse reports");
+        let at = view.read_with(cx, |v, _| {
+            v.bounds.origin + point(v.cell_size.width * 2.5, v.cell_size.height * 2.5)
+        });
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(at, MouseButton::Middle, none);
+        cx.simulate_mouse_down(at, MouseButton::Right, none);
+        cx.simulate_mouse_up(at, MouseButton::Right, none);
+        let read = || server.hc(&["read", &t]);
+        // ESC [ M, then 32 + button (3: up), column and row from 1.
+        let reports = "1b5b4d2123231b5b4d2323231b5b4d2223231b5b4d232323";
+        assert!(
+            wait_until(Duration::from_secs(5), || read().contains(reports)),
+            "it read {:?}",
+            read()
+        );
+    }
+
+    #[test]
+    fn mouse_reports_take_the_encoding_asked_for() {
+        use crate::gui::keys::{Mods, MouseButton as B, MouseEncoding as E, mouse_report};
+        let report =
+            |e, col, pressed| mouse_report(e, B::Left, false, Mods::default(), col, 0, pressed);
+        assert_eq!(report(E::Normal, 0, true).unwrap(), b"\x1b[M !!");
+        assert_eq!(report(E::Normal, 0, false).unwrap(), b"\x1b[M#!!");
+        assert_eq!(report(E::Normal, 300, true), None, "past 223");
+        // Column 101: 32 + 101 is U+0085, two bytes in UTF-8.
+        assert_eq!(report(E::Utf8, 100, true).unwrap(), b"\x1b[M \xc2\x85!");
+        assert_eq!(
+            mouse_report(E::Normal, B::WheelUp, false, Mods::default(), 0, 0, false),
+            None,
+            "a wheel doesn't come up"
+        );
+        assert_eq!(report(E::Sgr, 0, true).unwrap(), b"\x1b[<0;1;1M");
     }
 
     /// Rows reach the painter without the blanks after their text.
