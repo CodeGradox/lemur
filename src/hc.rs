@@ -973,7 +973,7 @@ fn test_route(host: &str) -> Option<String> {
     let routes = TEST_ROUTES.lock().unwrap();
     routes
         .iter()
-        .find(|(h, _)| h == host)
+        .rfind(|(h, _)| h == host)
         .map(|(_, s)| s.clone())
 }
 
@@ -1042,18 +1042,21 @@ mod tests {
     #[test]
     fn a_machine_by_the_hosts_name_must_match_it() {
         let server = HcServer::new("machine-match");
-        let _far = server.far_config("box");
+        let _far = server.far_config("match-box");
         let core = server.core();
-        let host = Host::new("BOX", "box");
-        assert_eq!(core.machine(&host).unwrap(), "box");
+        let host = Host::new("Match-Box", "match-box");
+        assert_eq!(core.machine(&host).unwrap(), "match-box");
 
-        let mut other = Host::new("box", "box");
+        let mut other = Host::new("match-box", "match-box");
         other.hc_session = Some("another".into());
         let e = core.machine(&other).unwrap_err();
-        assert!(format!("{e:#}").contains("machine box reaches"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("machine match-box reaches"),
+            "{e:#}"
+        );
 
         // Kept a while, so each refresh doesn't ask, or dial, again.
-        let kept = core.machines.lock().unwrap()["box"].clone();
+        let kept = core.machines.lock().unwrap()["match-box"].clone();
         assert!(matches!(&*kept.lock().unwrap(), Some(Err(_))));
         let again = core.machine(&other).unwrap_err();
         assert_eq!(format!("{again:#}"), format!("{e:#}"));

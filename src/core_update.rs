@@ -247,7 +247,7 @@ mod tests {
         assert!(v.here.is_some(), "{v:?}");
         assert!(v.machines.is_empty());
 
-        let far = server.far_config("box");
+        let far = server.far_config("update-box");
         assert_eq!(
             Cores::of(&far),
             Cores {

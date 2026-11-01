@@ -319,19 +319,24 @@ fn test_cores_have_tags_of_their_own() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut files,
     );
-    let mut seen = std::collections::HashMap::new();
-    let call = concat!("HcServer::new", "(\"");
-    for file in files {
-        let text = std::fs::read_to_string(&file).unwrap();
-        for (at, _) in text.match_indices(call) {
-            let rest = &text[at + call.len()..];
-            let tag = &rest[..rest.find('"').unwrap()];
-            if let Some(other) = seen.insert(tag.to_string(), file.clone()) {
-                panic!("tag {tag:?} in {} and {}", other.display(), file.display());
+    // Stand-in hosts too: their routes are found by name.
+    for call in [
+        concat!("HcServer::new", "(\""),
+        concat!("far_config", "(\""),
+    ] {
+        let mut seen = std::collections::HashMap::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (at, _) in text.match_indices(call) {
+                let rest = &text[at + call.len()..];
+                let tag = &rest[..rest.find('"').unwrap()];
+                if let Some(other) = seen.insert(tag.to_string(), file.clone()) {
+                    panic!("{tag:?} in {} and {}", other.display(), file.display());
+                }
             }
         }
+        assert!(!seen.is_empty(), "found no {call}");
     }
-    assert!(seen.len() > 50, "found {} tags", seen.len());
 }
 
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.
