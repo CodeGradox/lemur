@@ -51,6 +51,9 @@ pub(super) struct ChangesPanel {
     /// What the last commit did, or why it didn't.
     note: Option<(String, bool)>,
     _message: Subscription,
+    /// Asking the worktree for its changes; apart from the diff and the
+    /// commit, so neither cancels it.
+    _refresh: Option<Task<()>>,
     _task: Option<Task<()>>,
 }
 
@@ -77,6 +80,7 @@ impl ChangesPanel {
             committing: false,
             note: None,
             _message: events,
+            _refresh: None,
             _task: None,
         }
     }
@@ -127,7 +131,8 @@ impl ChangesPanel {
         }
         self.loading = true;
         let open = self.open.clone();
-        self._task = Some(cx.spawn(async move |this, cx| {
+        let asked = (host.name.clone(), path.clone());
+        self._refresh = Some(cx.spawn(async move |this, cx| {
             let (files, diff) = cx
                 .background_spawn(async move {
                     let files = changes_in(&host, &path);
@@ -143,6 +148,11 @@ impl ChangesPanel {
                 .await;
             this.update(cx, |this, cx| {
                 this.loading = false;
+                // Another worktree shows now: its changes, not these.
+                if !this.shows(&asked) {
+                    this.refresh(cx);
+                    return;
+                }
                 match files {
                     Ok(files) => {
                         this.error = None;
@@ -170,6 +180,13 @@ impl ChangesPanel {
         }));
     }
 
+    /// Whether worktree `path` on host `name` shows.
+    fn shows(&self, (name, path): &(String, String)) -> bool {
+        self.place
+            .as_ref()
+            .is_some_and(|(h, p, _)| h.name == *name && p == path)
+    }
+
     fn set_diff(&mut self, (lines, added): (Vec<String>, Option<u64>)) {
         if let (Some(open), Some(added)) = (&self.open, added)
             && let Some(f) = self.files.iter_mut().find(|f| f.path == *open)
@@ -187,16 +204,20 @@ impl ChangesPanel {
         let Some(file) = self.files.iter().find(|f| f.path == path).cloned() else {
             return;
         };
-        self.open = Some(path);
+        self.open = Some(path.clone());
         self.lines = vec!["Loading…".into()];
         cx.notify();
+        let asked = (host.name.clone(), root.clone());
         self._task = Some(cx.spawn(async move |this, cx| {
             let diff = cx
                 .background_spawn(async move { diff_of(&host, &root, &file) })
                 .await;
             this.update(cx, |this, cx| {
-                this.set_diff(diff);
-                cx.notify();
+                // Still the file shown, in the worktree shown.
+                if this.shows(&asked) && this.open.as_ref() == Some(&path) {
+                    this.set_diff(diff);
+                    cx.notify();
+                }
             })
             .ok();
         }));
@@ -624,6 +645,69 @@ mod tests {
             diff_lines("Binary files a/x and b/x differ\n", false).0,
             ["A binary file changed"]
         );
+    }
+
+    /// Switched to another worktree while it asks the first, the panel
+    /// lists the second's changes, not the first's; and a click on a file
+    /// while it asks again doesn't stop it asking from then on.
+    #[gpui::test]
+    fn the_panel_lists_the_worktree_it_shows(cx: &mut gpui::TestAppContext) {
+        use super::ChangesPanel;
+        use crate::test_support::wait_until;
+        use gpui_kit::AppContext;
+        use std::time::Duration;
+        let server = crate::test_support::HcServer::new("changes-switch");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-switch");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_in(&repo, &["add", "a.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        git_in(&repo, &["worktree", "add", "-q", "-b", "b", "../b"]);
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let b = dir.join("b");
+        std::fs::write(b.join("b.txt"), "new\n").unwrap();
+        let (a, b_path) = (
+            repo.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        );
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let mut panel = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| ChangesPanel::new(window, cx));
+            panel = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let panel = panel.unwrap();
+        let listed = |cx: &mut gpui::VisualTestContext| {
+            panel.read_with(cx, |p, _| (p.loading, p.listed().0))
+        };
+        panel.update(cx, |p, cx| {
+            p.show(host.clone(), a.clone(), "main".into(), cx);
+            p.show(host.clone(), b_path.clone(), "b".into(), cx);
+        });
+        let settled = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            let (loading, files) = listed(cx);
+            !loading && !files.is_empty()
+        });
+        assert!(settled, "{:?}", listed(cx));
+        assert_eq!(listed(cx).1, [("b.txt".to_string(), '?')]);
+
+        panel.update(cx, |p, cx| {
+            p.refresh(cx);
+            p.open_file("b.txt".into(), cx);
+        });
+        std::fs::write(b.join("c.txt"), "more\n").unwrap();
+        let again = wait_until(Duration::from_secs(10), || {
+            panel.update(cx, |p, cx| p.refresh(cx));
+            cx.run_until_parked();
+            listed(cx).1.len() == 2
+        });
+        assert!(again, "{:?}", listed(cx));
     }
 
     /// In a real repository, on a test herdr-core: listed, diffed, then
