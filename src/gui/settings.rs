@@ -515,13 +515,11 @@ impl SettingsView {
             Some(Ok(v)) => v.clone(),
         };
         let latest = versions.latest.clone();
-        let shown = |v: &Option<String>| {
-            let v = v.clone().unwrap_or_else(|| "unknown".into());
-            match &latest {
-                Some(l) if core_update::newer(l, &v) => format!("{v} · {l} is out"),
-                Some(_) => format!("{v} · up to date"),
-                None => v,
-            }
+        let shown = |v: &Option<String>| match (v, &latest) {
+            (None, _) => "unknown".to_string(),
+            (Some(v), Some(l)) if core_update::newer(l, v) => format!("{v} · {l} is out"),
+            (Some(v), Some(_)) => format!("{v} · up to date"),
+            (Some(v), None) => v.clone(),
         };
         let mut here = shown(&versions.here);
         if let Some(by) = &versions.managed {
@@ -532,13 +530,7 @@ impl SettingsView {
             group = group.item(SettingItem::new(name.clone(), text(shown(v))));
         }
         let outdated = versions.outdated();
-        let what = if latest.is_none() {
-            "Couldn't ask for the latest release.".to_string()
-        } else if outdated.is_empty() {
-            "Everything is up to date.".to_string()
-        } else {
-            format!("Updates {}.", versions.describe(&outdated))
-        };
+        let what = update_summary(&versions);
         let this = cx.entity().downgrade();
         let updating = self.updating;
         let can = !outdated.is_empty() && !updating;
@@ -581,6 +573,30 @@ impl SettingsView {
             ));
         }
         group
+    }
+}
+
+/// What Update does, or why there's nothing for it to do.
+fn update_summary(versions: &Versions) -> String {
+    let outdated = versions.outdated();
+    let Some(latest) = &versions.latest else {
+        return "Couldn't ask for the latest release.".to_string();
+    };
+    if !outdated.is_empty() {
+        return format!("Updates {}.", versions.describe(&outdated));
+    }
+    // Behind, but this Mac's isn't Lemur's to update, and the hosts get
+    // what this Mac has.
+    match &versions.managed {
+        Some(by)
+            if versions
+                .here
+                .as_deref()
+                .is_some_and(|v| core_update::newer(latest, v)) =>
+        {
+            format!("{by} updates this Mac's herdr-core; then Lemur can update the hosts.")
+        }
+        _ => "Everything is up to date.".to_string(),
     }
 }
 
@@ -637,7 +653,7 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             Shortcut {
                 what: "Toggle the right panel",
                 how: Press::Keys(&["cmd-r"]),
-                more: Some("The notes, or the agents if they showed last."),
+                more: Some("The panel that showed last: the notes at first."),
             },
             keys("Toggle the agents", &["cmd-shift-a"]),
             Shortcut {
@@ -672,7 +688,7 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             Shortcut {
                 what: "Close the thread on show",
                 how: Press::Keys(&["cmd-w"]),
-                more: Some("After asking."),
+                more: Some("Asking first while something runs in it."),
             },
             Shortcut {
                 what: "Next thread in the worktree",
@@ -830,8 +846,39 @@ fn monospace_fonts(cx: &App) -> Vec<SharedString> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla};
+    use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla, update_summary};
     use crate::config::ThemeChoice;
+    use crate::core_update::Versions;
+
+    /// With nothing Lemur can update, Update says why, though this Mac's
+    /// herdr-core is behind: a package manager updates it.
+    #[test]
+    fn update_says_why_theres_nothing_to_do() {
+        let behind = Versions {
+            here: Some("0.1.15".into()),
+            managed: Some("homebrew".into()),
+            machines: vec![("agent".into(), Some("0.1.15".into()))],
+            latest: Some("0.1.16".into()),
+        };
+        assert_eq!(
+            update_summary(&behind),
+            "homebrew updates this Mac's herdr-core; then Lemur can update the hosts."
+        );
+        let current = Versions {
+            here: Some("0.1.16".into()),
+            machines: vec![("agent".into(), Some("0.1.16".into()))],
+            ..behind.clone()
+        };
+        assert_eq!(update_summary(&current), "Everything is up to date.");
+        let ours = Versions {
+            managed: None,
+            ..behind
+        };
+        assert_eq!(
+            update_summary(&ours),
+            "Updates this Mac 0.1.15, agent 0.1.15."
+        );
+    }
     use crate::gui::terminal::{DARK, Palette, Slot, set_color};
     use gpui_kit::component::ActiveTheme;
     use gpui_kit::{Keystroke, hsla};
