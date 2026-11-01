@@ -19,6 +19,7 @@ mod new;
 mod notes;
 mod notification;
 mod palette;
+mod peek;
 mod projects;
 mod prompt;
 mod resume;
@@ -32,7 +33,7 @@ mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::config::{Config, ThemeChoice, leaf};
+use crate::config::{Config, Host, ThemeChoice, leaf};
 use crate::dictate;
 use crate::hc;
 use crate::snapshot::{self, Activity, HostData, Session, Snapshot, Worktree};
@@ -255,6 +256,8 @@ struct Lemur {
     palette: Option<palette::Palette>,
     /// The lists whose "Put away" is open, by their key.
     away_open: HashSet<SharedString>,
+    /// A thread peeked at, over the one on show.
+    peek: Option<Key>,
     /// Dictating, under the terminal.
     dictation: Option<(Entity<DictationBar>, Subscription)>,
     /// lemur-dictate, which dictation runs; tests have a stand-in.
@@ -547,6 +550,7 @@ impl Lemur {
             picker: None,
             palette: None,
             away_open: HashSet::new(),
+            peek: None,
             dictation: None,
             helper: dictate::helper(),
             sidebar,
@@ -697,6 +701,9 @@ impl Lemur {
                 || unreached.contains(k.0.as_str())
         };
         self.terminals.retain(|k, _| live(k));
+        if self.peek.as_ref().is_some_and(|k| !live(k)) {
+            self.peek = None;
+        }
         // The thread on show ended: another takes its place.
         let mut instead = None;
         if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
@@ -860,16 +867,15 @@ impl Lemur {
         self.open(host, session, window, cx);
     }
 
-    fn open(&mut self, host: String, session: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(h) = self.cfg.host(&host).cloned() else {
-            return;
-        };
-        let key = (host.clone(), session.clone());
+    /// The terminal view of thread `key` on host `h`, made and attached
+    /// the first time, and attached again once its stream ended.
+    fn terminal_for(&mut self, key: &Key, h: Host, cx: &mut Context<Self>) -> Entity<TerminalView> {
+        let session = key.1.clone();
         let view = self
             .terminals
             .entry(key.clone())
             .or_insert_with(|| {
-                let view = cx.new(|cx| TerminalView::new(h, session.clone(), cx));
+                let view = cx.new(|cx| TerminalView::new(h, session, cx));
                 // Its message shows in the window's snackbars.
                 cx.subscribe(&view, |_, _, _: &StatusChanged, cx| cx.notify())
                     .detach();
@@ -878,6 +884,19 @@ impl Lemur {
             .clone();
         if view.read(cx).exited() {
             view.update(cx, |v, cx| v.connect(cx));
+        }
+        view
+    }
+
+    fn open(&mut self, host: String, session: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(h) = self.cfg.host(&host).cloned() else {
+            return;
+        };
+        let key = (host.clone(), session.clone());
+        let view = self.terminal_for(&key, h, cx);
+        // Peeked at, it's shown now.
+        if self.peek.as_ref() == Some(&key) {
+            self.peek = None;
         }
         self.done.remove(&key);
         self.close_popup(&key, cx);
@@ -1277,6 +1296,7 @@ impl Render for Lemur {
                     .ok();
             })
         });
+        let peek = self.peek_card(cx);
         let palette = self.palette_card(window, cx).map(|card| {
             let this = this.clone();
             spotlight::overlay(card, move |window, cx| {
@@ -1424,6 +1444,7 @@ impl Render for Lemur {
                     ),
             )
             .children(picker)
+            .children(peek)
             .children(prompt)
             .children(palette)
             // Holds the window's focus with no terminal open. It takes no room
@@ -3672,13 +3693,28 @@ mod tests {
             cx.run_until_parked();
         };
         let active = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
-        click("agent-0-1", cx);
-        assert_eq!(active(cx), Some(key(&b)));
-        app.update(cx, |app, cx| app.refresh(cx).detach());
-        cx.run_until_parked();
-        assert_eq!(active(cx), Some(key(&b)), "kept across a refresh");
+        let peeked = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.peek.clone());
+        // A helper's terminal is peeked at, over the one on show.
         click("agent-0-0", cx);
         assert_eq!(active(cx), Some(key(&a)), "a subagent shows its thread");
+        click("agent-0-1", cx);
+        assert_eq!(peeked(cx), Some(key(&b)));
+        assert_eq!(active(cx), Some(key(&a)), "still on show under it");
+        assert!(cx.debug_bounds("peek").is_some());
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(peeked(cx), Some(key(&b)), "kept across a refresh");
+        // A click outside puts it away again.
+        cx.simulate_click(point(px(600.0), px(20.0)), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(peeked(cx), None);
+        click("agent-0-1", cx);
+        // ↗ shows it instead.
+        click("peek-open", cx);
+        assert_eq!((active(cx), peeked(cx)), (Some(key(&b)), None));
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(active(cx), Some(key(&b)), "kept open across a refresh");
         let_attaches_end(&app, cx);
     }
 

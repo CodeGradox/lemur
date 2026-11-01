@@ -6,6 +6,7 @@
 use super::sidebar::{claude_icon, status_dot, thread_icon};
 use super::{Key, Lemur, key, sessions, worktree_label};
 use crate::snapshot::{Activity, Helper, Session};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -130,9 +131,23 @@ impl Lemur {
                 this.open(host.clone(), name.clone(), window, cx)
             })
         };
+        let peek = {
+            let k = k.clone();
+            Button::new(SharedString::from(format!("peek-{i}")))
+                .icon(IconName::Eye)
+                .ghost()
+                .xsmall()
+                .tooltip("Peek at it")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.peek(k.clone(), window, cx);
+                }))
+        };
+        let group = SharedString::from(format!("agent-row-{i}"));
         h_flex()
             .id(SharedString::from(format!("agent-{i}")))
             .debug_selector(move || format!("agent-{i}"))
+            .group(group.clone())
             .w_full()
             .px_2()
             .py_1()
@@ -164,6 +179,14 @@ impl Lemur {
                             .child(place),
                     ),
             )
+            .when(!shown, |row| {
+                row.child(
+                    div()
+                        .invisible()
+                        .group_hover(group, |style| style.visible())
+                        .child(peek),
+                )
+            })
             .child(status_dot(&k, color, s.activity == Activity::Working, tip))
             .into_any_element()
     }
@@ -201,10 +224,17 @@ impl Lemur {
         }
         .into();
         let dot_key: Key = (host.to_string(), format!("{}/{}", s.name, h.id));
+        // A terminal of its own is peeked at, as Herdr does: what the
+        // thread's agent started, over the one on show.
+        let terminal = h.terminal;
         let open = {
             let host = host.to_string();
             cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open(host.clone(), opens.clone(), window, cx)
+                if terminal {
+                    this.peek((host.clone(), opens.clone()), window, cx);
+                } else {
+                    this.open(host.clone(), opens.clone(), window, cx);
+                }
             })
         };
         let icon = if h.terminal {

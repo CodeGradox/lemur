@@ -451,8 +451,17 @@ impl Lemur {
                         Ask::Rename { host, session }
                     })
                 };
+                let peek = {
+                    let (this, key) = (this.clone(), key.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        this.update(cx, |this, cx| this.peek(key.clone(), window, cx))
+                            .ok();
+                    }
+                };
                 let (this, key) = (this.clone(), key.clone());
-                let menu = menu.item(PopupMenuItem::new("Rename…").on_click(rename));
+                let menu = menu
+                    .item(PopupMenuItem::new("Rename…").on_click(rename))
+                    .item(PopupMenuItem::new("Peek").on_click(peek));
                 if away {
                     menu.item(PopupMenuItem::new("Bring back").on_click(move |_, _, cx| {
                         this.update(cx, |this, cx| this.bring_back(&key, cx)).ok();
