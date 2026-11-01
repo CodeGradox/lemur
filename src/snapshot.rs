@@ -588,6 +588,9 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
 fn session(t: &Terminal, now_ms: u64) -> Session {
     let label = |key: &str| t.labels.get(key).filter(|v| !v.is_empty());
     let (activity, waiting_for) = match &t.status {
+        // With its shell back at its prompt, what a program said is over:
+        // a Claude killed outright never says it stopped.
+        Some(_) if !busy(t) => (Activity::Unknown, None),
         Some(status) => {
             let activity = activity(&status.state);
             let asks = activity == Activity::NeedsInput && !status.msg.is_empty();
@@ -1148,6 +1151,29 @@ mod tests {
             (Activity::Working, None),
             "no report: claude agents says"
         );
+    }
+
+    /// What a program said is over once its shell is back at its prompt: a
+    /// Claude killed outright never says it stopped.
+    #[test]
+    fn a_status_left_at_the_prompt_is_over() {
+        let cfg = cfg();
+        let data = parse(&cfg, &cfg.hosts[0], "");
+        let left = |program: &str, pid: u32| Terminal {
+            status: Some(Status {
+                state: "working".into(),
+                ..Default::default()
+            }),
+            foreground: Some(Foreground {
+                pid,
+                name: program.into(),
+                ..Default::default()
+            }),
+            ..terminal("agent/t1", "/tmp", 100, &[])
+        };
+        let shown = |t: Terminal| view(&cfg, &cfg.hosts[0], &data, &[t]).other[0].activity;
+        assert_eq!(shown(left("claude", 200)), Activity::Working);
+        assert_eq!(shown(left("zsh", 100)), Activity::Unknown);
     }
 
     /// A terminal lemur didn't label is called by what it shows.
