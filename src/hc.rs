@@ -557,29 +557,46 @@ impl Core {
         }
         let list = self.call("machine.list", json!({}))?;
         let machines = list["machines"].as_array().cloned().unwrap_or_default();
-        let named = |m: &&Value| m["name"] == host.name.as_str();
-        let reached = |m: &&Value| m["target"] == host.ssh.as_str() && m["via"] != true;
-        let found = machines
-            .iter()
-            .find(named)
-            .or_else(|| machines.iter().find(reached));
+        let wanted = machine_name(&host.name);
+        // Its session, where the host's config names one.
+        let session = |m: &Value| host.hc_session.as_deref().is_none_or(|s| m["session"] == s);
+        let reached =
+            |m: &&Value| m["target"] == host.ssh.as_str() && m["via"] != true && session(m);
+        let named = machines.iter().find(|m| m["name"] == wanted.as_str());
+        // One by the host's name that goes elsewhere would run all of it
+        // there. One reached through a command (`--via`) was set up by
+        // hand, and can't be compared.
+        if let Some(m) = named
+            && ((m["via"] != true && m["target"] != host.ssh.as_str()) || !session(m))
+        {
+            bail!(
+                "herdr-core's machine {wanted} reaches {} (session {}), but the config's host {} \
+                 says {} (session {}): change one, or remove the machine (`hc machine rm {wanted}`)",
+                m["target"].as_str().unwrap_or("?"),
+                m["session"].as_str().unwrap_or("default"),
+                host.name,
+                host.ssh,
+                host.hc_session.as_deref().unwrap_or("default"),
+            );
+        }
+        let found = named.or_else(|| machines.iter().find(reached));
         let name = match found.and_then(|m| m["name"].as_str()) {
             Some(name) => name.to_string(),
             None => {
                 let added = self
                     .call_timeout(
                         "machine.add",
-                        json!({"target": host.ssh, "name": host.name, "session": host.hc_session}),
+                        json!({"target": host.ssh, "name": wanted, "session": host.hc_session}),
                         Duration::from_secs(60),
                     )
                     .with_context(|| {
                         format!(
                             "adding {} to herdr-core (it needs herdr-core on the host too: \
-                             `hc machine add {} --name {} --install`)",
-                            host.name, host.ssh, host.name
+                             `hc machine add {} --name {wanted} --install`)",
+                            host.name, host.ssh
                         )
                     })?;
-                added["name"].as_str().unwrap_or(&host.name).to_string()
+                added["name"].as_str().unwrap_or(&wanted).to_string()
             }
         };
         known.insert(host.name.clone(), name.clone());
@@ -799,6 +816,40 @@ pub fn core(session: Option<&str>) -> Result<Arc<Core>> {
     Ok(core)
 }
 
+/// `name` as herdr-core takes a machine's: 1-32 of a-z 0-9 - _ ., starting
+/// with a letter or digit, and not shaped like a terminal's id (`t7`). A
+/// host typed as `me@Build.example.com` is `me-build.example.com`.
+fn machine_name(name: &str) -> String {
+    let lower: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name: String = lower
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .chars()
+        .take(32)
+        .collect();
+    // herdr-core's ids: t, then 1-9, then its own digits.
+    let id_shaped = name.strip_prefix('t').is_some_and(|rest| {
+        rest.starts_with(|c: char| matches!(c, '1'..='9'))
+            && rest
+                .bytes()
+                .all(|b| b"0123456789bcdfghjkmnpqrstvwxyz".contains(&b))
+    });
+    match name.as_str() {
+        "" => "host".into(),
+        _ if id_shaped => format!("host-{}", &name[..name.len().min(27)]),
+        _ => name,
+    }
+}
+
 /// The core that runs `host`'s terminals, and its name for the host: None
 /// for this Mac.
 pub fn for_host(host: &Host) -> Result<(Arc<Core>, Option<String>)> {
@@ -871,6 +922,33 @@ mod tests {
     use super::*;
     use crate::test_support::{HcServer, TempDir, wait_until};
     use futures::StreamExt;
+
+    #[test]
+    fn hosts_get_names_herdr_core_takes() {
+        assert_eq!(machine_name("agent"), "agent");
+        assert_eq!(machine_name("me@Build.example.com"), "me-build.example.com");
+        assert_eq!(machine_name("-dev box"), "dev-box");
+        assert_eq!(machine_name("t7"), "host-t7");
+        assert_eq!(machine_name("@@"), "host");
+        assert_eq!(machine_name(&"x".repeat(40)).len(), 32);
+        assert_eq!(machine_name("team"), "team", "a word, not an id");
+    }
+
+    /// A host is found under the name herdr-core takes for it; one by its
+    /// name that runs another session than the config says isn't used.
+    #[test]
+    fn a_machine_by_the_hosts_name_must_match_it() {
+        let server = HcServer::new("machine-match");
+        let _far = server.far_config("box");
+        let core = server.core();
+        let host = Host::new("BOX", "box");
+        assert_eq!(core.machine(&host).unwrap(), "box");
+
+        let mut other = Host::new("box", "box");
+        other.hc_session = Some("another".into());
+        let e = core.machine(&other).unwrap_err();
+        assert!(format!("{e:#}").contains("machine box reaches"), "{e:#}");
+    }
 
     /// A `herdr-core connect` that fails the handshake is ended and reaped,
     /// not left a zombie: Lemur tries again every few seconds.
