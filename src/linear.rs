@@ -232,10 +232,11 @@ impl Linear {
         Ok(kept.clone().flatten())
     }
 
+    /// Keeps `tokens`: here first, so they're used even if the store fails,
+    /// as the refresh token they replace is retired.
     fn keep(&self, kept: &mut Option<Option<Tokens>>, tokens: Tokens) -> Result<()> {
-        self.store.save(&tokens)?;
-        *kept = Some(Some(tokens));
-        Ok(())
+        *kept = Some(Some(tokens.clone()));
+        self.store.save(&tokens)
     }
 
     /// Forgets the sign-in; forgotten here even if the store fails.
@@ -377,10 +378,21 @@ impl Linear {
     /// refuses signs Lemur out.
     fn access(&self, stale: Option<&str>) -> Result<String> {
         let mut kept = self.kept();
-        let tokens = self.load(&mut kept)?.ok_or(SignedOut)?;
-        let due = tokens.expires <= now() + 60 || stale == Some(tokens.access.as_str());
-        if !due {
+        let mut tokens = self.load(&mut kept)?.ok_or(SignedOut)?;
+        let due = |t: &Tokens| t.expires <= now() + 60 || stale == Some(t.access.as_str());
+        if !due(&tokens) {
             return Ok(tokens.access);
+        }
+        // Another Lemur (the app, and one built here) may have refreshed it
+        // since: its refresh token is the one Linear still takes.
+        if let Some(stored) = self.store.load()?
+            && stored != tokens
+        {
+            *kept = Some(Some(stored.clone()));
+            if !due(&stored) {
+                return Ok(stored.access);
+            }
+            tokens = stored;
         }
         match self.token(&[
             ("grant_type", "refresh_token"),
@@ -410,8 +422,10 @@ impl Linear {
                 .as_str()
                 .or(answer["error"].as_str())
                 .unwrap_or("no reason given");
-            // Linear turned it down, as a used or revoked refresh token.
-            if (400..500).contains(&status) {
+            // Linear turned it down, as a used or revoked refresh token, or
+            // a code already traded. Anything else, as being asked too
+            // often, leaves the sign-in as it is.
+            if answer["error"] == "invalid_grant" {
                 return Err(anyhow!(Refused).context(format!("Linear refused: {why}")));
             }
             bail!("Linear answered {status}: {why}");
@@ -1023,6 +1037,13 @@ mod tests {
             ("/oauth/token", _) if r.body.contains("refresh_token=r-dead") => {
                 (400, json!({ "error": "invalid_grant" }).to_string())
             }
+            ("/oauth/token", _) if r.body.contains("refresh_token=r-busy") => {
+                (429, json!({ "error": "rate_limited" }).to_string())
+            }
+            (_, Some("Bearer a3")) => (
+                200,
+                json!({ "data": { "issue": issue_json("LAFT-1", "One") } }).to_string(),
+            ),
             ("/oauth/token", _) => (
                 200,
                 json!({ "access_token": "a2", "refresh_token": "r2", "expires_in": 86399 })
@@ -1060,11 +1081,66 @@ mod tests {
         assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
         assert_eq!(api.requests().len(), 5);
 
+        // Another Lemur refreshed it meanwhile: its tokens are used, as
+        // the refresh token here is retired.
+        keep("a1", "r1", now() + 10);
+        store
+            .save(&Tokens {
+                access: "a3".into(),
+                refresh: "r3".into(),
+                expires: now() + 3600,
+            })
+            .unwrap();
+        let asked = api.requests().len();
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        assert_eq!(api.requests().len(), asked + 1, "no refresh");
+
+        // Asked too often: an error, but still signed in.
+        keep("a-old", "r-busy", now() + 10);
+        let e = linear.issue("LAFT-1").unwrap_err();
+        assert!(!is_signed_out(&e), "{e}");
+        assert!(linear.signed_in().unwrap());
+
         // Refused: signed out.
         keep("a-old", "r-dead", now() + 3600);
         let e = linear.issue("LAFT-1").unwrap_err();
         assert!(is_signed_out(&e), "{e}");
         assert!(!linear.signed_in().unwrap());
+    }
+
+    /// Tokens the store fails to keep are still used here: the refresh
+    /// token they replaced is retired.
+    #[test]
+    fn fresh_tokens_are_used_though_the_store_fails() {
+        let api = FakeLinear::new(|r| match (r.path.as_str(), r.authorization.as_deref()) {
+            ("/oauth/token", _) => (
+                200,
+                json!({ "access_token": "a2", "refresh_token": "r2", "expires_in": 86399 })
+                    .to_string(),
+            ),
+            (_, Some("Bearer a2")) => (
+                200,
+                json!({ "data": { "issue": issue_json("LAFT-1", "One") } }).to_string(),
+            ),
+            _ => (401, json!({ "errors": [{ "message": "no" }] }).to_string()),
+        });
+        let dir = TempDir::new("linear-store-fails");
+        // No such folder: every save fails.
+        let linear = Linear::at(&api.url, Store::File(dir.join("gone/tokens")));
+        let due = Tokens {
+            access: "a1".into(),
+            refresh: "r1".into(),
+            expires: now() + 10,
+        };
+        assert!(linear.keep(&mut linear.kept(), due).is_err());
+        assert!(linear.issue("LAFT-1").is_err(), "the save failed");
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        let refreshed = api
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/oauth/token")
+            .count();
+        assert_eq!(refreshed, 1, "r1 isn't used again");
     }
 
     /// Search asks Linear's search, or for the issue when the term is its
