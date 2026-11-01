@@ -187,7 +187,7 @@ impl Lemur {
                         .child(peek),
                 )
             })
-            .child(status_dot(&k, color, s.activity == Activity::Working, tip))
+            .child(status_dot(&k, color, self.breathes(s.activity), tip))
             .into_any_element()
     }
 
@@ -265,12 +265,7 @@ impl Lemur {
             .on_click(open)
             .child(icon.xsmall())
             .child(div().flex_1().min_w_0().truncate().child(label))
-            .child(status_dot(
-                &dot_key,
-                color,
-                h.activity == Activity::Working,
-                tip,
-            ))
+            .child(status_dot(&dot_key, color, self.breathes(h.activity), tip))
             .into_any_element()
     }
 }

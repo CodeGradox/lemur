@@ -419,7 +419,7 @@ impl Lemur {
         let key = key(host, s);
         let active = self.active.as_ref() == Some(&key);
         let label = s.label.clone();
-        let working = s.activity == Activity::Working;
+        let breathes = self.breathes(s.activity);
         let (dot, tip) = self.activity(&key, s, cx);
         let detail = age(s.idle_secs);
         let muted = cx.theme().muted_foreground;
@@ -488,7 +488,7 @@ impl Lemur {
         let suffix = move |_: &mut Window, _: &mut App| {
             let this = this.clone();
             let key = key.clone();
-            let status = status_dot(&key, dot, working, tip.clone());
+            let status = status_dot(&key, dot, breathes, tip.clone());
             let helpers = helpers.clone().map(|(n, names)| {
                 let selector = selector.clone();
                 h_flex()
@@ -531,6 +531,12 @@ impl Lemur {
             menu: Rc::new(menu),
             suffix: Rc::new(move |window, cx| suffix(window, cx).into_any_element()),
         }
+    }
+
+    /// Whether a dot for `activity` breathes: while Claude works, and only
+    /// while Lemur is the active window, as each breath redraws the window.
+    pub(super) fn breathes(&self, activity: Activity) -> bool {
+        activity == Activity::Working && self.looking
     }
 
     /// A thread's dot: its color, and what it says.
@@ -718,8 +724,9 @@ fn ask_on_click(
     }
 }
 
-/// A session's status dot; it breathes while Claude works.
-pub(super) fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyElement {
+/// A session's status dot; it breathes while `breathes` (see
+/// `Lemur::breathes`).
+pub(super) fn status_dot(key: &Key, color: Hsla, breathes: bool, tip: SharedString) -> AnyElement {
     let id = SharedString::from(format!("status-{}-{}", key.0, key.1));
     let dot = div()
         .id(id.clone())
@@ -727,13 +734,15 @@ pub(super) fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedStrin
         .rounded_full()
         .bg(color)
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
-    if working {
+    if breathes {
         dot.with_animation(
             id,
-            // Every animation frame redraws the window; 15 fps is smooth enough.
+            // Every animation frame redraws the window, and the sidebar's
+            // list with it: 7.5 a second keep that cheap and still look
+            // smooth enough.
             Animation::new(Duration::from_millis(1600))
                 .repeat()
-                .with_max_fps(15.0)
+                .with_max_fps(7.5)
                 .with_easing(pulsating_between(0.35, 1.0)),
             |dot, delta| dot.opacity(delta),
         )

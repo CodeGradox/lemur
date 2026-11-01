@@ -154,7 +154,7 @@ impl Lemur {
         let theme = cx.theme();
         let shown = self.active.as_ref() == Some(&key);
         let (dot, tip) = self.activity(&key, s, cx);
-        let working = s.activity == Activity::Working;
+        let breathes = self.breathes(s.activity);
         let open = {
             let key = key.clone();
             cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -207,7 +207,7 @@ impl Lemur {
             .on_click(open)
             .child(thread_icon(s).small())
             .child(div().max_w(px(200.0)).truncate().child(s.label.clone()))
-            .child(status_dot(&key, dot, working, tip))
+            .child(status_dot(&key, dot, breathes, tip))
             .child(close);
         rows::draggable_tab(tab, drag, i, s.label.clone().into(), reorder, cx)
             .context_menu(move |m, window, cx| menu(m, window, cx))

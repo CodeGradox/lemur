@@ -269,6 +269,9 @@ struct Lemur {
     away_open: HashSet<SharedString>,
     /// A thread peeked at, over the one on show.
     peek: Option<Key>,
+    /// Lemur is the active window: only then do working dots breathe, as
+    /// each breath redraws the window.
+    looking: bool,
     /// Dictating, under the terminal.
     dictation: Option<(Entity<DictationBar>, Subscription)>,
     /// lemur-dictate, which dictation runs; tests have a stand-in.
@@ -529,6 +532,8 @@ impl Lemur {
         // Back in the window, the shown session's popup has had its say, as
         // in Zed.
         let back = cx.observe_window_activation(window, |this, window, cx| {
+            this.looking = window.is_window_active();
+            cx.notify();
             if window.is_window_active()
                 && let Some(key) = this.active.clone()
             {
@@ -574,6 +579,7 @@ impl Lemur {
             palette: None,
             away_open: HashSet::new(),
             peek: None,
+            looking: window.is_window_active(),
             dictation: None,
             helper: dictate::helper(),
             sidebar,
@@ -3272,6 +3278,40 @@ mod tests {
         app.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert!(renders(cx) > before);
+    }
+
+    /// A working thread's dot breathes, a few breaths' frames a second,
+    /// only while Lemur is the active window; otherwise it holds still and
+    /// the sidebar isn't redrawn for it.
+    #[gpui::test]
+    fn working_dots_breathe_only_in_the_active_window(cx: &mut gpui::TestAppContext) {
+        // No hosts, so no refresh replaces the snapshot below.
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        apply(&app, &[("busy", Activity::Working)], cx);
+        cx.run_until_parked();
+        let renders =
+            |cx: &mut VisualTestContext| app.read_with(cx, |app, cx| app.sidebar.read(cx).renders);
+        let in_a_second = |cx: &mut VisualTestContext| {
+            let before = renders(cx);
+            for _ in 0..50 {
+                cx.executor().advance_clock(Duration::from_millis(20));
+                cx.run_until_parked();
+            }
+            renders(cx) - before
+        };
+        // Test windows start inactive.
+        assert_eq!(in_a_second(cx), 0, "still in the background");
+
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let breaths = in_a_second(cx);
+        assert!((6..=8).contains(&breaths), "{breaths} frames");
+
+        cx.deactivate_window();
+        cx.run_until_parked();
+        in_a_second(cx);
+        assert_eq!(in_a_second(cx), 0, "still again");
     }
 
     #[gpui::test]

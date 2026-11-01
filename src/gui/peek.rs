@@ -45,12 +45,7 @@ impl Lemur {
         };
         let dot = session.as_ref().map(|s| {
             let (color, tip) = self.activity(&key, s, cx);
-            status_dot(
-                &key,
-                color,
-                s.activity == crate::snapshot::Activity::Working,
-                tip,
-            )
+            status_dot(&key, color, self.breathes(s.activity), tip)
         });
         let header = h_flex()
             .h_10()

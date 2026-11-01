@@ -132,7 +132,7 @@ CLI: `lemur ls`, `lemur new <base> <name> [--branch <branch>] [--from <branch>]`
 
 Each session's dot comes from Claude Code itself: Claude reports what it's doing to the terminal it runs in, and herdr-core tells Lemur at once. Where it doesn't, Lemur runs `claude agents --json` on the host, at most every 30 seconds, which lists each running Claude with its process and status, and Lemur matches the process to its terminal; that's also where Lemur learns each Claude's conversation, to resume it. No setup needed; `claude agents` needs Claude Code 2.1.139 or later, on `PATH` or in `~/.local/bin`.
 
-- **Green, breathing:** Claude is working.
+- **Green, breathing:** Claude is working. It breathes only while Lemur is the active window, as each breath redraws it; otherwise it's a still green.
 - **Yellow:** Claude needs input (a question or permission prompt); hover the dot for what it's asking.
 - **Blue:** it finished while you were looking at another session; opening it clears that.
 - **Grey:** idle, or no Claude running.
