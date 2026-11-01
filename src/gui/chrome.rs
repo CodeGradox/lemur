@@ -65,7 +65,7 @@ impl Lemur {
     }
 
     /// The worktree the thread on show runs in, and the host it's on.
-    fn active_worktree(&self) -> Option<(&str, &Worktree)> {
+    pub(super) fn active_worktree(&self) -> Option<(&str, &Worktree)> {
         let (host, session) = self.active.as_ref()?;
         let (_, w) = self.project_of(host, session)?;
         Some((host, w))
@@ -323,7 +323,8 @@ impl Lemur {
     }
 
     /// Under the terminal: where the thread on show runs (its host, and its
-    /// worktree's branch and servers), and how many agents there are.
+    /// worktree's branch, its lines added and removed, and its servers),
+    /// and how many agents there are.
     pub(super) fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let item = |icon: Icon, text: SharedString| {
@@ -359,7 +360,9 @@ impl Lemur {
                 (None, Some(head)) => format!("detached at {}", &head[..head.len().min(8)]),
                 (None, None) => crate::config::leaf(&w.path).to_string(),
             };
-            bar = bar.child(item(icons::git_branch(), branch.into()));
+            bar = bar
+                .child(item(icons::git_branch(), branch.into()))
+                .children(self.changes_item(host, &w.path, cx));
             let links = self.links(host, w, cx);
             if !links.is_empty() {
                 bar = bar.child(

@@ -3,6 +3,7 @@
 //! Every session you open keeps its own terminal, attached through
 //! herdr-core, so switching is instant and scrollback survives.
 
+mod changes;
 mod chrome;
 mod cycle;
 mod dictation;
@@ -214,6 +215,8 @@ struct Lemur {
     loads: HashMap<String, (crate::machine::Load, Option<f32>)>,
     /// How much of Claude's plan is used, at the foot of the sidebar.
     meter: meter::Meter,
+    /// Each worktree's lines added and removed, for the status bar.
+    diffs: changes::Changes,
     /// Notification popups that are showing, one per session.
     popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
     /// Counts changes a snapshot fetched across one would undo (the thread
@@ -234,6 +237,7 @@ struct Lemur {
     _refresh: Task<()>,
     _watch: Task<()>,
     _meter: Task<()>,
+    _changes: Task<()>,
     _meter_setting: Subscription,
     /// Focused when no terminal is, so keys and menu actions reach the
     /// window.
@@ -399,6 +403,31 @@ impl Lemur {
             }
         });
         let meter_setting = cx.observe_global::<Prefs>(|this, cx| this.follow_meter_setting(cx));
+        // The worktree on show's changes, every `changes::EVERY` while you
+        // look at Lemur; out of sight, every `changes::AWAY`.
+        let changing = cx.spawn(async move |this, cx| {
+            let mut since = changes::AWAY;
+            loop {
+                let looking = handle
+                    .update(cx, |_, window, _| window.is_window_active())
+                    .unwrap_or(false);
+                if looking || since >= changes::AWAY {
+                    if this
+                        .update(cx, |this, cx| {
+                            if this.loaded {
+                                this.ask_changes(cx)
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    since = Duration::ZERO;
+                }
+                cx.background_executor().timer(changes::EVERY).await;
+                since += changes::EVERY;
+            }
+        });
         // herdr-core tells of every change to a terminal as it happens:
         // started, ended, relabelled, what Claude says it's doing.
         let watch = cx.spawn(async move |this, cx| {
@@ -468,6 +497,7 @@ impl Lemur {
             popups: HashMap::new(),
             loads: HashMap::new(),
             meter: meter::Meter::new(cx),
+            diffs: changes::Changes::default(),
             changes: 0,
             notes,
             notes_open: false,
@@ -477,6 +507,7 @@ impl Lemur {
             sidebar,
             _refresh: refresh,
             _meter: asking,
+            _changes: changing,
             _meter_setting: meter_setting,
             _watch: watch,
             focus,
@@ -653,6 +684,7 @@ impl Lemur {
         self.loaded = true;
         if first {
             self.tick_meter(window.is_window_active(), cx);
+            self.ask_changes(cx);
         }
         self.keep_claude_ids(cx);
         self.notify_news(news, window, cx);
@@ -797,6 +829,7 @@ impl Lemur {
             self.touch(key.clone());
         }
         self.active = Some(key);
+        self.ask_changes(cx);
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
             self.notes
                 .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
@@ -3317,6 +3350,60 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert!(tab(0, cx).is_some() && tab(1, cx).is_none());
+        let_attaches_end(&app, cx);
+    }
+
+    /// Beside the branch, the status bar counts the lines added and removed
+    /// in the worktree on show since its last commit; nothing while it has
+    /// none.
+    #[gpui::test]
+    fn the_status_bar_counts_the_worktrees_changes(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("changes");
+        let dir = TempDir::new("changes-gui");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(&repo, &["add", "a.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        git_in(&repo, &["worktree", "add", "-q", "-b", "auth", "wt/auth"]);
+        let wt = repo.join("wt/auth");
+        std::fs::write(wt.join("a.txt"), "one\n2\nthree\n").unwrap();
+        let clean = server.run(
+            &repo.to_string_lossy(),
+            &["lemur.label=clean"],
+            &["sleep", "600"],
+        );
+        let changed = server.run(
+            &wt.to_string_lossy(),
+            &["lemur.label=changed"],
+            &["sleep", "600"],
+        );
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let listed = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.project_of("local", &changed).is_some()
+                    && app.project_of("local", &clean).is_some()
+            })
+        });
+        assert!(listed);
+        let counted = |cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(5), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.diffs.asking.is_empty())
+            });
+            cx.debug_bounds("changes").is_some()
+        };
+
+        open(&app, &changed, cx);
+        assert!(counted(cx), "+2 -1");
+        open(&app, &clean, cx);
+        assert!(!counted(cx), "the main checkout has none");
         let_attaches_end(&app, cx);
     }
 
