@@ -366,6 +366,17 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
     )
 }
 
+/// How many processes the shell `pid` on `host` started that still run or
+/// wait: jobs sent off with `&`, or stopped with ⌃Z. Closing its terminal
+/// ends them.
+pub fn shell_jobs(cfg: &Config, host: &str, pid: Option<u32>) -> Result<usize> {
+    let pid = pid.context("its shell has no pid")?;
+    let out = Remote::new(cfg.host_or_err(host)?).run(&format!(
+        "ps -A -o ppid= | awk -v p={pid} '$1 == p {{ n++ }} END {{ print n + 0 }}'\n"
+    ))?;
+    out.trim().parse().context("counting its shell's jobs")
+}
+
 /// Whether `session` is a herdr-core address (`t7`, `agent/t7`), not a tmux
 /// session's name from before.
 fn is_address(session: &str) -> bool {

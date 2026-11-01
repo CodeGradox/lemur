@@ -110,6 +110,9 @@ pub struct Session {
     /// Its program runs: herdr-core knows its pid. A kept terminal whose
     /// program was lost has none until its new shell starts.
     pub running: bool,
+    /// Its program's pid, on its own host: the shell's, for a thread
+    /// lemur started.
+    pub pid: Option<u32>,
     /// What it runs to help it, as a tree in order: Claude Code's subagents
     /// while they work, and terminals its agent started with `hc run`.
     pub helpers: Vec<Helper>,
@@ -577,6 +580,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         claude: None,
         busy: busy(t),
         running: t.pid.is_some(),
+        pid: t.pid,
         helpers: vec![],
         away: label(AWAY).is_some(),
         issue: label(ISSUE).cloned(),

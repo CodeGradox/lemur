@@ -133,6 +133,9 @@ fn bind_keys(cx: &mut App) {
 }
 
 const REFRESH: Duration = Duration::from_secs(3);
+/// What closing a shell with jobs ends.
+const JOBS: &str =
+    "The terminal ends, and the jobs its shell started (sent off with &, or stopped with ⌃Z).";
 /// How long changes herdr-core tells of are gathered into one snapshot.
 const BURST: Duration = Duration::from_millis(30);
 /// Out of sight, the sidebar refreshes every this many REFRESH ticks.
@@ -1133,7 +1136,7 @@ impl Lemur {
     }
 
     /// Closes the thread `key`, asking first while something other than
-    /// its shell runs in it.
+    /// its shell runs in it, in front or as a job of the shell's.
     pub(super) fn confirm_close_of(
         &mut self,
         key: Key,
@@ -1141,7 +1144,22 @@ impl Lemur {
         cx: &mut Context<Self>,
     ) {
         let (label, claude) = match self.session_of(&key) {
-            Some(s) if !s.busy => return self.close_thread(key, cx),
+            Some(s) if !s.busy => {
+                // A shell at its prompt closes at once, unless jobs it
+                // started still run or wait (`&`, ⌃Z): they'd end too.
+                let (cfg, label, pid) = (self.cfg.clone(), s.label.clone(), s.pid);
+                let host = key.0.clone();
+                self.in_background(
+                    cx,
+                    move || actions::shell_jobs(&cfg, &host, pid),
+                    move |this, jobs, window, cx| match jobs {
+                        Ok(0) => this.close_thread(key, cx),
+                        _ => this.ask_close(key, label, JOBS, window, cx),
+                    },
+                )
+                .detach();
+                return;
+            }
             Some(s) => (s.label.clone(), s.runs_claude()),
             None => (self.label_of(&key.0, &key.1), false),
         };
@@ -1150,6 +1168,19 @@ impl Lemur {
         } else {
             "The terminal ends, and whatever runs in it."
         };
+        self.ask_close(key, label, description, window, cx);
+    }
+
+    /// Asks whether to close thread `key`, called `label`, saying what that
+    /// ends.
+    fn ask_close(
+        &mut self,
+        key: Key,
+        label: String,
+        description: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, key) = (this.clone(), key.clone());
@@ -1848,6 +1879,7 @@ mod tests {
                 claude: None,
                 busy: false,
                 running: true,
+                pid: None,
                 helpers: vec![],
                 away: false,
                 issue: None,
@@ -4625,6 +4657,39 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert!(server.addresses().contains(&a), "a still runs");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A shell at its prompt with a job of its own (`&`, or ⌃Z) asks
+    /// before ⌘W closes it: the job would end too.
+    #[gpui::test]
+    fn a_shell_with_a_job_asks_before_closing(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("close-job");
+        let b = server.run("/", &["lemur.label=b"], &["sh"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &b, cx);
+        server.hc(&["send", &b, "sleep 600 &"]);
+        // Back at its prompt, with the job behind it.
+        let idle = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            server.hc(&["read", &b]).contains("[1] ")
+                && app.read_with(cx, |app, _| {
+                    app.session_of(&key(&b)).is_some_and(|s| !s.busy)
+                })
+        });
+        assert!(idle, "{}", server.hc(&["read", &b]));
+
+        cx.simulate_keystrokes("cmd-w");
+        let asked = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.has_active_dialog(cx))
+        });
+        assert!(asked, "⌘W asks");
+        assert!(server.addresses().contains(&b), "still running");
+        cx.update(|window, cx| window.close_dialog(cx));
         let_attaches_end(&app, cx);
     }
 
