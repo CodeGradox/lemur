@@ -32,6 +32,8 @@ pub(super) struct Meter {
     /// Asks in a row that failed.
     fails: u32,
     asked: Option<Instant>,
+    /// When the answer shown came, in seconds since 1970.
+    answered: Option<i64>,
     asking: bool,
 }
 
@@ -43,19 +45,37 @@ impl Meter {
         }
     }
 
-    /// Whether it's time to ask again (see `usage::wait`).
-    fn due(&self, looking: bool, now: Instant) -> bool {
+    /// Whether it's time to ask again (see `usage::wait`), or a limit shown
+    /// has reset since the answer (`epoch`, seconds since 1970, is now):
+    /// its use shown is over.
+    fn due(&self, looking: bool, now: Instant, epoch: i64) -> bool {
+        let reset = match (&self.shown, self.answered) {
+            (Some(Ok(u)), Some(answered)) => u
+                .limits
+                .iter()
+                .filter_map(|l| l.resets_at.as_deref().and_then(usage::epoch))
+                .any(|at| answered < at && at <= epoch),
+            _ => false,
+        };
         !self.asking
-            && self
-                .asked
-                .is_none_or(|at| now.duration_since(at) >= usage::wait(looking, self.fails))
+            && (reset
+                || self
+                    .asked
+                    .is_none_or(|at| now.duration_since(at) >= usage::wait(looking, self.fails)))
     }
+}
+
+/// Seconds since 1970.
+fn epoch_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 impl Lemur {
     /// Asks, once the hosts are known, when it's time.
     pub(super) fn tick_meter(&mut self, looking: bool, cx: &mut Context<Self>) {
-        if self.meter.on && self.loaded && self.meter.due(looking, Instant::now()) {
+        if self.meter.on && self.loaded && self.meter.due(looking, Instant::now(), epoch_now()) {
             self.ask_usage(cx);
         }
     }
@@ -103,6 +123,7 @@ impl Lemur {
                     return;
                 }
                 meter.asked = Some(Instant::now());
+                meter.answered = Some(epoch_now());
                 meter.fails = if answer.is_ok() { 0 } else { meter.fails + 1 };
                 meter.shown = Some(answer);
                 cx.notify();
@@ -137,9 +158,7 @@ impl Lemur {
         if !self.meter.on {
             return None;
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        let now = epoch_now();
         let shown = describe(self.meter.shown.as_ref(), now);
         let minimized = self.cfg.minimized_usage;
         let open = !minimized;
@@ -393,17 +412,42 @@ mod tests {
     fn the_meter_asks_when_its_time() {
         let now = Instant::now();
         let mut m = Meter::default();
-        assert!(m.due(true, now), "at first");
+        assert!(m.due(true, now, 0), "at first");
         m.asked = Some(now);
-        assert!(!m.due(true, now + Duration::from_secs(60)));
-        assert!(m.due(true, now + usage::EVERY));
+        assert!(!m.due(true, now + Duration::from_secs(60), 0));
+        assert!(m.due(true, now + usage::EVERY, 0));
         assert!(
-            !m.due(false, now + usage::EVERY),
+            !m.due(false, now + usage::EVERY, 0),
             "out of sight it waits longer"
         );
         m.fails = 1;
-        assert!(!m.due(true, now + usage::EVERY), "after a failure too");
+        assert!(!m.due(true, now + usage::EVERY, 0), "after a failure too");
         m.asking = true;
-        assert!(!m.due(true, now + usage::SLOWEST), "one ask at a time");
+        assert!(!m.due(true, now + usage::SLOWEST, 0), "one ask at a time");
+    }
+
+    /// Once a limit shown has reset, its use shown is over: asked again.
+    #[test]
+    fn the_meter_asks_again_once_a_limit_resets() {
+        let now = Instant::now();
+        let reset = usage::epoch("2026-11-07T10:00:00Z").unwrap();
+        let mut m = Meter {
+            shown: Some(Ok(Usage {
+                limits: vec![Limit {
+                    label: "Week".into(),
+                    percent: 95.0,
+                    resets_at: Some("2026-11-07T10:00:00Z".into()),
+                }],
+                host: "agent".into(),
+            })),
+            asked: Some(now),
+            answered: Some(reset - 600),
+            ..Default::default()
+        };
+        let soon = now + Duration::from_secs(60);
+        assert!(!m.due(true, soon, reset - 1));
+        assert!(m.due(true, soon, reset + 1), "it has reset");
+        m.answered = Some(reset + 1);
+        assert!(!m.due(true, soon, reset + 2), "asked since");
     }
 }
