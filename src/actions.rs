@@ -2,7 +2,7 @@ use crate::attach::Active;
 use crate::config::{ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
-use crate::snapshot::{AWAY, ISSUE, KIND, LABEL, ORDER, WORKTREE};
+use crate::snapshot::{AWAY, ISSUE, KIND, LABEL, ORDER, SHELL, WORKTREE};
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
 use std::collections::BTreeMap;
@@ -316,18 +316,26 @@ fn start_thread(
     Ok(address)
 }
 
-/// Starts a thread again once its terminal is gone, as after its host
-/// restarted, and resumes its Claude conversation in it. Returns the new
-/// terminal's address.
+/// Resumes a thread's Claude conversation once its Claude is gone: in its
+/// terminal when that came back from its host restarting as a fresh shell,
+/// else in a new one, as when that's gone too. Returns the terminal's
+/// address.
 pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
     if !is_uuid(&thread.claude_session) {
         bail!("{} isn't a Claude session ID", thread.claude_session);
     }
     let host = cfg.host_or_err(&thread.host)?;
     let (core, _) = hc::for_host(host)?;
-    if core.terminals().iter().any(|t| t.address == thread.session) {
-        bail!("{} still runs", thread.shown());
-    }
+    // Back from its host restarting as a fresh shell, it resumes there.
+    let back = match core
+        .terminals()
+        .iter()
+        .find(|t| t.address == thread.session)
+    {
+        Some(t) if crate::snapshot::came_back(t) => t.pid,
+        Some(_) => bail!("{} still runs", thread.shown()),
+        None => None,
+    };
     // A thread from before herdr-core, Lemur 1.8 and older, may still run
     // in tmux: resumed, two Claudes would work on one conversation.
     let in_tmux = if is_address(&thread.session) {
@@ -357,6 +365,11 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         .filter(|l| validate_name(l).is_ok())
         .unwrap_or_else(|| "claude".into());
     let resume = format!("{} --resume {}", host.claude, thread.claude_session);
+    if let Some(pid) = back {
+        core.type_line(&thread.session, &resume)?;
+        core.label(&thread.session, &[(SHELL, &pid.to_string())])?;
+        return Ok(thread.session.clone());
+    }
     start_thread(
         host,
         &thread.path,
@@ -364,6 +377,13 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         Some(&resume),
         thread.issue.as_deref(),
     )
+}
+
+/// Notes the shell `pid` a Claude thread runs in, to tell when its host
+/// restarted.
+pub fn note_shell(cfg: &Config, host: &str, session: &str, pid: u32) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(SHELL, &pid.to_string())])
 }
 
 /// How many processes the shell `pid` on `host` started that still run or
@@ -1089,6 +1109,67 @@ mod tests {
         };
         assert!(resume_thread(&cfg, &odd).is_err());
         assert_eq!(server.addresses().len(), before);
+    }
+
+    /// After its host restarts, herdr-core gives a Claude thread's terminal
+    /// a fresh shell at the same address: it counts as gone, and resumes
+    /// there, not in a second terminal.
+    #[test]
+    fn a_thread_back_from_a_restart_resumes_in_its_terminal() {
+        let server = HcServer::new("resume-back");
+        let (dir, mut cfg) = cloned("resume-back", &server);
+        cfg.hosts[0].claude = r#"sh -c 'echo "claude $*"' claude"#.into();
+        let path = dir.join("repo").canonicalize().unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let started = new_thread_in(&cfg, 0, &path, "claude", false).unwrap();
+        let thread = started.claude.expect("a Claude thread");
+        cfg.threads.push(thread.clone());
+        let t = thread.session.clone();
+        listed_by(&server, &t);
+        let pid = || {
+            server
+                .core()
+                .terminals()
+                .into_iter()
+                .find(|x| x.address == t)
+                .and_then(|x| x.pid)
+        };
+        let before = pid().expect("its shell");
+        note_shell(&cfg, "local", &t, before).unwrap();
+        // Filed as a thread, or as one to resume.
+        let filed = |cfg: &Config| {
+            let snap = crate::snapshot::fetch(cfg);
+            let worktrees = snap.hosts[0].bases[0].worktrees.clone();
+            let live = worktrees
+                .iter()
+                .any(|w| w.sessions.iter().any(|s| s.name == t));
+            let gone = worktrees
+                .iter()
+                .any(|w| w.gone.iter().any(|g| g.session == t));
+            (live, gone)
+        };
+        assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (true, false)));
+        assert!(resume_thread(&cfg, &thread).is_err(), "it still runs");
+
+        // The host restarts: herdr-core stops, and starts again.
+        server.hc(&["server", "stop"]);
+        let back = wait_until(Duration::from_secs(15), || {
+            pid().is_some_and(|now| now != before)
+        });
+        assert!(back, "a fresh shell at {t}");
+        assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (false, true)));
+        let count = server.addresses().len();
+        assert_eq!(resume_thread(&cfg, &thread).unwrap(), t, "in its terminal");
+        let resumed = format!("claude --resume {}", thread.claude_session);
+        assert!(
+            wait_until(Duration::from_secs(10), || server
+                .hc(&["read", &t])
+                .contains(&resumed)),
+            "{}",
+            server.hc(&["read", &t])
+        );
+        assert_eq!(server.addresses().len(), count, "no second terminal");
+        assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (true, false)));
     }
 
     /// A thread from before herdr-core still running in tmux isn't resumed

@@ -113,6 +113,8 @@ pub struct Session {
     /// Its program's pid, on its own host: the shell's, for a thread
     /// lemur started.
     pub pid: Option<u32>,
+    /// The shell lemur last saw it run (`SHELL`), if it noted one.
+    pub shell: Option<u32>,
     /// What it runs to help it, as a tree in order: Claude Code's subagents
     /// while they work, and terminals its agent started with `hc run`.
     pub helpers: Vec<Helper>,
@@ -152,6 +154,20 @@ impl Session {
     pub fn runs_claude(&self) -> bool {
         self.started_claude || self.activity != Activity::Unknown
     }
+
+    /// Came back from its host restarting as a fresh shell at its prompt
+    /// (see `came_back`).
+    pub fn came_back(&self) -> bool {
+        self.shell
+            .is_some_and(|noted| self.pid.is_some_and(|pid| pid != noted))
+            && !self.busy
+    }
+
+    /// A Claude thread whose shell lemur hasn't noted yet.
+    pub fn shell_to_note(&self) -> Option<u32> {
+        self.pid
+            .filter(|_| self.started_claude && self.shell.is_none())
+    }
 }
 
 /// Ordered by urgency, so a session with several Claudes shows the most
@@ -175,6 +191,10 @@ pub const ORDER: &str = "lemur.order";
 pub const AWAY: &str = "lemur.away";
 /// The Linear issue pinned to a thread, by its key (`LAFT-3184`).
 pub const ISSUE: &str = "lemur.issue";
+/// The pid of the shell a Claude thread's Claude runs in, as lemur last
+/// saw it. herdr-core keeps lemur's terminals: after their host restarts,
+/// each comes back at its address with a fresh shell and another pid.
+pub const SHELL: &str = "lemur.shell";
 
 /// What Claude is doing. `claude agents` lists every running session with
 /// its pid and status; the process tree (`@@ps`) ties each one to the
@@ -519,6 +539,15 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
         }
     }
 
+    // A Claude thread whose host restarted is back at its address as a
+    // fresh shell: gone, as far as resuming it goes, which happens there.
+    sessions.retain(|s| {
+        !(s.came_back()
+            && cfg
+                .threads
+                .iter()
+                .any(|t| t.host == host.name && t.session == s.name))
+    });
     let mut bases = data.bases.clone();
     let live: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let mut other = vec![];
@@ -581,6 +610,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         busy: busy(t),
         running: t.pid.is_some(),
         pid: t.pid,
+        shell: label(SHELL).and_then(|p| p.parse().ok()),
         helpers: vec![],
         away: label(AWAY).is_some(),
         issue: label(ISSUE).cloned(),
@@ -663,6 +693,13 @@ const SHELLS: [&str; 12] = [
 /// foreground is something other than its own program, or that program
 /// isn't a shell. herdr-core reads that about twice a second; until it
 /// has, a live terminal counts as busy.
+/// Whether `t` came back from its host restarting as a fresh shell at its
+/// prompt, where lemur saw another shell run it.
+pub fn came_back(t: &Terminal) -> bool {
+    let noted = t.labels.get(SHELL).and_then(|p| p.parse::<u32>().ok());
+    noted.is_some_and(|noted| t.pid.is_some_and(|pid| pid != noted)) && !busy(t)
+}
+
 fn busy(t: &Terminal) -> bool {
     match &t.foreground {
         Some(f) => t.pid != Some(f.pid) || !SHELLS.contains(&f.name.trim_start_matches('-')),

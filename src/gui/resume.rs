@@ -53,6 +53,29 @@ impl Lemur {
         cx.notify();
     }
 
+    /// Notes the shell each Claude thread runs in, so that one whose host
+    /// restarted, back at its address as a fresh shell, is known to be.
+    pub(super) fn note_shells(&mut self, cx: &mut Context<Self>) {
+        let notes: Vec<(String, String, u32)> = sessions(&self.snap)
+            .filter_map(|(host, s)| Some((host.to_string(), s.name.clone(), s.shell_to_note()?)))
+            .collect();
+        if notes.is_empty() {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        self.in_background(
+            cx,
+            move || {
+                for (host, session, pid) in notes {
+                    // Noted at the next snapshot if it can't be now.
+                    let _ = actions::note_shell(&cfg, &host, &session, pid);
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .detach();
+    }
+
     /// Keeps each running Claude's session ID as `claude agents` reports
     /// it: a thread lemur didn't start gets one, and one whose Claude
     /// started over (`/clear`) gets the new one.

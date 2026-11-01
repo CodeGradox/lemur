@@ -817,6 +817,7 @@ impl Lemur {
             self.check_core_updates(cx);
         }
         self.keep_claude_ids(cx);
+        self.note_shells(cx);
         self.follow_linear(cx);
         self.notify_news(news, window, cx);
         if let Some((host, session)) = restore {
@@ -1880,6 +1881,7 @@ mod tests {
                 busy: false,
                 running: true,
                 pid: None,
+                shell: None,
                 helpers: vec![],
                 away: false,
                 issue: None,
@@ -4658,6 +4660,29 @@ mod tests {
         cx.run_until_parked();
         assert!(server.addresses().contains(&a), "a still runs");
         let_attaches_end(&app, cx);
+    }
+
+    /// Lemur notes the shell each Claude thread runs in, once, so a thread
+    /// whose host restarted is known when it comes back as a fresh one.
+    #[gpui::test]
+    fn claude_threads_have_their_shell_noted(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("note-shell");
+        let t = server.run("/", &["lemur.kind=claude", "lemur.label=c"], &["sh"]);
+        let shell = server.run("/", &["lemur.label=s"], &["sh"]);
+        let (app, cx) = rooted(server.config(), cx);
+        let noted = |address: &str| {
+            let t = server.core().terminals();
+            let t = t.into_iter().find(|x| x.address == address).unwrap();
+            (t.pid, t.labels.get(snapshot::SHELL).cloned())
+        };
+        let done = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            let (pid, label) = noted(&t);
+            pid.is_some() && label == pid.map(|p| p.to_string())
+        });
+        assert!(done, "{:?}", noted(&t));
+        assert_eq!(noted(&shell).1, None, "not a Claude thread");
     }
 
     /// A shell at its prompt with a job of its own (`&`, or ⌃Z) asks
