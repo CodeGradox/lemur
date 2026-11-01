@@ -88,9 +88,17 @@ pub(super) fn init(linear: Linear, cx: &mut App) {
                 }
             })
             .await;
-        cx.update(|cx| set_account(state, cx));
+        cx.update(|cx| checked(state, cx));
     })
     .detach();
+}
+
+/// Takes what checking the kept sign-in found, unless a sign-in started
+/// meanwhile: its Cancel would go, and its answer would be lost.
+fn checked(state: Account, cx: &mut App) {
+    if matches!(LinearAccount::get(cx).state, Account::Checking) {
+        set_account(state, cx);
+    }
 }
 
 /// Opens Linear's page asking you to approve Lemur, and waits for the
@@ -182,8 +190,17 @@ impl LinearPanel {
                 this.search(cx);
             }
         });
-        // Drawn again, it asks what a sign-in now lets it.
-        let account = cx.observe_global::<LinearAccount>(|_, cx| cx.notify());
+        // What Linear said was another sign-in's, or an error it no longer
+        // has: asked again, as it's drawn.
+        let account = cx.observe_global::<LinearAccount>(|this, cx| {
+            this.mine = None;
+            this.issues.clear();
+            this.found = None;
+            if LinearAccount::signed_in(cx) {
+                this.search(cx);
+            }
+            cx.notify();
+        });
         LinearPanel {
             thread: None,
             query,
@@ -270,7 +287,12 @@ impl LinearPanel {
             cx.notify();
             return;
         }
+        // Back to what was found: a search for what was typed meanwhile
+        // would answer for a term no longer in the box.
         if self.found.as_ref().is_some_and(|(t, _)| *t == term) {
+            self.searching = false;
+            self._search = None;
+            cx.notify();
             return;
         }
         let linear = LinearAccount::get(cx).linear.clone();
@@ -662,5 +684,148 @@ pub(super) fn settings_action(cx: &App) -> (&'static str, fn(&mut App)) {
         Account::SignedIn(_) => ("Sign out", sign_out),
         Account::SigningIn(_) => ("Cancel", cancel_sign_in),
         _ => ("Sign in with Linear", sign_in),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Account, LinearAccount, LinearPanel, checked, init, set_account};
+    use crate::linear::{Linear, Store};
+    use crate::test_support::{FakeLinear, TempDir, wait_until};
+    use gpui::VisualTestContext;
+    use gpui_kit::{AppContext, Entity};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    /// A stand-in Linear with one issue per search term, signed in, and
+    /// the panel in a window.
+    fn panel<'a>(
+        tag: &str,
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (
+        FakeLinear,
+        TempDir,
+        Entity<LinearPanel>,
+        &'a mut VisualTestContext,
+    ) {
+        let api = FakeLinear::new(|r| {
+            let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            let term = body["variables"]["term"].as_str().unwrap_or("mine");
+            let issue = json!({
+                "identifier": "LAFT-1", "title": term, "url": "https://linear.app/x/issue/LAFT-1",
+                "branchName": "b", "priorityLabel": "High",
+                "state": { "name": "Todo", "color": "#aaaaaa", "type": "unstarted" },
+                "assignee": null,
+            });
+            let data = if body["query"].as_str().unwrap().contains("searchIssues") {
+                json!({ "searchIssues": { "nodes": [issue] } })
+            } else if body["query"].as_str().unwrap().contains("assignedIssues") {
+                json!({ "viewer": { "assignedIssues": { "nodes": [issue] } } })
+            } else {
+                json!({ "viewer": { "name": "M" }, "organization": { "name": "L" } })
+            };
+            (200, json!({ "data": data }).to_string())
+        });
+        let dir = TempDir::new(tag);
+        let linear = Linear::at(&api.url, Store::File(dir.join("tokens")));
+        linear.sign_in_as("a").unwrap();
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        cx.update(|cx| init(linear, cx));
+        let mut made = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| LinearPanel::new(window, cx));
+            made = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let signed_in = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            cx.update(|_, cx| LinearAccount::signed_in(cx))
+        });
+        assert!(signed_in);
+        (api, dir, made.unwrap(), cx)
+    }
+
+    /// Typed back to what was found, the panel shows what was found, not
+    /// what a search for the longer term answers.
+    #[gpui::test]
+    fn typed_back_the_search_shows_what_was_found(cx: &mut gpui::TestAppContext) {
+        let (_api, _dir, panel, cx) = panel("linear-panel-search", cx);
+        let type_in = |text: &str, cx: &mut VisualTestContext| {
+            panel.update_in(cx, |p, window, cx| {
+                p.query.update(cx, |q, cx| q.set_value(text, window, cx));
+                p.search(cx);
+            });
+        };
+        let found = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |p, _| {
+                let titles = p
+                    .found
+                    .as_ref()
+                    .and_then(|(_, f)| f.as_ref().ok())
+                    .map(|f| f.iter().map(|i| i.title.clone()).collect::<Vec<_>>());
+                (p.searching, titles)
+            })
+        };
+        // Typing pauses: the clock moves past the debounce.
+        type_in("lease", cx);
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(Duration::from_millis(400));
+            cx.run_until_parked();
+            found(cx) == (false, Some(vec!["lease".into()]))
+        }));
+        type_in("leasex", cx);
+        assert!(found(cx).0, "searching");
+        type_in("lease", cx);
+        assert_eq!(found(cx), (false, Some(vec!["lease".to_string()])));
+        for _ in 0..10 {
+            cx.executor().advance_clock(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(30));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            found(cx),
+            (false, Some(vec!["lease".to_string()])),
+            "not leasex's"
+        );
+    }
+
+    /// Signed out and in again, what Linear said before isn't shown.
+    #[gpui::test]
+    fn a_new_sign_in_forgets_what_linear_said(cx: &mut gpui::TestAppContext) {
+        let (_api, _dir, panel, cx) = panel("linear-panel-forget", cx);
+        panel.update(cx, |p, cx| p.show(None, cx));
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            panel.read_with(cx, |p, _| p.mine.is_some())
+        }));
+        cx.update(|_, cx| set_account(Account::SignedOut(None), cx));
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |p, _| p.mine.is_none()));
+    }
+
+    /// A sign-in started while Lemur still checks the one it kept isn't
+    /// undone when the check ends: its Cancel stays.
+    #[gpui::test]
+    fn a_check_ending_leaves_a_sign_in_under_way(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(LinearAccount {
+                linear: Linear::new(),
+                state: Account::Checking,
+            });
+            checked(Account::SignedOut(None), cx);
+            assert!(matches!(
+                LinearAccount::get(cx).state,
+                Account::SignedOut(_)
+            ));
+            set_account(Account::SigningIn(Arc::new(AtomicBool::new(false))), cx);
+            checked(Account::SignedOut(None), cx);
+            assert!(matches!(
+                LinearAccount::get(cx).state,
+                Account::SigningIn(_)
+            ));
+        });
     }
 }
