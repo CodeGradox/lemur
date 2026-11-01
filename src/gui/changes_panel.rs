@@ -1,7 +1,9 @@
 //! The Changes panel, on the right as the notes and the agents are, as
 //! Herdr's: the files changed in the worktree on show since its last
 //! commit, each with its lines added and removed; a click shows its diff.
-//! Under them, a message and Commit commit them all (`git add -A`).
+//! Under them, a message and Commit commit the files listed. Other
+//! repositories inside the worktree, as worktrees kept in a project's
+//! folder, are neither listed nor committed.
 
 use super::settings::Prefs;
 use crate::config::Host;
@@ -209,12 +211,13 @@ impl ChangesPanel {
         if message.is_empty() || self.files.is_empty() || self.committing {
             return;
         }
+        let files: Vec<String> = self.files.iter().map(|f| f.path.clone()).collect();
         self.committing = true;
         self.note = None;
         cx.notify();
         self._task = Some(cx.spawn_in(window, async move |this, cx| {
             let done = cx
-                .background_spawn(async move { commit_in(&host, &path, &message) })
+                .background_spawn(async move { commit_in(&host, &path, &message, &files) })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.committing = false;
@@ -400,7 +403,7 @@ impl Render for ChangesPanel {
                                     "Commit"
                                 })
                                 .disabled(!can_commit)
-                                .tooltip("Commits every change listed (git add -A)")
+                                .tooltip("Commits every change listed")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.commit(window, cx)),
                                 ),
@@ -424,7 +427,7 @@ impl Render for ChangesPanel {
 }
 
 /// The worktree's changes since its last commit, staged or not, new files
-/// too, in git's order.
+/// too, in git's order; other repositories inside it aren't its changes.
 fn changes_in(host: &Host, path: &str) -> Result<Vec<Change>, String> {
     let script = format!(
         "cd {} 2>/dev/null || {{ echo '@@error There is no such folder'; exit 0; }}\n\
@@ -464,6 +467,10 @@ fn parse_changes(out: &str) -> Result<Vec<Change>, String> {
     Ok(status
         .split('\0')
         .filter(|e| e.len() > 3)
+        // Listing every untracked file, git names a folder only when it's
+        // another repository: a worktree kept inside this one, or a clone.
+        // Adding it would commit a link to it, not its files.
+        .filter(|e| !(e.starts_with("?? ") && e.ends_with('/')))
         .map(|entry| {
             let (xy, path) = (&entry[..2], entry[3..].to_string());
             let status = if xy == "??" {
@@ -544,11 +551,15 @@ fn diff_lines(out: &str, new: bool) -> (Vec<String>, Option<u64>) {
     (lines, None)
 }
 
-/// Commits everything in the worktree with `message`; what git said of it.
-fn commit_in(host: &Host, path: &str, message: &str) -> Result<String, String> {
+/// Commits `files` of the worktree, as they are now, with `message`; what
+/// git said of it.
+fn commit_in(host: &Host, path: &str, message: &str, files: &[String]) -> Result<String, String> {
+    let files: Vec<String> = files.iter().map(|f| quote(f)).collect();
+    // Literal: a file named like `:(glob)*` is that file.
     let script = format!(
-        "cd {} || exit 1\ngit add -A && git commit -q -m {} && git log -1 --format='Committed %h: %s'\n",
+        "cd {} || exit 1\ngit --literal-pathspecs add -A -- {} && git commit -q -m {} && git log -1 --format='Committed %h: %s'\n",
         sh_path(path),
+        files.join(" "),
         quote(message)
     );
     Remote::new(host)
@@ -565,7 +576,7 @@ mod tests {
 
     #[test]
     fn changes_are_read_from_git() {
-        let out = "@@status\n M src/a.rs\0A  b.rs\0?? new.txt\0 D gone.rs\0UU both.rs\0\n@@numstat\n\
+        let out = "@@status\n M src/a.rs\0A  b.rs\0?? new.txt\0?? .claude/worktrees/x/\0 D gone.rs\0UU both.rs\0\n@@numstat\n\
                    3\t1\tsrc/a.rs\x002\t0\tb.rs\0-\t-\tlogo.png\0\n@@end\n";
         let changes = parse_changes(out).unwrap();
         let brief: Vec<(&str, char, Option<u64>, Option<u64>)> = changes
@@ -616,7 +627,8 @@ mod tests {
     }
 
     /// In a real repository, on a test herdr-core: listed, diffed, then
-    /// all committed with the message, quotes and all.
+    /// all committed with the message, quotes and all; a worktree kept
+    /// inside it, and a clone, are neither.
     #[test]
     fn a_worktree_is_listed_diffed_and_committed() {
         let server = crate::test_support::HcServer::new("changes-panel");
@@ -628,6 +640,10 @@ mod tests {
         std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
         git_in(&repo, &["add", "a.txt"]);
         git_in(&repo, &["commit", "-q", "-m", "init"]);
+        git_in(&repo, &["worktree", "add", "-q", ".claude/worktrees/feat"]);
+        std::fs::create_dir(repo.join("clone")).unwrap();
+        git_in(&repo.join("clone"), &["init", "-q"]);
+        std::fs::write(repo.join("clone/x.txt"), "x\n").unwrap();
         std::fs::write(repo.join("a.txt"), "one\n2\n").unwrap();
         std::fs::write(repo.join("it's new.txt"), "x\ny\nz\n").unwrap();
         let root = repo.to_string_lossy().into_owned();
@@ -645,10 +661,20 @@ mod tests {
         );
         assert_eq!(diff_of(&host, &root, &changes[1]).1, Some(3));
 
-        let said = commit_in(&host, &root, "Fix it's \"quotes\"").unwrap();
+        let files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+        let said = commit_in(&host, &root, "Fix it's \"quotes\"", &files).unwrap();
         assert!(said.starts_with("Committed "), "{said}");
         assert!(said.ends_with("Fix it's \"quotes\""), "{said}");
         assert!(changes_in(&host, &root).unwrap().is_empty());
+        let committed = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&committed.stdout),
+            "a.txt\nit's new.txt\n"
+        );
         assert_eq!(
             changes_in(&host, &dir.to_string_lossy()),
             Err("Not a git repository".into())
