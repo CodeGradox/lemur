@@ -1289,6 +1289,14 @@ mod tests {
         let sent = upload(&host, &[up]).unwrap();
         assert!(sent[0].starts_with(&format!("{path}/uploads/")), "{sent:?}");
         assert_eq!(std::fs::read_to_string(&sent[0]).unwrap(), "hello");
+        // Bigger than herdr-core takes in one write, or one frame: in parts.
+        let big: Vec<u8> = (0..13_000_000u32).map(|i| (i % 251) as u8).collect();
+        let up = dir.join("big.bin");
+        std::fs::write(&up, &big).unwrap();
+        let sent = upload(&host, &[up]).unwrap();
+        assert!(std::fs::read(&sent[0]).unwrap() == big, "the same bytes");
+        let left = std::fs::read_dir(dir.join("uploads")).unwrap().count();
+        assert_eq!(left, 2, "no parts left behind");
 
         let started = new_thread_in(&cfg, 0, &path, "build", true).unwrap();
         assert!(started.session.starts_with("box/"), "{}", started.session);

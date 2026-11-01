@@ -9,6 +9,10 @@ use std::time::Duration;
 
 /// How long a script may take, `git fetch` included.
 const SCRIPT_TIME: Duration = Duration::from_secs(300);
+/// The most of a file one write sends: herdr-core takes at most 8 MB a
+/// write, and a frame over 16 MiB (base64 adds a third) ends Lemur's whole
+/// connection to it.
+const PART: usize = 4 << 20;
 
 pub struct Remote<'a> {
     pub host: &'a Host,
@@ -52,8 +56,30 @@ impl<'a> Remote<'a> {
         }
         let data = std::fs::read(local).with_context(|| format!("reading {}", local.display()))?;
         let (core, on) = hc::for_host(self.host)?;
-        core.write_file(on.as_deref(), remote_path, &data)
-            .with_context(|| format!("copying to {remote_path} on {}", self.host.name))?;
+        let copying = || format!("copying to {remote_path} on {}", self.host.name);
+        if data.len() <= PART {
+            core.write_file(on.as_deref(), remote_path, &data)
+                .with_context(copying)?;
+            return Ok(());
+        }
+        // In parts, joined there.
+        let parts: Vec<String> = (0..data.len().div_ceil(PART))
+            .map(|i| format!("{remote_path}.lemur-part-{i}"))
+            .collect();
+        let quoted: Vec<String> = parts.iter().map(|p| quote(p)).collect();
+        let written = parts
+            .iter()
+            .zip(data.chunks(PART))
+            .try_for_each(|(part, chunk)| core.write_file(on.as_deref(), part, chunk).map(drop));
+        let joined = written.and_then(|()| {
+            self.run(&format!(
+                "cat {} > {} || exit 1\n",
+                quoted.join(" "),
+                quote(remote_path)
+            ))
+        });
+        let _ = self.run(&format!("rm -f {}\n", quoted.join(" ")));
+        joined.with_context(copying)?;
         Ok(())
     }
 
