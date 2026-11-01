@@ -531,7 +531,7 @@ fn diff_of(host: &Host, root: &str, file: &Change) -> (Vec<String>, Option<u64>)
         )
     } else {
         format!(
-            "cd {} || exit 0\ngit diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git diff --cached --no-color -- {path}\n",
+            "cd {} || exit 0\ngit --literal-pathspecs diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git --literal-pathspecs diff --cached --no-color -- {path}\n",
             sh_path(root)
         )
     };
@@ -816,6 +816,33 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&shown.stdout), "and more\n");
         assert!(changes_in(&host, &root).unwrap().is_empty());
+    }
+
+    /// A file's diff is that file's, though its name reads as a pattern
+    /// (`[id]`) that another changed file matches too.
+    #[test]
+    fn a_diff_is_of_the_file_named() {
+        let server = crate::test_support::HcServer::new("changes-literal");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-literal");
+        let repo = dir.join("repo");
+        for d in ["app/[id]", "app/d"] {
+            std::fs::create_dir_all(repo.join(d)).unwrap();
+            std::fs::write(repo.join(d).join("page.tsx"), "one\n").unwrap();
+        }
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        for d in ["app/[id]", "app/d"] {
+            std::fs::write(repo.join(d).join("page.tsx"), format!("{d}\n")).unwrap();
+        }
+        let root = repo.to_string_lossy().into_owned();
+        let changes = changes_in(&host, &root).unwrap();
+        let id = changes.iter().find(|c| c.path.contains("[id]")).unwrap();
+        assert_eq!(
+            diff_of(&host, &root, id).0,
+            ["@@ -1 +1 @@", "-one", "+app/[id]"]
+        );
     }
 
     /// More new files than a command line holds commit too.
