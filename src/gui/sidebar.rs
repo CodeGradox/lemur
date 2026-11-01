@@ -153,14 +153,24 @@ impl Lemur {
         let mut hosts = 0;
         for h in &self.snap.hosts {
             if let Some(e) = &h.error {
-                groups.push(rows::Group::new(
-                    h.name.clone(),
-                    rows::Menu::default().child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new(e.clone())
-                            .icon(IconName::TriangleAlert)
-                            .disable(true),
-                    ))),
-                ));
+                let mut menu = rows::Menu::default().child(rows::Entry::Item(Box::new(
+                    SidebarMenuItem::new(e.clone())
+                        .icon(IconName::TriangleAlert)
+                        .disable(true),
+                )));
+                // herdr-core needs you to add it: in a terminal, as Herdr's.
+                if let Some(host) = self.cfg.host(&h.name).filter(|_| h.needs_you).cloned() {
+                    let this = cx.entity().downgrade();
+                    menu = menu.child(rows::Entry::Item(Box::new(
+                        SidebarMenuItem::new(format!("Set up {}…", h.name))
+                            .icon(IconName::SquareTerminal)
+                            .on_click(move |_, _, cx| {
+                                this.update(cx, |this, cx| this.set_up_host(host.clone(), cx))
+                                    .ok();
+                            }),
+                    )));
+                }
+                groups.push(rows::Group::new(h.name.clone(), menu));
             } else {
                 let local = self
                     .cfg

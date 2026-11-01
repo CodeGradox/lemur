@@ -40,6 +40,9 @@ impl Snapshot {
 pub struct HostView {
     pub name: String,
     pub error: Option<String>,
+    /// Its error needs you: herdr-core asks for it, to add the host
+    /// (`actions::set_up_host`).
+    pub needs_you: bool,
     /// Its user's home folder, where threads outside every project start;
     /// empty until its script has said.
     pub home: String,
@@ -230,6 +233,8 @@ fi
 pub struct HostData {
     pub name: String,
     pub error: Option<String>,
+    /// The error needs you: herdr-core asks for it (`hc::NeedsYou`).
+    pub needs_you: bool,
     pub home: String,
     pub machine: Reading,
     bases: Vec<BaseView>,
@@ -284,7 +289,7 @@ pub fn compose(cfg: &Config, data: &[HostData]) -> Snapshot {
         .filter_map(|d| {
             let host = cfg.host(&d.name)?;
             if let Some(e) = &d.error {
-                return Some(failed(host, e.clone()));
+                return Some(failed(host, e.clone(), d.needs_you));
             }
             Some(match hc::for_host(host) {
                 Ok((core, machine)) => {
@@ -295,17 +300,18 @@ pub fn compose(cfg: &Config, data: &[HostData]) -> Snapshot {
                         .collect();
                     view(cfg, host, d, &terminals)
                 }
-                Err(e) => failed(host, format!("{e:#}")),
+                Err(e) => failed(host, format!("{e:#}"), hc::needs_you(&e)),
             })
         })
         .collect();
     Snapshot { hosts }
 }
 
-fn failed(host: &Host, error: String) -> HostView {
+fn failed(host: &Host, error: String, needs_you: bool) -> HostView {
     HostView {
         name: host.name.clone(),
         error: Some(error),
+        needs_you,
         home: String::new(),
         machine: Reading::default(),
         bases: vec![],
@@ -396,6 +402,7 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostData {
         Err(e) => HostData {
             name: host.name.clone(),
             error: Some(format!("{e:#}")),
+            needs_you: hc::needs_you(&e),
             home: String::new(),
             machine: Reading::default(),
             bases: vec![],
@@ -497,6 +504,7 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
     HostData {
         name: host.name.clone(),
         error: None,
+        needs_you: false,
         home,
         machine: reading,
         bases,
@@ -578,6 +586,7 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
     HostView {
         name: host.name.clone(),
         error: None,
+        needs_you: false,
         home: data.home.clone(),
         machine: data.machine.clone(),
         bases,

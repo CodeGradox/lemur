@@ -45,6 +45,8 @@ pub enum PickerEvent {
         host: HostChoice,
         path: String,
     },
+    /// herdr-core needs you to add `host`: set it up in a terminal.
+    SetUp(Host),
     Dismiss,
 }
 
@@ -133,10 +135,15 @@ impl FolderPicker {
                 .timer(Duration::from_millis(80))
                 .await;
             let key = dir.clone();
+            let picked = host.clone();
             let listed = cx
                 .background_spawn(async move { browse::list_folders(&host, &dir) })
                 .await;
             this.update(cx, |this, cx| {
+                // As Herdr's Add a machine: herdr-core asks in a terminal.
+                if listed.as_ref().err().is_some_and(crate::hc::needs_you) {
+                    cx.emit(PickerEvent::SetUp(picked));
+                }
                 this.listings
                     .insert(key, listed.map_err(|e| format!("{e:#}")));
                 this.listing = None;
@@ -499,6 +506,7 @@ mod tests {
                         host: host.clone(),
                         path: path.clone(),
                     },
+                    PickerEvent::SetUp(host) => PickerEvent::SetUp(host.clone()),
                     PickerEvent::Dismiss => PickerEvent::Dismiss,
                 })
             })
@@ -593,6 +601,31 @@ mod tests {
 
         cx.simulate_keystrokes("escape");
         assert_eq!(events.borrow().last(), Some(&PickerEvent::Dismiss));
+    }
+
+    /// Picked, a host herdr-core needs you to add is set up in a terminal,
+    /// as Herdr's Add a machine does.
+    #[gpui::test]
+    fn a_host_that_needs_you_is_set_up(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("picker-set-up");
+        server.far_config("pick-box");
+        server.core().needed_you("pick-box");
+        let (_picker, events, cx) = picker(server.config().hosts.remove(0), cx);
+        cx.simulate_input("pick-box");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        let asked = crate::test_support::wait_until(Duration::from_secs(5), || {
+            settle(cx);
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, PickerEvent::SetUp(_)))
+        });
+        assert!(asked, "{:?}", events.borrow());
+        assert_eq!(
+            events.borrow().last(),
+            Some(&PickerEvent::SetUp(Host::new("pick-box", "pick-box")))
+        );
     }
 
     #[gpui::test]

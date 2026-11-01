@@ -32,8 +32,10 @@ impl Lemur {
         let hosts = host_choices(&self.cfg);
         let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
         let events = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
-            if let PickerEvent::Add { host, path } = event {
-                this.add_folder(host.clone(), path.clone(), cx);
+            match event {
+                PickerEvent::Add { host, path } => this.add_folder(host.clone(), path.clone(), cx),
+                PickerEvent::SetUp(host) => this.set_up_host(host.clone(), cx),
+                PickerEvent::Dismiss => {}
             }
             this.close_picker(window, cx);
         });

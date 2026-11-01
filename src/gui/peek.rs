@@ -1,11 +1,16 @@
 //! Peeking at a thread, as Herdr peeks at a sub-agent: its terminal over
 //! the one on show, live, without switching to it. ↗ shows it instead;
-//! × or a click outside puts the one on show back.
+//! × or a click outside puts the one on show back. Setting up a host shows
+//! its terminal the same way.
 
 use super::sidebar::thread_icon;
 use super::{Key, Lemur, worktree_label};
+use crate::actions;
+use crate::config::Host;
+use crate::hc;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 impl Lemur {
@@ -24,11 +29,63 @@ impl Lemur {
     }
 
     pub(super) fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.peek.take().and_then(|k| self.terminals.get(&k)) {
+        let closed = self.peek.take();
+        if let Some(view) = closed.as_ref().and_then(|k| self.terminals.get(k)) {
             view.update(cx, |v, _| v.hidden());
+        }
+        if let Some(key) = closed {
+            self.set_up_done(key, cx);
         }
         self.focus_terminal(window, cx);
         cx.notify();
+    }
+
+    /// Opens `hc machine add` for `host` in a terminal over the window, as
+    /// Herdr does, where you answer what herdr-core asks to add it: to
+    /// install herdr-core there or update it, a password, a new host key.
+    pub(super) fn set_up_host(&mut self, host: Host, cx: &mut Context<Self>) {
+        let asked = host.clone();
+        self.in_background(
+            cx,
+            move || actions::set_up_host(&asked),
+            move |this, started, window, cx| match started {
+                Ok((address, here)) => {
+                    let key = (here.name.clone(), address);
+                    this.setups.insert(key.clone(), host);
+                    let view = this.terminal_for(&key, here, cx);
+                    view.read(cx).focus_handle(cx).focus(window, cx);
+                    this.peek = Some(key);
+                    cx.notify();
+                }
+                Err(e) => this.fail(e.context(format!("setting up {}", host.name)), cx),
+            },
+        )
+        .detach();
+    }
+
+    /// Done with setting up a host, if `key` is the terminal that did:
+    /// it goes, ended if it still runs, and herdr-core is asked again.
+    fn set_up_done(&mut self, key: Key, cx: &mut Context<Self>) {
+        let Some(host) = self.setups.remove(&key) else {
+            return;
+        };
+        self.terminals.remove(&key);
+        self.in_background(
+            cx,
+            move || {
+                let core = hc::core(hc::machines_session(&host).as_deref())?;
+                core.kill(&key.1)?;
+                core.forget_machine(&host);
+                anyhow::Ok(())
+            },
+            |this, done, _, cx| {
+                if let Err(e) = done {
+                    this.fail(e, cx);
+                }
+                this.refresh(cx).detach();
+            },
+        )
+        .detach();
     }
 
     /// The thread peeked at, over the window: who it is and how it's doing
@@ -38,9 +95,15 @@ impl Lemur {
         let view = self.terminals.get(&key)?.clone();
         let theme = cx.theme().clone();
         let session = self.session_of(&key).cloned();
-        let label = session
-            .as_ref()
-            .map_or_else(|| self.label_of(&key.0, &key.1), |s| s.label.clone());
+        let setting_up = self
+            .setups
+            .get(&key)
+            .map(|h| format!("Setting up {}", h.name));
+        let label = setting_up.clone().unwrap_or_else(|| {
+            session
+                .as_ref()
+                .map_or_else(|| self.label_of(&key.0, &key.1), |s| s.label.clone())
+        });
         let place = match self.project_of(&key.0, &key.1) {
             Some((base, w)) => format!("{} · {}", self.cfg.bases[base].name(), worktree_label(w)),
             None => key.0.clone(),
@@ -72,22 +135,25 @@ impl Lemur {
                     .child(place),
             )
             .children(dot)
-            .child(
-                div().debug_selector(|| "peek-open".into()).child(
-                    Button::new("peek-open")
-                        .icon(IconName::ExternalLink)
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Show it instead")
-                        .on_click(cx.listener({
-                            let key = key.clone();
-                            move |this, _, window, cx| {
-                                let (host, session) = key.clone();
-                                this.open(host, session, window, cx);
-                            }
-                        })),
-                ),
-            )
+            // A host's set-up isn't a thread to show instead.
+            .when(setting_up.is_none(), |header| {
+                header.child(
+                    div().debug_selector(|| "peek-open".into()).child(
+                        Button::new("peek-open")
+                            .icon(IconName::ExternalLink)
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Show it instead")
+                            .on_click(cx.listener({
+                                let key = key.clone();
+                                move |this, _, window, cx| {
+                                    let (host, session) = key.clone();
+                                    this.open(host, session, window, cx);
+                                }
+                            })),
+                    ),
+                )
+            })
             .child(
                 Button::new("peek-close")
                     .icon(IconName::Close)

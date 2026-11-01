@@ -249,6 +249,9 @@ struct Lemur {
     /// a time, and the order dragged meanwhile, written next. Snapshots
     /// meanwhile would show it half written: they're dropped.
     ordering: HashMap<List, Option<Vec<String>>>,
+    /// Terminals setting up a host (`hc machine add`), shown in the peek
+    /// card until it's put away, and the host each sets up.
+    setups: HashMap<Key, Host>,
     /// The tabs' and the peek card's dots, by where and whose.
     dots: std::cell::RefCell<HashMap<(&'static str, Key), Entity<sidebar::DotView>>>,
     /// Shown in a snackbar over the terminal.
@@ -630,6 +633,7 @@ impl Lemur {
             seen: HashMap::new(),
             agent_walk: vec![],
             dots: Default::default(),
+            setups: HashMap::new(),
             ordering: HashMap::new(),
             status: None,
             restore,
@@ -780,6 +784,7 @@ impl Lemur {
         // A host that couldn't be reached keeps its own: they aren't known
         // to be gone, and reattach once it's back.
         let fresh = &self.fresh;
+        let setups = &self.setups;
         let unreached: HashSet<&str> = snap
             .hosts
             .iter()
@@ -799,6 +804,7 @@ impl Lemur {
             now.contains_key(k)
                 || fresh.contains_key(k)
                 || helpers.contains(k)
+                || setups.contains_key(k)
                 || unreached.contains(k.0.as_str())
         };
         // What can show instead of a thread that ended: not one put away,
@@ -2018,6 +2024,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                needs_you: false,
                 home: String::new(),
                 machine: Default::default(),
                 bases: vec![],
@@ -2474,6 +2481,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                needs_you: false,
                 home: String::new(),
                 machine: Default::default(),
                 bases: vec![BaseView {
@@ -3128,6 +3136,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                needs_you: false,
                 home: String::new(),
                 machine: Default::default(),
                 bases: vec![BaseView {
@@ -4017,6 +4026,7 @@ mod tests {
             hosts: vec![HostView {
                 name: "local".into(),
                 error: None,
+                needs_you: false,
                 home: String::new(),
                 machine,
                 bases: vec![BaseView {
@@ -4771,6 +4781,51 @@ mod tests {
             visited.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
         }
         assert_eq!(visited, ["a", "b", "c"]);
+    }
+
+    /// A host herdr-core needs you to add is set up in a terminal over the
+    /// window, as Herdr does: `hc machine add`, where you answer. Put away,
+    /// it ends, and herdr-core is asked again.
+    #[gpui::test]
+    fn a_host_that_needs_you_is_set_up_in_a_terminal(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("set-up");
+        let cfg = server.far_config("set-box");
+        let host = cfg.hosts[0].clone();
+        // In place of `hc machine add`, which would dial the host.
+        *crate::actions::SET_UP.lock().unwrap() = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo set-box now has hc; exec sleep 600".into(),
+        ]);
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        app.update(cx, |app, cx| app.set_up_host(host, cx));
+        let shown = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.peek.is_some())
+        });
+        assert!(shown, "its terminal shows");
+        let key = app.read_with(cx, |app, _| app.peek.clone().unwrap());
+        assert_eq!(key.0, crate::actions::HERE);
+        assert!(wait_until(Duration::from_secs(5), || server
+            .hc(&["read", &key.1])
+            .contains("set-box now has hc")));
+        // A refresh keeps it while it shows.
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.peek.clone()),
+            Some(key.clone())
+        );
+
+        cx.update(|window, cx| app.update(cx, |app, cx| app.close_peek(window, cx)));
+        let ended = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !server.addresses().contains(&key.1)
+        });
+        assert!(ended, "its terminal ended");
+        assert!(app.read_with(cx, |app, _| app.setups.is_empty()));
+        *crate::actions::SET_UP.lock().unwrap() = None;
     }
 
     /// A list whose every thread is put away still shows them, under "Put

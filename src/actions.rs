@@ -554,6 +554,51 @@ pub fn why_kept(e: &anyhow::Error) -> Option<Kept> {
     }
 }
 
+/// What this Mac is called where it shows a terminal of its own, as one
+/// that sets up a host.
+pub const HERE: &str = "this Mac";
+
+/// Starts `hc machine add` for `host` in a terminal on this Mac, in the
+/// core that reaches the other hosts, where you answer what herdr-core
+/// asks to add it: to install herdr-core there or update it, a password, a
+/// new host key, as Herdr does. Returns the terminal's address, and this
+/// Mac as the host to show it from.
+pub fn set_up_host(host: &Host) -> Result<(String, Host)> {
+    let session = hc::machines_session(host);
+    let here = Host {
+        hc_session: session.clone(),
+        ..Host::new(HERE, "local")
+    };
+    let (core, _) = hc::for_host(&here)?;
+    let labels = BTreeMap::from([(LABEL.to_string(), format!("set up {}", host.name))]);
+    let home = crate::config::home()?.to_string_lossy().into_owned();
+    let address = core.run(None, &home, &set_up_argv(host, session.as_deref()), &labels)?;
+    Ok((address, here))
+}
+
+/// `hc machine add` for `host`, to the core of `session` here.
+fn set_up_argv(host: &Host, session: Option<&str>) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(argv) = SET_UP.lock().unwrap().clone() {
+        return argv;
+    }
+    let mut argv = vec![];
+    if let Some(session) = session {
+        argv.extend(["env".to_string(), format!("HC_SESSION={session}")]);
+    }
+    argv.push(hc::binary().to_string_lossy().into_owned());
+    argv.extend(["machine", "add", &host.ssh, "--name"].map(String::from));
+    argv.push(hc::machine_name(&host.name));
+    if let Some(theirs) = &host.hc_session {
+        argv.extend(["--session".to_string(), theirs.clone()]);
+    }
+    argv
+}
+
+/// What tests run in place of `hc machine add`, which would dial a host.
+#[cfg(test)]
+pub static SET_UP: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
 /// Ends a thread's terminal.
 pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
@@ -1176,6 +1221,24 @@ mod tests {
         );
         assert_eq!(server.addresses().len(), count, "no second terminal");
         assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (true, false)));
+    }
+
+    /// Setting up a host runs `hc machine add` for it, under the name
+    /// herdr-core takes, with the session on it the config names, to this
+    /// Mac's core for the hosts.
+    #[test]
+    fn setting_up_a_host_adds_it_as_herdr_does() {
+        let mut host = Host::new("Agent", "me@agent.example");
+        let argv = set_up_argv(&host, None);
+        assert_eq!(
+            &argv[1..],
+            ["machine", "add", "me@agent.example", "--name", "agent"]
+        );
+        assert!(argv[0].ends_with("herdr-core"), "{argv:?}");
+        host.hc_session = Some("lemur".into());
+        let argv = set_up_argv(&host, Some("test"));
+        assert_eq!(&argv[..2], ["env", "HC_SESSION=test"]);
+        assert_eq!(&argv[argv.len() - 2..], ["--session", "lemur"]);
     }
 
     /// A thread from before herdr-core still running in tmux isn't resumed

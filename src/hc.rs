@@ -316,7 +316,51 @@ pub struct Core {
     machines: Mutex<HashMap<String, Arc<Mutex<Option<Machine>>>>>,
 }
 
-type Machine = std::result::Result<String, (std::time::Instant, String)>;
+/// A machine's name, or why the core couldn't add it, when, and whether it
+/// needs you for it (`NeedsYou`).
+type Machine = std::result::Result<String, (std::time::Instant, String, bool)>;
+
+/// herdr-core can't add a host without you: herdr-core to install there,
+/// or to update, a password, or a new host key. `hc machine add` asks for
+/// them in a terminal (`actions::set_up_host`).
+#[derive(Debug)]
+pub struct NeedsYou(pub String);
+
+impl std::fmt::Display for NeedsYou {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsYou {}
+
+/// Whether `e` is herdr-core needing you to add a host.
+pub fn needs_you(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<NeedsYou>().is_some())
+}
+
+/// Whether herdr-core's answer to adding a host asks for what only you can
+/// give, as Herdr tells: then `hc machine add` asks in a terminal.
+fn asks_you(e: &anyhow::Error) -> bool {
+    let kinds = [
+        "hc_missing",
+        "incompatible",
+        "login_needed",
+        "auth_failed",
+        "host_key",
+    ];
+    let said = format!("{e:#}").to_lowercase();
+    error_kind(e).is_some_and(|k| kinds.contains(&k))
+        || [
+            "password",
+            "passphrase",
+            "host key",
+            "permission denied",
+            "login",
+        ]
+        .iter()
+        .any(|w| said.contains(w))
+}
 
 /// How long a host the core couldn't add isn't asked again: each refresh
 /// would dial it again.
@@ -595,17 +639,44 @@ impl Core {
             .clone();
         // Held while asking, so two threads asking at once add a host once.
         let mut known = entry.lock().unwrap();
+        let failed = |why: String, needs: bool| match needs {
+            true => anyhow::Error::new(NeedsYou(why)),
+            false => anyhow!(why),
+        };
         match &*known {
             Some(Ok(name)) => return Ok(name.clone()),
-            Some(Err((at, why))) if at.elapsed() < MACHINE_RETRY => bail!("{why}"),
+            Some(Err((at, why, needs))) if at.elapsed() < MACHINE_RETRY => {
+                return Err(failed(why.clone(), *needs));
+            }
             _ => {}
         }
-        let found = self.find_machine(host);
-        *known = Some(match &found {
-            Ok(name) => Ok(name.clone()),
-            Err(e) => Err((std::time::Instant::now(), format!("{e:#}"))),
-        });
-        found
+        match self.find_machine(host) {
+            Ok(name) => {
+                *known = Some(Ok(name.clone()));
+                Ok(name)
+            }
+            Err(e) => {
+                let (why, needs) = (format!("{e:#}"), asks_you(&e));
+                *known = Some(Err((std::time::Instant::now(), why.clone(), needs)));
+                Err(failed(why, needs))
+            }
+        }
+    }
+
+    /// Has the core said, a moment ago, that adding the host `name` needs
+    /// you: what a test can't make herdr-core say without dialing a host.
+    #[cfg(test)]
+    pub fn needed_you(&self, name: &str) {
+        let said = Err((std::time::Instant::now(), format!("{name} has no hc"), true));
+        self.machines
+            .lock()
+            .unwrap()
+            .insert(name.into(), Arc::new(Mutex::new(Some(said))));
+    }
+
+    /// Forgets what the core said of `host`, as once it's been set up.
+    pub fn forget_machine(&self, host: &Host) {
+        self.machines.lock().unwrap().remove(&host.name);
     }
 
     /// Finds the core's machine for `host`, or adds it.
@@ -644,13 +715,7 @@ impl Core {
                         json!({"target": host.ssh, "name": wanted, "session": host.hc_session}),
                         Duration::from_secs(60),
                     )
-                    .with_context(|| {
-                        format!(
-                            "adding {} to herdr-core (it needs herdr-core on the host too: \
-                             `hc machine add {} --name {wanted} --install`)",
-                            host.name, host.ssh
-                        )
-                    })?;
+                    .with_context(|| format!("adding {} to herdr-core", host.name))?;
                 added["name"].as_str().unwrap_or(&wanted).to_string()
             }
         };
@@ -888,7 +953,7 @@ pub fn core(session: Option<&str>) -> Result<Arc<Core>> {
 /// `name` as herdr-core takes a machine's: 1-32 of a-z 0-9 - _ ., starting
 /// with a letter or digit, and not shaped like a terminal's id (`t7`). A
 /// host typed as `me@Build.example.com` is `me-build.example.com`.
-fn machine_name(name: &str) -> String {
+pub fn machine_name(name: &str) -> String {
     let lower: String = name
         .to_ascii_lowercase()
         .chars()
@@ -925,14 +990,22 @@ pub fn for_host(host: &Host) -> Result<(Arc<Core>, Option<String>)> {
     if host.ssh == "local" {
         return Ok((core(host.hc_session.as_deref())?, None));
     }
-    // Tests reach their stand-in hosts through their own core.
-    #[cfg(test)]
-    let session = test_route(&host.name);
-    #[cfg(not(test))]
-    let session: Option<String> = None;
-    let core = core(session.as_deref())?;
+    let core = core(machines_session(host).as_deref())?;
     let machine = core.machine(host)?;
     Ok((core, Some(machine)))
+}
+
+/// The session of the core on this Mac that reaches the other hosts, as
+/// machines of its: herdr-core's default. Tests reach their stand-in hosts
+/// through their own core.
+pub fn machines_session(host: &Host) -> Option<String> {
+    #[cfg(test)]
+    return test_route(&host.name);
+    #[cfg(not(test))]
+    {
+        let _ = host;
+        None
+    }
 }
 
 /// Whether `t` runs on `host`, as the core `for_host` gives calls it.
@@ -1024,6 +1097,30 @@ mod tests {
         core.kill(address).unwrap();
         core.kill(address).unwrap();
         core.kill("t999").unwrap();
+    }
+
+    /// What herdr-core asks you for to add a host, `hc machine add` asks
+    /// in a terminal; a host that's just down isn't that.
+    #[test]
+    fn what_only_you_can_give_is_told_apart() {
+        let refused = |kind: &str| {
+            anyhow::Error::new(RpcError(json!({"message": "no", "data": {"kind": kind}})))
+                .context("adding agent to herdr-core")
+        };
+        assert!(asks_you(&refused("hc_missing")));
+        assert!(asks_you(&refused("incompatible")));
+        assert!(asks_you(&refused("host_key")));
+        assert!(!asks_you(&refused("unreachable")));
+        assert!(asks_you(&anyhow!(
+            "Permission denied (publickey,password)."
+        )));
+        assert!(!asks_you(&anyhow!(
+            "ssh: connect to host agent port 22: Operation timed out"
+        )));
+        assert!(needs_you(
+            &anyhow::Error::new(NeedsYou("x".into())).context("refreshing")
+        ));
+        assert!(!needs_you(&anyhow!("x")));
     }
 
     #[test]

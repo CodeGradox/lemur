@@ -16,7 +16,7 @@ Lemur runs its terminals in herdr-core (`hc`), here and on each host, where it n
 curl -fsSL https://releases.herdr.dev/core/install.sh | sh
 ```
 
-herdr-core reaches the hosts over SSH itself; Lemur adds each host from the config to it the first time (`hc machine ls` lists them). A host whose SSH login asks for a password needs `hc machine login <name>` in a terminal first. Lemur shares herdr-core with Herdr unless a host sets `hc_session`. Lemur 1.8 and older ran sessions in tmux: those don't show up, but Claude threads Lemur kept resume in herdr-core, once their tmux session has ended (Lemur won't start a second Claude on a conversation still running there).
+herdr-core reaches the hosts over SSH itself; Lemur adds each host from the config to it the first time (`hc machine ls` lists them). When herdr-core needs you to add a host (to install herdr-core there or update it, a password, a new host key), picking the host in the folder picker, or **Set up <host>…** under its error in the sidebar, opens `hc machine add` in a terminal over the window, where you answer it, as Herdr's Add a machine does; **×** or `⌘W` once it's done, and Lemur asks herdr-core again. Lemur shares herdr-core with Herdr unless a host sets `hc_session`. Lemur 1.8 and older ran sessions in tmux: those don't show up, but Claude threads Lemur kept resume in herdr-core, once their tmux session has ended (Lemur won't start a second Claude on a conversation still running there).
 
 From source:
 
