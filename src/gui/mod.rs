@@ -1122,6 +1122,11 @@ impl Lemur {
         if self.prompt.is_some() || self.picker.is_some() {
             return;
         }
+        // The peek is in front, not the thread on show under it.
+        if self.peek.is_some() {
+            self.close_peek(window, cx);
+            return;
+        }
         if let Some(key) = self.active.clone() {
             self.confirm_close_of(key, window, cx);
         }
@@ -4585,6 +4590,41 @@ mod tests {
                 .map(|p| p.input.read(cx).value().to_string())
         });
         assert_eq!(typed.as_deref(), Some("x"));
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘W while peeking puts the peek away; the idle shell on show under
+    /// it, which ⌘W would close without asking, stays.
+    #[gpui::test]
+    fn cmd_w_while_peeking_puts_the_peek_away(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("peek-close");
+        let [a, b] = ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sh"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let idle = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                [&a, &b]
+                    .iter()
+                    .all(|s| app.session_of(&key(s)).is_some_and(|s| !s.busy))
+            })
+        });
+        assert!(idle, "both shells at their prompt");
+        open(&app, &a, cx);
+        cx.update(|window, cx| app.update(cx, |app, cx| app.peek(key(&b), window, cx)));
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.peek, None, "the peek went");
+            assert_eq!(app.active, Some(key(&a)), "a still shows");
+        });
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert!(server.addresses().contains(&a), "a still runs");
         let_attaches_end(&app, cx);
     }
 
