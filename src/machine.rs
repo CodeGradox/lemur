@@ -3,17 +3,21 @@
 //! runs in, so a worktree's dev server can be found from the worktree. Read
 //! by the same script that lists the host's worktrees.
 
-/// Reads the load (Linux's /proc only), then the servers listening (`ss`
-/// and /proc on Linux, `lsof` on macOS): port, address, pid, program and
-/// folder, a tab between each. Herdr's projects mod reads them the same way.
-pub const SCRIPT: &str = r#"echo '@@load'
+/// Reads the load (Linux's /proc only).
+pub const LOAD: &str = r#"echo '@@load'
 if [ -r /proc/stat ]; then
   head -1 /proc/stat
   grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo
   cat /proc/loadavg
   nproc 2>/dev/null
 fi
-echo '@@ports'
+"#;
+
+/// Reads the servers listening (`ss` and /proc on Linux, `lsof` on macOS):
+/// port, address, pid, program and folder, a tab between each. Herdr's
+/// projects mod reads them the same way. `lsof` takes a moment of CPU, so
+/// it's asked less often than the load.
+pub const PORTS: &str = r#"echo '@@ports'
 if [ "$(uname -s)" = Linux ]; then
   ss -ltnpH 2>/dev/null | while read -r st rq sq local peer users; do
     [ -n "$users" ] || continue
@@ -276,7 +280,7 @@ mod tests {
     #[test]
     fn the_script_runs() {
         let out = std::process::Command::new("sh")
-            .args(["-c", &format!("{SCRIPT}{TAILNET}")])
+            .args(["-c", &format!("{LOAD}{PORTS}{TAILNET}")])
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .output()
             .unwrap();

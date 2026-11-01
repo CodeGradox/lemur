@@ -141,7 +141,7 @@ Each session's dot comes from Claude Code itself: Claude reports what it's doing
 
 When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. It names the project and worktree under the session's name. **Show** brings Lemur forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too, and so does coming back to Lemur while it's the session on show. A popup never keeps the keyboard: if `⌘Tab` back to Lemur hands it to one, it goes on to the main window.
 
-What Claude reports arrives at once. The refresh, for worktrees, servers and hosts' load, runs every 3 seconds while Lemur is in front, and every 15 seconds while it's in the background; `claude agents` runs with it at most every 30 seconds, as it costs each host a moment of CPU.
+What Claude reports arrives at once. The refresh, for worktrees, servers and hosts' load, runs every 3 seconds while Lemur is in front, and every 15 seconds while it's in the background; `claude agents`, and the servers listening (`lsof` on a Mac), run with it at most every 30 seconds, as they cost each host a moment of CPU.
 
 ## Trademarks
 

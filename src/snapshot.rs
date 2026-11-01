@@ -5,7 +5,7 @@
 
 use crate::config::{ClaudeThread, Config, Host};
 use crate::hc::{self, Terminal};
-use crate::machine::{self, Reading};
+use crate::machine::{self, Reading, Server};
 use crate::remote::{Remote, sh_path};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -275,10 +275,35 @@ static TAILNETS: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
 /// it adds, each conversation's ID for resuming it, rarely changes.
 const AGENTS_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// When each host (and herdr-core session) last answered `claude agents`,
-/// and what it said: its agents and the process tree that places them.
-type Asked = (std::time::Instant, String, HashMap<u32, u32>);
-static AGENTS: Mutex<Vec<(String, Asked)>> = Mutex::new(Vec::new());
+/// How often a host's listening servers are asked: `lsof` takes a moment of
+/// CPU each time, and servers rarely come and go.
+const PORTS_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When each host (and herdr-core session) last answered something asked
+/// only every so often, and what it said.
+type Asked<T> = Mutex<Vec<(String, (std::time::Instant, T))>>;
+
+/// What `claude agents` said: the agents, and the process tree that places
+/// them.
+static AGENTS: Asked<(String, HashMap<u32, u32>)> = Mutex::new(Vec::new());
+static PORTS: Asked<Vec<Server>> = Mutex::new(Vec::new());
+
+/// What `place` said last, unless it's been `every` since.
+fn said<T: Clone>(asked: &Asked<T>, place: &str, every: std::time::Duration) -> Option<T> {
+    asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(p, (at, _))| p == place && at.elapsed() < every)
+        .map(|(_, (_, said))| said.clone())
+}
+
+/// Keeps what `place` said just now.
+fn remember<T>(asked: &Asked<T>, place: &str, said: T) {
+    let mut all = asked.lock().unwrap();
+    all.retain(|(p, _)| p != place);
+    all.push((place.to_string(), (std::time::Instant::now(), said)));
+}
 
 fn fetch_host(cfg: &Config, host: &Host) -> HostData {
     let known = TAILNETS
@@ -292,29 +317,23 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostData {
         host.ssh,
         host.hc_session.as_deref().unwrap_or_default()
     );
-    let asked = AGENTS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(p, _)| *p == place)
-        .map(|(_, asked)| asked.clone())
-        .filter(|(at, ..)| at.elapsed() < AGENTS_EVERY);
-    let mut script = script(cfg, host, asked.is_none());
+    let agents = said(&AGENTS, &place, AGENTS_EVERY);
+    let servers = said(&PORTS, &place, PORTS_EVERY);
+    let mut script = script(cfg, host, agents.is_none(), servers.is_none());
     if known.is_none() {
         script += machine::TAILNET;
     }
     match Remote::new(host).run(&script) {
         Ok(out) => {
             let mut data = parse(cfg, host, &out);
-            match asked {
-                // Not asked this time: what it said last.
-                Some((_, agents, parents)) => (data.agents, data.parents) = (agents, parents),
-                None => {
-                    let mut all = AGENTS.lock().unwrap();
-                    all.retain(|(p, _)| *p != place);
-                    let now = std::time::Instant::now();
-                    all.push((place, (now, data.agents.clone(), data.parents.clone())));
-                }
+            // Not asked this time: what it said last.
+            match agents {
+                Some((agents, parents)) => (data.agents, data.parents) = (agents, parents),
+                None => remember(&AGENTS, &place, (data.agents.clone(), data.parents.clone())),
+            }
+            match servers {
+                Some(servers) => data.machine.servers = servers,
+                None => remember(&PORTS, &place, data.machine.servers.clone()),
             }
             match known {
                 Some(name) => data.machine.tailnet = name,
@@ -337,8 +356,9 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostData {
     }
 }
 
-/// The host's script; `agents`: with `claude agents` too.
-fn script(cfg: &Config, host: &Host, agents: bool) -> String {
+/// The host's script; `agents`: with `claude agents` too, `ports`: with
+/// the servers listening.
+fn script(cfg: &Config, host: &Host, agents: bool, ports: bool) -> String {
     let mut s = String::from("printf '@@home %s\\n' \"$HOME\"\n");
     for (i, b) in cfg
         .bases
@@ -356,7 +376,10 @@ fn script(cfg: &Config, host: &Host, agents: bool) -> String {
     if agents {
         s += CLAUDE;
     }
-    s += machine::SCRIPT;
+    s += machine::LOAD;
+    if ports {
+        s += machine::PORTS;
+    }
     s
 }
 
@@ -791,13 +814,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    /// `claude agents` is asked only when a Claude may run: without a
-    /// session registry, or with a live pid in it. Otherwise the answer is
-    /// known: none.
-    /// `claude agents` is asked of a host at most every `AGENTS_EVERY`; in
-    /// between, a refresh goes by what it said last.
+    /// `claude agents`, and the servers listening, are asked of a host at
+    /// most every 30 seconds; in between, a refresh goes by what it said
+    /// last.
     #[test]
-    fn claude_agents_is_asked_at_most_every_30_seconds() {
+    fn claude_agents_and_ports_are_asked_at_most_every_30_seconds() {
         let server = crate::test_support::HcServer::new("agents-every");
         let cfg = server.config();
         let host = &cfg.hosts[0];
@@ -806,32 +827,44 @@ mod tests {
             host.ssh,
             host.hc_session.as_deref().unwrap_or_default()
         );
-        let asked = || {
-            AGENTS
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(p, _)| *p == place)
-                .map(|(_, (at, ..))| *at)
-        };
-        assert!(!script(&cfg, host, false).contains("@@agents"));
-        assert!(script(&cfg, host, true).contains("@@agents"));
-
-        fetch_host(&cfg, host);
-        let first = asked().expect("asked the first time");
-        fetch_host(&cfg, host);
-        assert_eq!(asked(), Some(first), "not again so soon");
-        // Once it's due, asked again.
-        for (p, (at, ..)) in AGENTS.lock().unwrap().iter_mut() {
-            if *p == place {
-                *at -= AGENTS_EVERY;
+        fn asked_at<T>(asked: &Asked<T>, place: &str) -> Option<std::time::Instant> {
+            let all = asked.lock().unwrap();
+            all.iter().find(|(p, _)| p == place).map(|(_, (at, _))| *at)
+        }
+        fn age<T>(asked: &Asked<T>, place: &str, by: std::time::Duration) {
+            for (p, (at, _)) in asked.lock().unwrap().iter_mut() {
+                if p == place {
+                    *at -= by;
+                }
             }
         }
+        let asked = || (asked_at(&AGENTS, &place), asked_at(&PORTS, &place));
+        assert!(!script(&cfg, host, false, false).contains("@@agents"));
+        assert!(script(&cfg, host, true, false).contains("@@agents"));
+        assert!(!script(&cfg, host, false, false).contains("@@ports"));
+        assert!(script(&cfg, host, false, true).contains("@@ports"));
+
+        let servers = fetch_host(&cfg, host).machine.servers;
+        let first = asked();
+        assert!(
+            first.0.is_some() && first.1.is_some(),
+            "asked the first time"
+        );
+        assert_eq!(fetch_host(&cfg, host).machine.servers, servers, "as before");
+        assert_eq!(asked(), first, "not again so soon");
+        // Once one is due, it alone is asked again.
+        age(&AGENTS, &place, AGENTS_EVERY);
         fetch_host(&cfg, host);
-        assert!(asked().is_some_and(|at| at > first - AGENTS_EVERY));
-        assert_ne!(asked(), Some(first - AGENTS_EVERY));
+        assert!(asked().0 > first.0, "agents again");
+        assert_eq!(asked().1, first.1);
+        age(&PORTS, &place, PORTS_EVERY);
+        fetch_host(&cfg, host);
+        assert!(asked().1 > first.1, "ports again");
     }
 
+    /// `claude agents` is asked only when a Claude may run: without a
+    /// session registry, or with a live pid in it. Otherwise the answer is
+    /// known: none.
     #[test]
     fn claude_agents_runs_only_when_a_claude_does() {
         let dir = TempDir::new("claude-registry");
