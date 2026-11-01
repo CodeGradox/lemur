@@ -32,6 +32,12 @@ pub const CONTEXT: &str = "Terminal";
 /// The least time between attaching again on its own after a drop.
 const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Output is drawn at most this often, about 30 times a second, as
+/// Herdr does: a program printing fast redraws the window far less, and
+/// looks the same. Right after typing (`TYPING`), at once.
+const OUTPUT_EVERY: std::time::Duration = std::time::Duration::from_millis(33);
+const TYPING: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Where this view is with its terminal's byte stream.
 enum Attachment {
     Attaching,
@@ -82,6 +88,12 @@ pub struct TerminalView {
     _reader: Option<Task<()>>,
     /// Shows a synchronized update that never said it was done.
     _sync: Option<Task<()>>,
+    /// When you last typed into it, so its echo shows at once.
+    typed_at: std::cell::Cell<Option<Instant>>,
+    /// Draws output that came since the last frame, at `OUTPUT_EVERY`.
+    _redraw: Option<Task<()>>,
+    #[cfg(test)]
+    renders: usize,
     _prefs: Subscription,
 }
 
@@ -141,6 +153,10 @@ impl TerminalView {
             tried: None,
             _reader: None,
             _sync: None,
+            typed_at: std::cell::Cell::new(None),
+            _redraw: None,
+            #[cfg(test)]
+            renders: 0,
             _prefs: cx.observe_global::<Prefs>(|this, cx| {
                 this.metrics = None;
                 cx.notify();
@@ -344,9 +360,31 @@ impl TerminalView {
             self.lost = !over;
             let note = (!over).then(|| ("disconnected · reconnecting…".into(), Kind::Warning));
             self.set_status(note, cx);
+            cx.notify();
+        } else {
+            self.redraw_soon(cx);
         }
-        cx.notify();
         open
+    }
+
+    /// Draws new output at the next `OUTPUT_EVERY`, or at once while you
+    /// type.
+    fn redraw_soon(&mut self, cx: &mut Context<Self>) {
+        if self.typed_at.get().is_some_and(|t| t.elapsed() < TYPING) {
+            cx.notify();
+            return;
+        }
+        if self._redraw.is_some() {
+            return;
+        }
+        self._redraw = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(OUTPUT_EVERY).await;
+            this.update(cx, |this, cx| {
+                this._redraw = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn on_term_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
@@ -377,6 +415,7 @@ impl TerminalView {
     }
 
     fn write(&self, bytes: Vec<u8>) {
+        self.typed_at.set(Some(Instant::now()));
         if let Attachment::Attached(core, channel) = &self.attachment {
             core.input(*channel, &bytes);
         }
@@ -1268,6 +1307,10 @@ impl TerminalInput {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         let metrics = self
             .metrics
             .get_or_insert_with(|| Self::measure(window, cx))
@@ -1392,9 +1435,10 @@ impl Render for TerminalView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{TerminalInput, TerminalView, block, snapshot};
+    use super::{OUTPUT_EVERY, TerminalInput, TerminalView, block, snapshot};
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Screen, Size};
+    use crate::hc::Stream;
     use crate::test_support::{HcServer, wait_until};
     use gpui_kit::{
         Capslock, InputHandler, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
@@ -1440,6 +1484,36 @@ mod tests {
             let rows: Vec<String> = frame.rows.into_iter().map(|r| r.text).collect();
             rows.join("\n").trim_end().to_string()
         })
+    }
+
+    /// Output is drawn at most every `OUTPUT_EVERY`, however much comes
+    /// meanwhile; right after typing, at once, so the echo doesn't lag.
+    #[gpui::test]
+    fn output_is_drawn_about_30_times_a_second(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("redraws");
+        let (view, _, cx) = attach(&server, &["sleep", "600"], cx);
+        cx.executor().advance_clock(OUTPUT_EVERY);
+        cx.run_until_parked();
+        let renders = |cx: &mut gpui::VisualTestContext| view.read_with(cx, |v, _| v.renders);
+        let before = renders(cx);
+        view.update(cx, |v, cx| {
+            for i in 0..50 {
+                v.ingest(vec![Stream::Data(format!("line {i}\r\n").into_bytes())], cx);
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before, "not yet");
+        cx.executor().advance_clock(OUTPUT_EVERY);
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before + 1, "once for all fifty");
+        assert!(shown(&view, cx).contains("line 49"));
+
+        view.update(cx, |v, cx| {
+            v.typed_at.set(Some(std::time::Instant::now()));
+            v.ingest(vec![Stream::Data(b"x".to_vec())], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before + 2, "typing shows at once");
     }
 
     /// Holding ⌘ over a URL shows it, and ⌘-clicking opens it; a plain
