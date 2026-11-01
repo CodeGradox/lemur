@@ -1,7 +1,10 @@
 //! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font and
-//! colors, and the language dictation listens for. Changes apply at once in
-//! every window and are saved to the config file.
+//! colors, the language dictation listens for, and whether to show Claude's
+//! plan usage. Changes apply at once in every window and are saved to the
+//! config file.
 
+use super::meter::ClaudeFound;
+use super::sidebar::claude_icon;
 use super::terminal::{Palette, SLOTS, Slot, set_color};
 use crate::config::{Config, FONT_SIZES, Language, Terminal, ThemeChoice};
 use alacritty_terminal::vte::ansi::Rgb;
@@ -27,6 +30,8 @@ pub struct Prefs {
     pub theme: ThemeChoice,
     pub dictation_language: Language,
     pub terminal: Terminal,
+    /// Whether the sidebar shows how much of Claude's plan is used.
+    pub claude_usage: bool,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
     /// Why the last change couldn't be saved.
@@ -41,6 +46,7 @@ impl Prefs {
             theme: cfg.theme,
             dictation_language: cfg.dictation_language,
             terminal: cfg.terminal.clone(),
+            claude_usage: cfg.claude_usage,
             file,
             error: None,
         }
@@ -63,9 +69,15 @@ impl Prefs {
         let theme = prefs.theme;
         change(&mut prefs);
         prefs.error = prefs.file.as_deref().and_then(|path| {
-            Config::save_settings(path, prefs.theme, prefs.dictation_language, &prefs.terminal)
-                .err()
-                .map(|e| format!("{e:#}"))
+            Config::save_settings(
+                path,
+                prefs.theme,
+                prefs.dictation_language,
+                &prefs.terminal,
+                prefs.claude_usage,
+            )
+            .err()
+            .map(|e| format!("{e:#}"))
         });
         cx.set_global(prefs);
         if Prefs::get(cx).theme != theme {
@@ -123,6 +135,7 @@ struct SettingsView {
     pickers: Vec<Picker>,
     focus: FocusHandle,
     _prefs: Subscription,
+    _found: Subscription,
     _pickers: Vec<Subscription>,
 }
 
@@ -174,6 +187,7 @@ impl SettingsView {
                 this.sync_pickers(window, cx);
                 cx.notify();
             }),
+            _found: cx.observe_global::<ClaudeFound>(|_, cx| cx.notify()),
             _pickers: subscriptions,
         }
     }
@@ -271,6 +285,26 @@ impl Render for SettingsView {
             },
         )
         .default_value(Language::default().as_str());
+        // Offered once Lemur has seen Claude Code; turned on, it can be
+        // turned off whatever happens.
+        let found = cx.try_global::<ClaudeFound>().is_some_and(|f| f.0);
+        let usage_on = Prefs::get(cx).claude_usage;
+        let usage = SettingItem::new(
+            "Show plan usage",
+            SettingField::switch(
+                |cx| Prefs::get(cx).claude_usage,
+                |on, cx| Prefs::update(cx, |p| p.claude_usage = on),
+            ),
+        )
+        .disabled(!found && !usage_on)
+        .description(if found || usage_on {
+            "How much of your Claude plan is used, above the hosts' load in the sidebar. \
+             Lemur runs Claude Code's /usage every 10 minutes (30 while Lemur isn't in front) \
+             on the host where Claude ran last; Claude Code asks, with its own sign-in."
+        } else {
+            "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, \
+             then turn this on."
+        });
         let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
             SettingPage::new("Appearance").icon(IconName::Sun).group(
                 SettingGroup::new().item(
@@ -299,6 +333,9 @@ impl Render for SettingsView {
                             "What ⌘D listens for. The dictation bar switches it too.",
                         )),
                 ),
+            SettingPage::new("Claude")
+                .icon(claude_icon())
+                .group(SettingGroup::new().item(usage)),
             SettingPage::new("Shortcuts")
                 // Not among gpui-component's own icons; the full set has it.
                 .icon(gpui_kit::assets::IconName::Keyboard)

@@ -9,7 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::*;
 use std::rc::Rc;
 use std::time::Duration;
@@ -217,9 +217,16 @@ impl Lemur {
         let sidebar = Sidebar::new("sessions")
             .collapsible(SidebarCollapsible::None)
             .w(self.sidebar_width);
-        let sidebar = match self.machines(cx) {
-            Some(machines) => sidebar.footer(machines),
-            None => sidebar,
+        // At its foot, how much of Claude's plan is used, then each host's load.
+        let foot: Vec<AnyElement> = self
+            .usage_meter(cx)
+            .into_iter()
+            .chain(self.machines(cx).map(IntoElement::into_any_element))
+            .collect();
+        let sidebar = if foot.is_empty() {
+            sidebar
+        } else {
+            sidebar.footer(v_flex().w_full().children(foot))
         };
         // The window's top row, its buttons at the left: over the header's
         // padding, to the window's top and the sidebar's sides.

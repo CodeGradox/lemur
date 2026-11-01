@@ -13,6 +13,7 @@ mod remote;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
+mod usage;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};

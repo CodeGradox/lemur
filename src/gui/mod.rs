@@ -11,6 +11,7 @@ mod goto;
 mod icons;
 pub(crate) mod keys;
 mod links;
+mod meter;
 mod new;
 mod notes;
 mod notification;
@@ -211,6 +212,8 @@ struct Lemur {
     /// Each host's last load, and the CPU share between it and the one
     /// before.
     loads: HashMap<String, (crate::machine::Load, Option<f32>)>,
+    /// How much of Claude's plan is used, at the foot of the sidebar.
+    meter: meter::Meter,
     /// Notification popups that are showing, one per session.
     popups: HashMap<Key, (WindowHandle<Notification>, Subscription)>,
     /// Counts changes a snapshot fetched across one would undo (the thread
@@ -230,6 +233,8 @@ struct Lemur {
     sidebar: Entity<SidebarView>,
     _refresh: Task<()>,
     _watch: Task<()>,
+    _meter: Task<()>,
+    _meter_setting: Subscription,
     /// Focused when no terminal is, so keys and menu actions reach the
     /// window.
     focus: FocusHandle,
@@ -377,6 +382,23 @@ impl Lemur {
                 since += 1;
             }
         });
+        // How much of Claude's plan is used, once it's turned on, as
+        // `usage::wait` says.
+        let asking = cx.spawn(async move |this, cx| {
+            loop {
+                let looking = handle
+                    .update(cx, |_, window, _| window.is_window_active())
+                    .unwrap_or(false);
+                if this
+                    .update(cx, |this, cx| this.tick_meter(looking, cx))
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(meter::TICK).await;
+            }
+        });
+        let meter_setting = cx.observe_global::<Prefs>(|this, cx| this.follow_meter_setting(cx));
         // herdr-core tells of every change to a terminal as it happens:
         // started, ended, relabelled, what Claude says it's doing.
         let watch = cx.spawn(async move |this, cx| {
@@ -445,6 +467,7 @@ impl Lemur {
             window: window.window_handle(),
             popups: HashMap::new(),
             loads: HashMap::new(),
+            meter: meter::Meter::new(cx),
             changes: 0,
             notes,
             notes_open: false,
@@ -453,6 +476,8 @@ impl Lemur {
             helper: dictate::helper(),
             sidebar,
             _refresh: refresh,
+            _meter: asking,
+            _meter_setting: meter_setting,
             _watch: watch,
             focus,
             _appearance: appearance,
@@ -595,8 +620,14 @@ impl Lemur {
             self.close_popup(&k, cx);
         }
         self.snap = snap;
+        self.note_claude(cx);
         self.follow_loads();
+        // With the hosts known, the meter can ask now, not at its next tick.
+        let first = !self.loaded;
         self.loaded = true;
+        if first {
+            self.tick_meter(window.is_window_active(), cx);
+        }
         self.keep_claude_ids(cx);
         self.notify_news(news, window, cx);
         if let Some((host, session)) = restore.or(instead) {
@@ -1306,10 +1337,11 @@ fn key(host: &str, s: &Session) -> Key {
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::folder_picker::HostChoice;
+    use super::settings::Prefs;
     use super::snackbar::Kind;
     use super::{
         Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
-        SIDEBAR_WIDTH, move_item, moved_to,
+        SIDEBAR_WIDTH, meter, move_item, moved_to,
     };
     use crate::config::{Base, Config, Host};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
@@ -3464,6 +3496,66 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(server.addresses().contains(&a), "cancelled");
+    }
+
+    /// Turned on in Settings, the sidebar's foot shows each limit the
+    /// host's Claude command's `/usage` lists; a Claude that can't answer
+    /// says so; turned off, it's gone. Off, it never asks.
+    #[gpui::test]
+    fn the_meter_follows_settings(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("meter");
+        let dir = TempDir::new("meter");
+        let printed = dir.join("printed.jsonl");
+        std::fs::write(&printed, crate::usage::PRINTED).unwrap();
+        let ran = dir.join("ran");
+        let mut cfg = server.config();
+        // Says it ran, and prints what /usage prints; `#` leaves out the
+        // arguments Lemur adds.
+        cfg.hosts[0].claude = format!("touch {}; cat {} #", ran.display(), printed.display());
+        let (app, cx) = rooted(cfg, cx);
+        let loaded = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.loaded)
+        });
+        assert!(loaded);
+        let found = cx.update(|_, cx| cx.global::<meter::ClaudeFound>().0);
+        assert!(!found, "no Claude here yet");
+        app.update(cx, |app, cx| app.tick_meter(true, cx));
+        cx.run_until_parked();
+        assert!(!ran.exists(), "off, it doesn't ask");
+        assert!(cx.debug_bounds("usage").is_none());
+
+        let set = |on: bool, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| Prefs::update(cx, |p| p.claude_usage = on));
+        };
+        let shown = |cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(5), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.meter.shown.is_some())
+            });
+            app.read_with(cx, |app, _| app.meter.shown.clone())
+        };
+        set(true, cx);
+        let usage = shown(cx).expect("asked at once").expect("its limits");
+        assert!(ran.exists());
+        assert_eq!(usage.host, "local");
+        let labels: Vec<&str> = usage.limits.iter().map(|l| l.label.as_str()).collect();
+        assert_eq!(labels, ["Week", "Week · Fable"]);
+        assert!(cx.debug_bounds("usage").is_some());
+
+        app.update(cx, |app, cx| {
+            app.cfg.hosts[0].claude = "false".into();
+            app.meter.shown = None;
+            app.ask_usage(cx);
+        });
+        let failed = shown(cx).expect("asked").unwrap_err();
+        assert_eq!(failed, "Claude Code didn't answer (on local)");
+        assert!(cx.debug_bounds("usage").is_some(), "it says so");
+
+        set(false, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("usage").is_none());
+        assert!(app.read_with(cx, |app, _| app.meter.shown.is_none()));
     }
 
     /// Every host is listed in Other, threads or none, and its + starts a

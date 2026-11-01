@@ -556,6 +556,17 @@ impl Lemur {
 /// One measure of a host, as a bar: its name, how full, and the number.
 /// Nearly full turns it to a warning, then to danger.
 fn bar(name: &'static str, percent: Option<f32>, text: String, cx: &App) -> Div {
+    bar_sized(name.into(), (px(28.0), px(92.0)), percent, text, cx)
+}
+
+/// A bar whose name and number take these widths.
+pub(super) fn bar_sized(
+    name: SharedString,
+    (name_width, text_width): (Pixels, Pixels),
+    percent: Option<f32>,
+    text: String,
+    cx: &App,
+) -> Div {
     let theme = cx.theme();
     let fill = percent.unwrap_or(0.0).clamp(0.0, 100.0);
     let color = match fill {
@@ -569,8 +580,9 @@ fn bar(name: &'static str, percent: Option<f32>, text: String, cx: &App) -> Div 
         .text_xs()
         .child(
             div()
-                .w(px(28.0))
+                .w(name_width)
                 .flex_shrink_0()
+                .truncate()
                 .text_color(theme.muted_foreground)
                 .child(name),
         )
@@ -588,5 +600,5 @@ fn bar(name: &'static str, percent: Option<f32>, text: String, cx: &App) -> Div 
                         .w(relative(fill / 100.0)),
                 ),
         )
-        .child(div().w(px(92.0)).flex_shrink_0().text_right().child(text))
+        .child(div().w(text_width).flex_shrink_0().text_right().child(text))
 }

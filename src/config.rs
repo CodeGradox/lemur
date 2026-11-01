@@ -42,6 +42,10 @@ pub struct Config {
     pub notes_width: Option<f32>,
     #[serde(default)]
     pub terminal: Terminal,
+    /// Whether the sidebar shows how much of Claude's plan is used; off
+    /// until turned on in Settings.
+    #[serde(default)]
+    pub claude_usage: bool,
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
@@ -348,6 +352,7 @@ impl Config {
         theme: ThemeChoice,
         language: Language,
         terminal: &Terminal,
+        claude_usage: bool,
     ) -> Result<()> {
         edit(path, |doc| {
             doc["theme"] = toml_edit::value(theme.as_str());
@@ -355,6 +360,11 @@ impl Config {
                 doc.remove("dictation_language");
             } else {
                 doc["dictation_language"] = toml_edit::value(language.as_str());
+            }
+            if claude_usage {
+                doc["claude_usage"] = toml_edit::value(true);
+            } else {
+                doc.remove("claude_usage");
             }
             let table = doc
                 .entry("terminal")
@@ -733,7 +743,14 @@ path = \"~/projects/api\"
             },
             ..Default::default()
         };
-        Config::save_settings(&path, ThemeChoice::Dark, Language::Norwegian, &terminal).unwrap();
+        Config::save_settings(
+            &path,
+            ThemeChoice::Dark,
+            Language::Norwegian,
+            &terminal,
+            true,
+        )
+        .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
             saved.contains("# my hosts") && saved.contains("# the box"),
@@ -743,6 +760,7 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::Dark);
         assert_eq!(cfg.dictation_language, Language::Norwegian);
+        assert!(cfg.claude_usage);
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
 
@@ -751,10 +769,21 @@ path = \"~/projects/api\"
             font_size: 12.5,
             ..terminal
         };
-        Config::save_settings(&path, ThemeChoice::System, Language::English, &terminal).unwrap();
+        Config::save_settings(
+            &path,
+            ThemeChoice::System,
+            Language::English,
+            &terminal,
+            false,
+        )
+        .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved.matches("font_size").count(), 1, "{saved}");
         assert!(!saved.contains("dictation_language"), "{saved}");
+        assert!(
+            !saved.contains("claude_usage"),
+            "off is the default: {saved}"
+        );
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::System);
         assert_eq!(cfg.terminal.font_size, 12.5);
