@@ -253,6 +253,14 @@ impl EventLines {
             return true;
         }
         let t = &mut self.terminals[i];
+        // A status event doesn't carry its time: herdr-core moves it when
+        // the word changes, as here.
+        if kind == "status" && t["status"]["state"] != data["status"]["state"] {
+            t["status_ms"] = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64)
+                .into();
+        }
         let mut set = |keys: &[&str]| {
             for k in keys {
                 t[*k] = data[*k].clone();
@@ -1130,10 +1138,17 @@ mod tests {
         lines.push(event(8, "status", "t2", json!({"status": {"state": "working"}})).as_bytes());
         lines.push(event(9, "foreground", "t2", json!({"name": "vim", "cwd": "/src"})).as_bytes());
         assert_eq!(lines.live()[1].status.as_ref().unwrap().state, "working");
+        // Its time moves with its word, as herdr-core's does, though the
+        // event doesn't carry it; the same word again leaves it.
+        let since = lines.live()[1].status_ms.expect("a time");
+        assert!(since > 1_700_000_000_000, "{since}");
+        lines.terminals[1]["status_ms"] = 1.into();
+        lines.push(event(10, "status", "t2", json!({"status": {"state": "working"}})).as_bytes());
+        assert_eq!(lines.live()[1].status_ms, Some(1));
         assert_eq!(lines.live()[1].folder(), "/src");
-        lines.push(event(10, "finished", "t1", json!({"reason": "exited"})).as_bytes());
+        lines.push(event(11, "finished", "t1", json!({"reason": "exited"})).as_bytes());
         assert_eq!(addresses(&lines), ["t2"], "finished: no longer live");
-        lines.push(event(11, "removed", "t2", json!({})).as_bytes());
+        lines.push(event(12, "removed", "t2", json!({})).as_bytes());
         assert!(addresses(&lines).is_empty());
         let missed = format!(
             "{}\n",
