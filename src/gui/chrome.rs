@@ -479,8 +479,9 @@ impl Lemur {
     }
 
     /// Each host's CPU and memory, as bars at the foot of the sidebar; none
-    /// for hosts without /proc to read them from.
-    pub(super) fn machines(&self, cx: &App) -> Option<Div> {
+    /// for hosts without /proc to read them from. A click on a host's name
+    /// minimizes it to that line.
+    pub(super) fn machines(&self, cx: &mut Context<Self>) -> Option<Div> {
         let mut hosts: Vec<(&String, &(Load, Option<f32>))> = self.loads.iter().collect();
         if hosts.is_empty() {
             return None;
@@ -517,6 +518,20 @@ impl Lemur {
             let cpu_text = cpu.map_or("…".to_string(), |c| format!("{c:.0}%"));
             let ram_text = format!("{} / {} GiB", gib(load.mem_used_kb), gib(load.mem_total_kb));
             let selector = format!("load {name}");
+            let minimized = self.cfg.minimized_hosts.contains(name);
+            // Minimized, the bars' numbers take the load's place.
+            let right = if minimized {
+                let ram = load
+                    .memory()
+                    .map_or("…".to_string(), |m| format!("{m:.0}%"));
+                Some(format!("CPU {cpu_text} · RAM {ram}"))
+            } else {
+                load.load.first().map(|l| format!("load {l}"))
+            };
+            let toggle = {
+                let name = (*name).clone();
+                cx.listener(move |this, _, _, cx| this.toggle_host_minimized(&name, cx))
+            };
             v_flex()
                 .id(SharedString::from(format!("load-{name}")))
                 .debug_selector(move || selector)
@@ -524,21 +539,30 @@ impl Lemur {
                 .py_1()
                 .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .text_sm()
-                        .child(icons::server().xsmall().text_color(theme.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                        .children(load.load.first().map(|l| {
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("load {l}"))
-                        })),
+                    minimizable_header(
+                        SharedString::from(format!("load-header-{name}")),
+                        minimized,
+                        cx,
+                    )
+                    .on_mouse_down(MouseButton::Left, toggle)
+                    .child(icons::server().xsmall().text_color(theme.muted_foreground))
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .children(right.map(|right| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(right)
+                    }))
+                    .child(chevron(minimized)),
                 )
-                .child(bar("CPU", *cpu, cpu_text, cx))
-                .child(bar("RAM", load.memory(), ram_text, cx))
+                .when(!minimized, |this| {
+                    this.child(bar("CPU", *cpu, cpu_text, cx)).child(bar(
+                        "RAM",
+                        load.memory(),
+                        ram_text,
+                        cx,
+                    ))
+                })
         });
         Some(
             v_flex()
@@ -550,6 +574,59 @@ impl Lemur {
                 .border_color(theme.sidebar_border)
                 .children(rows),
         )
+    }
+}
+
+/// The first line of a block at the sidebar's foot, which a press minimizes
+/// to that line, or opens again: on the press, not the release, so it's
+/// done before the button comes up.
+pub(super) fn minimizable_header(id: SharedString, minimized: bool, cx: &App) -> Stateful<Div> {
+    let selector = format!("{id}{}", if minimized { " minimized" } else { "" });
+    h_flex()
+        .id(id)
+        .debug_selector(move || selector)
+        .gap_2()
+        .items_center()
+        .text_sm()
+        .cursor_pointer()
+        .rounded(cx.theme().radius)
+}
+
+/// The caret at a minimizable line's end, as a project's: down while open.
+/// A click on it reaches the line, which minimizes.
+pub(super) fn chevron(minimized: bool) -> Button {
+    Button::new("minimize").xsmall().ghost().icon(
+        Icon::new(IconName::ChevronRight)
+            .size_4()
+            .when(!minimized, |this| this.rotate(percentage(90. / 360.))),
+    )
+}
+
+impl Lemur {
+    /// Minimizes a host's load to its one line, or opens it again.
+    pub(super) fn toggle_host_minimized(&mut self, host: &str, cx: &mut Context<Self>) {
+        let hosts = &mut self.cfg.minimized_hosts;
+        match hosts.iter().position(|h| h == host) {
+            Some(i) => {
+                hosts.remove(i);
+            }
+            None => hosts.push(host.to_string()),
+        }
+        self.save_minimized(cx);
+    }
+
+    /// Keeps what's minimized at the sidebar's foot in the config.
+    pub(super) fn save_minimized(&mut self, cx: &mut Context<Self>) {
+        if let Some(file) = Prefs::get(cx).config_file()
+            && let Err(e) = crate::config::Config::save_minimized(
+                file,
+                self.cfg.minimized_usage,
+                &self.cfg.minimized_hosts,
+            )
+        {
+            self.fail(e, cx);
+        }
+        cx.notify();
     }
 }
 

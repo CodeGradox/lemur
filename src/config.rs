@@ -46,6 +46,12 @@ pub struct Config {
     /// until turned on in Settings.
     #[serde(default)]
     pub claude_usage: bool,
+    /// The sidebar's foot, minimized to one line each: Claude's usage, and
+    /// the hosts' load by host name.
+    #[serde(default)]
+    pub minimized_usage: bool,
+    #[serde(default)]
+    pub minimized_hosts: Vec<String>,
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
@@ -486,6 +492,25 @@ impl Config {
         })
     }
 
+    /// Keeps which of the sidebar's foot is minimized: Claude's usage, and
+    /// the hosts' load.
+    pub fn save_minimized(path: &Path, usage: bool, hosts: &[String]) -> Result<()> {
+        edit(path, |doc| {
+            if usage {
+                doc["minimized_usage"] = toml_edit::value(true);
+            } else {
+                doc.remove("minimized_usage");
+            }
+            if hosts.is_empty() {
+                doc.remove("minimized_hosts");
+            } else {
+                let hosts: toml_edit::Array = hosts.iter().collect();
+                doc["minimized_hosts"] = toml_edit::value(hosts);
+            }
+            Ok(())
+        })
+    }
+
     /// Puts the config file's `[[bases]]` entries in the order of `bases`,
     /// each with its comments. They swap places in the file, so what's
     /// between them, like `[[hosts]]`, stays where it is.
@@ -789,6 +814,26 @@ path = \"~/projects/api\"
         assert_eq!(cfg.terminal.font_size, 12.5);
         assert_eq!(cfg.terminal.dark.background.as_deref(), Some("#000000"));
         assert!(saved.contains("[terminal.dark]"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_what_is_minimized_keeps_it_before_the_tables() {
+        let path = std::env::temp_dir().join(format!("lemur-min-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "# mine\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n",
+        )
+        .unwrap();
+        Config::save_minimized(&path, true, &["agent".into()]).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert!(cfg.minimized_usage);
+        assert_eq!(cfg.minimized_hosts, ["agent"]);
+        assert!(saved.contains("# mine"), "{saved}");
+        Config::save_minimized(&path, false, &[]).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("minimized"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 

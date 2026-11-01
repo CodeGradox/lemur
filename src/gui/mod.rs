@@ -3541,7 +3541,30 @@ mod tests {
         assert_eq!(usage.host, "local");
         let labels: Vec<&str> = usage.limits.iter().map(|l| l.label.as_str()).collect();
         assert_eq!(labels, ["Week", "Week · Fable"]);
-        assert!(cx.debug_bounds("usage").is_some());
+        assert!(cx.debug_bounds("usage bars").is_some());
+
+        // A click on "Claude" minimizes it to that line, and opens it again.
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        // On the press: it's minimized before the button comes up.
+        let header = cx.debug_bounds("usage-header").unwrap().center();
+        cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("usage bars").is_none());
+        cx.simulate_mouse_up(header, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("usage bars").is_none(),
+            "the release does nothing"
+        );
+        assert!(cx.debug_bounds("usage-header minimized").is_some());
+        assert!(app.read_with(cx, |app, _| app.cfg.minimized_usage), "kept");
+        click("usage-header minimized", cx);
+        assert!(cx.debug_bounds("usage bars").is_some());
+        assert!(!app.read_with(cx, |app, _| app.cfg.minimized_usage));
 
         app.update(cx, |app, cx| {
             app.cfg.hosts[0].claude = "false".into();
@@ -3550,7 +3573,16 @@ mod tests {
         });
         let failed = shown(cx).expect("asked").unwrap_err();
         assert_eq!(failed, "Claude Code didn't answer (on local)");
-        assert!(cx.debug_bounds("usage").is_some(), "it says so");
+        assert!(cx.debug_bounds("usage bars").is_some(), "it says so");
+        // A click there asks again.
+        app.update(cx, |app, _| {
+            app.cfg.hosts[0].claude = format!("cat {} #", printed.display());
+        });
+        click("usage bars", cx);
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| matches!(app.meter.shown, Some(Ok(_))))
+        }));
 
         set(false, cx);
         cx.run_until_parked();
@@ -3709,6 +3741,23 @@ mod tests {
         };
         read(100, 1000, cx);
         assert!(cx.debug_bounds("load local").is_some());
+        // A click on its name minimizes it to that line, and opens it again.
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        let minimized = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| app.cfg.minimized_hosts.clone())
+        };
+        let tall = |cx: &mut VisualTestContext| cx.debug_bounds("load local").unwrap().size.height;
+        let open = tall(cx);
+        click("load-header-local", cx);
+        assert_eq!(minimized(cx), ["local"]);
+        assert!(tall(cx) < open, "its bars are gone");
+        click("load-header-local minimized", cx);
+        assert!(minimized(cx).is_empty());
+        assert_eq!(tall(cx), open);
         let cpu = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.loads["local"].1);
         assert_eq!(cpu(cx), None, "one reading");
         read(200, 1400, cx);

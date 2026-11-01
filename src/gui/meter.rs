@@ -3,13 +3,14 @@
 //! few minutes (see `crate::usage`), or that it couldn't be asked. Off
 //! until turned on in Settings.
 
-use super::chrome::bar_sized;
+use super::chrome::{bar_sized, chevron, minimizable_header};
 use super::settings::Prefs;
 use super::sidebar::claude_icon;
 use super::{Lemur, sessions};
 use crate::usage::{self, Usage};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Sizable, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -129,7 +130,9 @@ impl Lemur {
     }
 
     /// "Claude" and when its next limit starts over, then a bar for each
-    /// limit; what each says on hover. A click asks again.
+    /// limit, or that Claude couldn't be asked; what each says on hover. A
+    /// click on the bars asks again; on "Claude", it minimizes the meter to
+    /// that line, the most used limit beside it.
     pub(super) fn usage_meter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.meter.on {
             return None;
@@ -138,7 +141,15 @@ impl Lemur {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         let shown = describe(self.meter.shown.as_ref(), now);
-        let tip = SharedString::from(shown.tip);
+        let minimized = self.cfg.minimized_usage;
+        let open = !minimized;
+        let failed = matches!(self.meter.shown, Some(Err(_)));
+        let tip = match (&self.meter.shown, open) {
+            (Some(Ok(_)), true) => format!("{}\nClick a bar to ask now.", shown.tip),
+            (Some(Err(_)), true) => format!("{} Click to try again.", shown.tip),
+            _ => shown.tip,
+        };
+        let tip = SharedString::from(tip);
         let rows: Vec<Div> = shown
             .rows
             .into_iter()
@@ -155,6 +166,33 @@ impl Lemur {
             .collect();
         let theme = cx.theme();
         let (border, muted) = (theme.sidebar_border, theme.muted_foreground);
+        let right = if minimized { shown.brief } else { shown.right };
+        let header = minimizable_header("usage-header".into(), minimized, cx)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.toggle_usage_minimized(cx)),
+            )
+            .child(claude_icon().xsmall())
+            .child(div().flex_1().min_w_0().truncate().child("Claude"))
+            .child(div().text_xs().text_color(muted).child(right))
+            .child(chevron(minimized));
+        let body = (open && (failed || !rows.is_empty())).then(|| {
+            v_flex()
+                .id("usage-bars")
+                .debug_selector(|| "usage bars".into())
+                .gap_0p5()
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| this.ask_usage(cx)))
+                .when(failed, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Couldn't fetch usage from Claude."),
+                    )
+                })
+                .children(rows)
+        });
         Some(
             v_flex()
                 .w_full()
@@ -168,22 +206,18 @@ impl Lemur {
                         .debug_selector(|| "usage".into())
                         .gap_0p5()
                         .py_1()
-                        .cursor_pointer()
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .on_click(cx.listener(|this, _, _, cx| this.ask_usage(cx)))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .text_sm()
-                                .child(claude_icon().xsmall())
-                                .child(div().flex_1().min_w_0().truncate().child("Claude"))
-                                .child(div().text_xs().text_color(muted).child(shown.right)),
-                        )
-                        .children(rows),
+                        .child(header)
+                        .children(body),
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Minimizes the meter to its one line, or opens it again.
+    pub(super) fn toggle_usage_minimized(&mut self, cx: &mut Context<Self>) {
+        self.cfg.minimized_usage = !self.cfg.minimized_usage;
+        self.save_minimized(cx);
     }
 }
 
@@ -194,10 +228,11 @@ fn by_last_claude(mut hosts: Vec<(String, Option<u64>)>) -> Vec<String> {
     hosts.into_iter().map(|(name, _)| name).collect()
 }
 
-/// What the meter shows: beside "Claude", a bar for each limit, and on
-/// hover.
+/// What the meter shows: beside "Claude", open and minimized, a bar for
+/// each limit, and on hover.
 struct Shown {
     right: String,
+    brief: String,
     rows: Vec<(String, f64)>,
     tip: String,
 }
@@ -208,6 +243,7 @@ fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
         None => {
             return Shown {
                 right: "asking…".into(),
+                brief: "asking…".into(),
                 rows: vec![],
                 tip: "Asking Claude Code how much of your plan is used…".into(),
             };
@@ -215,8 +251,9 @@ fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
         Some(Err(why)) => {
             return Shown {
                 right: "unavailable".into(),
+                brief: "unavailable".into(),
                 rows: vec![],
-                tip: format!("Couldn't fetch usage from Claude: {why}. Click to try again."),
+                tip: format!("Couldn't fetch usage from Claude: {why}."),
             };
         }
         Some(Ok(u)) => u,
@@ -237,10 +274,18 @@ fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
         lines.push("Claude Code listed no limits for your plan.".into());
     }
     lines.push(format!(
-        "From Claude Code's /usage on {}, every 10 minutes. Click to ask now.",
+        "From Claude Code's /usage on {}, every 10 minutes.",
         u.host
     ));
+    // The most used limit, for the one line.
+    let most = u
+        .limits
+        .iter()
+        .max_by(|a, b| a.percent.total_cmp(&b.percent));
     Shown {
+        brief: most.map_or("no limits".into(), |l| {
+            format!("{} {:.0}%", l.label, l.percent)
+        }),
         right: match soonest {
             Some(at) => format!("resets in {}", until(at - now)),
             None if u.limits.is_empty() => "no limits".into(),
@@ -309,19 +354,25 @@ mod tests {
                 ("Week · Fable".to_string(), 81.0)
             ]
         );
+        assert_eq!(shown.brief, "Week · Fable 81%");
         assert_eq!(
             shown.tip,
             "Session: 42% used, resets in 2h 13m\nWeek · Fable: 81% used\n\
-             From Claude Code's /usage on agent, every 10 minutes. Click to ask now."
+             From Claude Code's /usage on agent, every 10 minutes."
         );
 
         let none = Usage {
             limits: vec![],
             host: "agent".into(),
         };
-        assert_eq!(describe(Some(&Ok(none)), now).right, "no limits");
+        let none = describe(Some(&Ok(none)), now);
+        assert_eq!(
+            (none.right.as_str(), none.brief.as_str()),
+            ("no limits", "no limits")
+        );
         let failed = describe(Some(&Err("Claude Code isn't installed there".into())), now);
         assert_eq!(failed.right, "unavailable");
+        assert_eq!(failed.brief, "unavailable");
         assert!(failed.rows.is_empty());
         assert!(failed.tip.contains("isn't installed"), "{}", failed.tip);
         assert_eq!(describe(None, now).right, "asking…");
