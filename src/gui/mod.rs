@@ -6,6 +6,7 @@
 mod agents;
 mod away;
 mod changes;
+mod changes_panel;
 mod chrome;
 mod cycle;
 mod dictation;
@@ -70,6 +71,7 @@ actions!(
         PreviousAgent,
         CommandPalette,
         PutAway,
+        ToggleChanges,
         OpenSettings,
         AddProject,
         Refresh,
@@ -132,6 +134,14 @@ const REFRESH: Duration = Duration::from_secs(3);
 const BURST: Duration = Duration::from_millis(30);
 /// Out of sight, the sidebar refreshes every this many REFRESH ticks.
 const AWAY: u32 = 5;
+
+/// What shows on the right of the terminal, one at a time.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Right {
+    Notes,
+    Changes,
+    Agents,
+}
 
 /// The notes panel's width until its edge is dragged.
 const NOTES_WIDTH: Pixels = px(360.0);
@@ -242,14 +252,14 @@ struct Lemur {
     changes: u64,
     /// The notes of the last worktree opened, beside the terminal.
     notes: Entity<NotesPanel>,
-    notes_open: bool,
-    /// Every Claude thread and what it runs, where the notes are; one or
-    /// the other shows.
+    /// Every Claude thread and what it runs.
     agents: Entity<agents::AgentsView>,
-    agents_open: bool,
-    /// The agents were on the right last, rather than the notes: ⌘R
-    /// brings back whichever was.
-    agents_last: bool,
+    /// The worktree on show's changes, to commit.
+    changes_panel: Entity<changes_panel::ChangesPanel>,
+    /// Which of them shows on the right, if any; one at a time.
+    right: Option<Right>,
+    /// The one that showed last, which ⌘R brings back.
+    right_last: Right,
     /// Adding a folder, over the window.
     picker: Option<(Entity<FolderPicker>, Subscription)>,
     /// Every command by name, over the window.
@@ -327,6 +337,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Right Panel", ToggleRightPanel),
                     MenuItem::action("Toggle Notes", ToggleNotes),
+                    MenuItem::action("Toggle Changes", ToggleChanges),
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::separator(),
                     MenuItem::action("Next Thread in Worktree", NextThread),
@@ -399,9 +410,15 @@ impl Lemur {
         let lemur = cx.weak_entity();
         let sidebar = cx.new(|_| SidebarView::new(lemur.clone()));
         let agents = cx.new(|_| agents::AgentsView::new(lemur));
+        let changes_panel = cx.new(|cx| changes_panel::ChangesPanel::new(window, cx));
+        cx.subscribe(
+            &changes_panel,
+            |this, _, _: &changes_panel::Committed, cx| this.ask_changes(cx),
+        )
+        .detach();
         let sidebar_follows = cx.observe_self(|this, cx| {
             this.sidebar.update(cx, |_, cx| cx.notify());
-            if this.agents_open {
+            if this.right == Some(Right::Agents) {
                 this.agents.update(cx, |_, cx| cx.notify());
             }
         });
@@ -458,7 +475,10 @@ impl Lemur {
                     if this
                         .update(cx, |this, cx| {
                             if this.loaded {
-                                this.ask_changes(cx)
+                                this.ask_changes(cx);
+                                if this.right == Some(Right::Changes) {
+                                    this.changes_panel.update(cx, |p, cx| p.refresh(cx));
+                                }
                             }
                         })
                         .is_err()
@@ -543,10 +563,10 @@ impl Lemur {
             diffs: changes::Changes::default(),
             changes: 0,
             notes,
-            notes_open: false,
             agents,
-            agents_open: false,
-            agents_last: false,
+            changes_panel,
+            right: None,
+            right_last: Right::Notes,
             picker: None,
             palette: None,
             away_open: HashSet::new(),
@@ -908,6 +928,9 @@ impl Lemur {
         self.bring_back(&key, cx);
         self.active = Some(key);
         self.ask_changes(cx);
+        if self.right == Some(Right::Changes) {
+            self.show_changes(cx);
+        }
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
             self.notes
                 .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
@@ -965,9 +988,8 @@ impl Lemur {
     ) {
         self.notes
             .update(cx, |n, cx| n.show(host, worktree, label, window, cx));
-        self.notes_open = true;
-        self.agents_open = false;
-        self.agents_last = false;
+        self.right = Some(Right::Notes);
+        self.right_last = Right::Notes;
         cx.notify();
     }
 
@@ -1097,34 +1119,58 @@ impl Lemur {
         cx.notify();
     }
 
-    /// The notes and the agents take turns on the right, as Herdr's Files
-    /// and Changes do: showing one hides the other.
-    fn toggle_notes(&mut self, cx: &mut Context<Self>) {
-        self.notes_open = !self.notes_open;
-        self.agents_open &= !self.notes_open;
-        self.agents_last &= !self.notes_open;
+    /// The notes, the changes and the agents take turns on the right, as
+    /// Herdr's Files and Changes do: showing one hides the other, and
+    /// showing the one that shows hides it.
+    fn toggle_right(&mut self, which: Right, cx: &mut Context<Self>) {
+        if self.right == Some(which) {
+            self.right = None;
+        } else {
+            self.right = Some(which);
+            self.right_last = which;
+            if which == Right::Changes {
+                self.show_changes(cx);
+            }
+        }
         cx.notify();
     }
 
+    fn toggle_notes(&mut self, cx: &mut Context<Self>) {
+        self.toggle_right(Right::Notes, cx);
+    }
+
     fn toggle_agents(&mut self, cx: &mut Context<Self>) {
-        self.agents_open = !self.agents_open;
-        self.notes_open &= !self.agents_open;
-        self.agents_last |= self.agents_open;
-        cx.notify();
+        self.toggle_right(Right::Agents, cx);
     }
 
     /// ⌘R: hides the right panel, or brings back the one shown last; the
     /// notes the first time.
     fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
-        if self.notes_open || self.agents_open {
-            self.notes_open = false;
-            self.agents_open = false;
-            cx.notify();
-        } else if self.agents_last {
-            self.toggle_agents(cx);
-        } else {
-            self.toggle_notes(cx);
+        match self.right {
+            Some(_) => {
+                self.right = None;
+                cx.notify();
+            }
+            None => self.toggle_right(self.right_last, cx),
         }
+    }
+
+    /// Whether `which` shows on the right.
+    #[cfg(test)]
+    fn shows(&self, which: Right) -> bool {
+        self.right == Some(which)
+    }
+
+    /// Points the Changes panel at the worktree on show, and asks it.
+    fn show_changes(&mut self, cx: &mut Context<Self>) {
+        let place = self.active_worktree().and_then(|(host, w)| {
+            let h = self.cfg.host(host)?.clone();
+            Some((h, w.path.clone(), worktree_label(w)))
+        });
+        self.changes_panel.update(cx, |p, cx| match place {
+            Some((h, path, label)) => p.show(h, path, label, cx),
+            None => p.clear(cx),
+        });
     }
 
     /// Follows the pointer (`x`) dragging a side panel's edge across the
@@ -1139,7 +1185,7 @@ impl Lemur {
         let shown = |open: bool, width: Pixels| if open { width } else { px(0.0) };
         match panel {
             Panel::Sidebar => {
-                let right = self.notes_open || self.agents_open;
+                let right = self.right.is_some();
                 let room = bounds.size.width - shown(right, self.notes_width) - MIN_TERMINAL;
                 self.sidebar_width = panel_width(x - bounds.left(), MIN_SIDEBAR, room);
             }
@@ -1201,9 +1247,19 @@ impl Lemur {
                     .label("Notes")
                     .ghost()
                     .small()
-                    .selected(self.notes_open)
+                    .selected(self.right == Some(Right::Notes))
                     .tooltip("Toggle notes")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
+            )
+            .child(
+                Button::new("toggle-changes")
+                    .icon(icons::file_diff())
+                    .label("Changes")
+                    .ghost()
+                    .small()
+                    .selected(self.right == Some(Right::Changes))
+                    .tooltip("Toggle changes")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right(Right::Changes, cx))),
             )
             .child(
                 Button::new("toggle-agents")
@@ -1211,7 +1267,7 @@ impl Lemur {
                     .label("Agents")
                     .ghost()
                     .small()
-                    .selected(self.agents_open)
+                    .selected(self.right == Some(Right::Agents))
                     .tooltip("Toggle agents (⌘⇧A)")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_agents(cx))),
             )
@@ -1313,6 +1369,9 @@ impl Render for Lemur {
             .on_action(cx.listener(|this, _: &ToggleNotes, _, cx| this.toggle_notes(cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
             .on_action(cx.listener(|this, _: &ToggleAgents, _, cx| this.toggle_agents(cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleChanges, _, cx| this.toggle_right(Right::Changes, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
             )
@@ -1419,12 +1478,12 @@ impl Render for Lemur {
                                     .children(self.dictation.as_ref().map(|(bar, _)| bar.clone()))
                                     .child(self.status_bar(cx)),
                             )
-                            .when(self.notes_open || self.agents_open, |this| {
+                            .when_some(self.right, |this, right| {
                                 // Cached like the terminal; each redraws on its own changes.
-                                let panel: AnyView = if self.agents_open {
-                                    self.agents.clone().into()
-                                } else {
-                                    self.notes.clone().into()
+                                let panel: AnyView = match right {
+                                    Right::Notes => self.notes.clone().into(),
+                                    Right::Agents => self.agents.clone().into(),
+                                    Right::Changes => self.changes_panel.clone().into(),
                                 };
                                 this.child(
                                     div()
@@ -1546,7 +1605,7 @@ mod tests {
     use super::snackbar::Kind;
     use super::{
         Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
-        SIDEBAR_WIDTH, meter, move_item, moved_to,
+        Right, SIDEBAR_WIDTH, meter, move_item, moved_to,
     };
     use crate::config::{Base, Config, Host};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
@@ -2030,7 +2089,7 @@ mod tests {
         let notes = |cx: &mut VisualTestContext| {
             app.read_with(cx, |app, cx| {
                 let shown = app.notes.read(cx).worktree().map(str::to_string);
-                (shown, app.notes_open)
+                (shown, app.shows(Right::Notes))
             })
         };
         assert_eq!(notes(cx), (None, false));
@@ -2861,7 +2920,7 @@ mod tests {
         cx.simulate_keystrokes("up enter");
         cx.run_until_parked();
         app.read_with(cx, |app, cx| {
-            assert!(app.notes_open);
+            assert!(app.shows(Right::Notes));
             assert_eq!(app.notes.read(cx).worktree(), Some(path.as_str()));
         });
         let_attaches_end(&app, cx);
@@ -3097,9 +3156,9 @@ mod tests {
         app.read_with(cx, |app, _| assert!(app.picker.is_none()));
 
         cx.simulate_keystrokes("cmd-r");
-        app.read_with(cx, |app, _| assert!(app.notes_open));
+        app.read_with(cx, |app, _| assert!(app.shows(Right::Notes)));
         cx.simulate_keystrokes("cmd-r");
-        app.read_with(cx, |app, _| assert!(!app.notes_open));
+        app.read_with(cx, |app, _| assert!(!app.shows(Right::Notes)));
 
         app.update(cx, |app, _| app.loaded = false);
         cx.dispatch_action(super::Refresh);
@@ -3556,6 +3615,72 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// The Changes panel lists the worktree on show's changes, and a click
+    /// on one shows its diff; it follows the thread on show.
+    #[gpui::test]
+    fn the_changes_panel_lists_and_diffs(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("chpanel");
+        let dir = TempDir::new("changes-gui-panel");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(&repo, &["add", "a.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        git_in(&repo, &["worktree", "add", "-q", "-b", "auth", "wt/auth"]);
+        git_in(&repo, &["worktree", "add", "-q", "-b", "docs", "wt/docs"]);
+        let wt = repo.join("wt/auth");
+        std::fs::write(wt.join("a.txt"), "one\n2\n").unwrap();
+        let clean = server.run(
+            &repo.join("wt/docs").to_string_lossy(),
+            &["lemur.label=clean"],
+            &["sleep", "600"],
+        );
+        let changed = server.run(
+            &wt.to_string_lossy(),
+            &["lemur.label=changed"],
+            &["sleep", "600"],
+        );
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1400.0), px(800.0)));
+        assert!(wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.project_of("local", &changed).is_some()
+                    && app.project_of("local", &clean).is_some()
+            })
+        }));
+        open(&app, &changed, cx);
+        cx.dispatch_action(super::ToggleChanges);
+        let listed = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| app.changes_panel.read(cx).listed())
+        };
+        let files = |cx: &mut VisualTestContext| listed(cx).0;
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !files(cx).is_empty()
+        }));
+        assert_eq!(files(cx), [("a.txt".to_string(), 'M')]);
+        let at = cx.debug_bounds("change 0").expect("its row").center();
+        cx.simulate_click(at, Modifiers::none());
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            listed(cx).1.len() > 1
+        }));
+        assert_eq!(listed(cx).1, ["@@ -1,2 +1,2 @@", " one", "-two", "+2"]);
+
+        open(&app, &clean, cx);
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            files(cx).is_empty()
+        }));
+        let_attaches_end(&app, cx);
+    }
+
     /// ⌘W asks before closing the thread on show; closed, or ended any
     /// other way, the one opened before it in its worktree shows instead,
     /// else its neighbour there.
@@ -3810,7 +3935,11 @@ mod tests {
         cx.update(|_, cx| super::bind_keys(cx));
         let open = |cx: &mut VisualTestContext| {
             app.read_with(cx, |app, _| {
-                (app.palette.is_some(), app.notes_open, app.agents_open)
+                (
+                    app.palette.is_some(),
+                    app.shows(Right::Notes),
+                    app.shows(Right::Agents),
+                )
             })
         };
         cx.simulate_keystrokes("cmd-shift-p");
@@ -3883,7 +4012,9 @@ mod tests {
         assert_eq!(listed, ["asks", "works", "idle"], "a plain shell isn't one");
 
         let open = |cx: &mut VisualTestContext| {
-            app.read_with(cx, |app, _| (app.notes_open, app.agents_open))
+            app.read_with(cx, |app, _| {
+                (app.shows(Right::Notes), app.shows(Right::Agents))
+            })
         };
         cx.simulate_keystrokes("cmd-r");
         assert_eq!(open(cx), (true, false), "⌘R: the notes first");

@@ -17,3 +17,8 @@ pub fn server() -> Icon {
 pub fn monitor() -> Icon {
     Icon::empty().data(include_bytes!("icons/monitor.svg"))
 }
+
+/// A worktree's changes since its last commit.
+pub fn file_diff() -> Icon {
+    Icon::empty().data(include_bytes!("icons/file-diff.svg"))
+}

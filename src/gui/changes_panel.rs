@@ -1,0 +1,657 @@
+//! The Changes panel, on the right as the notes and the agents are, as
+//! Herdr's: the files changed in the worktree on show since its last
+//! commit, each with its lines added and removed; a click shows its diff.
+//! Under them, a message and Commit commit them all (`git add -A`).
+
+use super::settings::Prefs;
+use crate::config::Host;
+use crate::remote::{Remote, quote, sh_path};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
+use std::collections::HashMap;
+
+/// The most diff lines shown of one file.
+const MOST_LINES: usize = 3000;
+
+/// A changed file: its path in the worktree, git's word for the change,
+/// and its lines added and removed (none known for a new file until it's
+/// shown, nor ever for a binary one).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Change {
+    pub(super) path: String,
+    /// M changed, A added, D deleted, ? new (not tracked yet), U in
+    /// conflict.
+    pub(super) status: char,
+    pub(super) added: Option<u64>,
+    pub(super) removed: Option<u64>,
+}
+
+/// A commit went in: the status bar's count is out of date.
+pub(super) struct Committed;
+
+impl EventEmitter<Committed> for ChangesPanel {}
+
+pub(super) struct ChangesPanel {
+    /// The host and worktree shown, and what it's called.
+    place: Option<(Host, String, String)>,
+    files: Vec<Change>,
+    /// Why there are none to show, as outside a repository.
+    error: Option<String>,
+    loading: bool,
+    /// The file whose diff shows, and its lines.
+    open: Option<String>,
+    lines: Vec<SharedString>,
+    message: Entity<InputState>,
+    committing: bool,
+    /// What the last commit did, or why it didn't.
+    note: Option<(String, bool)>,
+    _message: Subscription,
+    _task: Option<Task<()>>,
+}
+
+impl ChangesPanel {
+    pub(super) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let message = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
+        let events = cx.subscribe_in(
+            &message,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.commit(window, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            },
+        );
+        ChangesPanel {
+            place: None,
+            files: vec![],
+            error: None,
+            loading: false,
+            open: None,
+            lines: vec![],
+            message,
+            committing: false,
+            note: None,
+            _message: events,
+            _task: None,
+        }
+    }
+
+    /// Shows worktree `path` on `host`, called `label`, and asks it again.
+    pub(super) fn show(&mut self, host: Host, path: String, label: String, cx: &mut Context<Self>) {
+        let same = self
+            .place
+            .as_ref()
+            .is_some_and(|(h, p, _)| h.name == host.name && *p == path);
+        if !same {
+            self.files.clear();
+            self.open = None;
+            self.lines.clear();
+            self.error = None;
+            self.note = None;
+        }
+        self.place = Some((host, path, label));
+        self.refresh(cx);
+    }
+
+    #[cfg(test)]
+    pub(super) fn listed(&self) -> (Vec<(String, char)>, Vec<String>) {
+        let files = self
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.status))
+            .collect();
+        (files, self.lines.iter().map(|l| l.to_string()).collect())
+    }
+
+    /// Nothing on show to tell changes of.
+    pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
+        self.place = None;
+        self.files.clear();
+        self.open = None;
+        self.lines.clear();
+        cx.notify();
+    }
+
+    /// Asks the worktree for its changes, and the open file's diff.
+    pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some((host, path, _)) = self.place.clone() else {
+            return;
+        };
+        if self.loading || self.committing {
+            return;
+        }
+        self.loading = true;
+        let open = self.open.clone();
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let (files, diff) = cx
+                .background_spawn(async move {
+                    let files = changes_in(&host, &path);
+                    let diff = match (&files, &open) {
+                        (Ok(files), Some(open)) => files
+                            .iter()
+                            .find(|f| f.path == *open)
+                            .map(|f| diff_of(&host, &path, f)),
+                        _ => None,
+                    };
+                    (files, diff)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.loading = false;
+                match files {
+                    Ok(files) => {
+                        this.error = None;
+                        if this
+                            .open
+                            .as_ref()
+                            .is_some_and(|o| !files.iter().any(|f| f.path == *o))
+                        {
+                            this.open = None;
+                            this.lines.clear();
+                        }
+                        this.files = files;
+                    }
+                    Err(e) => {
+                        this.error = Some(e);
+                        this.files.clear();
+                    }
+                }
+                if let Some(diff) = diff {
+                    this.set_diff(diff);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn set_diff(&mut self, (lines, added): (Vec<String>, Option<u64>)) {
+        if let (Some(open), Some(added)) = (&self.open, added)
+            && let Some(f) = self.files.iter_mut().find(|f| f.path == *open)
+        {
+            f.added = Some(added);
+        }
+        self.lines = lines.into_iter().map(SharedString::from).collect();
+    }
+
+    /// Shows file `path`'s diff.
+    fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some((host, root, _)) = self.place.clone() else {
+            return;
+        };
+        let Some(file) = self.files.iter().find(|f| f.path == path).cloned() else {
+            return;
+        };
+        self.open = Some(path);
+        self.lines = vec!["Loading…".into()];
+        cx.notify();
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let diff = cx
+                .background_spawn(async move { diff_of(&host, &root, &file) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_diff(diff);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Commits every change listed, with the message typed.
+    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self.message.read(cx).value().trim().to_string();
+        let Some((host, path, _)) = self.place.clone() else {
+            return;
+        };
+        if message.is_empty() || self.files.is_empty() || self.committing {
+            return;
+        }
+        self.committing = true;
+        self.note = None;
+        cx.notify();
+        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+            let done = cx
+                .background_spawn(async move { commit_in(&host, &path, &message) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.committing = false;
+                match done {
+                    Ok(summary) => {
+                        this.note = Some((summary, false));
+                        this.open = None;
+                        this.lines.clear();
+                        this.message.update(cx, |m, cx| m.set_value("", window, cx));
+                        cx.emit(Committed);
+                    }
+                    Err(e) => this.note = Some((format!("Commit failed: {e}"), true)),
+                }
+                this.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+}
+
+impl Render for ChangesPanel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let font = Prefs::get(cx).terminal.font_family.clone();
+        let title = match &self.place {
+            Some((_, _, label)) => format!("Changes · {label}"),
+            None => "Changes".to_string(),
+        };
+        let header = h_flex()
+            .h_10()
+            .flex_shrink_0()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_semibold()
+                    .child(title),
+            )
+            .when(!self.files.is_empty(), |h| {
+                h.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(self.files.len().to_string()),
+                )
+            });
+        let empty = match (&self.place, &self.error) {
+            (None, _) => Some("Open a thread in a worktree to see its changes.".to_string()),
+            (_, Some(e)) => Some(e.clone()),
+            _ if self.files.is_empty() && self.loading => Some("Loading changes…".into()),
+            _ if self.files.is_empty() => Some("No changes since the last commit.".into()),
+            _ => None,
+        };
+        let files = self.files.iter().enumerate().map(|(i, f)| {
+            let path = f.path.clone();
+            let shown = self.open.as_deref() == Some(&f.path);
+            let color = match f.status {
+                'A' | '?' => theme.success,
+                'D' | 'U' => theme.danger,
+                _ => theme.warning,
+            };
+            let (dir, name) = match f.path.rsplit_once('/') {
+                Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+                None => (String::new(), f.path.clone()),
+            };
+            h_flex()
+                .id(SharedString::from(format!("change-{i}")))
+                .debug_selector(move || format!("change {i}"))
+                .px_2()
+                .py_0p5()
+                .gap_2()
+                .items_center()
+                .rounded(theme.radius)
+                .text_xs()
+                .cursor_pointer()
+                .map(|row| {
+                    if shown {
+                        row.bg(theme.tokens.sidebar_accent)
+                    } else {
+                        row.hover(|row| row.bg(theme.sidebar_accent.opacity(0.5)))
+                    }
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.open_file(path.clone(), cx)))
+                .child(div().w_3().text_color(color).child(f.status.to_string()))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_color(muted).truncate().child(dir))
+                        .child(div().flex_shrink_0().child(name)),
+                )
+                .children(
+                    f.added
+                        .map(|n| div().text_color(theme.success).child(format!("+{n}"))),
+                )
+                .children(
+                    f.removed
+                        .map(|n| div().text_color(theme.danger).child(format!("-{n}"))),
+                )
+        });
+        let list = v_flex()
+            .id("changes-files")
+            .max_h(relative(0.4))
+            .flex_shrink_0()
+            .px_2()
+            .gap_0p5()
+            .overflow_y_scroll()
+            .children(files)
+            .children(empty.map(|e| div().p_1().text_sm().text_color(muted).child(e)));
+        let lines = self.lines.clone();
+        let (added, removed, hunk) = (
+            theme.success.opacity(0.15),
+            theme.danger.opacity(0.15),
+            theme.info,
+        );
+        let diff = (!lines.is_empty()).then(|| {
+            let count = lines.len();
+            let row_font = font.clone();
+            uniform_list("changes-diff", count, move |range, _, _| {
+                range
+                    .map(|i| {
+                        let line = lines[i].clone();
+                        // Its own size and font: the list measures a line
+                        // apart from the panel's text style.
+                        div()
+                            .w_full()
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .px_2()
+                            .text_xs()
+                            .font_family(row_font.clone())
+                            .whitespace_nowrap()
+                            .map(|row| match line.chars().next() {
+                                Some('+') => row.bg(added),
+                                Some('-') => row.bg(removed),
+                                Some('@') => row.text_color(hunk),
+                                _ => row,
+                            })
+                            .child(if line.is_empty() {
+                                SharedString::from(" ")
+                            } else {
+                                line
+                            })
+                    })
+                    .collect()
+            })
+            .flex_1()
+            .min_h_0()
+            .border_t_1()
+            .border_color(theme.border)
+            .font_family(font.clone())
+            .text_xs()
+        });
+        let can_commit = !self.files.is_empty()
+            && !self.committing
+            && !self.message.read(cx).value().trim().is_empty();
+        let commit = v_flex()
+            .flex_shrink_0()
+            .p_2()
+            .gap_1()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Input::new(&self.message).small()))
+                    .child(
+                        div().debug_selector(|| "commit".into()).child(
+                            Button::new("commit")
+                                .small()
+                                .primary()
+                                .label(if self.committing {
+                                    "Committing…"
+                                } else {
+                                    "Commit"
+                                })
+                                .disabled(!can_commit)
+                                .tooltip("Commits every change listed (git add -A)")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.commit(window, cx)),
+                                ),
+                        ),
+                    ),
+            )
+            .children(self.note.as_ref().map(|(note, failed)| {
+                div()
+                    .text_xs()
+                    .text_color(if *failed { theme.danger } else { muted })
+                    .child(note.clone())
+            }));
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(list)
+            .when_some(diff, |panel, diff| panel.child(diff))
+            .when(self.lines.is_empty(), |panel| panel.child(div().flex_1()))
+            .when(self.place.is_some(), |panel| panel.child(commit))
+    }
+}
+
+/// The worktree's changes since its last commit, staged or not, new files
+/// too, in git's order.
+fn changes_in(host: &Host, path: &str) -> Result<Vec<Change>, String> {
+    let script = format!(
+        "cd {} 2>/dev/null || {{ echo '@@error There is no such folder'; exit 0; }}\n\
+         git rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo '@@error Not a git repository'; exit 0; }}\n\
+         echo @@status\n\
+         git status --porcelain=v1 -z --no-renames --untracked-files=all\n\
+         echo; echo @@numstat\n\
+         git diff HEAD --numstat -z --no-renames 2>/dev/null || git diff --cached --numstat -z --no-renames\n\
+         echo; echo @@end\n",
+        sh_path(path)
+    );
+    let out = Remote::new(host)
+        .run(&script)
+        .map_err(|e| format!("{e:#}"))?;
+    parse_changes(&out)
+}
+
+/// What the script printed, as changes.
+fn parse_changes(out: &str) -> Result<Vec<Change>, String> {
+    if let Some(e) = out.lines().find_map(|l| l.strip_prefix("@@error ")) {
+        return Err(e.to_string());
+    }
+    let section = |from: &str, to: &str| -> Option<String> {
+        let start = out.find(from)? + from.len();
+        let end = out[start..].find(to)? + start;
+        Some(out[start..end].trim_matches('\n').to_string())
+    };
+    let status = section("@@status\n", "@@numstat").ok_or("git didn't answer")?;
+    let numstat = section("@@numstat\n", "@@end").unwrap_or_default();
+    let mut counts: HashMap<String, (Option<u64>, Option<u64>)> = HashMap::new();
+    for record in numstat.split('\0') {
+        let mut fields = record.trim_start_matches('\n').splitn(3, '\t');
+        if let (Some(a), Some(d), Some(path)) = (fields.next(), fields.next(), fields.next()) {
+            counts.insert(path.to_string(), (a.parse().ok(), d.parse().ok()));
+        }
+    }
+    Ok(status
+        .split('\0')
+        .filter(|e| e.len() > 3)
+        .map(|entry| {
+            let (xy, path) = (&entry[..2], entry[3..].to_string());
+            let status = if xy == "??" {
+                '?'
+            } else if xy.contains('U') || xy == "AA" || xy == "DD" {
+                'U'
+            } else if xy.contains('D') {
+                'D'
+            } else if xy.contains('A') {
+                'A'
+            } else {
+                'M'
+            };
+            let (added, removed) = counts.get(&path).copied().unwrap_or((None, None));
+            Change {
+                path,
+                status,
+                added,
+                removed,
+            }
+        })
+        .collect())
+}
+
+/// `file`'s diff from the last commit, a line each, and for a new file its
+/// lines counted; a note where there's no text to show.
+fn diff_of(host: &Host, root: &str, file: &Change) -> (Vec<String>, Option<u64>) {
+    let path = quote(&file.path);
+    let script = if file.status == '?' {
+        format!(
+            "cd {} || exit 0\nif grep -Iq . -- {path} 2>/dev/null || ! [ -s {path} ]; then head -c 400000 -- {path}; else echo @@binary; fi\n",
+            sh_path(root)
+        )
+    } else {
+        format!(
+            "cd {} || exit 0\ngit diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git diff --cached --no-color -- {path}\n",
+            sh_path(root)
+        )
+    };
+    let out = match Remote::new(host).run(&script) {
+        Ok(out) => out,
+        Err(e) => return (vec![format!("Couldn't read it: {e:#}")], None),
+    };
+    diff_lines(&out, file.status == '?')
+}
+
+/// The lines to show of a diff, or of a new file (all added), and how many
+/// a new file has.
+fn diff_lines(out: &str, new: bool) -> (Vec<String>, Option<u64>) {
+    if out.trim_end() == "@@binary" {
+        return (vec!["A binary file: no text to show".into()], None);
+    }
+    if new {
+        let lines: Vec<&str> = out.strip_suffix('\n').unwrap_or(out).split('\n').collect();
+        let count = if out.is_empty() {
+            0
+        } else {
+            lines.len() as u64
+        };
+        let mut shown = vec![format!("@@ -0,0 +1,{count} @@")];
+        shown.extend(lines.iter().take(MOST_LINES).map(|l| format!("+{l}")));
+        return (shown, Some(count));
+    }
+    let lines: Vec<String> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("@@"))
+        .take(MOST_LINES)
+        .map(String::from)
+        .collect();
+    if lines.is_empty() {
+        let note = if out.contains("Binary files") {
+            "A binary file changed"
+        } else {
+            "No text diff to show"
+        };
+        return (vec![note.into()], None);
+    }
+    (lines, None)
+}
+
+/// Commits everything in the worktree with `message`; what git said of it.
+fn commit_in(host: &Host, path: &str, message: &str) -> Result<String, String> {
+    let script = format!(
+        "cd {} || exit 1\ngit add -A && git commit -q -m {} && git log -1 --format='Committed %h: %s'\n",
+        sh_path(path),
+        quote(message)
+    );
+    Remote::new(host)
+        .run(&script)
+        .map(|out| out.trim().to_string())
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui's `test` would stand in for the plain one.
+    use super::{changes_in, commit_in, diff_lines, diff_of, parse_changes};
+    use crate::test_support::{TempDir, git_in};
+
+    #[test]
+    fn changes_are_read_from_git() {
+        let out = "@@status\n M src/a.rs\0A  b.rs\0?? new.txt\0 D gone.rs\0UU both.rs\0\n@@numstat\n\
+                   3\t1\tsrc/a.rs\x002\t0\tb.rs\0-\t-\tlogo.png\0\n@@end\n";
+        let changes = parse_changes(out).unwrap();
+        let brief: Vec<(&str, char, Option<u64>, Option<u64>)> = changes
+            .iter()
+            .map(|c| (c.path.as_str(), c.status, c.added, c.removed))
+            .collect();
+        assert_eq!(
+            brief,
+            [
+                ("src/a.rs", 'M', Some(3), Some(1)),
+                ("b.rs", 'A', Some(2), Some(0)),
+                ("new.txt", '?', None, None),
+                ("gone.rs", 'D', None, None),
+                ("both.rs", 'U', None, None),
+            ]
+        );
+        assert_eq!(
+            parse_changes("@@error Not a git repository\n"),
+            Err("Not a git repository".into())
+        );
+        assert!(
+            parse_changes("@@status\n\n@@numstat\n\n@@end\n")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diffs_start_at_their_first_hunk() {
+        let out = "diff --git a/x b/x\nindex 1..2\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-one\n+two\n";
+        assert_eq!(diff_lines(out, false).0, ["@@ -1 +1 @@", "-one", "+two"]);
+        let (lines, count) = diff_lines("a\nb\n", true);
+        assert_eq!(
+            (lines, count),
+            (
+                vec!["@@ -0,0 +1,2 @@".to_string(), "+a".into(), "+b".into()],
+                Some(2)
+            )
+        );
+        assert_eq!(
+            diff_lines("@@binary\n", true).0,
+            ["A binary file: no text to show"]
+        );
+        assert_eq!(
+            diff_lines("Binary files a/x and b/x differ\n", false).0,
+            ["A binary file changed"]
+        );
+    }
+
+    /// In a real repository, on a test herdr-core: listed, diffed, then
+    /// all committed with the message, quotes and all.
+    #[test]
+    fn a_worktree_is_listed_diffed_and_committed() {
+        let server = crate::test_support::HcServer::new("changes-panel");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-panel");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(&repo, &["add", "a.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("a.txt"), "one\n2\n").unwrap();
+        std::fs::write(repo.join("it's new.txt"), "x\ny\nz\n").unwrap();
+        let root = repo.to_string_lossy().into_owned();
+
+        let changes = changes_in(&host, &root).unwrap();
+        let brief: Vec<(&str, char)> = changes
+            .iter()
+            .map(|c| (c.path.as_str(), c.status))
+            .collect();
+        assert_eq!(brief, [("a.txt", 'M'), ("it's new.txt", '?')]);
+        assert_eq!((changes[0].added, changes[0].removed), (Some(1), Some(1)));
+        assert_eq!(
+            diff_of(&host, &root, &changes[0]).0,
+            ["@@ -1,2 +1,2 @@", " one", "-two", "+2"]
+        );
+        assert_eq!(diff_of(&host, &root, &changes[1]).1, Some(3));
+
+        let said = commit_in(&host, &root, "Fix it's \"quotes\"").unwrap();
+        assert!(said.starts_with("Committed "), "{said}");
+        assert!(said.ends_with("Fix it's \"quotes\""), "{said}");
+        assert!(changes_in(&host, &root).unwrap().is_empty());
+        assert_eq!(
+            changes_in(&host, &dir.to_string_lossy()),
+            Err("Not a git repository".into())
+        );
+    }
+}
