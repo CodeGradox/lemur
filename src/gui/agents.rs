@@ -148,6 +148,8 @@ impl Lemur {
                 }
             })
             .on_click(open)
+            // Put away: still an agent, but out of the way.
+            .when(s.away, |row| row.opacity(0.6))
             .child(thread_icon(s).small())
             .child(
                 v_flex()

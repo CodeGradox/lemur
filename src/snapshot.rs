@@ -113,6 +113,9 @@ pub struct Session {
     /// What it runs to help it, as a tree in order: Claude Code's subagents
     /// while they work, and terminals its agent started with `hc run`.
     pub helpers: Vec<Helper>,
+    /// Put away: listed after the rest, and out of the sidebar's lists and
+    /// the tabs.
+    pub away: bool,
 }
 
 /// Something a thread runs to help it: one of Claude Code's subagents, as
@@ -162,6 +165,9 @@ pub const LABEL: &str = "lemur.label";
 pub const KIND: &str = "lemur.kind";
 pub const WORKTREE: &str = "lemur.worktree";
 pub const ORDER: &str = "lemur.order";
+/// Set on a thread put away: out of the sidebar's lists and the tabs while
+/// it runs, until it needs you or is opened.
+pub const AWAY: &str = "lemur.away";
 
 /// What Claude is doing. `claude agents` lists every running session with
 /// its pid and status; the process tree (`@@ps`) ties each one to the
@@ -525,6 +531,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         busy: busy(t),
         running: t.pid.is_some(),
         helpers: vec![],
+        away: label(AWAY).is_some(),
     }
 }
 
@@ -632,10 +639,12 @@ fn shown_name(t: &Terminal) -> String {
 }
 
 /// Threads in the order they were dragged into; ones never placed follow,
-/// oldest first.
+/// oldest first. Those put away go last, so the rest are the first in a
+/// list, as the sidebar and the tabs show and drag them.
 fn sort(sessions: &mut [Session]) {
     sessions.sort_by(|a, b| {
-        (a.order.is_none(), a.order, a.started, &a.name).cmp(&(
+        (a.away, a.order.is_none(), a.order, a.started, &a.name).cmp(&(
+            b.away,
             b.order.is_none(),
             b.order,
             b.started,
@@ -1215,6 +1224,13 @@ mod tests {
         let (a, b, c, d) = (&names[0], &names[1], &names[2], &names[3]);
         crate::actions::set_order(&cfg, "local", &[d.clone(), b.clone()]).unwrap();
         let placed = [d, b, a, c].map(String::clone);
+        assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == placed));
+        // One put away goes last, whatever its place, and is marked so.
+        crate::actions::set_away(&cfg, "local", d, true).unwrap();
+        let away = [b, a, c, d].map(String::clone);
+        assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == away));
+        assert!(fetch(&cfg).hosts[0].other[3].away);
+        crate::actions::set_away(&cfg, "local", d, false).unwrap();
         assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == placed));
     }
 

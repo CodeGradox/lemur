@@ -4,7 +4,7 @@
 use super::prompt::{Down, Up};
 use super::{
     AddProject, CloseThread, Dictate, GoToThread, Lemur, NewTerminal, NewThreadHere, NextAgent,
-    NextThread, OpenSettings, PreviousAgent, PreviousThread, Quit, Refresh, ToggleAgents,
+    NextThread, OpenSettings, PreviousAgent, PreviousThread, PutAway, Quit, Refresh, ToggleAgents,
     ToggleNotes, ToggleRightPanel, ToggleSidebar, spotlight,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -40,6 +40,7 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("New Thread in Worktree…", Box::new(NewThreadHere)),
         ("New Terminal", Box::new(NewTerminal)),
         ("Close Thread", Box::new(CloseThread)),
+        ("Put Thread Away", Box::new(PutAway)),
         ("Next Agent", Box::new(NextAgent)),
         ("Previous Agent", Box::new(PreviousAgent)),
         ("Next Thread in Worktree", Box::new(NextThread)),

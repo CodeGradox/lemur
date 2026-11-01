@@ -41,6 +41,11 @@ pub struct Threads {
     /// Threads whose session is gone, dimmed under the rest.
     pub gone: Vec<Thread>,
     pub reorder: Reorder,
+    /// Threads put away, under "Put away", which `toggle_away` opens and
+    /// folds: dimmed there, and not dragged.
+    pub away: Vec<Thread>,
+    pub away_open: bool,
+    pub toggle_away: Toggle,
 }
 
 /// How many agents and shells run in a worktree, and whether one of them
@@ -649,6 +654,73 @@ fn host(
 /// The Hidden row at the bottom of a project, with how many it holds, and
 /// while `is_open` the hidden worktrees under it; clicking it calls
 /// `toggle`.
+/// "Put away" and how many, a click on which shows them under it, dimmed,
+/// or folds them; nothing without any.
+fn away_rows(
+    away: Vec<Thread>,
+    is_open: bool,
+    toggle: Toggle,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<AnyElement> {
+    if away.is_empty() {
+        return vec![];
+    }
+    let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        toggle(window, cx);
+    };
+    let count = div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(away.len().to_string());
+    let header = row(
+        "away",
+        Icon::new(IconName::EyeOff),
+        "Put away".into(),
+        false,
+        count.into_any_element(),
+        cx,
+    )
+    .debug_selector(|| "away".into())
+    .cursor_pointer()
+    .text_color(cx.theme().muted_foreground)
+    .on_click(fold.clone())
+    .child(
+        Button::new("caret")
+            .xsmall()
+            .ghost()
+            .icon(
+                Icon::new(IconName::ChevronRight)
+                    .size_4()
+                    .when(is_open, |this| this.rotate(percentage(90. / 360.))),
+            )
+            .on_click(fold),
+    );
+    let mut rows = vec![header.into_any_element()];
+    if is_open {
+        rows.extend(away.into_iter().enumerate().map(|(ix, t)| {
+            let (on_click, menu) = (t.on_click, t.menu);
+            let id = format!("away-{ix}");
+            let suffix = (t.suffix)(window, cx);
+            row(
+                SharedString::from(id.clone()),
+                t.icon,
+                t.label,
+                t.active,
+                suffix,
+                cx,
+            )
+            .debug_selector(move || id)
+            .opacity(0.6)
+            .on_click(move |event, window, cx| on_click(event, window, cx))
+            .context_menu(move |m, window, cx| menu(m, window, cx))
+            .into_any_element()
+        }));
+    }
+    rows
+}
+
 fn hidden(
     id: SharedString,
     entries: Vec<Entry>,
@@ -817,7 +889,11 @@ fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElemen
         rows,
         gone,
         reorder,
+        away,
+        away_open,
+        toggle_away,
     } = threads;
+    let away = away_rows(away, away_open, toggle_away, window, cx);
     let gone: Vec<_> = gone
         .into_iter()
         .enumerate()
@@ -856,6 +932,7 @@ fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElemen
             draggable::<ThreadRow>(row, key.clone(), ix, t.label, reorder.clone(), cx)
                 .context_menu(move |m, window, cx| menu(m, window, cx))
         }))
+        .children(away)
         .children(gone)
         .into_any_element()
 }

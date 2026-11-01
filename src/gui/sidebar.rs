@@ -383,10 +383,22 @@ impl Lemur {
     ) -> rows::Threads {
         let this = cx.entity().downgrade();
         let list: List = (host.to_string(), worktree.map(str::to_string));
+        let key: SharedString = format!("{host}\n{}", worktree.unwrap_or_default()).into();
+        // Those put away come last in a list, so the rest keep their places
+        // for dragging.
+        let (away, shown): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|s| s.away);
+        let toggle_away: rows::Toggle = {
+            let (this, key) = (this.clone(), key.clone());
+            Rc::new(move |_, cx| {
+                this.update(cx, |this, cx| this.toggle_away_list(key.clone(), cx))
+                    .ok();
+            })
+        };
         rows::Threads {
-            key: format!("{host}\n{}", worktree.unwrap_or_default()).into(),
-            rows: sessions
-                .iter()
+            away_open: self.away_open.contains(&key),
+            key,
+            rows: shown
+                .into_iter()
                 .map(|s| self.session_item(host, s, cx))
                 .collect(),
             gone: gone.iter().map(|t| gone_item(t, cx)).collect(),
@@ -394,6 +406,11 @@ impl Lemur {
                 this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
                     .ok();
             }),
+            away: away
+                .into_iter()
+                .map(|s| self.session_item(host, s, cx))
+                .collect(),
+            toggle_away,
         }
     }
 
@@ -422,17 +439,32 @@ impl Lemur {
                 .ok();
             }
         };
+        let away = s.away;
         let menu = {
             let this = this.clone();
             let key = key.clone();
             move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-                let key = key.clone();
-                menu.item(
-                    PopupMenuItem::new("Rename…").on_click(ask_on_click(&this, move || {
+                let rename = {
+                    let key = key.clone();
+                    ask_on_click(&this, move || {
                         let (host, session) = key.clone();
                         Ask::Rename { host, session }
-                    })),
-                )
+                    })
+                };
+                let (this, key) = (this.clone(), key.clone());
+                let menu = menu.item(PopupMenuItem::new("Rename…").on_click(rename));
+                if away {
+                    menu.item(PopupMenuItem::new("Bring back").on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| this.bring_back(&key, cx)).ok();
+                    }))
+                } else {
+                    menu.item(
+                        PopupMenuItem::new("Put away").on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| this.put_away(key.clone(), window, cx))
+                                .ok();
+                        }),
+                    )
+                }
             }
         };
         // How many it runs to help it, Claude's subagents above all; the

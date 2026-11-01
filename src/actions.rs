@@ -2,7 +2,7 @@ use crate::attach::Active;
 use crate::config::{ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
-use crate::snapshot::{KIND, LABEL, ORDER, WORKTREE};
+use crate::snapshot::{AWAY, KIND, LABEL, ORDER, WORKTREE};
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
 use std::collections::BTreeMap;
@@ -332,6 +332,12 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
 }
 
 /// Records the order threads were dragged into: `lemur.order` 0, 1, 2, …
+/// Puts a thread away, or with `away` false brings it back.
+pub fn set_away(cfg: &Config, host: &str, session: &str, away: bool) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(AWAY, if away { "1" } else { "" })])
+}
+
 pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
     for (i, s) in sessions.iter().enumerate() {

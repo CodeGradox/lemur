@@ -259,11 +259,20 @@ impl Lemur {
                     }
                     None => menu,
                 };
-                menu.separator().item(
-                    PopupMenuItem::new("Close")
-                        .action(Box::new(CloseThread))
-                        .on_click(close),
-                )
+                let away = {
+                    let (this, key) = (this.clone(), key.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        this.update(cx, |this, cx| this.put_away(key.clone(), window, cx))
+                            .ok();
+                    }
+                };
+                menu.separator()
+                    .item(PopupMenuItem::new("Put away").on_click(away))
+                    .item(
+                        PopupMenuItem::new("Close")
+                            .action(Box::new(CloseThread))
+                            .on_click(close),
+                    )
             },
         )
     }

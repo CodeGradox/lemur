@@ -3,6 +3,7 @@
 //! Tab goes one further; letting go of it settles on the thread on show.
 
 use super::{Key, Lemur};
+use crate::snapshot::Session;
 use gpui_kit::*;
 
 /// `threads` by when they were last opened (`recent`, the latest first);
@@ -17,18 +18,25 @@ impl Lemur {
     /// threads outside every worktree.
     pub(super) fn siblings(&self, active: &Key) -> Vec<Key> {
         let (host, session) = active;
+        // Those put away aren't tabs, unless on show.
+        let shown = |s: &&Session| !s.away || s.name == *session;
         let names: Vec<String> = match self
             .snap
             .worktrees(host)
             .find(|w| w.sessions.iter().any(|s| s.name == *session))
         {
-            Some(w) => w.sessions.iter().map(|s| s.name.clone()).collect(),
+            Some(w) => w
+                .sessions
+                .iter()
+                .filter(shown)
+                .map(|s| s.name.clone())
+                .collect(),
             None => self
                 .snap
                 .hosts
                 .iter()
                 .filter(|h| h.name == *host)
-                .flat_map(|h| h.other.iter().map(|s| s.name.clone()))
+                .flat_map(|h| h.other.iter().filter(shown).map(|s| s.name.clone()))
                 .collect(),
         };
         names.into_iter().map(|name| (host.clone(), name)).collect()

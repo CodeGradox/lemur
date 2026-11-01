@@ -4,6 +4,7 @@
 //! herdr-core, so switching is instant and scrollback survives.
 
 mod agents;
+mod away;
 mod changes;
 mod chrome;
 mod cycle;
@@ -67,6 +68,7 @@ actions!(
         NextAgent,
         PreviousAgent,
         CommandPalette,
+        PutAway,
         OpenSettings,
         AddProject,
         Refresh,
@@ -251,6 +253,8 @@ struct Lemur {
     picker: Option<(Entity<FolderPicker>, Subscription)>,
     /// Every command by name, over the window.
     palette: Option<palette::Palette>,
+    /// The lists whose "Put away" is open, by their key.
+    away_open: HashSet<SharedString>,
     /// Dictating, under the terminal.
     dictation: Option<(Entity<DictationBar>, Subscription)>,
     /// lemur-dictate, which dictation runs; tests have a stand-in.
@@ -309,6 +313,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("New Thread in Worktree…", NewThreadHere),
                     MenuItem::action("Go to Thread…", GoToThread),
                     MenuItem::action("Close Thread", CloseThread),
+                    MenuItem::action("Put Thread Away", PutAway),
                     MenuItem::action("Dictate", Dictate),
                     MenuItem::separator(),
                     MenuItem::action("Refresh", Refresh),
@@ -541,6 +546,7 @@ impl Lemur {
             agents_last: false,
             picker: None,
             palette: None,
+            away_open: HashSet::new(),
             dictation: None,
             helper: dictate::helper(),
             sidebar,
@@ -727,6 +733,7 @@ impl Lemur {
             self.close_popup(&k, cx);
         }
         self.snap = snap;
+        self.bring_back_needed(cx);
         self.reconnect_terminals(cx);
         self.note_claude(cx);
         self.follow_loads();
@@ -879,6 +886,7 @@ impl Lemur {
         if self.cycling.is_none() {
             self.touch(key.clone());
         }
+        self.bring_back(&key, cx);
         self.active = Some(key);
         self.ask_changes(cx);
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
@@ -1288,6 +1296,11 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &PutAway, window, cx| {
+                if let Some(k) = this.active.clone() {
+                    this.put_away(k, window, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &NextAgent, window, cx| this.next_agent(false, window, cx)),
             )
@@ -1546,6 +1559,7 @@ mod tests {
                 busy: false,
                 running: true,
                 helpers: vec![],
+                away: false,
             })
             .collect();
         Snapshot {
@@ -3665,6 +3679,90 @@ mod tests {
         assert_eq!(active(cx), Some(key(&b)), "kept across a refresh");
         click("agent-0-0", cx);
         assert_eq!(active(cx), Some(key(&a)), "a subagent shows its thread");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A thread put away leaves the sidebar's list and the tabs for "Put
+    /// away", still running, and herdr-core keeps it so; on show, another
+    /// shows instead. Opened again, it's back; and one that needs you
+    /// comes back on its own.
+    #[gpui::test]
+    fn a_thread_put_away_comes_back_when_it_needs_you(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("away");
+        let a = server.run("/", &["lemur.label=a"], &["sleep", "600"]);
+        // Asks for you once it's told to.
+        let asks =
+            r#"read x; printf '\033]7501;state=blocked:app=claude-code\033\\'; exec sleep 600"#;
+        let b = server.run("/", &["lemur.label=b"], &["sh", "-c", asks]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        open(&app, &b, cx);
+        cx.run_until_parked();
+        let labelled = |t: &str| {
+            server
+                .core()
+                .terminals()
+                .into_iter()
+                .find(|x| x.address == t)
+                .is_some_and(|x| x.labels.contains_key(crate::snapshot::AWAY))
+        };
+        let listed = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                app.snap.hosts[0]
+                    .other
+                    .iter()
+                    .filter(|s| !s.away)
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let refresh = |cx: &mut VisualTestContext| {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+        };
+
+        cx.dispatch_action(super::PutAway);
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active.clone()),
+            Some(key(&a))
+        );
+        assert_eq!(listed(cx), std::slice::from_ref(&a));
+        assert!(wait_until(Duration::from_secs(5), || labelled(&b)));
+        refresh(cx);
+        assert_eq!(
+            listed(cx),
+            std::slice::from_ref(&a),
+            "herdr-core keeps it away"
+        );
+        assert!(cx.debug_bounds("away").is_some(), "under Put away");
+        assert!(cx.debug_bounds("tab-1").is_none(), "nor a tab");
+
+        open(&app, &b, cx);
+        let back = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !labelled(&b)
+        });
+        assert!(back, "opened, it's back");
+        refresh(cx);
+        assert_eq!(listed(cx), [a.clone(), b.clone()]);
+
+        // Away again, it asks for you: it's back.
+        cx.update(|window, cx| app.update(cx, |app, cx| app.put_away(key(&b), window, cx)));
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            labelled(&b)
+        }));
+        server.hc(&["send", &b, "go"]);
+        let back = wait_until(Duration::from_secs(10), || {
+            refresh(cx);
+            !labelled(&b)
+        });
+        assert!(back, "it needs you");
+        refresh(cx);
+        assert_eq!(listed(cx), [a.clone(), b.clone()]);
         let_attaches_end(&app, cx);
     }
 
