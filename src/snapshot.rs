@@ -1275,19 +1275,24 @@ mod tests {
         assert_eq!(other[1].order, None);
     }
 
-    /// A folder without git is one row, holding the threads started in it.
+    /// A folder without git is one row, holding the threads started in it;
+    /// added through a link, it's filed under its real path.
     #[test]
     fn a_folder_without_git_is_a_single_row() {
         let server = HcServer::new("plain");
         let dir = TempDir::new("plain");
-        let real = dir.to_string_lossy().into_owned();
+        let real = dir.join("real").to_string_lossy().into_owned();
+        std::fs::create_dir(&real).unwrap();
+        let linked = dir.join("link");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
         server.run(
             &real,
             &[&format!("lemur.worktree={real}")],
             &["sleep", "600"],
         );
         let mut cfg = server.config();
-        cfg.bases.push(crate::config::Base::new("local", &real));
+        cfg.bases
+            .push(crate::config::Base::new("local", &linked.to_string_lossy()));
 
         let mut snap = Snapshot::default();
         assert!(wait_until(Duration::from_secs(5), || {
@@ -1302,6 +1307,7 @@ mod tests {
         assert_eq!(base.error, None);
         assert_eq!(base.worktrees.len(), 1);
         assert_eq!(base.worktrees[0].path, real);
+        assert_eq!(base.worktrees[0].sessions.len(), 1);
     }
 
     #[test]
