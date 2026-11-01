@@ -509,15 +509,21 @@ impl Core {
             .ok_or_else(|| anyhow!("herdr-core gave events no channel"))?
             as u32;
         *core.lines.lock().unwrap() = EventLines::new(&snapshot);
-        let early = {
-            let mut r = core.routes.lock().unwrap();
-            r.events = Some(channel);
-            r.early.remove(&channel).unwrap_or_default()
-        };
-        for item in early {
+        // Under the routes' lock, so the reader can't apply a frame read
+        // meanwhile before these, which came first.
+        let mut r = core.routes.lock().unwrap();
+        r.events = Some(channel);
+        for item in r.early.remove(&channel).unwrap_or_default() {
             follow(&item, channel, &core.lines, &core.watchers, &core.writer);
         }
+        drop(r);
         Ok(core)
+    }
+
+    /// How many terminals' streams it follows.
+    #[cfg(test)]
+    pub fn streams(&self) -> usize {
+        self.routes.lock().unwrap().streams.len()
     }
 
     /// Whether the connection to the core dropped.
