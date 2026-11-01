@@ -110,12 +110,15 @@ fn diff_in(host: &Host, path: &str) -> Option<Diff> {
 }
 
 /// Prints the worktree's changes from HEAD, one NUL-ended record a file,
-/// then `@@end` if git could say. Without writing the index, which would
-/// hold its lock: an agent's `git add` meanwhile would fail.
+/// then `@@end` if git could say; with no commit yet, what's staged, as
+/// the Changes panel lists. Without writing the index, which would hold
+/// its lock: an agent's `git add` meanwhile would fail.
 fn script(path: &str) -> String {
     format!(
         "cd {} 2>/dev/null || exit 0\n\
-         git -c diff.autoRefreshIndex=false diff HEAD --numstat -z --no-renames 2>/dev/null && echo @@end\n\
+         {{ git -c diff.autoRefreshIndex=false diff HEAD --numstat -z --no-renames 2>/dev/null \
+         || git -c diff.autoRefreshIndex=false diff --cached --numstat -z --no-renames 2>/dev/null; }} \
+         && echo @@end\n\
          exit 0\n",
         sh_path(path)
     )
@@ -195,6 +198,20 @@ mod tests {
         );
         assert_eq!(run(&dir), None, "not a repository");
         assert_eq!(run(&dir.join("gone")), None);
+        // No commit yet: what's staged, as the Changes panel lists.
+        let fresh = dir.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        git_in(&fresh, &["init", "-q", "-b", "main"]);
+        std::fs::write(fresh.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(&fresh, &["add", "a.txt"]);
+        assert_eq!(
+            run(&fresh),
+            Some(Diff {
+                files: 1,
+                added: 2,
+                removed: 0
+            })
+        );
 
         // A file touched but not changed leaves the index as it is: its lock
         // is the one an agent's `git add` takes.
