@@ -27,6 +27,9 @@ pub(super) struct Change {
     /// M changed, A added, D deleted, ? new (not tracked yet), U in
     /// conflict.
     pub(super) status: char,
+    /// Changed since it was staged, or never staged: Commit adds it. One
+    /// staged as it is, a removal or a rename too, is committed as staged.
+    pub(super) unstaged: bool,
     pub(super) added: Option<u64>,
     pub(super) removed: Option<u64>,
 }
@@ -232,7 +235,7 @@ impl ChangesPanel {
         if message.is_empty() || self.files.is_empty() || self.committing {
             return;
         }
-        let files: Vec<String> = self.files.iter().map(|f| f.path.clone()).collect();
+        let files = to_add(&self.files);
         self.committing = true;
         self.note = None;
         cx.notify();
@@ -509,6 +512,7 @@ fn parse_changes(out: &str) -> Result<Vec<Change>, String> {
             Change {
                 path,
                 status,
+                unstaged: xy == "??" || &xy[1..] != " ",
                 added,
                 removed,
             }
@@ -572,15 +576,35 @@ fn diff_lines(out: &str, new: bool) -> (Vec<String>, Option<u64>) {
     (lines, None)
 }
 
-/// Commits `files` of the worktree, as they are now, with `message`; what
-/// git said of it.
+/// The files Commit adds before committing: those with changes not staged.
+/// What's staged as it is, a removal or a rename too, `git add` may not
+/// even name any more.
+fn to_add(files: &[Change]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| f.unstaged)
+        .map(|f| f.path.clone())
+        .collect()
+}
+
+/// Commits what's staged in the worktree with `message`, after adding
+/// `files` (those with changes not staged) as they are now; what git said
+/// of it.
 fn commit_in(host: &Host, path: &str, message: &str, files: &[String]) -> Result<String, String> {
-    let files: Vec<String> = files.iter().map(|f| quote(f)).collect();
-    // Literal: a file named like `:(glob)*` is that file.
+    // From stdin, as many as there are: on the command line, some 15,000
+    // paths are too many. Literal, so a file named like `:(glob)*` is that
+    // file; each C-quoted, so no name ends the list early.
+    let add = if files.is_empty() {
+        String::new()
+    } else {
+        let listed: String = files.iter().map(|f| format!("{}\n", c_quoted(f))).collect();
+        format!(
+            "git --literal-pathspecs add -A --pathspec-from-file=- <<'LEMUR_PATHS' || exit 1\n{listed}LEMUR_PATHS\n"
+        )
+    };
     let script = format!(
-        "cd {} || exit 1\ngit --literal-pathspecs add -A -- {} && git commit -q -m {} && git log -1 --format='Committed %h: %s'\n",
+        "cd {} || exit 1\n{add}git commit -q -m {} && git log -1 --format='Committed %h: %s'\n",
         sh_path(path),
-        files.join(" "),
         quote(message)
     );
     Remote::new(host)
@@ -589,10 +613,31 @@ fn commit_in(host: &Host, path: &str, message: &str, files: &[String]) -> Result
         .map_err(|e| format!("{e:#}"))
 }
 
+/// `path` in double quotes, as git reads a path in a list of them: `\`
+/// and `"` escaped, and control characters as octal escapes.
+fn c_quoted(path: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in path.chars() {
+        match c {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            c if c.is_control() => {
+                let mut bytes = [0; 4];
+                for b in c.encode_utf8(&mut bytes).bytes() {
+                    quoted.push_str(&format!("\\{b:03o}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's `test` would stand in for the plain one.
-    use super::{changes_in, commit_in, diff_lines, diff_of, parse_changes};
+    use super::{changes_in, commit_in, diff_lines, diff_of, parse_changes, to_add};
     use crate::test_support::{TempDir, git_in};
 
     #[test]
@@ -708,6 +753,96 @@ mod tests {
             listed(cx).1.len() == 2
         });
         assert!(again, "{:?}", listed(cx));
+    }
+
+    /// What's staged commits as staged: a removal (of an ignored file too)
+    /// and a rename, which `git add` can't name any more. What isn't is
+    /// added first, whatever its name.
+    #[test]
+    fn staged_changes_commit_as_staged() {
+        let server = crate::test_support::HcServer::new("changes-staged");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-staged");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        for f in ["a.txt", "b.txt", "c.txt", "kept.log"] {
+            std::fs::write(repo.join(f), format!("{f}\n")).unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        git(&["rm", "-q", "b.txt"]);
+        git(&["mv", "c.txt", "e.txt"]);
+        git(&["rm", "-q", "--cached", "kept.log"]);
+        std::fs::write(repo.join("a.txt"), "staged\n").unwrap();
+        git(&["add", "a.txt"]);
+        std::fs::write(repo.join("a.txt"), "and more\n").unwrap();
+        for name in ["new\nline.txt", "say \"hi\".txt", "back\\slash.txt"] {
+            std::fs::write(repo.join(name), "x\n").unwrap();
+        }
+        let root = repo.to_string_lossy().into_owned();
+
+        let files = to_add(&changes_in(&host, &root).unwrap());
+        let said = commit_in(&host, &root, "Tidy", &files).unwrap();
+        assert!(said.ends_with("Tidy"), "{said}");
+        let tree = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "-z", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let mut tree: Vec<String> = String::from_utf8_lossy(&tree.stdout)
+            .split('\0')
+            .filter(|f| !f.is_empty())
+            .map(String::from)
+            .collect();
+        tree.sort();
+        assert_eq!(
+            tree,
+            [
+                ".gitignore",
+                "a.txt",
+                "back\\slash.txt",
+                "e.txt",
+                "new\nline.txt",
+                "say \"hi\".txt"
+            ]
+        );
+        let shown = std::process::Command::new("git")
+            .args(["show", "HEAD:a.txt"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&shown.stdout), "and more\n");
+        assert!(changes_in(&host, &root).unwrap().is_empty());
+    }
+
+    /// More new files than a command line holds commit too.
+    #[test]
+    fn thousands_of_files_commit() {
+        let server = crate::test_support::HcServer::new("changes-many");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-many");
+        let repo = dir.join("repo");
+        // Long paths, so fewer files make about 1.3 MB of them: this Mac
+        // takes 1 MB of arguments.
+        let deep = repo.join(format!("vendor/{}", "package-".repeat(25)));
+        std::fs::create_dir_all(&deep).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        for i in 0..6_000 {
+            std::fs::write(deep.join(format!("file-{i:05}.txt")), "").unwrap();
+        }
+        let root = repo.to_string_lossy().into_owned();
+        let files: Vec<String> = changes_in(&host, &root)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert_eq!(files.len(), 6_000);
+        let said = commit_in(&host, &root, "Vendor", &files).unwrap();
+        assert!(said.ends_with("Vendor"), "{said}");
+        assert!(changes_in(&host, &root).unwrap().is_empty());
     }
 
     /// In a real repository, on a test herdr-core: listed, diffed, then
