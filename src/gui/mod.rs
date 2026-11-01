@@ -17,6 +17,7 @@ mod meter;
 mod new;
 mod notes;
 mod notification;
+mod palette;
 mod projects;
 mod prompt;
 mod resume;
@@ -65,6 +66,7 @@ actions!(
         ToggleRightPanel,
         NextAgent,
         PreviousAgent,
+        CommandPalette,
         OpenSettings,
         AddProject,
         Refresh,
@@ -98,6 +100,7 @@ fn bind_keys(cx: &mut App) {
         // As Herdr's; the notes indent with them, as they take them first.
         KeyBinding::new("cmd-]", NextAgent, None),
         KeyBinding::new("cmd-[", PreviousAgent, None),
+        KeyBinding::new("cmd-shift-p", CommandPalette, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
         // A new tab, as in a terminal app; ⌘W closes the one on show.
@@ -118,6 +121,7 @@ fn bind_keys(cx: &mut App) {
     folder_picker::bind_keys(cx);
     notes::bind_keys(cx);
     prompt::bind_keys(cx);
+    palette::bind_keys(cx);
 }
 
 const REFRESH: Duration = Duration::from_secs(3);
@@ -245,6 +249,8 @@ struct Lemur {
     agents_last: bool,
     /// Adding a folder, over the window.
     picker: Option<(Entity<FolderPicker>, Subscription)>,
+    /// Every command by name, over the window.
+    palette: Option<palette::Palette>,
     /// Dictating, under the terminal.
     dictation: Option<(Entity<DictationBar>, Subscription)>,
     /// lemur-dictate, which dictation runs; tests have a stand-in.
@@ -308,6 +314,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("Refresh", Refresh),
                 ]),
                 Menu::new("View").items([
+                    MenuItem::action("Command Palette…", CommandPalette),
+                    MenuItem::separator(),
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Right Panel", ToggleRightPanel),
                     MenuItem::action("Toggle Notes", ToggleNotes),
@@ -532,6 +540,7 @@ impl Lemur {
             agents_open: false,
             agents_last: false,
             picker: None,
+            palette: None,
             dictation: None,
             helper: dictate::helper(),
             sidebar,
@@ -1260,6 +1269,13 @@ impl Render for Lemur {
                     .ok();
             })
         });
+        let palette = self.palette_card(window, cx).map(|card| {
+            let this = this.clone();
+            spotlight::overlay(card, move |window, cx| {
+                this.update(cx, |this, cx| this.close_palette(window, cx))
+                    .ok();
+            })
+        });
         h_flex()
             .relative()
             .size_full()
@@ -1269,6 +1285,9 @@ impl Render for Lemur {
             .on_action(cx.listener(|this, _: &ToggleNotes, _, cx| this.toggle_notes(cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
             .on_action(cx.listener(|this, _: &ToggleAgents, _, cx| this.toggle_agents(cx)))
+            .on_action(
+                cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &NextAgent, window, cx| this.next_agent(false, window, cx)),
             )
@@ -1305,6 +1324,9 @@ impl Render for Lemur {
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 if e.keystroke.key == "escape" && this.prompt.is_some() {
                     this.close_prompt(window, cx);
+                    cx.stop_propagation();
+                } else if e.keystroke.key == "escape" && this.palette.is_some() {
+                    this.close_palette(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -1390,6 +1412,7 @@ impl Render for Lemur {
             )
             .children(picker)
             .children(prompt)
+            .children(palette)
             // Holds the window's focus with no terminal open. It takes no room
             // and can't be clicked, so clicks elsewhere keep their focus.
             .child(div().absolute().track_focus(&self.focus))
@@ -3643,6 +3666,36 @@ mod tests {
         click("agent-0-0", cx);
         assert_eq!(active(cx), Some(key(&a)), "a subagent shows its thread");
         let_attaches_end(&app, cx);
+    }
+
+    /// ⌘⇧P lists every command; what's typed narrows them, ↓ picks the
+    /// next, and ⏎ runs it as its key would. Esc closes it.
+    #[gpui::test]
+    fn the_palette_runs_commands_by_name(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        let open = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                (app.palette.is_some(), app.notes_open, app.agents_open)
+            })
+        };
+        cx.simulate_keystrokes("cmd-shift-p");
+        assert_eq!(open(cx), (true, false, false));
+        assert!(cx.debug_bounds("command 0").is_some());
+        cx.simulate_input("toggle agents");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(open(cx), (false, false, true), "Toggle Agents ran");
+
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_input("toggle");
+        // Toggle Sidebar, Right Panel, Notes: the third.
+        cx.simulate_keystrokes("down down enter");
+        cx.run_until_parked();
+        assert_eq!(open(cx), (false, true, false), "Toggle Notes ran");
+
+        cx.simulate_keystrokes("cmd-shift-p escape");
+        assert_eq!(open(cx), (false, true, false));
     }
 
     /// ⌘] and ⌘[ go through the agents in the panel's order, round and

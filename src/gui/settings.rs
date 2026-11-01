@@ -421,6 +421,11 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
     (
         "Window",
         &[
+            Shortcut {
+                what: "Command palette",
+                how: Press::Keys(&["cmd-shift-p"]),
+                more: Some("Every command by name, with its key."),
+            },
             keys("Toggle the sidebar", &["cmd-b"]),
             Shortcut {
                 what: "Toggle the right panel",
