@@ -239,6 +239,9 @@ struct Lemur {
     fresh: HashMap<Key, u8>,
     /// Sessions that finished while you were looking at another one.
     done: HashSet<Key>,
+    /// What each thread was doing at the last snapshot, or before its host
+    /// couldn't be reached.
+    seen: HashMap<Key, Activity>,
     /// Shown in a snackbar over the terminal.
     status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
@@ -589,6 +592,7 @@ impl Lemur {
             prompt: None,
             fresh: HashMap::new(),
             done: HashSet::new(),
+            seen: HashMap::new(),
             status: None,
             restore,
             window: window.window_handle(),
@@ -723,9 +727,6 @@ impl Lemur {
     }
 
     fn set_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
-        let before: HashMap<Key, Activity> = sessions(&self.snap)
-            .map(|(h, s)| (key(h, s), s.activity))
-            .collect();
         let now: HashMap<Key, &Session> = sessions(&snap).map(|(h, s)| (key(h, s), s)).collect();
         // A thread just started may not be listed yet.
         self.fresh.retain(|k, left| {
@@ -757,6 +758,11 @@ impl Lemur {
                 || helpers.contains(k)
                 || unreached.contains(k.0.as_str())
         };
+        // What can show instead of a thread that ended: not one put away,
+        // nor one only kept for a host that can't be reached.
+        let showable = |k: &Key| {
+            now.get(k).is_some_and(|s| !s.away) || fresh.contains_key(k) || helpers.contains(k)
+        };
         // Whether the thread on show has the keyboard, before its terminal
         // may go.
         let had_keyboard = self
@@ -772,8 +778,11 @@ impl Lemur {
         let mut instead = None;
         if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
             self.active = None;
-            instead = self.successor(&gone, live);
+            instead = self.successor(&gone, showable);
         }
+        // What each thread did last. A host that can't be reached keeps its
+        // own: back, its threads haven't just finished or come to need you.
+        let before = std::mem::take(&mut self.seen);
         // Working -> idle is "finished"; anything -> waiting is "needs input".
         let mut news = vec![];
         for (k, s) in &now {
@@ -787,18 +796,25 @@ impl Lemur {
                 news.push((k.clone(), s.activity, s.waiting_for.clone()));
             }
         }
+        self.seen = before
+            .into_iter()
+            .filter(|(k, _)| unreached.contains(k.0.as_str()) && !now.contains_key(k))
+            .chain(now.iter().map(|(k, s)| (k.clone(), s.activity)))
+            .collect();
+        let kept = |k: &Key| unreached.contains(k.0.as_str()) && !now.contains_key(k);
         self.done
-            .retain(|k| now.get(k).is_some_and(|s| s.activity != Activity::Working));
+            .retain(|k| kept(k) || now.get(k).is_some_and(|s| s.activity != Activity::Working));
         let gone: Vec<Key> = self
             .popups
             .keys()
-            .filter(|k| !now.contains_key(*k))
+            .filter(|k| !now.contains_key(*k) && !kept(k))
             .cloned()
             .collect();
+        // Not one put away since: it stays away across restarts.
         let restore = self
             .restore
             .take()
-            .filter(|k| now.contains_key(k) && self.active.is_none());
+            .filter(|k| now.get(k).is_some_and(|s| !s.away) && self.active.is_none());
         drop(now);
         for k in gone {
             self.close_popup(&k, cx);
@@ -3524,6 +3540,61 @@ mod tests {
         assert_eq!(in_a_second(cx), 0, "still again");
     }
 
+    /// While its host can't be reached, a thread keeps what it was doing
+    /// and its done mark: back, it hasn't just changed, and finishing then
+    /// still counts.
+    #[gpui::test]
+    fn a_host_out_of_reach_keeps_what_its_threads_did(cx: &mut gpui::TestAppContext) {
+        let cfg: Config = toml::from_str("").unwrap();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| Lemur::new(cfg, None, window, cx));
+        app.update(cx, |app, _| app.active = Some(key("shown")));
+        let out_of_reach = |cx: &mut VisualTestContext| {
+            let mut snap = snapshot(&[]);
+            snap.hosts[0].error = Some("can't reach it".into());
+            cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        };
+        apply(
+            &app,
+            &[("shown", Activity::Working), ("done", Activity::Working)],
+            cx,
+        );
+        apply(
+            &app,
+            &[("shown", Activity::Working), ("done", Activity::Idle)],
+            cx,
+        );
+        out_of_reach(cx);
+        app.read_with(cx, |app, _| {
+            assert!(app.done.contains(&key("done")), "kept")
+        });
+        apply(
+            &app,
+            &[("shown", Activity::Idle), ("done", Activity::Idle)],
+            cx,
+        );
+        app.read_with(cx, |app, _| assert!(app.done.contains(&key("done"))));
+
+        apply(
+            &app,
+            &[("shown", Activity::Working), ("other", Activity::Working)],
+            cx,
+        );
+        out_of_reach(cx);
+        apply(
+            &app,
+            &[("shown", Activity::Working), ("other", Activity::Idle)],
+            cx,
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.done.contains(&key("other")),
+                "it finished: {:?}",
+                app.done
+            )
+        });
+    }
+
     #[gpui::test]
     fn a_session_that_finishes_elsewhere_is_marked_done(cx: &mut gpui::TestAppContext) {
         // No hosts, so the background refresh has nothing to fetch.
@@ -4383,6 +4454,49 @@ mod tests {
         assert!(back, "it needs you");
         refresh(cx);
         assert_eq!(listed(cx), [a.clone(), b.clone()]);
+        let_attaches_end(&app, cx);
+    }
+
+    /// A thread put away doesn't show instead of one that ended, nor when
+    /// Lemur starts again: it stays away.
+    #[gpui::test]
+    fn a_thread_put_away_doesnt_come_back_on_its_own(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("away-stays");
+        let [x, y] =
+            ["x", "y"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &x, cx);
+        open(&app, &y, cx);
+        cx.update(|window, cx| app.update(cx, |app, cx| app.put_away(key(&x), window, cx)));
+        let away = |cx: &mut VisualTestContext| {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&x)).is_some_and(|s| s.away)
+            })
+        };
+        assert!(wait_until(Duration::from_secs(5), || away(cx)));
+
+        server.hc(&["kill", &y]);
+        let ended = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(super::BURST);
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.session_of(&key(&y)).is_none())
+        });
+        assert!(ended);
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.active, None, "x isn't shown instead")
+        });
+        assert!(away(cx), "still away");
+
+        // Shown last before Lemur quit, it isn't opened when it starts.
+        app.update(cx, |app, _| app.restore = Some(key(&x)));
+        assert!(away(cx));
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.active, None, "nor when Lemur starts")
+        });
         let_attaches_end(&app, cx);
     }
 
