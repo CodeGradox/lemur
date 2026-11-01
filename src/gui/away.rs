@@ -22,6 +22,7 @@ impl Lemur {
             if let Some((host, session)) = next {
                 self.open(host, session, window, cx);
             }
+            self.follow_nothing(cx);
         }
         self.save_away(k, true, cx);
     }

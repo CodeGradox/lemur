@@ -848,7 +848,16 @@ impl Lemur {
             // the notes, a commit message or a spotlight goes on there.
             self.show_thread(host, session, had_keyboard, window, cx);
         }
+        self.follow_nothing(cx);
         cx.notify();
+    }
+
+    /// With no thread on show, the Changes panel says so, rather than
+    /// showing, and committing in, the worktree of the one that was.
+    fn follow_nothing(&mut self, cx: &mut Context<Self>) {
+        if self.active.is_none() && self.right == Some(Right::Changes) {
+            self.show_changes(cx);
+        }
     }
 
     /// What shows once `gone`, the thread on show, has ended: the one opened
@@ -4148,6 +4157,52 @@ mod tests {
         });
         let kept = app.read_with(cx, |app, _| app.cfg.threads[0].issue.clone());
         assert_eq!(kept.as_deref(), Some("LAFT-12"));
+    }
+
+    /// When the thread on show ends and none shows instead, the Changes
+    /// panel no longer lists its worktree's changes, nor commits there.
+    #[gpui::test]
+    fn the_changes_panel_empties_with_nothing_on_show(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("chpanel-none");
+        let dir = TempDir::new("changes-none");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_in(&repo, &["add", "a.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let t = server.run(
+            &repo.to_string_lossy(),
+            &["lemur.label=t"],
+            &["sleep", "600"],
+        );
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &repo.to_string_lossy()));
+        let (app, cx) = rooted(cfg, cx);
+        assert!(wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.project_of("local", &t).is_some())
+        }));
+        open(&app, &t, cx);
+        cx.dispatch_action(super::ToggleChanges);
+        let files = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| app.changes_panel.read(cx).listed().0)
+        };
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !files(cx).is_empty()
+        }));
+        server.hc(&["kill", &t]);
+        let ended = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(super::BURST);
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active.is_none())
+        });
+        assert!(ended);
+        assert!(files(cx).is_empty(), "{:?}", files(cx));
     }
 
     /// The Changes panel lists the worktree on show's changes, and a click

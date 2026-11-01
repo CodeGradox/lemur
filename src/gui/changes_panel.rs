@@ -117,6 +117,9 @@ impl ChangesPanel {
 
     /// Nothing on show to tell changes of.
     pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
+        if self.place.is_none() {
+            return;
+        }
         self.place = None;
         self.files.clear();
         self.open = None;
