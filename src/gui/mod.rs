@@ -754,6 +754,13 @@ impl Lemur {
                 || helpers.contains(k)
                 || unreached.contains(k.0.as_str())
         };
+        // Whether the thread on show has the keyboard, before its terminal
+        // may go.
+        let had_keyboard = self
+            .active
+            .as_ref()
+            .and_then(|k| self.terminals.get(k))
+            .is_some_and(|v| v.read(cx).focus_handle(cx).is_focused(window));
         self.terminals.retain(|k, _| live(k));
         if self.peek.as_ref().is_some_and(|k| !live(k)) {
             self.peek = None;
@@ -809,8 +816,12 @@ impl Lemur {
         self.keep_claude_ids(cx);
         self.follow_linear(cx);
         self.notify_news(news, window, cx);
-        if let Some((host, session)) = restore.or(instead) {
+        if let Some((host, session)) = restore {
             self.open(host, session, window, cx);
+        } else if let Some((host, session)) = instead {
+            // It takes the keyboard only from the one that ended: typing in
+            // the notes, a commit message or a spotlight goes on there.
+            self.show_thread(host, session, had_keyboard, window, cx);
         }
         cx.notify();
     }
@@ -950,6 +961,18 @@ impl Lemur {
     }
 
     fn open(&mut self, host: String, session: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_thread(host, session, true, window, cx);
+    }
+
+    /// Shows a thread, and with `focus` gives it the keyboard.
+    fn show_thread(
+        &mut self,
+        host: String,
+        session: String,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(h) = self.cfg.host(&host).cloned() else {
             return;
         };
@@ -978,7 +1001,9 @@ impl Lemur {
                 .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
         }
         self.remember(host, session);
-        view.read(cx).focus_handle(cx).focus(window, cx);
+        if focus {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -4522,6 +4547,44 @@ mod tests {
         cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
         app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘J answered"));
+        let_attaches_end(&app, cx);
+    }
+
+    /// The thread on show ending on its own while you type elsewhere, as
+    /// in a spotlight, shows another, but leaves the keyboard where it is.
+    #[gpui::test]
+    fn a_thread_shown_instead_leaves_the_keyboard_where_it_is(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("ended-elsewhere");
+        let [a, b] =
+            ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-p");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.prompt.is_some(), "⌘P's spotlight"));
+
+        server.hc(&["kill", &a]);
+        let switched = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(super::BURST);
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active == Some(key(&b)))
+        });
+        assert!(switched, "b shows instead");
+        let b_has_it = cx.update(|window, cx| {
+            let view = app.read(cx).terminals[&key(&b)].clone();
+            gpui_kit::Focusable::focus_handle(view.read(cx), cx).is_focused(window)
+        });
+        assert!(!b_has_it, "the spotlight keeps the keyboard");
+        cx.simulate_keystrokes("x");
+        let typed = app.read_with(cx, |app, cx| {
+            app.prompt
+                .as_ref()
+                .map(|p| p.input.read(cx).value().to_string())
+        });
+        assert_eq!(typed.as_deref(), Some("x"));
         let_attaches_end(&app, cx);
     }
 
