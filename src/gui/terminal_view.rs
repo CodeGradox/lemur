@@ -234,6 +234,11 @@ impl TerminalView {
         matches!(self.attachment, Attachment::Attached(..))
     }
 
+    #[cfg(test)]
+    pub fn attaching(&self) -> bool {
+        matches!(self.attachment, Attachment::Attaching)
+    }
+
     /// Its stream ended, so it shows what it last had.
     pub fn exited(&self) -> bool {
         matches!(self.attachment, Attachment::Ended)

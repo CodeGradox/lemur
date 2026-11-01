@@ -3800,14 +3800,16 @@ mod tests {
         }
     }
 
-    /// Lets the terminals' attach attempts end before the server cleans up.
+    /// Lets the terminals' attach attempts end, attached or not, before the
+    /// server cleans up.
     fn let_attaches_end(app: &Entity<Lemur>, cx: &mut VisualTestContext) {
-        wait_until(Duration::from_secs(5), || {
+        let ended = wait_until(Duration::from_secs(5), || {
             cx.run_until_parked();
             app.read_with(cx, |app, cx| {
-                app.terminals.values().all(|t| t.read(cx).exited())
+                app.terminals.values().all(|t| !t.read(cx).attaching())
             })
         });
+        assert!(ended, "a terminal still attaching");
     }
 
     /// The tabs are the threads of the worktree on show: a click opens one,
