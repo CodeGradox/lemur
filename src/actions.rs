@@ -1103,12 +1103,17 @@ mod tests {
         };
         let err = resume_thread(&cfg, &gone).unwrap_err();
         assert!(format!("{err:#}").contains("is gone"), "{err:#}");
+        // Typed into a shell, it would run: here only a mark, should the
+        // check ever fail.
+        let ran = dir.join("ran");
         let odd = ClaudeThread {
             session: "t998".into(),
-            claude_session: "x; rm -rf ~".into(),
+            claude_session: format!("x; touch {}", ran.display()),
             ..claude
         };
         assert!(resume_thread(&cfg, &odd).is_err());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!ran.exists(), "it ran");
         assert_eq!(server.addresses().len(), before);
     }
 
