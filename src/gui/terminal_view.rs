@@ -243,6 +243,17 @@ impl TerminalView {
         matches!(self.attachment, Attachment::Attaching)
     }
 
+    /// No longer shown: its program is told it lost focus (vim's FocusLost,
+    /// Claude's paused spinner), as it would be shown again.
+    pub fn hidden(&mut self) {
+        if let Attachment::Attached(core, channel) = &self.attachment
+            && self.told_focus != Some(false)
+        {
+            core.focus(*channel, false);
+            self.told_focus = Some(false);
+        }
+    }
+
     /// Its stream ended, so it shows what it last had.
     pub fn exited(&self) -> bool {
         matches!(self.attachment, Attachment::Ended)

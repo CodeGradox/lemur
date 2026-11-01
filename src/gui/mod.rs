@@ -1037,6 +1037,7 @@ impl Lemur {
             return;
         };
         let key = (host.clone(), session.clone());
+        self.hide_shown(Some(&key), cx);
         let view = self.terminal_for(&key, h, cx);
         // Peeked at, it's shown now.
         if self.peek.as_ref() == Some(&key) {
@@ -1065,6 +1066,16 @@ impl Lemur {
             view.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// Tells the thread on show's program it's no longer shown, unless it's
+    /// `next`.
+    fn hide_shown(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
+        if let Some(shown) = self.active.as_ref().filter(|k| Some(*k) != next)
+            && let Some(view) = self.terminals.get(shown)
+        {
+            view.update(cx, |v, _| v.hidden());
+        }
     }
 
     /// The project (its place in the config) and worktree a session runs in.
@@ -4188,6 +4199,33 @@ mod tests {
         });
         let kept = app.read_with(cx, |app, _| app.cfg.threads[0].issue.clone());
         assert_eq!(kept.as_deref(), Some("LAFT-12"));
+    }
+
+    /// A program that asks for focus reports hears it lost focus when
+    /// another thread shows instead of it, and got it back when it shows
+    /// again.
+    #[gpui::test]
+    fn a_thread_shown_no_more_hears_it_lost_focus(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("focus-out");
+        let a = server.run(
+            "/",
+            &["lemur.label=a"],
+            &["sh", "-c", r"printf '\033[?1004h'; exec cat -v"],
+        );
+        let b = server.run("/", &["lemur.label=b"], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let heard = |what: &str, cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(5), || {
+                cx.run_until_parked();
+                server.hc(&["read", &a]).contains(what)
+            })
+        };
+        open(&app, &a, cx);
+        assert!(heard("^[[I", cx), "{}", server.hc(&["read", &a]));
+        open(&app, &b, cx);
+        assert!(heard("^[[O", cx), "{}", server.hc(&["read", &a]));
+        let_attaches_end(&app, cx);
     }
 
     /// When the thread on show ends and none shows instead, the Changes

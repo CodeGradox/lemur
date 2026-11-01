@@ -18,6 +18,7 @@ impl Lemur {
             let next = self.successor(&k, |other| {
                 *other != k && self.session_of(other).is_some_and(|s| !s.away)
             });
+            self.hide_shown(None, cx);
             self.active = None;
             if let Some((host, session)) = next {
                 self.open(host, session, window, cx);

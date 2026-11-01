@@ -24,7 +24,9 @@ impl Lemur {
     }
 
     pub(super) fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.peek = None;
+        if let Some(view) = self.peek.take().and_then(|k| self.terminals.get(&k)) {
+            view.update(cx, |v, _| v.hidden());
+        }
         self.focus_terminal(window, cx);
         cx.notify();
     }
