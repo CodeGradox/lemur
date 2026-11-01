@@ -63,6 +63,8 @@ actions!(
         ToggleNotes,
         ToggleAgents,
         ToggleRightPanel,
+        NextAgent,
+        PreviousAgent,
         OpenSettings,
         AddProject,
         Refresh,
@@ -93,6 +95,9 @@ fn bind_keys(cx: &mut App) {
         // As Zed's right dock; Refresh does without a key.
         KeyBinding::new("cmd-r", ToggleRightPanel, None),
         KeyBinding::new("cmd-shift-a", ToggleAgents, None),
+        // As Herdr's; the notes indent with them, as they take them first.
+        KeyBinding::new("cmd-]", NextAgent, None),
+        KeyBinding::new("cmd-[", PreviousAgent, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
         // A new tab, as in a terminal app; ⌘W closes the one on show.
@@ -310,6 +315,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::separator(),
                     MenuItem::action("Next Thread in Worktree", NextThread),
                     MenuItem::action("Previous Thread in Worktree", PreviousThread),
+                    MenuItem::action("Next Agent", NextAgent),
+                    MenuItem::action("Previous Agent", PreviousAgent),
                 ]),
             ]);
             let options = WindowOptions {
@@ -1262,6 +1269,14 @@ impl Render for Lemur {
             .on_action(cx.listener(|this, _: &ToggleNotes, _, cx| this.toggle_notes(cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| this.toggle_right_panel(cx)))
             .on_action(cx.listener(|this, _: &ToggleAgents, _, cx| this.toggle_agents(cx)))
+            .on_action(
+                cx.listener(|this, _: &NextAgent, window, cx| this.next_agent(false, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousAgent, window, cx| {
+                    this.next_agent(true, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &AddProject, window, cx| this.open_picker(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx).detach()))
             .on_action(
@@ -3627,6 +3642,32 @@ mod tests {
         assert_eq!(active(cx), Some(key(&b)), "kept across a refresh");
         click("agent-0-0", cx);
         assert_eq!(active(cx), Some(key(&a)), "a subagent shows its thread");
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘] and ⌘[ go through the agents in the panel's order, round and
+    /// round, starting from the first.
+    #[gpui::test]
+    fn cmd_brackets_go_through_the_agents(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("next-agent");
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        apply(
+            &app,
+            &[
+                ("idle", Activity::Idle),
+                ("asks", Activity::NeedsInput),
+                ("works", Activity::Working),
+                ("shell", Activity::Unknown),
+            ],
+            cx,
+        );
+        let mut seen = vec![];
+        for keys in ["cmd-]", "cmd-]", "cmd-]", "cmd-]", "cmd-[", "cmd-["] {
+            cx.simulate_keystrokes(keys);
+            seen.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
+        }
+        assert_eq!(seen, ["asks", "works", "idle", "asks", "idle", "works"]);
         let_attaches_end(&app, cx);
     }
 

@@ -51,6 +51,28 @@ impl Lemur {
         agents
     }
 
+    /// ⌘] and ⌘[: shows the next agent, or the one before, in the agents
+    /// panel's order, as Herdr's do: from the thread on show, or the first.
+    pub(super) fn next_agent(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let agents: Vec<Key> = self.agents().into_iter().map(|(h, s)| key(h, s)).collect();
+        if agents.is_empty() {
+            self.note("No Claude threads".into(), cx);
+            return;
+        }
+        let at = self
+            .active
+            .as_ref()
+            .and_then(|a| agents.iter().position(|k| k == a));
+        let n = agents.len();
+        let next = match (at, back) {
+            (Some(i), false) => (i + 1) % n,
+            (Some(i), true) => (i + n - 1) % n,
+            (None, _) => 0,
+        };
+        let (host, session) = agents[next].clone();
+        self.open(host, session, window, cx);
+    }
+
     fn agents_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
