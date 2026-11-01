@@ -452,14 +452,16 @@ impl Render for ChangesPanel {
 
 /// The worktree's changes since its last commit, staged or not, new files
 /// too, in git's order; other repositories inside it aren't its changes.
+/// Without writing the index, which would hold its lock: an agent's `git
+/// add` meanwhile would fail.
 fn changes_in(host: &Host, path: &str) -> Result<Vec<Change>, String> {
     let script = format!(
         "cd {} 2>/dev/null || {{ echo '@@error There is no such folder'; exit 0; }}\n\
          git rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo '@@error Not a git repository'; exit 0; }}\n\
          echo @@status\n\
-         git status --porcelain=v1 -z --no-renames --untracked-files=all\n\
+         git --no-optional-locks status --porcelain=v1 -z --no-renames --untracked-files=all\n\
          echo; echo @@numstat\n\
-         git diff HEAD --numstat -z --no-renames 2>/dev/null || git diff --cached --numstat -z --no-renames\n\
+         git -c diff.autoRefreshIndex=false diff HEAD --numstat -z --no-renames 2>/dev/null || git -c diff.autoRefreshIndex=false diff --cached --numstat -z --no-renames\n\
          echo; echo @@end\n",
         sh_path(path)
     );
@@ -531,7 +533,7 @@ fn diff_of(host: &Host, root: &str, file: &Change) -> (Vec<String>, Option<u64>)
         )
     } else {
         format!(
-            "cd {} || exit 0\ngit --literal-pathspecs diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git --literal-pathspecs diff --cached --no-color -- {path}\n",
+            "cd {} || exit 0\ngit --literal-pathspecs -c diff.autoRefreshIndex=false diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git --literal-pathspecs -c diff.autoRefreshIndex=false diff --cached --no-color -- {path}\n",
             sh_path(root)
         )
     };
@@ -816,6 +818,39 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&shown.stdout), "and more\n");
         assert!(changes_in(&host, &root).unwrap().is_empty());
+    }
+
+    /// Listing changes and showing a diff leave the index as it is, a file
+    /// touched but not changed too: its lock is the one an agent's `git
+    /// add` takes.
+    #[test]
+    fn listing_changes_leaves_the_index_alone() {
+        let server = crate::test_support::HcServer::new("changes-no-lock");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-no-lock");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "one\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+        let index = repo.join(".git/index");
+        let written = || std::fs::metadata(&index).unwrap().modified().unwrap();
+        let before = written();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::File::options()
+            .write(true)
+            .open(repo.join("a.txt"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let root = repo.to_string_lossy().into_owned();
+        let changes = changes_in(&host, &root).unwrap();
+        assert_eq!(changes.len(), 1);
+        diff_of(&host, &root, &changes[0]);
+        assert_eq!(written(), before, "the index was written");
     }
 
     /// A file's diff is that file's, though its name reads as a pattern

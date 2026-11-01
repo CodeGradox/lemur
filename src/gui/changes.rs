@@ -110,11 +110,12 @@ fn diff_in(host: &Host, path: &str) -> Option<Diff> {
 }
 
 /// Prints the worktree's changes from HEAD, one NUL-ended record a file,
-/// then `@@end` if git could say.
+/// then `@@end` if git could say. Without writing the index, which would
+/// hold its lock: an agent's `git add` meanwhile would fail.
 fn script(path: &str) -> String {
     format!(
         "cd {} 2>/dev/null || exit 0\n\
-         git diff HEAD --numstat -z --no-renames 2>/dev/null && echo @@end\n\
+         git -c diff.autoRefreshIndex=false diff HEAD --numstat -z --no-renames 2>/dev/null && echo @@end\n\
          exit 0\n",
         sh_path(path)
     )
@@ -194,5 +195,23 @@ mod tests {
         );
         assert_eq!(run(&dir), None, "not a repository");
         assert_eq!(run(&dir.join("gone")), None);
+
+        // A file touched but not changed leaves the index as it is: its lock
+        // is the one an agent's `git add` takes.
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "two"]);
+        let index = repo.join(".git/index");
+        let written = || std::fs::metadata(&index).unwrap().modified().unwrap();
+        let before = written();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let later = std::time::SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(repo.join("a.txt"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        run(&repo);
+        assert_eq!(written(), before, "the index was written");
     }
 }
