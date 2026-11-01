@@ -77,13 +77,14 @@ fn fetch_from(host: &Host) -> Result<Vec<Limit>, String> {
 }
 
 /// Runs `/usage` with `claude`, the host's command for Claude Code, away
-/// from any project, so no project's settings or hooks load. `@@exit` says
-/// how it ended.
+/// from any project, and with no settings or MCP servers: it needs none,
+/// and each ask would run your hooks and start your MCP servers. `@@exit`
+/// says how it ended.
 fn script(claude: &str) -> String {
     format!(
         "cd \"${{TMPDIR:-/tmp}}\" 2>/dev/null || cd /\n\
-         {claude} -p /usage --no-session-persistence --output-format stream-json --verbose \
-         </dev/null 2>/dev/null\n\
+         {claude} -p /usage --no-session-persistence --setting-sources '' --strict-mcp-config \
+         --output-format stream-json --verbose </dev/null 2>/dev/null\n\
          echo \"@@exit $?\"\n"
     )
 }
@@ -339,7 +340,9 @@ mod tests {
         assert!(out.ends_with("@@exit 0\n"), "{out}");
         assert_eq!(
             std::fs::read_to_string(args).unwrap(),
-            "-p\n/usage\n--no-session-persistence\n--output-format\nstream-json\n--verbose\n"
+            "-p\n/usage\n--no-session-persistence\n--setting-sources\n\n--strict-mcp-config\n\
+             --output-format\nstream-json\n--verbose\n",
+            "no settings (hooks) or MCP servers"
         );
 
         let missing = run("lemur-no-such-claude");
