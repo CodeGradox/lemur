@@ -339,25 +339,51 @@ pub fn binary() -> PathBuf {
     .clone()
 }
 
+/// A `herdr-core connect` until it's a core's: one that fails the
+/// handshake is ended and reaped when this drops. A std Child dropped as is
+/// stays a zombie, and Lemur tries again every few seconds.
+struct Connecting(Option<Child>);
+
+impl Connecting {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("a child until it's the core's")
+    }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 impl Core {
     /// Connects to the core of `session` (hc's default without one),
     /// starting it if needed, and follows its terminals.
     fn connect(session: Option<&str>) -> Result<Arc<Core>> {
-        let mut command = Command::new(binary());
+        Core::connect_with(binary(), session)
+    }
+
+    fn connect_with(binary: PathBuf, session: Option<&str>) -> Result<Arc<Core>> {
+        let mut command = Command::new(binary);
         command.arg("connect");
         if let Some(session) = session {
             command.args(["--session", session]);
         }
         #[cfg(test)]
         command.envs(test_env(session));
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("can't run herdr-core: is it installed? See https://herdr.dev")?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut child = Connecting(Some(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .context("can't run herdr-core: is it installed? See https://herdr.dev")?,
+        ));
+        let mut stdin = child.child().stdin.take().expect("piped stdin");
+        let mut reader = BufReader::new(child.child().stdout.take().expect("piped stdout"));
         let hello = json!({"jsonrpc": "2.0", "id": 0, "method": "hello",
             "params": {"framed": true, "generation": GENERATION}});
         stdin.write_all(format!("{hello}\n").as_bytes())?;
@@ -395,7 +421,7 @@ impl Core {
             watchers: watchers.clone(),
             lost: lost.clone(),
             next_id: AtomicU64::new(1),
-            child: Mutex::new(child),
+            child: Mutex::new(child.0.take().expect("the child")),
             machines: Mutex::new(HashMap::new()),
         });
         std::thread::Builder::new()
@@ -835,8 +861,45 @@ fn test_env(session: Option<&str>) -> Env {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{HcServer, wait_until};
+    use crate::test_support::{HcServer, TempDir, wait_until};
     use futures::StreamExt;
+
+    /// A `herdr-core connect` that fails the handshake is ended and reaped,
+    /// not left a zombie: Lemur tries again every few seconds.
+    #[test]
+    fn a_failed_handshake_leaves_no_zombie() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("hc-zombie");
+        for (name, answer) in [
+            // Another protocol, then waiting, as a core would.
+            (
+                "other",
+                r#"printf '{"jsonrpc":"2.0","id":0,"result":{"generation":999}}\n'; cat >/dev/null"#,
+            ),
+            // Gone at once, as when the core can't start.
+            ("gone", "exit 1"),
+        ] {
+            let pid_file = dir.join(format!("{name}.pid"));
+            let fake = dir.join(format!("herdr-core-{name}"));
+            std::fs::write(
+                &fake,
+                format!("#!/bin/sh\necho $$ > '{}'\n{answer}\n", pid_file.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(Core::connect_with(fake, None).is_err(), "{name}");
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            let stat = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&stat.stdout).trim(),
+                "",
+                "{name}: pid {pid}"
+            );
+        }
+    }
 
     #[test]
     fn frames_round_trip() {
