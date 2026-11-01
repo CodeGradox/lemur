@@ -58,7 +58,22 @@ impl Lemur {
         if self.overlaid() {
             return;
         }
-        let agents: Vec<Key> = self.agents().into_iter().map(|(h, s)| key(h, s)).collect();
+        let now: Vec<Key> = self.agents().into_iter().map(|(h, s)| key(h, s)).collect();
+        // ⌘] after ⌘] keeps to the order it started from: an agent done
+        // while you looked away leaves that rank once opened, which would
+        // skip the next one. A new agent, or one that ends, starts over.
+        let same = |walk: &[Key]| walk.len() == now.len() && now.iter().all(|k| walk.contains(k));
+        let agents = if self
+            .active
+            .as_ref()
+            .is_some_and(|a| self.agent_walk.contains(a))
+            && same(&self.agent_walk)
+        {
+            self.agent_walk.clone()
+        } else {
+            now
+        };
+        self.agent_walk = agents.clone();
         if agents.is_empty() {
             self.note("No Claude threads".into(), cx);
             return;

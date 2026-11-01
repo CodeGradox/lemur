@@ -242,6 +242,9 @@ struct Lemur {
     /// What each thread was doing at the last snapshot, or before its host
     /// couldn't be reached.
     seen: HashMap<Key, Activity>,
+    /// The agents in the order ⌘] and ⌘[ go through them, from the first
+    /// press on.
+    agent_walk: Vec<Key>,
     /// Shown in a snackbar over the terminal.
     status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
@@ -619,6 +622,7 @@ impl Lemur {
             fresh: HashMap::new(),
             done: HashSet::new(),
             seen: HashMap::new(),
+            agent_walk: vec![],
             status: None,
             restore,
             window: window.window_handle(),
@@ -822,6 +826,8 @@ impl Lemur {
                 && matches!(s.activity, Activity::Idle | Activity::Unknown);
             if finished && self.active.as_ref() != Some(k) {
                 self.done.insert(k.clone());
+                // It ranks among the done now: ⌘] starts over.
+                self.agent_walk.clear();
             }
             if finished || (s.activity == Activity::NeedsInput && was != Activity::NeedsInput) {
                 news.push((k.clone(), s.activity, s.waiting_for.clone()));
@@ -4634,6 +4640,38 @@ mod tests {
             assert_eq!(app.active, None, "nor when Lemur starts")
         });
         let_attaches_end(&app, cx);
+    }
+
+    /// ⌘] goes through the agents done while you looked away one by one,
+    /// then the rest: opening one doesn't skip the next.
+    #[gpui::test]
+    fn next_agent_goes_through_each_done_one(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("next-agent");
+        let (app, cx) = rooted(server.config(), cx);
+        apply(
+            &app,
+            &[
+                ("a", Activity::Working),
+                ("b", Activity::Working),
+                ("c", Activity::Idle),
+            ],
+            cx,
+        );
+        apply(
+            &app,
+            &[
+                ("a", Activity::Idle),
+                ("b", Activity::Idle),
+                ("c", Activity::Idle),
+            ],
+            cx,
+        );
+        let mut visited = vec![];
+        for _ in 0..3 {
+            cx.update(|window, cx| app.update(cx, |app, cx| app.next_agent(false, window, cx)));
+            visited.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
+        }
+        assert_eq!(visited, ["a", "b", "c"]);
     }
 
     /// A list whose every thread is put away still shows them, under "Put
