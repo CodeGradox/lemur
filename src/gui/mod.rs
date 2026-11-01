@@ -633,8 +633,13 @@ impl Lemur {
     /// herdr-core comes back, or a kept program's new shell starts.
     fn reconnect_terminals(&self, cx: &mut Context<Self>) {
         let running: HashSet<Key> = sessions(&self.snap)
-            .filter(|(_, s)| s.running)
-            .map(|(h, s)| key(h, s))
+            .flat_map(|(h, s)| {
+                let own = s.running.then(|| key(h, s));
+                // A helper's terminal, opened or peeked at from under it.
+                let helpers = s.helpers.iter().filter(|x| x.terminal);
+                own.into_iter()
+                    .chain(helpers.map(move |x| (h.to_string(), x.id.clone())))
+            })
             .collect();
         for (k, view) in &self.terminals {
             if running.contains(k) && view.read(cx).disconnected() {
@@ -4626,6 +4631,69 @@ mod tests {
         app.update(cx, |app, cx| app.toggle_notes(cx));
         cx.simulate_keystrokes("cmd-r cmd-r");
         assert_eq!(open(cx), (true, false), "the notes again");
+    }
+
+    /// A helper's terminal, peeked at from under its thread, attaches again
+    /// on its own too once its stream drops.
+    #[gpui::test]
+    fn a_dropped_helper_reattaches_on_its_own(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("reattach-helper");
+        let a = server.run("/", &["lemur.label=a"], &["sleep", "600"]);
+        let out = server.hc(&[
+            "run",
+            "--bg",
+            "--json",
+            "--keep",
+            "--parent",
+            &a,
+            "--label",
+            "lemur.label=h",
+            "--",
+            "sh",
+        ]);
+        let started: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let b = started["address"].as_str().unwrap().to_string();
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        let listed = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&a))
+                    .is_some_and(|s| s.helpers.iter().any(|h| h.id == b))
+            })
+        });
+        assert!(listed, "b is a's helper");
+        cx.update(|window, cx| app.update(cx, |app, cx| app.peek(key(&b), window, cx)));
+        let view = app.read_with(cx, |app, _| app.terminals[&key(&b)].clone());
+        let attached = |cx: &mut VisualTestContext| view.read_with(cx, |v, _| v.is_attached());
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            attached(cx)
+        }));
+        let pid = server
+            .core()
+            .terminals()
+            .into_iter()
+            .find(|t| t.address == b)
+            .and_then(|t| t.pid)
+            .expect("its shell's pid");
+        std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.disconnected())
+        }));
+        let back = wait_until(Duration::from_secs(20), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            attached(cx)
+        });
+        assert!(back, "attached again on its own");
+        let_attaches_end(&app, cx);
     }
 
     /// A terminal whose stream dropped while its program may still run
