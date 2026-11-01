@@ -171,6 +171,9 @@ struct Routes {
     streams: HashMap<u32, UnboundedSender<Stream>>,
     /// Frames for a channel whose reply hasn't been handled yet.
     early: HashMap<u32, Vec<Stream>>,
+    /// Channels let go of, whose last frames, and the core's close, are
+    /// still on their way: dropped, not kept as early.
+    detached: std::collections::HashSet<u32>,
     /// The event stream's channel.
     events: Option<u32>,
 }
@@ -474,6 +477,11 @@ impl Core {
                     match r.streams.get(&channel) {
                         Some(tx) => {
                             let _ = tx.unbounded_send(item);
+                        }
+                        None if r.detached.contains(&channel) => {
+                            if closing {
+                                r.detached.remove(&channel);
+                            }
                         }
                         None => r.early.entry(channel).or_default().push(item),
                     }
@@ -793,7 +801,12 @@ impl Core {
     }
 
     pub fn detach(&self, channel: u32) {
-        self.routes.lock().unwrap().streams.remove(&channel);
+        let mut routes = self.routes.lock().unwrap();
+        // Already closed by the core: nothing more comes.
+        if routes.streams.remove(&channel).is_some() {
+            routes.detached.insert(channel);
+        }
+        drop(routes);
         self.send(channel, CLOSE, &[]);
     }
 
@@ -964,6 +977,26 @@ mod tests {
     use super::*;
     use crate::test_support::{HcServer, TempDir, wait_until};
     use futures::StreamExt;
+
+    /// What comes for a terminal Lemur let go of, the core's close of it and
+    /// output on its way, is dropped, not kept for the life of the
+    /// connection.
+    #[test]
+    fn a_detached_stream_leaves_nothing_behind() {
+        let server = HcServer::new("detach-early");
+        let ticking = "while :; do echo tick; sleep 0.01; done";
+        let address = server.run("/", &[], &["sh", "-c", ticking]);
+        let core = server.core();
+        let attached = core.attach(&address, 40, 10, 0, json!({})).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        core.detach(attached.channel);
+        let closed = wait_until(Duration::from_secs(5), || {
+            core.routes.lock().unwrap().detached.is_empty()
+        });
+        assert!(closed, "the core closed it");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(core.routes.lock().unwrap().early.is_empty());
+    }
 
     /// Killing a terminal already gone, or one herdr-core removes as it
     /// ends (`hc run --rm`), is done: it's not an error.
