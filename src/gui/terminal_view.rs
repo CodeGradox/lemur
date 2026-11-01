@@ -52,6 +52,9 @@ pub struct TerminalView {
     pub host: Host,
     pub session: String,
     screen: Option<Screen>,
+    /// The screen an attach paints, once it's attached: until then the
+    /// last one shows, and stays if the attach fails.
+    fresh: Option<Screen>,
     attachment: Attachment,
     focus: FocusHandle,
     /// Where the grid was last painted, and the size of its cells, for
@@ -176,6 +179,7 @@ impl TerminalView {
             host,
             session,
             screen: None,
+            fresh: None,
             attachment: Attachment::Ended,
             focus: cx.focus_handle(),
             bounds: Bounds::default(),
@@ -279,7 +283,11 @@ impl TerminalView {
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         self.detach();
         let scrollback = Prefs::get(cx).terminal.scrollback;
-        self.screen = Some(Screen::new(self.cell, scrollback));
+        let fresh = Screen::new(self.cell, scrollback);
+        match self.screen {
+            Some(_) => self.fresh = Some(fresh),
+            None => self.screen = Some(fresh),
+        }
         self.attachment = Attachment::Attaching;
         self.held.borrow_mut().clear();
         self.tried = Some(Instant::now());
@@ -318,6 +326,7 @@ impl TerminalView {
                         // Tried again once the terminal runs.
                         this.attachment = Attachment::Ended;
                         this.held.borrow_mut().clear();
+                        this.fresh = None;
                         this.lost = true;
                         let error = format!("{e:#} · trying again");
                         this.set_status(Some((error, Kind::Error)), cx);
@@ -354,6 +363,10 @@ impl TerminalView {
         // goes by a viewer's size only once the viewer says something.
         core.resize(channel, self.cell.cols, self.cell.lines);
         self.attachment = Attachment::Attached(core, channel);
+        if let Some(mut fresh) = self.fresh.take() {
+            fresh.resize(self.cell);
+            self.screen = Some(fresh);
+        }
         if std::mem::take(&mut self.lost) {
             self.set_status(None, cx);
         }
@@ -1561,6 +1574,34 @@ mod tests {
         });
         assert!(attached, "never attached");
         (view, t, cx)
+    }
+
+    /// Attaching again and failing, as to a host that's down, leaves what
+    /// the terminal showed.
+    #[gpui::test]
+    fn a_failed_reattach_leaves_what_showed(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("reattach-fails");
+        let (view, _, cx) = attach(
+            &server,
+            &["sh", "-c", "echo hello there; exec sleep 600"],
+            cx,
+        );
+        assert!(wait_until(Duration::from_secs(5), || shown(&view, cx)
+            .contains("hello there")));
+        view.update(cx, |v, cx| {
+            // A session herdr-core refuses: the attach fails.
+            v.host.hc_session = Some("no/such".into());
+            v.connect(cx);
+        });
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.exited())
+        }));
+        assert!(
+            shown(&view, cx).contains("hello there"),
+            "{}",
+            shown(&view, cx)
+        );
     }
 
     /// Input given while the terminal (re)attaches waits for it, then
