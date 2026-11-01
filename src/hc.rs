@@ -323,20 +323,25 @@ fn read_frame(r: &mut impl Read) -> Option<(u32, u8, Vec<u8>)> {
 
 /// herdr-core: on PATH, else where its installer puts it.
 pub fn binary() -> PathBuf {
+    // Found once; not found, looked for again, as it may be installed
+    // while Lemur runs.
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let on_path = std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("herdr-core"))
-                .find(|p| p.is_file())
-        });
-        let installed = crate::config::home()
-            .ok()
-            .map(|h| h.join(".local/bin/herdr-core"))
-            .filter(|p| p.is_file());
-        on_path.or(installed).unwrap_or_else(|| "herdr-core".into())
-    })
-    .clone()
+    if let Some(found) = BIN.get() {
+        return found.clone();
+    }
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("herdr-core"))
+            .find(|p| p.is_file())
+    });
+    let installed = crate::config::home()
+        .ok()
+        .map(|h| h.join(".local/bin/herdr-core"))
+        .filter(|p| p.is_file());
+    match on_path.or(installed) {
+        Some(found) => BIN.get_or_init(|| found).clone(),
+        None => "herdr-core".into(),
+    }
 }
 
 /// A `herdr-core connect` until it's a core's: one that fails the
@@ -690,6 +695,9 @@ impl Core {
             Ok(_) => {}
             // Already over: it only needs forgetting.
             Err(e) if error_kind(&e) == Some("finished") => {}
+            // Already gone: closed and removed meanwhile, or started to be
+            // removed once it ends (`hc run --rm`), as killing it just did.
+            Err(e) if error_kind(&e) == Some("not_found") => return Ok(()),
             Err(e) => return Err(e),
         }
         let _ = self.call("terminal.rm", json!({"terminal": address}));
@@ -929,6 +937,20 @@ mod tests {
     use super::*;
     use crate::test_support::{HcServer, TempDir, wait_until};
     use futures::StreamExt;
+
+    /// Killing a terminal already gone, or one herdr-core removes as it
+    /// ends (`hc run --rm`), is done: it's not an error.
+    #[test]
+    fn killing_a_terminal_already_gone_is_done() {
+        let server = HcServer::new("kill-gone");
+        let out = server.hc(&["run", "--bg", "--json", "--rm", "--", "sleep", "600"]);
+        let started: Value = serde_json::from_str(&out).unwrap();
+        let address = started["address"].as_str().unwrap();
+        let core = server.core();
+        core.kill(address).unwrap();
+        core.kill(address).unwrap();
+        core.kill("t999").unwrap();
+    }
 
     #[test]
     fn hosts_get_names_herdr_core_takes() {
