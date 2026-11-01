@@ -1,12 +1,13 @@
 //! The sidebar: each project's worktrees and their threads, as rows to
 //! open, fold, drag into order and right-click.
 
+use super::chrome::{WINDOW_BUTTONS, title_bar};
 use super::{Ask, Key, Lemur, List, ToggleNotes, key, rows, worktree_label};
 use crate::config::{Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenuItem};
+use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex};
 use gpui_kit::*;
@@ -40,20 +41,22 @@ impl SidebarView {
 }
 
 impl Render for SidebarView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
         }
         match self.lemur.upgrade() {
-            Some(lemur) => lemur.update(cx, |lemur, cx| lemur.sidebar(cx).into_any_element()),
+            Some(lemur) => {
+                lemur.update(cx, |lemur, cx| lemur.sidebar(window, cx).into_any_element())
+            }
             None => div().into_any_element(),
         }
     }
 }
 
 impl Lemur {
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let mut groups: Vec<rows::Group> = vec![];
         // Projects first, in the config's order whatever their host; then
@@ -218,15 +221,34 @@ impl Lemur {
             Some(machines) => sidebar.footer(machines),
             None => sidebar,
         };
+        // The window's top row, its buttons at the left: over the header's
+        // padding, to the window's top and the sidebar's sides.
+        let buttons = if window.is_fullscreen() {
+            px(12.0)
+        } else {
+            WINDOW_BUTTONS
+        };
         sidebar
             .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .child(div().font_semibold().child("Lemur"))
-                        .child(h_flex().gap_1().child(find).child(add).child(refresh)),
-                ),
+                title_bar("sidebar top bar", window, cx)
+                    .flex_1()
+                    .h_10()
+                    .mt_neg_3()
+                    .mx_neg_3()
+                    .pl(buttons)
+                    .pr_3()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().min_w_0().truncate().font_semibold().child("Lemur"))
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_1()
+                            .child(find)
+                            .child(add)
+                            .child(refresh),
+                    ),
             )
             .children(groups)
     }

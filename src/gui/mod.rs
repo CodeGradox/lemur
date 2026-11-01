@@ -290,10 +290,13 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                 ]),
             ]);
             let options = WindowOptions {
+                // Drawn by the top row instead, as Herdr's; it moves the window.
                 titlebar: Some(TitlebarOptions {
                     title: Some("Lemur".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(chrome::WINDOW_BUTTONS_AT),
                 }),
+                app_owns_titlebar_drag: true,
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
                     size(px(1280.0), px(820.0)),
@@ -987,7 +990,7 @@ impl Lemur {
         }
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let toggle = Button::new("toggle-sidebar")
             .icon(if self.collapsed {
                 IconName::PanelLeftOpen
@@ -998,9 +1001,12 @@ impl Lemur {
             .small()
             .tooltip("Toggle sidebar (⌘B)")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
-        h_flex()
+        // With the sidebar shut, the window's buttons are on this row.
+        let buttons = self.collapsed && !window.is_fullscreen();
+        chrome::title_bar("top bar", window, cx)
             .h_10()
             .px_2()
+            .when(buttons, |this| this.pl(chrome::WINDOW_BUTTONS))
             .gap_2()
             .items_center()
             .border_b_1()
@@ -1173,7 +1179,7 @@ impl Render for Lemur {
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .child(self.header(cx))
+                    .child(self.header(window, cx))
                     .child(
                         h_flex()
                             .flex_1()
@@ -1478,6 +1484,56 @@ mod tests {
             .collect();
         assert_eq!(kept, [b.as_str(), &c, &a]);
         let_attaches_end(&app, cx);
+    }
+
+    /// Presses the mouse on `at` and moves it a little, as starting a drag.
+    fn press_and_move(at: gpui::Point<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            at + point(px(3.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+    }
+
+    /// The window has no title bar; its top row moves it instead, from
+    /// where nothing else takes the press. A test window can't move (its
+    /// `start_window_move` is unimplemented), so that panic is the move.
+    #[gpui::test]
+    #[should_panic(expected = "not implemented")]
+    fn dragging_the_top_bar_moves_the_window(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = rooted(toml::from_str("").unwrap(), cx);
+        let empty = cx.debug_bounds("top bar").expect("the top bar").center();
+        press_and_move(empty, cx);
+    }
+
+    /// The sidebar's top row too, where the window's buttons are.
+    #[gpui::test]
+    #[should_panic(expected = "not implemented")]
+    fn dragging_the_sidebars_top_moves_the_window(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = rooted(toml::from_str("").unwrap(), cx);
+        let empty = cx
+            .debug_bounds("sidebar top bar")
+            .expect("its top")
+            .center();
+        press_and_move(empty, cx);
+    }
+
+    /// A press on a top row's button is the button's: moving a little
+    /// before letting go still clicks it, and doesn't move the window.
+    #[gpui::test]
+    fn a_top_bar_button_keeps_its_press(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        let bar = cx.debug_bounds("top bar").expect("the top bar");
+        // Toggle sidebar, the first thing on it.
+        let toggle = point(bar.left() + px(20.0), bar.center().y);
+        press_and_move(toggle, cx);
+        cx.simulate_mouse_up(
+            toggle + point(px(3.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        app.read_with(cx, |app, _| assert!(app.collapsed));
     }
 
     /// A terminal started elsewhere joins the sidebar as herdr-core tells

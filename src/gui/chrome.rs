@@ -20,6 +20,42 @@ use std::rc::Rc;
 const STATUS_HEIGHT: Pixels = px(28.0);
 const HEADER_HEIGHT: Pixels = px(30.0);
 
+/// The window has no title bar: its buttons sit at the left of the top
+/// row, at `WINDOW_BUTTONS_AT`, which leaves this much room for them.
+pub(super) const WINDOW_BUTTONS: Pixels = px(80.0);
+pub(super) const WINDOW_BUTTONS_AT: Point<Pixels> = point(px(12.0), px(12.0));
+
+/// A top row that does a title bar's work: a drag that starts where no
+/// button or tab takes the press moves the window, and a double click
+/// zooms it (or does what System Settings says a title bar's does).
+pub(super) fn title_bar(id: &'static str, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+    // Whether the left button went down on the row itself.
+    let pressed =
+        window.use_keyed_state(SharedString::from(format!("{id} pressed")), cx, |_, _| {
+            false
+        });
+    let (down, out) = (pressed.clone(), pressed.clone());
+    h_flex()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
+            // Buttons and tabs take their presses before the row sees them.
+            let own = !window.default_prevented();
+            if own && e.click_count == 2 {
+                window.titlebar_double_click();
+            }
+            down.update(cx, |p, _| *p = own && e.click_count == 1);
+        })
+        .on_mouse_down_out(move |_, _, cx| out.update(cx, |p, _| *p = false))
+        .on_mouse_move(move |e: &MouseMoveEvent, window, cx| {
+            if pressed.update(cx, |p, _| std::mem::take(p))
+                && e.pressed_button == Some(MouseButton::Left)
+            {
+                window.start_window_move();
+            }
+        })
+}
+
 impl Lemur {
     /// The thread behind `key`, if a snapshot lists it.
     pub(super) fn session_of(&self, key: &Key) -> Option<&Session> {
@@ -97,6 +133,9 @@ impl Lemur {
                     .min_w_0()
                     .gap_1()
                     .overflow_x_scroll()
+                    // A press here is the tabs', to click or drag, not the
+                    // title bar's (see `title_bar`).
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                     .children(tabs),
             )
             .children(add)
