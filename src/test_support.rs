@@ -86,17 +86,27 @@ impl HcServer {
     /// SSH would log in to another.
     pub fn far_config(&self, name: &str) -> Config {
         let far = format!("{}-far", self.session);
-        self.hc(&[
-            "machine",
-            "add",
-            "--name",
-            name,
-            "--session",
-            &far,
-            "--via",
-            "sh -c",
-        ]);
+        let added = Command::new(hc::binary())
+            .args([
+                "machine",
+                "add",
+                "--name",
+                name,
+                "--session",
+                &far,
+                "--via",
+                "sh -c",
+            ])
+            .envs(self.env())
+            .output()
+            .expect("running hc");
         self.far.borrow_mut().push(far);
+        // Otherwise Lemur would add `name` itself, as a host to dial.
+        assert!(
+            added.status.success(),
+            "adding the stand-in machine {name}: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
         hc::set_test_route(name, &self.session);
         toml::from_str(&format!(
             "[[hosts]]\nname = \"{name}\"\n{} = \"{name}\"\n",
@@ -117,8 +127,12 @@ impl HcServer {
 
 impl Drop for HcServer {
     fn drop(&mut self) {
-        // This core first: it would dial the stand-in hosts' again.
-        self.hc(&["server", "stop"]);
+        // This core first: it would dial the stand-in hosts' again. Never
+        // a panic here: in a test already failing, that aborts the run.
+        let _ = Command::new(hc::binary())
+            .args(["server", "stop"])
+            .envs(self.env())
+            .output();
         for far in self.far.borrow().iter() {
             let _ = Command::new(hc::binary())
                 .args(["server", "stop"])
@@ -210,11 +224,7 @@ impl FakeLinear {
         std::thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        if let Some(request) = serve(stream, &answer) {
-                            kept.lock().unwrap().push(request);
-                        }
-                    }
+                    Ok((stream, _)) => serve(stream, &answer, &kept),
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
             }
@@ -238,8 +248,17 @@ impl Drop for FakeLinear {
     }
 }
 
-/// Reads one HTTP request from `stream` and answers it.
-fn serve(mut stream: std::net::TcpStream, answer: &Answer) -> Option<Request> {
+/// Reads one HTTP request from `stream`, keeps it in `kept`, and answers
+/// it: kept first, as the caller may look as soon as it has the answer.
+fn serve(stream: std::net::TcpStream, answer: &Answer, kept: &std::sync::Mutex<Vec<Request>>) {
+    let _ = serve_one(stream, answer, kept);
+}
+
+fn serve_one(
+    mut stream: std::net::TcpStream,
+    answer: &Answer,
+    kept: &std::sync::Mutex<Vec<Request>>,
+) -> Option<()> {
     use std::io::{Read, Write};
     stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -272,12 +291,13 @@ fn serve(mut stream: std::net::TcpStream, answer: &Answer) -> Option<Request> {
         body: String::from_utf8_lossy(&data[head_end..head_end + length]).into_owned(),
     };
     let (status, body) = answer(&request);
+    kept.lock().unwrap().push(request);
     let _ = write!(
         stream,
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    Some(request)
+    Some(())
 }
 
 /// Each test's core has a tag of its own: two tests running at once with
