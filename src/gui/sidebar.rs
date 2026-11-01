@@ -394,7 +394,6 @@ impl Lemur {
         let this = cx.entity().downgrade();
         let key = key(host, s);
         let active = self.active.as_ref() == Some(&key);
-        let arming = self.confirm_kill.as_ref() == Some(&key);
         let label = s.label.clone();
         let working = s.activity == Activity::Working;
         let (dot, tip) = self.activity(&key, s, cx);
@@ -433,25 +432,25 @@ impl Lemur {
             let this = this.clone();
             let key = key.clone();
             let status = status_dot(&key, dot, working, tip.clone());
-            let kill = Button::new("kill")
+            let close = Button::new("close")
                 .ghost()
                 .xsmall()
-                .on_click(move |_, _, cx| {
-                    // Otherwise the row opens the session too, which disarms the kill.
+                .icon(IconName::Close)
+                .tooltip("Close thread")
+                .on_click(move |_, window, cx| {
+                    // Otherwise the row opens the session too.
                     cx.stop_propagation();
-                    this.update(cx, |this, cx| this.kill(key.clone(), cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.confirm_close_of(key.clone(), window, cx)
+                    })
+                    .ok();
                 });
-            let kill = if arming {
-                kill.danger().label("Kill?")
-            } else {
-                kill.icon(IconName::Close).tooltip("Kill session")
-            };
             h_flex()
                 .gap_1()
                 .items_center()
                 .child(div().text_xs().text_color(muted).child(detail.clone()))
                 .child(status)
-                .child(kill)
+                .child(close)
         };
         rows::Thread {
             icon: thread_icon(s),

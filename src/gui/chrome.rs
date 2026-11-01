@@ -153,7 +153,6 @@ impl Lemur {
         let menu = self.tab_menu(&key, cx);
         let theme = cx.theme();
         let shown = self.active.as_ref() == Some(&key);
-        let arming = self.confirm_kill.as_ref() == Some(&key);
         let (dot, tip) = self.activity(&key, s, cx);
         let working = s.activity == Activity::Working;
         let open = {
@@ -170,18 +169,15 @@ impl Lemur {
         let close = Button::new(SharedString::from(format!("close-tab-{i}")))
             .ghost()
             .xsmall()
+            .icon(IconName::Close)
+            .tooltip("Close thread")
             .on_click(cx.listener({
                 let key = key.clone();
-                move |this, _, _, cx| {
+                move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.kill(key.clone(), cx);
+                    this.confirm_close_of(key.clone(), window, cx);
                 }
             }));
-        let close = if arming {
-            close.danger().label("Kill?")
-        } else {
-            close.icon(IconName::Close).tooltip("Kill thread")
-        };
         let tab = h_flex()
             .id(SharedString::from(format!("tab-{i}")))
             .debug_selector(move || format!("tab-{i}"))

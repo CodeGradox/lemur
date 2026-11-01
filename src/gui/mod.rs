@@ -197,7 +197,6 @@ struct Lemur {
     sidebar_width: Pixels,
     notes_width: Pixels,
     prompt: Option<Prompt>,
-    confirm_kill: Option<Key>,
     /// Threads just started and opened, kept open until a snapshot lists
     /// them, by how many more snapshots may leave them out.
     fresh: HashMap<Key, u8>,
@@ -439,7 +438,6 @@ impl Lemur {
             sidebar_width,
             notes_width,
             prompt: None,
-            confirm_kill: None,
             fresh: HashMap::new(),
             done: HashSet::new(),
             status: None,
@@ -742,7 +740,6 @@ impl Lemur {
             self.touch(key.clone());
         }
         self.active = Some(key);
-        self.confirm_kill = None;
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
             self.notes
                 .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
@@ -861,16 +858,6 @@ impl Lemur {
         }
     }
 
-    /// First click arms, second click kills; the worktree stays.
-    fn kill(&mut self, key: Key, cx: &mut Context<Self>) {
-        if self.confirm_kill.as_ref() != Some(&key) {
-            self.confirm_kill = Some(key);
-            cx.notify();
-            return;
-        }
-        self.close_thread(key, cx);
-    }
-
     /// ⌘W: asks whether to close the thread on show.
     fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.prompt.is_some() || self.picker.is_some() {
@@ -917,7 +904,6 @@ impl Lemur {
 
     /// Ends a thread's terminal; the worktree stays.
     fn close_thread(&mut self, key: Key, cx: &mut Context<Self>) {
-        self.confirm_kill = None;
         let cfg = self.cfg.clone();
         let (host, session) = key;
         let killed = (host.clone(), vec![session.clone()]);
@@ -2356,9 +2342,7 @@ mod tests {
 
         // Killed in lemur, it's forgotten.
         let key: Key = ("local".into(), kept(cx)[0].session.clone());
-        for _ in 0..2 {
-            app.update(cx, |app, cx| app.kill(key.clone(), cx));
-        }
+        app.update(cx, |app, cx| app.close_thread(key.clone(), cx));
         cx.run_until_parked();
         assert!(kept(cx).is_empty());
         assert!(!shown("thread-0", cx) && !shown("gone-0", cx));
@@ -3223,7 +3207,7 @@ mod tests {
     }
 
     /// The tabs are the threads of the worktree on show: a click opens one,
-    /// and its × kills it, at the second click.
+    /// and its × closes it, asking first while its program runs.
     #[gpui::test]
     fn tabs_are_the_threads_of_the_worktree_on_show(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("tabs");
@@ -3262,8 +3246,12 @@ mod tests {
         let first = tab(0, cx).unwrap();
         let close = point(first.right() - px(10.0), first.center().y);
         cx.simulate_click(close, Modifiers::none());
-        assert!(server.addresses().contains(&a), "the first click arms it");
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(server.addresses().contains(&a), "cancelled");
         cx.simulate_click(close, Modifiers::none());
+        cx.simulate_keystrokes("enter");
         assert!(wait_until(Duration::from_secs(5), || !server
             .addresses()
             .contains(&a)));
@@ -3341,7 +3329,8 @@ mod tests {
     }
 
     /// A tab closed with its ×, as herdr-core tells of it, hands the
-    /// keyboard to the one shown instead: ⌘J works at once.
+    /// keyboard to the one shown instead: ⌘J works at once. Its program
+    /// running, the × asks first, as ⌘W does.
     #[gpui::test]
     fn the_tab_shown_after_a_close_has_the_keyboard(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("close-x");
@@ -3353,11 +3342,12 @@ mod tests {
         open(&app, &a, cx);
         cx.run_until_parked();
         let shown = |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.active.clone());
-        // The second tab's ×, clicked twice.
+        // a's ×; a runs sleep, so it asks.
         let tab = cx.debug_bounds("tab-0").expect("a's tab");
         let close = point(tab.right() - px(10.0), tab.center().y);
         cx.simulate_click(close, Modifiers::none());
-        cx.simulate_click(close, Modifiers::none());
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.simulate_keystrokes("enter");
         assert!(wait_until(Duration::from_secs(5), || !server
             .addresses()
             .contains(&a)));
@@ -3431,6 +3421,49 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         let_attaches_end(&app, cx);
+    }
+
+    /// A thread's × in the sidebar closes it as ⌘W does: a shell at its
+    /// prompt at once, one running a program after asking.
+    #[gpui::test]
+    fn the_sidebars_close_asks_as_cmd_w_does(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("close-row");
+        let a = server.run("/", &["lemur.label=a"], &["sleep", "600"]);
+        let b = server.run("/", &["lemur.label=b"], &["sh"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        // Once herdr-core has read what runs in b.
+        let idle = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&b)).is_some_and(|s| !s.busy)
+            })
+        });
+        assert!(idle);
+        // A row's × is at its right end.
+        let close = |row: &'static str, cx: &mut VisualTestContext| {
+            let row = cx.debug_bounds(row).expect(row);
+            cx.simulate_click(
+                point(row.right() - px(16.0), row.center().y),
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+        };
+        let asked =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| window.has_active_dialog(cx));
+
+        close("thread-1", cx);
+        assert!(!asked(cx), "b's shell is at its prompt");
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&b)));
+
+        close("thread-0", cx);
+        assert!(asked(cx), "a runs sleep");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(server.addresses().contains(&a), "cancelled");
     }
 
     /// Every host is listed in Other, threads or none, and its + starts a
