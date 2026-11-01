@@ -588,7 +588,14 @@ pub fn paste_line(paths: &[String]) -> String {
 pub fn paste(host: &Host, session: &str, text: &str) -> Result<()> {
     let t = terminal(host, session)?;
     let (core, _) = hc::for_host(host)?;
-    let mut attached = core.attach(session, t.cols.max(1), t.rows.max(1), serde_json::json!({}))?;
+    // Its screen's modes are all it needs, not its history.
+    let mut attached = core.attach(
+        session,
+        t.cols.max(1),
+        t.rows.max(1),
+        0,
+        serde_json::json!({}),
+    )?;
     // The first paint sets the program's modes, bracketed paste among
     // them; it's over once the stream goes quiet.
     let mut painted = Vec::new();

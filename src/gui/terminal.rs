@@ -61,17 +61,29 @@ pub struct Screen {
     parser: Processor<StdSyncHandler>,
     events: UnboundedReceiver<Event>,
     size: Size,
+    /// Lines it keeps above the screen to scroll back through.
+    scrollback: u32,
 }
 
 impl Screen {
-    pub fn new(size: Size) -> Screen {
+    pub fn new(size: Size, scrollback: u32) -> Screen {
         let (tx, events) = unbounded();
-        let term = Term::new(Config::default(), &size, Listener(tx));
+        let term = Term::new(config(scrollback), &size, Listener(tx));
         Screen {
             term: Arc::new(FairMutex::new(term)),
             parser: Processor::new(),
             events,
             size,
+            scrollback,
+        }
+    }
+
+    /// Keeps `lines` to scroll back through from now on; fewer drops the
+    /// oldest.
+    pub fn set_scrollback(&mut self, lines: u32) {
+        if lines != self.scrollback {
+            self.scrollback = lines;
+            self.term.lock().set_options(config(lines));
         }
     }
 
@@ -112,6 +124,14 @@ impl Screen {
     #[cfg(test)]
     pub fn size(&self) -> Size {
         self.size
+    }
+}
+
+/// alacritty's settings for a terminal keeping `scrollback` lines.
+fn config(scrollback: u32) -> Config {
+    Config {
+        scrolling_history: scrollback as usize,
+        ..Config::default()
     }
 }
 
@@ -474,7 +494,7 @@ mod tests {
 
     #[test]
     fn output_reaches_the_grid_and_answers_reach_the_program() {
-        let mut screen = Screen::new(SIZE);
+        let mut screen = Screen::new(SIZE, 100);
         screen.advance(b"hello\r\n\x1b[6n");
         assert!(screen_text(&screen).starts_with("hello"));
         // The cursor position the program asked for, to send it.
@@ -490,8 +510,23 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_keeps_as_many_lines_as_set() {
+        let history = |screen: &Screen| screen.term.lock().grid().history_size();
+        let mut screen = Screen::new(SIZE, 50);
+        let lines: String = (0..200).map(|i| format!("{i}\r\n")).collect();
+        screen.advance(lines.as_bytes());
+        assert_eq!(history(&screen), 50);
+        // Fewer drops the oldest at once; more keeps what comes next.
+        screen.set_scrollback(20);
+        assert_eq!(history(&screen), 20);
+        screen.set_scrollback(80);
+        screen.advance(lines.as_bytes());
+        assert_eq!(history(&screen), 80);
+    }
+
+    #[test]
     fn the_grid_follows_resizes() {
-        let mut screen = Screen::new(SIZE);
+        let mut screen = Screen::new(SIZE, 100);
         assert!(!screen.resize(SIZE), "no change");
         let larger = Size {
             cols: 60,
@@ -507,7 +542,7 @@ mod tests {
     /// deadline.
     #[test]
     fn synchronized_output_shows_when_done() {
-        let mut screen = Screen::new(SIZE);
+        let mut screen = Screen::new(SIZE, 100);
         screen.advance(b"\x1b[?2026hpartial");
         assert!(!screen_text(&screen).contains("partial"));
         assert!(screen.sync_deadline().is_some());

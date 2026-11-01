@@ -316,12 +316,15 @@ mod tests {
             .args(["-c", script])
             .output()
             .expect("running sh");
-        let mut screen = Screen::new(Size {
-            cols: 30,
-            lines: 6,
-            cell_width: 8,
-            cell_height: 16,
-        });
+        let mut screen = Screen::new(
+            Size {
+                cols: 30,
+                lines: 6,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            100,
+        );
         screen.advance(&out.stdout);
         let text = {
             let term = screen.term.lock();

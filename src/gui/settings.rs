@@ -1,12 +1,12 @@
-//! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font and
-//! colors, the language dictation listens for, and whether to show Claude's
+//! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font,
+//! scrollback and colors, the language dictation listens for, and whether to show Claude's
 //! plan usage. Changes apply at once in every window and are saved to the
 //! config file.
 
 use super::meter::ClaudeFound;
 use super::sidebar::claude_icon;
 use super::terminal::{Palette, SLOTS, Slot, set_color};
-use crate::config::{Config, FONT_SIZES, Language, Terminal, ThemeChoice};
+use crate::config::{Config, FONT_SIZES, Language, SCROLLBACKS, Terminal, ThemeChoice};
 use crate::core_update::{self, Versions};
 use alacritty_terminal::vte::ansi::Rgb;
 use gpui_kit::component::Disableable;
@@ -285,6 +285,19 @@ impl Render for SettingsView {
             |size, cx| Prefs::update(cx, |p| p.terminal.font_size = size),
         )
         .default_value(defaults.font_size);
+        let scrollback = SettingField::number_input(
+            NumberFieldOptions {
+                min: f64::from(*SCROLLBACKS.start()),
+                max: f64::from(*SCROLLBACKS.end()),
+                step: 1000.0,
+            },
+            |cx| f64::from(Prefs::get(cx).terminal.scrollback),
+            |lines, cx| {
+                let lines = (lines.round() as u32).min(*SCROLLBACKS.end());
+                Prefs::update(cx, |p| p.terminal.scrollback = lines)
+            },
+        )
+        .default_value(f64::from(defaults.scrollback));
         let languages = Language::ALL
             .map(|l| (l.as_str().into(), language_label(l).into()))
             .to_vec();
@@ -335,7 +348,13 @@ impl Render for SettingsView {
                             SettingItem::new("Font", font)
                                 .description("Monospaced fonts installed on this Mac."),
                         )
-                        .item(SettingItem::new("Font size", font_size).description("In points.")),
+                        .item(SettingItem::new("Font size", font_size).description("In points."))
+                        .item(SettingItem::new("Scrollback", scrollback).description(
+                            "Lines each terminal keeps to scroll back through. A thousand \
+                             lines of a terminal 130 columns wide take about 3 MB. herdr-core \
+                             keeps about 2,600 of its own, which come back when Lemur \
+                             attaches again.",
+                        )),
                 ),
             SettingPage::new("Terminal colors")
                 .icon(IconName::Palette)

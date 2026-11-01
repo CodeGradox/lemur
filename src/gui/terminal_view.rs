@@ -190,6 +190,10 @@ impl TerminalView {
             renders: 0,
             _prefs: cx.observe_global::<Prefs>(|this, cx| {
                 this.metrics = None;
+                let scrollback = Prefs::get(cx).terminal.scrollback;
+                if let Some(screen) = &mut this.screen {
+                    screen.set_scrollback(scrollback);
+                }
                 cx.notify();
             }),
         };
@@ -246,7 +250,8 @@ impl TerminalView {
     /// host dropped. The core paints its screen and scrollback first.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         self.detach();
-        self.screen = Some(Screen::new(self.cell));
+        let scrollback = Prefs::get(cx).terminal.scrollback;
+        self.screen = Some(Screen::new(self.cell, scrollback));
         self.attachment = Attachment::Attaching;
         self.tried = Some(Instant::now());
         self.told_display = None;
@@ -266,7 +271,7 @@ impl TerminalView {
             let attached = cx
                 .background_spawn(async move {
                     let (core, _) = hc::for_host(&host)?;
-                    let attached = core.attach(&session, cols, lines, display)?;
+                    let attached = core.attach(&session, cols, lines, scrollback, display)?;
                     anyhow::Ok((core, attached))
                 })
                 .await;
@@ -1464,6 +1469,7 @@ mod tests {
     use crate::gui::terminal::{DARK, Screen, Size};
     use crate::hc::Stream;
     use crate::test_support::{HcServer, wait_until};
+    use alacritty_terminal::grid::Dimensions;
     use gpui_kit::{
         Capslock, InputHandler, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
         MouseButton, point, px, size,
@@ -1715,12 +1721,15 @@ mod tests {
     /// Rows reach the painter without the blanks after their text.
     #[test]
     fn trailing_blanks_are_not_drawn() {
-        let mut screen = Screen::new(Size {
-            cols: 40,
-            lines: 3,
-            cell_width: 8,
-            cell_height: 16,
-        });
+        let mut screen = Screen::new(
+            Size {
+                cols: 40,
+                lines: 3,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            100,
+        );
         screen.advance(b"hi");
         let frame = snapshot(&screen, &DARK);
         assert_eq!(frame.rows[0].text, "hi");
@@ -1735,12 +1744,15 @@ mod tests {
     /// glyphs, so Claude's mascot has no seams.
     #[test]
     fn block_elements_are_painted_not_typed() {
-        let mut screen = Screen::new(Size {
-            cols: 40,
-            lines: 3,
-            cell_width: 8,
-            cell_height: 16,
-        });
+        let mut screen = Screen::new(
+            Size {
+                cols: 40,
+                lines: 3,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            100,
+        );
         screen.advance("a▐▛x".as_bytes());
         let frame = snapshot(&screen, &DARK);
         assert_eq!(frame.rows[0].text, "a  x");
@@ -1792,6 +1804,31 @@ mod tests {
             "the core sees {:?}",
             seen()
         );
+    }
+
+    /// A terminal keeps as many lines to scroll back through as Settings
+    /// say, and fewer at once when they say fewer.
+    #[gpui::test]
+    fn the_terminal_keeps_the_scrollback_set(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("scrollback");
+        cx.update(|cx| Prefs::update(cx, |p| p.terminal.scrollback = 300));
+        let (view, _, cx) = attach(&server, &["sh", "-c", "seq 1 1000; exec sleep 600"], cx);
+        let history = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |v, _| {
+                let screen = v.screen.as_ref().expect("a screen");
+                Dimensions::history_size(screen.term.lock().grid())
+            })
+        };
+        let filled = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            history(cx) == 300
+        });
+        assert!(filled, "kept {}", history(cx));
+
+        // Changed in Settings, it keeps fewer at once.
+        cx.update(|_, cx| Prefs::update(cx, |p| p.terminal.scrollback = 50));
+        cx.run_until_parked();
+        assert_eq!(history(cx), 50);
     }
 
     /// A font size from Settings reaches open terminals: a bigger font fits

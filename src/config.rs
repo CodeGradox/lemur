@@ -27,6 +27,9 @@ pub const COLORS: [(&str, u32); 10] = [
 /// Terminal font sizes lemur accepts, in points.
 pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
 
+/// Lines a terminal can keep to scroll back through.
+pub const SCROLLBACKS: RangeInclusive<u32> = 0..=100_000;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -113,6 +116,8 @@ pub struct Terminal {
     pub font_family: String,
     /// In points.
     pub font_size: f64,
+    /// Lines each terminal keeps to scroll back through.
+    pub scrollback: u32,
     /// Colors over lemur's own for a dark app, then a light one.
     pub dark: TerminalColors,
     pub light: TerminalColors,
@@ -123,6 +128,9 @@ impl Default for Terminal {
         Terminal {
             font_family: "Menlo".into(),
             font_size: 13.0,
+            // About as many as herdr-core keeps itself, which come back
+            // when Lemur attaches again.
+            scrollback: 2000,
             dark: TerminalColors::default(),
             light: TerminalColors::default(),
         }
@@ -347,6 +355,14 @@ impl Config {
                 FONT_SIZES.end()
             );
         }
+        if !SCROLLBACKS.contains(&cfg.terminal.scrollback) {
+            bail!(
+                "terminal scrollback {} is outside {}-{}",
+                cfg.terminal.scrollback,
+                SCROLLBACKS.start(),
+                SCROLLBACKS.end()
+            );
+        }
         Ok(cfg)
     }
 
@@ -386,6 +402,14 @@ impl Config {
                 toml_edit::value(size)
             };
             table.insert("font_size", size);
+            if terminal.scrollback == Terminal::default().scrollback {
+                table.remove("scrollback");
+            } else {
+                table.insert(
+                    "scrollback",
+                    toml_edit::value(i64::from(terminal.scrollback)),
+                );
+            }
             for (name, colors) in [("dark", &terminal.dark), ("light", &terminal.light)] {
                 if colors.is_empty() {
                     table.remove(name);
@@ -721,6 +745,9 @@ mod tests {
         let cfg: Config = toml::from_str("[terminal]\nfont_size = 15").unwrap();
         assert_eq!(cfg.terminal.font_size, 15.0);
         assert_eq!(cfg.terminal.font_family, "Menlo");
+        assert_eq!(cfg.terminal.scrollback, 2000);
+        let cfg: Config = toml::from_str("[terminal]\nscrollback = 20000").unwrap();
+        assert_eq!(cfg.terminal.scrollback, 20000);
     }
 
     #[test]
@@ -762,6 +789,7 @@ path = \"~/projects/api\"
         let terminal = Terminal {
             font_family: "JetBrains Mono".into(),
             font_size: 14.0,
+            scrollback: 20000,
             dark: TerminalColors {
                 background: Some("#000000".into()),
                 ..Default::default()
@@ -782,6 +810,7 @@ path = \"~/projects/api\"
             "{saved}"
         );
         assert!(saved.contains("font_size = 14\n"), "{saved}");
+        assert!(saved.contains("scrollback = 20000\n"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::Dark);
         assert_eq!(cfg.dictation_language, Language::Norwegian);
@@ -789,9 +818,11 @@ path = \"~/projects/api\"
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
 
-        // Saving again updates the same keys rather than adding new ones.
+        // Saving again updates the same keys rather than adding new ones;
+        // the default scrollback goes without saying.
         let terminal = Terminal {
             font_size: 12.5,
+            scrollback: Terminal::default().scrollback,
             ..terminal
         };
         Config::save_settings(
@@ -805,6 +836,7 @@ path = \"~/projects/api\"
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved.matches("font_size").count(), 1, "{saved}");
         assert!(!saved.contains("dictation_language"), "{saved}");
+        assert!(!saved.contains("scrollback"), "{saved}");
         assert!(
             !saved.contains("claude_usage"),
             "off is the default: {saved}"

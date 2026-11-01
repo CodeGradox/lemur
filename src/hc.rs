@@ -33,8 +33,6 @@ const FACTS: u8 = 5;
 
 /// The core API generation lemur speaks.
 const GENERATION: u64 = 1;
-/// Scrollback lines a terminal shows when it's attached.
-const HISTORY: u32 = 2000;
 
 /// A terminal as the core describes it; lemur reads only these.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -655,13 +653,21 @@ impl Core {
         Ok(())
     }
 
-    /// Opens a terminal's byte stream at `cols` × `rows`: its screen and
-    /// scrollback first, then its output.
-    pub fn attach(&self, address: &str, cols: u16, rows: u16, display: Value) -> Result<Attached> {
+    /// Opens a terminal's byte stream at `cols` × `rows`: its screen and up
+    /// to `history` lines of scrollback first (as many as herdr-core kept),
+    /// then its output.
+    pub fn attach(
+        &self,
+        address: &str,
+        cols: u16,
+        rows: u16,
+        history: u32,
+        display: Value,
+    ) -> Result<Attached> {
         let r = self.call_timeout(
             "terminal.attach",
             json!({"terminal": address, "cols": cols, "rows": rows,
-                "history": HISTORY, "display": display}),
+                "history": history, "display": display}),
             Duration::from_secs(30),
         )?;
         let channel = r["channel"]
@@ -918,7 +924,7 @@ mod tests {
             "listed with its labels"
         );
         assert!(futures::executor::block_on(changes.next()).is_some());
-        let mut attached = core.attach(&address, 40, 10, json!({})).unwrap();
+        let mut attached = core.attach(&address, 40, 10, 0, json!({})).unwrap();
         let mut seen = Vec::new();
         let mut read_until = |needle: &str, seen: &mut Vec<u8>| {
             while !String::from_utf8_lossy(seen).contains(needle) {
