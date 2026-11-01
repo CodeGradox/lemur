@@ -1352,6 +1352,18 @@ impl Lemur {
         if let Some(s) = self.session_mut(&key) {
             s.issue = issue.clone();
         }
+        // Kept to resume it, it's pinned again then: whether or not its
+        // Claude runs, which keeps the entry current otherwise.
+        let kept = self
+            .cfg
+            .threads
+            .iter()
+            .find(|t| t.host == key.0 && t.session == key.1)
+            .cloned();
+        if let Some(thread) = kept {
+            let issue = issue.clone();
+            self.keep_thread(crate::config::ClaudeThread { issue, ..thread }, cx);
+        }
         self.changes += 1;
         self.follow_linear(cx);
         cx.notify();
@@ -4039,6 +4051,25 @@ mod tests {
                 .iter()
                 .all(|r| r.authorization.as_deref() == Some("Bearer a"))
         );
+
+        // Kept to resume, the thread is pinned again then, Claude running
+        // in it or not.
+        let thread = crate::config::ClaudeThread {
+            host: "local".into(),
+            session: t.clone(),
+            path: "/".into(),
+            claude_session: crate::actions::random_uuid(),
+            label: None,
+            issue: None,
+        };
+        cx.update(|_, cx| app.update(cx, |app, cx| app.keep_thread(thread, cx)));
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.pin_issue(key(&t), Some("LAFT-12".into()), cx)
+            })
+        });
+        let kept = app.read_with(cx, |app, _| app.cfg.threads[0].issue.clone());
+        assert_eq!(kept.as_deref(), Some("LAFT-12"));
     }
 
     /// The Changes panel lists the worktree on show's changes, and a click
