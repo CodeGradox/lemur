@@ -496,8 +496,13 @@ impl Lemur {
             };
             self.loads.insert(h.name.clone(), (load.clone(), cpu));
         }
-        self.loads
-            .retain(|name, _| self.snap.hosts.iter().any(|h| h.name == *name));
+        // One that can't be reached shows no load, rather than its last.
+        self.loads.retain(|name, _| {
+            self.snap
+                .hosts
+                .iter()
+                .any(|h| h.name == *name && h.error.is_none())
+        });
     }
 
     /// Each host's CPU and memory, as bars at the foot of the sidebar; none

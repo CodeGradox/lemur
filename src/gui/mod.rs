@@ -3692,6 +3692,22 @@ mod tests {
         assert!((6..=8).contains(&breaths), "{breaths} frames");
     }
 
+    /// A host that can't be reached shows no load, rather than its last.
+    #[gpui::test]
+    fn a_host_out_of_reach_shows_no_load(cx: &mut gpui::TestAppContext) {
+        let cfg: Config = toml::from_str("").unwrap();
+        cx.update(gpui_kit::init);
+        let (app, cx) = cx.add_window_view(|window, cx| Lemur::new(cfg, None, window, cx));
+        app.update(cx, |app, _| {
+            app.loads
+                .insert("local".into(), (crate::machine::Load::default(), Some(0.5)))
+        });
+        let mut snap = snapshot(&[]);
+        snap.hosts[0].error = Some("can't reach it".into());
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
+        assert!(app.read_with(cx, |app, _| app.loads.is_empty()));
+    }
+
     /// While its host can't be reached, a thread keeps what it was doing
     /// and its done mark: back, it hasn't just changed, and finishing then
     /// still counts.

@@ -384,10 +384,12 @@ fn fetch_host(cfg: &Config, host: &Host) -> HostData {
             }
             match known {
                 Some(name) => data.machine.tailnet = name,
-                None => TAILNETS
+                // None, as while tailscale is down: asked again next time.
+                None if data.machine.tailnet.is_some() => TAILNETS
                     .lock()
                     .unwrap()
                     .push((host.ssh.clone(), data.machine.tailnet.clone())),
+                None => {}
             }
             data
         }
