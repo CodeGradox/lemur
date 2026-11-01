@@ -8,6 +8,7 @@ use super::{Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
 use crate::config::{Base, Config, Host, home};
+use crate::snapshot;
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt, v_flex};
@@ -211,11 +212,10 @@ impl Lemur {
         if !move_item(&mut self.cfg.bases, from, to) {
             return;
         }
-        // The snapshot points into the config's bases by index: renumber
-        // its views, and drop snapshots on their way that use the old numbers.
-        for b in self.snap.hosts.iter_mut().flat_map(|h| h.bases.iter_mut()) {
-            b.index = moved_to(b.index, from, to);
-        }
+        // The snapshot, and what a recompose builds the next from, point
+        // into the config's bases by index: renumber their views, and drop
+        // snapshots on their way that use the old numbers.
+        self.renumber_bases(|i| Some(moved_to(i, from, to)));
         self.changes += 1;
         if let Some(file) = Prefs::get(cx).config_file()
             && let Err(e) = Config::save_project_order(file, &self.cfg.bases)
@@ -223,6 +223,17 @@ impl Lemur {
             self.fail(e, cx);
         }
         cx.notify();
+    }
+
+    /// Renumbers the views of the config's bases, in the snapshot and in
+    /// what the last refresh found, as `renumber` says; `None` drops one.
+    fn renumber_bases(&mut self, renumber: impl Fn(usize) -> Option<usize> + Copy) {
+        for h in &mut self.snap.hosts {
+            snapshot::renumber_views(&mut h.bases, renumber);
+        }
+        for data in &mut self.data {
+            data.renumber_bases(renumber);
+        }
     }
 
     /// Keeps how a project shows in the sidebar in the config file: its
@@ -280,17 +291,15 @@ impl Lemur {
             return;
         }
         self.cfg.bases.remove(index);
-        // The snapshot points into the config's bases by index: drop the
-        // project's view, shift the later ones, and drop snapshots on their
-        // way that still use the old numbers.
-        for h in &mut self.snap.hosts {
-            h.bases.retain(|b| b.index != index);
-            for b in &mut h.bases {
-                if b.index > index {
-                    b.index -= 1;
-                }
-            }
-        }
+        // The snapshot, and what a recompose builds the next from, point
+        // into the config's bases by index: drop the project's view, shift
+        // the later ones, and drop snapshots on their way that still use
+        // the old numbers.
+        self.renumber_bases(|i| match i.cmp(&index) {
+            std::cmp::Ordering::Less => Some(i),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(i - 1),
+        });
         self.changes += 1;
         // A name field may be asking about it.
         self.prompt = None;

@@ -2116,9 +2116,12 @@ mod tests {
         let (app, cx) = rooted(cfg, cx);
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
+        // The snapshot shown, and the one a herdr-core event would compose
+        // from what the last refresh found.
         let consistent = |cx: &mut VisualTestContext| {
             app.read_with(cx, |app, _| {
-                for h in &app.snap.hosts {
+                let recomposed = snapshot::compose(&app.cfg, &app.data);
+                for h in app.snap.hosts.iter().chain(&recomposed.hosts) {
                     assert_eq!(h.bases.len(), if h.name == "mac" { 1 } else { 2 });
                     for b in &h.bases {
                         assert_eq!(app.cfg.bases[b.index].host, h.name);
@@ -2429,6 +2432,14 @@ mod tests {
         // A refresh is on its way when the project goes.
         app.update(cx, |app, cx| app.refresh(cx).detach());
         app.update(cx, |app, cx| app.remove_project(&one, cx));
+        // A herdr-core event before the next refresh lands composes from
+        // what the last one found.
+        app.read_with(cx, |app, _| {
+            let recomposed = snapshot::compose(&app.cfg, &app.data);
+            let views = &recomposed.hosts[0].bases;
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].index, 0);
+        });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             let paths: Vec<&str> = app.cfg.bases.iter().map(|b| b.path.as_str()).collect();

@@ -214,6 +214,26 @@ pub struct HostData {
     parents: HashMap<u32, u32>,
 }
 
+impl HostData {
+    /// Renumbers its projects' views as the config's bases move, dropping
+    /// those `renumber` says are gone: they point into the bases by index.
+    pub fn renumber_bases(&mut self, renumber: impl Fn(usize) -> Option<usize>) {
+        renumber_views(&mut self.bases, renumber);
+    }
+}
+
+/// Renumbers projects' views as the config's bases move, dropping those
+/// `renumber` says are gone.
+pub fn renumber_views(views: &mut Vec<BaseView>, renumber: impl Fn(usize) -> Option<usize>) {
+    views.retain_mut(|b| match renumber(b.index) {
+        Some(index) => {
+            b.index = index;
+            true
+        }
+        None => false,
+    });
+}
+
 pub fn fetch(cfg: &Config) -> Snapshot {
     compose(cfg, &fetch_data(cfg))
 }
