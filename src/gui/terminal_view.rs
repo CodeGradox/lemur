@@ -409,20 +409,7 @@ impl TerminalView {
         if let Some(deadline) = deadline
             && self._sync.is_none()
         {
-            self._sync = Some(cx.spawn(async move |this, cx| {
-                let wait = deadline.saturating_duration_since(Instant::now());
-                cx.background_executor().timer(wait).await;
-                this.update(cx, |this, cx| {
-                    this._sync = None;
-                    if let Some(screen) = &mut this.screen
-                        && screen.sync_deadline().is_some_and(|d| d <= Instant::now())
-                    {
-                        screen.stop_sync();
-                        cx.notify();
-                    }
-                })
-                .ok();
-            }));
+            self.end_sync_at(deadline, cx);
         }
         // New output may have moved the link under the pointer.
         if self.hovered.is_some() {
@@ -438,6 +425,30 @@ impl TerminalView {
             self.redraw_soon(cx);
         }
         open
+    }
+
+    /// Shows a synchronized update that never said it was done, at
+    /// `deadline`; or later, where another one moved it on meanwhile.
+    fn end_sync_at(&mut self, deadline: Instant, cx: &mut Context<Self>) {
+        self._sync = Some(cx.spawn(async move |this, cx| {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| {
+                this._sync = None;
+                let Some(screen) = &mut this.screen else {
+                    return;
+                };
+                match screen.sync_deadline() {
+                    Some(d) if d <= Instant::now() => {
+                        screen.stop_sync();
+                        cx.notify();
+                    }
+                    Some(later) => this.end_sync_at(later, cx),
+                    None => {}
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Draws new output at the next `OUTPUT_EVERY`, or at once while you
@@ -1164,7 +1175,10 @@ fn snapshot(screen: &Screen, palette: &Palette) -> Frame {
     let cursor = (content.mode.contains(TermMode::SHOW_CURSOR)
         && content.cursor.shape != CursorShape::Hidden)
         .then(|| {
-            let line = usize::try_from(content.cursor.point.line.0 + offset).ok()?;
+            // Scrolled back, it can be below the rows shown.
+            let line = usize::try_from(content.cursor.point.line.0 + offset)
+                .ok()
+                .filter(|&line| line < rows.len())?;
             let color = hsla(palette.indexed(NamedColor::Cursor as usize, colors));
             Some((
                 content.cursor.point.column.0,
@@ -1576,6 +1590,22 @@ mod tests {
         (view, t, cx)
     }
 
+    /// An update shown all at once that never says it's done shows at its
+    /// deadline, though a second one moved that on.
+    #[gpui::test]
+    fn an_unfinished_synchronized_update_shows_at_its_deadline(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("sync-deadline");
+        let script =
+            r"sleep 0.3; printf '\033[?2026hAA'; sleep 0.1; printf '\033[?2026hBB'; exec sleep 600";
+        let (view, _, cx) = attach(&server, &["sh", "-c", script], cx);
+        let shows = wait_until(Duration::from_secs(5), || {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50));
+            shown(&view, cx).contains("AABB")
+        });
+        assert!(shows, "{:?}", shown(&view, cx));
+    }
+
     /// Attaching again and failing, as to a host that's down, leaves what
     /// the terminal showed.
     #[gpui::test]
@@ -1912,6 +1942,28 @@ mod tests {
             2
         );
         assert_eq!(frame.rows[1].text, "");
+    }
+
+    /// Scrolled back so the cursor's row is below the rows shown, the
+    /// cursor isn't drawn there.
+    #[test]
+    fn a_cursor_scrolled_out_of_view_isnt_drawn() {
+        let mut screen = Screen::new(
+            Size {
+                cols: 40,
+                lines: 3,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            100,
+        );
+        screen.advance(b"1\r\n2\r\n3\r\n4\r\n$ ");
+        assert!(snapshot(&screen, &DARK).cursor.is_some());
+        screen
+            .term
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(1));
+        assert_eq!(snapshot(&screen, &DARK).cursor, None);
     }
 
     /// Block elements reach the painter as rectangles of their cell, not as
