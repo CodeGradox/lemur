@@ -78,6 +78,11 @@ impl Screen {
         }
     }
 
+    /// Lines it keeps to scroll back through.
+    pub fn scrollback(&self) -> u32 {
+        self.scrollback
+    }
+
     /// Keeps `lines` to scroll back through from now on; fewer drops the
     /// oldest.
     pub fn set_scrollback(&mut self, lines: u32) {

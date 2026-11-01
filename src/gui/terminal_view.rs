@@ -207,8 +207,14 @@ impl TerminalView {
             renders: 0,
             _prefs: cx.observe_global::<Prefs>(|this, cx| {
                 this.metrics = None;
+                // More lines apply at once; fewer once it attaches again.
+                // Typing a number in Settings passes through smaller ones,
+                // which would drop history for good (beyond what herdr-core
+                // keeps).
                 let scrollback = Prefs::get(cx).terminal.scrollback;
-                if let Some(screen) = &mut this.screen {
+                if let Some(screen) = &mut this.screen
+                    && scrollback > screen.scrollback()
+                {
                     screen.set_scrollback(scrollback);
                 }
                 cx.notify();
@@ -1880,7 +1886,8 @@ mod tests {
     }
 
     /// A terminal keeps as many lines to scroll back through as Settings
-    /// say, and fewer at once when they say fewer.
+    /// say; fewer only once it attaches again, so typing a number there
+    /// doesn't drop its history on the way.
     #[gpui::test]
     fn the_terminal_keeps_the_scrollback_set(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("scrollback");
@@ -1898,10 +1905,18 @@ mod tests {
         });
         assert!(filled, "kept {}", history(cx));
 
-        // Changed in Settings, it keeps fewer at once.
-        cx.update(|_, cx| Prefs::update(cx, |p| p.terminal.scrollback = 50));
+        // Lowered in Settings, as typing 5 on the way to 500 does, it
+        // keeps what it has.
+        cx.update(|_, cx| Prefs::update(cx, |p| p.terminal.scrollback = 5));
         cx.run_until_parked();
-        assert_eq!(history(cx), 50);
+        assert_eq!(history(cx), 300);
+        // Attached again, it keeps as few.
+        view.update(cx, |v, cx| v.connect(cx));
+        let fewer = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.is_attached()) && history(cx) == 5
+        });
+        assert!(fewer, "kept {}", history(cx));
     }
 
     /// A font size from Settings reaches open terminals: a bigger font fits

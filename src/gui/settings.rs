@@ -379,7 +379,8 @@ impl Render for SettingsView {
                             "Lines each terminal keeps to scroll back through. A thousand \
                              lines of a terminal 130 columns wide take about 3 MB. herdr-core \
                              keeps about 2,600 of its own, which come back when Lemur \
-                             attaches again.",
+                             attaches again. More apply at once; fewer when a terminal \
+                             attaches again, as when Lemur starts.",
                         )),
                 ),
             SettingPage::new("Terminal colors")
