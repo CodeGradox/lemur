@@ -105,6 +105,19 @@ pub struct TerminalView {
     _prefs: Subscription,
 }
 
+/// An attach until its view takes it. Dropped first, as when the view went
+/// while it attached, it lets go of the terminal, which the core would
+/// otherwise go on streaming to.
+struct Unclaimed(Option<(Arc<Core>, u32)>);
+
+impl Drop for Unclaimed {
+    fn drop(&mut self) {
+        if let Some((core, channel)) = self.0.take() {
+            core.detach(channel);
+        }
+    }
+}
+
 /// Input waiting for the terminal to attach.
 enum Held {
     Bytes(Vec<u8>),
@@ -320,16 +333,18 @@ impl TerminalView {
                 .background_spawn(async move {
                     let (core, _) = hc::for_host(&host)?;
                     let attached = core.attach(&session, cols, lines, scrollback, display)?;
-                    anyhow::Ok((core, attached))
+                    let unclaimed = Unclaimed(Some((core.clone(), attached.channel)));
+                    anyhow::Ok((core, attached, unclaimed))
                 })
                 .await;
             let mut stream = match attached {
-                Ok((core, attached)) => {
+                Ok((core, attached, mut unclaimed)) => {
                     let channel = attached.channel;
                     let shown = this.update(cx, |this, cx| this.attached(core, channel, cx));
                     if shown.is_err() {
                         return;
                     }
+                    unclaimed.0 = None;
                     attached.stream
                 }
                 Err(e) => {
@@ -1615,6 +1630,19 @@ mod tests {
             shown(&view, cx).contains("AABB")
         });
         assert!(shows, "{:?}", shown(&view, cx));
+    }
+
+    /// An attach no view took, as when the view went while it attached,
+    /// lets go of the terminal: the core doesn't go on streaming to it.
+    #[test]
+    fn an_attach_no_view_took_lets_go() {
+        let server = HcServer::new("attach-orphan");
+        let t = server.run("/", &[], &["sleep", "600"]);
+        let core = server.core();
+        let attached = core.attach(&t, 40, 10, 0, serde_json::json!({})).unwrap();
+        assert_eq!(core.streams(), 1);
+        drop(super::Unclaimed(Some((core.clone(), attached.channel))));
+        assert_eq!(core.streams(), 0);
     }
 
     /// Attaching again and failing, as to a host that's down, leaves what
