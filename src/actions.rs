@@ -328,8 +328,27 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
     if core.terminals().iter().any(|t| t.address == thread.session) {
         bail!("{} still runs", thread.shown());
     }
+    // A thread from before herdr-core, Lemur 1.8 and older, may still run
+    // in tmux: resumed, two Claudes would work on one conversation.
+    let in_tmux = if is_address(&thread.session) {
+        String::new()
+    } else {
+        let tmux = match &host.tmux_socket {
+            Some(socket) => format!("tmux -L {}", quote(socket)),
+            None => "tmux".into(),
+        };
+        format!(
+            "if command -v tmux >/dev/null 2>&1 && {tmux} has-session -t {} 2>/dev/null; then echo {} >&2; exit 1; fi\n",
+            quote(&format!("={}", thread.session)),
+            quote(&format!(
+                "{} still runs in tmux, as {}: end it there first",
+                thread.shown(),
+                thread.session
+            )),
+        )
+    };
     Remote::new(host).run(&format!(
-        "if [ ! -d {} ]; then echo {} >&2; exit 1; fi\n",
+        "if [ ! -d {} ]; then echo {} >&2; exit 1; fi\n{in_tmux}",
         quote(&thread.path),
         quote(&format!("{} is gone", thread.path)),
     ))?;
@@ -345,6 +364,14 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         Some(&resume),
         thread.issue.as_deref(),
     )
+}
+
+/// Whether `session` is a herdr-core address (`t7`, `agent/t7`), not a tmux
+/// session's name from before.
+fn is_address(session: &str) -> bool {
+    let leaf = session.rsplit('/').next().unwrap_or(session);
+    leaf.strip_prefix('t')
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Records the order threads were dragged into: `lemur.order` 0, 1, 2, …
@@ -1051,6 +1078,65 @@ mod tests {
         };
         assert!(resume_thread(&cfg, &odd).is_err());
         assert_eq!(server.addresses().len(), before);
+    }
+
+    /// A thread from before herdr-core still running in tmux isn't resumed
+    /// a second time; once its tmux session is gone, it is.
+    #[test]
+    fn a_thread_still_in_tmux_isnt_resumed_twice() {
+        struct Tmux(String);
+        impl Drop for Tmux {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["-L", &self.0, "kill-server"])
+                    .output();
+            }
+        }
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("no tmux here: skipped");
+            return;
+        }
+        let server = HcServer::new("resume-tmux");
+        let dir = TempDir::new("resume-tmux");
+        let mut cfg = server.config();
+        let socket = Tmux(format!("lemur-test-{}", std::process::id()));
+        cfg.hosts[0].tmux_socket = Some(socket.0.clone());
+        cfg.hosts[0].claude = "true".into();
+        let name = "api/claude--calm-heron";
+        let started = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &socket.0,
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "sleep 600",
+            ])
+            .output()
+            .unwrap();
+        assert!(started.status.success(), "{started:?}");
+        let thread = ClaudeThread {
+            host: "local".into(),
+            session: name.into(),
+            path: dir.to_string_lossy().into_owned(),
+            claude_session: random_uuid(),
+            label: None,
+            issue: None,
+        };
+        let before = server.addresses().len();
+        let err = resume_thread(&cfg, &thread).unwrap_err();
+        assert!(format!("{err:#}").contains("still runs in tmux"), "{err:#}");
+        assert_eq!(server.addresses().len(), before, "nothing started");
+
+        drop(socket);
+        assert!(resume_thread(&cfg, &thread).is_ok());
+        assert!(is_address("t7") && is_address("agent/t12"));
+        assert!(!is_address(name) && !is_address("agent/t") && !is_address("tx"));
     }
 
     /// A paste goes to the program bracketed when it asked for that, and

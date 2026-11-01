@@ -198,9 +198,9 @@ pub struct Host {
     /// The herdr-core session (`HC_SESSION`) its terminals run in; unset
     /// uses herdr-core's default, which Herdr uses too.
     pub hc_session: Option<String>,
-    /// From before herdr-core ran lemur's terminals; read, and ignored.
-    #[allow(dead_code)]
-    tmux_socket: Option<String>,
+    /// From before herdr-core ran lemur's terminals: where a thread kept
+    /// from then may still run, so it isn't resumed a second time.
+    pub tmux_socket: Option<String>,
     /// Command that starts Claude Code in a new session.
     #[serde(default = "default_claude")]
     pub claude: String,
