@@ -803,6 +803,13 @@ impl Drop for Core {
 /// The connection to the core of each session lemur uses, made when first
 /// needed and again once lost.
 pub fn core(session: Option<&str>) -> Result<Arc<Core>> {
+    // The default core is the one in use, Herdr's too: a test that reached
+    // it could start it, and with it shells in the user's kept terminals.
+    #[cfg(test)]
+    assert!(
+        session.is_some(),
+        "a test reached herdr-core's default session: use an HcServer's"
+    );
     static CORES: OnceLock<Mutex<HashMap<Option<String>, Arc<Core>>>> = OnceLock::new();
     let mut cores = CORES.get_or_init(Default::default).lock().unwrap();
     let key = session.map(str::to_owned);

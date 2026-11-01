@@ -433,7 +433,7 @@ mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
     use super::{FolderPicker, HostChoice, PickerEvent, folder_path, split};
     use crate::config::Host;
-    use crate::test_support::{TempDir, git_in};
+    use crate::test_support::{HcServer, TempDir, git_in};
     use gpui::VisualTestContext;
     use gpui_kit::{AppContext, Entity};
     use std::cell::RefCell;
@@ -461,7 +461,9 @@ mod tests {
         dir
     }
 
+    /// The picker, offering `agent` and `local`, this Mac.
     fn picker(
+        local: Host,
         cx: &mut gpui::TestAppContext,
     ) -> (
         Entity<FolderPicker>,
@@ -477,7 +479,7 @@ mod tests {
                 configured: true,
             },
             HostChoice {
-                host: Host::new("local", "local"),
+                host: local,
                 configured: false,
             },
         ];
@@ -525,7 +527,10 @@ mod tests {
     fn picking_a_host_then_a_folder_adds_its_repo(cx: &mut gpui::TestAppContext) {
         let dir = temp_repos();
         let base = dir.to_string_lossy().into_owned();
-        let (picker, events, cx) = picker(cx);
+        // This Mac, through the test's own herdr-core, not the one in use.
+        let server = HcServer::new("picker");
+        let host = server.config().hosts.remove(0);
+        let (picker, events, cx) = picker(host.clone(), cx);
         assert_eq!(labels(&picker, cx), ["agent", "local"]);
         // Filter to this Mac, and pick it with Enter.
         cx.simulate_input("loc");
@@ -564,7 +569,7 @@ mod tests {
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         let local = HostChoice {
-            host: Host::new("local", "local"),
+            host,
             configured: false,
         };
         assert_eq!(
@@ -592,7 +597,8 @@ mod tests {
 
     #[gpui::test]
     fn a_typed_destination_offers_to_connect(cx: &mut gpui::TestAppContext) {
-        let (picker, _, cx) = picker(cx);
+        let server = HcServer::new("picker-type");
+        let (picker, _, cx) = picker(server.config().hosts.remove(0), cx);
         cx.simulate_input("me@build.example.com");
         cx.run_until_parked();
         assert_eq!(labels(&picker, cx), ["me@build.example.com"]);
