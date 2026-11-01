@@ -195,15 +195,17 @@ impl Lemur {
             .border_1()
             .text_sm()
             .cursor_pointer()
+            // Filled as the thread on show is in the sidebar, as Herdr's;
+            // hovered ones fainter, so they don't pass for it.
             .map(|tab| {
                 if shown {
-                    tab.bg(theme.tab_active)
+                    tab.bg(theme.tokens.sidebar_accent)
                         .border_color(theme.border)
                         .text_color(theme.tab_active_foreground)
                 } else {
                     tab.border_color(transparent_black())
                         .text_color(theme.muted_foreground)
-                        .hover(|tab| tab.bg(theme.secondary_hover))
+                        .hover(|tab| tab.bg(theme.sidebar_accent.opacity(0.5)))
                 }
             })
             .on_click(open)
