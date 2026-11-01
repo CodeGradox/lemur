@@ -75,7 +75,7 @@ pub struct TerminalView {
     scroll_lines: f32,
     /// What the core was last told: the colors and cell size lemur shows
     /// the terminal in, and whether it has the keyboard.
-    told_display: Option<serde_json::Value>,
+    told_display: Option<Facts>,
     told_focus: Option<bool>,
     /// Shown in the window's snackbars while this terminal is.
     status: Option<(String, Kind)>,
@@ -101,6 +101,37 @@ pub struct TerminalView {
 pub struct StatusChanged;
 
 impl EventEmitter<StatusChanged> for TerminalView {}
+
+/// The colors and cell size the terminal shows in, as the core answers
+/// programs that ask (a theme picks light or dark by the background).
+/// Compared each frame, so it's only sent when it changes.
+#[derive(Clone, Copy, PartialEq)]
+struct Facts {
+    fg: Rgb,
+    bg: Rgb,
+    cursor: Rgb,
+    cell: [u16; 2],
+}
+
+impl Facts {
+    fn new(palette: &Palette, cell: Size) -> Facts {
+        Facts {
+            fg: palette.foreground,
+            bg: palette.background,
+            cursor: palette.indexed(NamedColor::Cursor as usize, &Default::default()),
+            cell: [cell.cell_width, cell.cell_height],
+        }
+    }
+
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "fg": hex(self.fg),
+            "bg": hex(self.bg),
+            "cursor": hex(self.cursor),
+            "cell": self.cell,
+        })
+    }
+}
 
 /// The terminal font and the size of one cell in it.
 #[derive(Clone)]
@@ -198,19 +229,6 @@ impl TerminalView {
         }
     }
 
-    /// The colors and cell size the terminal shows in, as the core answers
-    /// programs that ask (a theme picks light or dark by the background).
-    fn display(&self, cx: &App) -> serde_json::Value {
-        let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
-        let cursor = palette.indexed(NamedColor::Cursor as usize, &Default::default());
-        serde_json::json!({
-            "fg": hex(palette.foreground),
-            "bg": hex(palette.background),
-            "cursor": hex(cursor),
-            "cell": [self.cell.cell_width, self.cell.cell_height],
-        })
-    }
-
     /// Whether its stream dropped while its program may still run.
     pub fn disconnected(&self) -> bool {
         self.lost && matches!(self.attachment, Attachment::Ended)
@@ -239,8 +257,10 @@ impl TerminalView {
         }
         let (host, session) = (self.host.clone(), self.session.clone());
         let (cols, lines) = (self.cell.cols, self.cell.lines);
-        let display = self.display(cx);
-        self.told_display = Some(display.clone());
+        let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
+        let facts = Facts::new(&palette, self.cell);
+        self.told_display = Some(facts);
+        let display = facts.json();
         self._reader = Some(cx.spawn(async move |this, cx| {
             // A terminal on a host still being reached can take seconds.
             let attached = cx
@@ -924,6 +944,10 @@ struct Row {
 /// right, bottom) fractions, and how opaque it is. The font's glyphs don't
 /// fill the cell, so neighbors would show seams between them.
 fn block(c: char) -> Option<(Vec<[f32; 4]>, f32)> {
+    // Asked of every cell each frame: most are no block, and cost nothing.
+    if !('\u{2580}'..='\u{259F}').contains(&c) {
+        return None;
+    }
     // Upper left, upper right, lower left, lower right.
     let quadrants = |on: [bool; 4]| -> Vec<[f32; 4]> {
         [
@@ -1324,10 +1348,10 @@ impl Render for TerminalView {
         // The core answers programs with the colors and cell size shown,
         // and hands the terminal to whoever has the keyboard.
         if let Attachment::Attached(core, channel) = &self.attachment {
-            let display = self.display(cx);
-            if self.told_display.as_ref() != Some(&display) {
-                core.facts(*channel, &display);
-                self.told_display = Some(display);
+            let facts = Facts::new(&palette, self.cell);
+            if self.told_display != Some(facts) {
+                core.facts(*channel, &facts.json());
+                self.told_display = Some(facts);
             }
             if self.told_focus != Some(focused) {
                 core.focus(*channel, focused);
