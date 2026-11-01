@@ -744,6 +744,14 @@ impl Core {
         self.routes.lock().unwrap().streams.remove(&channel);
         self.send(channel, CLOSE, &[]);
     }
+
+    /// Waits until the core has read every frame sent before: input, for
+    /// one, is only queued for the writer thread, which a process about to
+    /// exit doesn't wait for. A call goes after them, and is answered.
+    pub fn flush(&self) -> Result<()> {
+        self.call("server.status", json!({}))?;
+        Ok(())
+    }
 }
 
 /// Applies a frame of the event stream, and wakes the watchers if a

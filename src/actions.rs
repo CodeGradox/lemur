@@ -702,7 +702,8 @@ pub fn paste(host: &Host, session: &str, text: &str) -> Result<()> {
     let bracketed = painted.rfind("\x1b[?2004h") > painted.rfind("\x1b[?2004l");
     core.input(attached.channel, &crate::gui::keys::paste(text, bracketed));
     core.detach(attached.channel);
-    Ok(())
+    // `lemur paste` and `lemur upload` exit right after.
+    core.flush()
 }
 
 /// Uploads files and pastes their remote paths into a session's prompt.
