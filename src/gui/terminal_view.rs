@@ -40,6 +40,7 @@ const TYPING: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Where this view is with its terminal's byte stream.
 enum Attachment {
+    /// Input meanwhile waits in `held`.
     Attaching,
     /// The core, and the channel the terminal's bytes come on.
     Attached(Arc<Core>, u32),
@@ -90,11 +91,21 @@ pub struct TerminalView {
     _sync: Option<Task<()>>,
     /// When you last typed into it, so its echo shows at once.
     typed_at: std::cell::Cell<Option<Instant>>,
+    /// Input given while it attaches: sent once the core has painted the
+    /// screen, a paste as the program's modes then say (bracketed in
+    /// Claude). Dropped if the attach fails.
+    held: std::cell::RefCell<Vec<Held>>,
     /// Draws output that came since the last frame, at `OUTPUT_EVERY`.
     _redraw: Option<Task<()>>,
     #[cfg(test)]
     renders: usize,
     _prefs: Subscription,
+}
+
+/// Input waiting for the terminal to attach.
+enum Held {
+    Bytes(Vec<u8>),
+    Paste(String),
 }
 
 /// The terminal's message came or went.
@@ -190,6 +201,7 @@ impl TerminalView {
             _reader: None,
             _sync: None,
             typed_at: std::cell::Cell::new(None),
+            held: Default::default(),
             _redraw: None,
             #[cfg(test)]
             renders: 0,
@@ -258,6 +270,7 @@ impl TerminalView {
         let scrollback = Prefs::get(cx).terminal.scrollback;
         self.screen = Some(Screen::new(self.cell, scrollback));
         self.attachment = Attachment::Attaching;
+        self.held.borrow_mut().clear();
         self.tried = Some(Instant::now());
         self.told_display = None;
         self.told_focus = None;
@@ -293,6 +306,7 @@ impl TerminalView {
                     this.update(cx, |this, cx| {
                         // Tried again once the terminal runs.
                         this.attachment = Attachment::Ended;
+                        this.held.borrow_mut().clear();
                         this.lost = true;
                         let error = format!("{e:#} · trying again");
                         this.set_status(Some((error, Kind::Error)), cx);
@@ -358,6 +372,11 @@ impl TerminalView {
                 Stream::Lost => open = false,
             }
         }
+        // The first paint has set the program's modes: what waited goes now.
+        self.send_held();
+        let Some(screen) = &mut self.screen else {
+            return false;
+        };
         let events = screen.events();
         let deadline = screen.sync_deadline();
         for event in events {
@@ -446,16 +465,36 @@ impl TerminalView {
 
     fn write(&self, bytes: Vec<u8>) {
         self.typed_at.set(Some(Instant::now()));
-        if let Attachment::Attached(core, channel) = &self.attachment {
-            core.input(*channel, &bytes);
+        match &self.attachment {
+            Attachment::Attached(core, channel) => core.input(*channel, &bytes),
+            Attachment::Attaching => self.held.borrow_mut().push(Held::Bytes(bytes)),
+            Attachment::Ended => {}
         }
     }
 
     pub fn paste_text(&self, text: &str) {
+        if matches!(self.attachment, Attachment::Attaching) {
+            self.held.borrow_mut().push(Held::Paste(text.to_string()));
+            return;
+        }
         self.write(keys::paste(
             text,
             self.mode().contains(TermMode::BRACKETED_PASTE),
         ));
+    }
+
+    /// Sends the input that waited for the terminal to attach.
+    fn send_held(&self) {
+        if !matches!(self.attachment, Attachment::Attached(..)) {
+            return;
+        }
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        for input in held {
+            match input {
+                Held::Bytes(bytes) => self.write(bytes),
+                Held::Paste(text) => self.paste_text(&text),
+            }
+        }
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1510,6 +1549,34 @@ mod tests {
         });
         assert!(attached, "never attached");
         (view, t, cx)
+    }
+
+    /// Input given while the terminal (re)attaches waits for it, then
+    /// reaches the program; a paste goes as the program's modes say once
+    /// the core has painted them, here bracketed.
+    #[gpui::test]
+    fn input_given_while_attaching_reaches_the_program(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("early-input");
+        let t = server.run(
+            "/",
+            &[],
+            &["sh", "-c", "printf '\\033[?2004h'; exec cat -v"],
+        );
+        let host = server.config().hosts.remove(0);
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| TerminalView::new(host, t, cx));
+        view.update(cx, |v, cx| {
+            // Attaching again, as on a reconnect: attaching takes a while.
+            v.connect(cx);
+            assert!(!v.is_attached(), "still attaching");
+            v.paste_text("hello");
+            v.write(b"!".to_vec());
+        });
+        let echoed = wait_until(Duration::from_secs(10), || {
+            shown(&view, cx).contains("^[[200~hello^[[201~!")
+        });
+        assert!(echoed, "{}", shown(&view, cx));
     }
 
     /// What `view` shows, row by row, without trailing blanks.

@@ -5005,7 +5005,8 @@ echo '{"done": true}'
         });
         assert!(heard, "{:?}", dictated(&app, cx));
 
-        attached(&app, &b, cx);
+        // Pasted the moment it's opened: it may still be attaching.
+        open(&app, &b, cx);
         cx.simulate_keystrokes("cmd-enter");
         assert!(wait_until(Duration::from_secs(5), || {
             cx.run_until_parked();
