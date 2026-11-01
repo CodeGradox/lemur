@@ -731,6 +731,69 @@ fn ask_on_click(
     }
 }
 
+/// A thread's status dot as a view of its own, for where it's drawn in
+/// the window's own view (the tabs, the peek card): its breaths then
+/// redraw only it, not the window's view, which redraws the sidebar.
+pub(super) struct DotView {
+    key: Key,
+    color: Hsla,
+    breathes: bool,
+    tip: SharedString,
+}
+
+impl DotView {
+    pub(super) fn new(key: Key) -> Self {
+        DotView {
+            key,
+            color: Hsla::default(),
+            breathes: false,
+            tip: SharedString::default(),
+        }
+    }
+
+    pub(super) fn set(
+        &mut self,
+        color: Hsla,
+        breathes: bool,
+        tip: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        if (self.color, self.breathes, &self.tip) != (color, breathes, &tip) {
+            (self.color, self.breathes, self.tip) = (color, breathes, tip);
+            cx.notify();
+        }
+    }
+}
+
+impl Render for DotView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        status_dot(&self.key, self.color, self.breathes, self.tip.clone())
+    }
+}
+
+impl Lemur {
+    /// Thread `key`'s dot in `place` (a tab, the peek card), as a view of
+    /// its own (see `DotView`).
+    pub(super) fn dot_view(
+        &self,
+        place: &'static str,
+        key: &Key,
+        color: Hsla,
+        breathes: bool,
+        tip: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyView {
+        let view = self
+            .dots
+            .borrow_mut()
+            .entry((place, key.clone()))
+            .or_insert_with(|| cx.new(|_| DotView::new(key.clone())))
+            .clone();
+        view.update(cx, |dot, cx| dot.set(color, breathes, tip, cx));
+        view.into()
+    }
+}
+
 /// A session's status dot; it breathes while `breathes` (see
 /// `Lemur::breathes`).
 pub(super) fn status_dot(key: &Key, color: Hsla, breathes: bool, tip: SharedString) -> AnyElement {

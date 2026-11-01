@@ -245,6 +245,8 @@ struct Lemur {
     /// The agents in the order ⌘] and ⌘[ go through them, from the first
     /// press on.
     agent_walk: Vec<Key>,
+    /// The tabs' and the peek card's dots, by where and whose.
+    dots: std::cell::RefCell<HashMap<(&'static str, Key), Entity<sidebar::DotView>>>,
     /// Shown in a snackbar over the terminal.
     status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
@@ -623,6 +625,7 @@ impl Lemur {
             done: HashSet::new(),
             seen: HashMap::new(),
             agent_walk: vec![],
+            dots: Default::default(),
             status: None,
             restore,
             window: window.window_handle(),
@@ -3609,6 +3612,28 @@ mod tests {
         assert_eq!(in_a_second(cx), 0, "still again");
     }
 
+    /// A working thread on show, with its tab, redraws the sidebar no more
+    /// than its sidebar dot does: the tab's dot doesn't add its own breaths.
+    #[gpui::test]
+    fn a_working_tab_doesnt_redraw_the_sidebar_twice(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("tab-breath");
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        apply(&app, &[("busy", Activity::Working)], cx);
+        open(&app, "busy", cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let renders =
+            |cx: &mut VisualTestContext| app.read_with(cx, |app, cx| app.sidebar.read(cx).renders);
+        let before = renders(cx);
+        for _ in 0..50 {
+            cx.executor().advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+        let breaths = renders(cx) - before;
+        assert!((6..=8).contains(&breaths), "{breaths} frames");
+    }
+
     /// While its host can't be reached, a thread keeps what it was doing
     /// and its done mark: back, it hasn't just changed, and finishing then
     /// still counts.
@@ -4646,7 +4671,7 @@ mod tests {
     /// then the rest: opening one doesn't skip the next.
     #[gpui::test]
     fn next_agent_goes_through_each_done_one(cx: &mut gpui::TestAppContext) {
-        let server = HcServer::new("next-agent");
+        let server = HcServer::new("next-agent-walk");
         let (app, cx) = rooted(server.config(), cx);
         apply(
             &app,

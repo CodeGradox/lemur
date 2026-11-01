@@ -2,7 +2,7 @@
 //! the one on show, live, without switching to it. ↗ shows it instead;
 //! × or a click outside puts the one on show back.
 
-use super::sidebar::{status_dot, thread_icon};
+use super::sidebar::thread_icon;
 use super::{Key, Lemur, worktree_label};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable, h_flex, v_flex};
@@ -36,7 +36,7 @@ impl Lemur {
     pub(super) fn peek_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let key = self.peek.clone()?;
         let view = self.terminals.get(&key)?.clone();
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let session = self.session_of(&key).cloned();
         let label = session
             .as_ref()
@@ -45,9 +45,12 @@ impl Lemur {
             Some((base, w)) => format!("{} · {}", self.cfg.bases[base].name(), worktree_label(w)),
             None => key.0.clone(),
         };
+        self.dots
+            .borrow_mut()
+            .retain(|(place, k), _| *place != "peek" || *k == key);
         let dot = session.as_ref().map(|s| {
             let (color, tip) = self.activity(&key, s, cx);
-            status_dot(&key, color, self.breathes(s.activity), tip)
+            self.dot_view("peek", &key, color, self.breathes(s.activity), tip, cx)
         });
         let header = h_flex()
             .h_10()

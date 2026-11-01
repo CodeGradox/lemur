@@ -3,7 +3,7 @@
 //! the foot of the sidebar.
 
 use super::settings::Prefs;
-use super::sidebar::{status_dot, thread_icon};
+use super::sidebar::thread_icon;
 use super::terminal::Palette;
 use super::{Ask, CloseThread, Key, Lemur, List, NewTerminal, icons, rows, sessions};
 use crate::machine::{self, Load};
@@ -105,8 +105,12 @@ impl Lemur {
                     .ok();
             })
         };
-        let tabs: Vec<AnyElement> = self
-            .siblings(&active)
+        let siblings = self.siblings(&active);
+        // The dots of tabs no longer shown go with them.
+        self.dots
+            .borrow_mut()
+            .retain(|(place, key), _| *place != "tab" || siblings.contains(key));
+        let tabs: Vec<AnyElement> = siblings
             .into_iter()
             .enumerate()
             .filter_map(|(i, key)| {
@@ -213,7 +217,7 @@ impl Lemur {
                     .text_color(theme.muted_foreground)
                     .child(issue)
             }))
-            .child(status_dot(&key, dot, breathes, tip))
+            .child(self.dot_view("tab", &key, dot, breathes, tip, cx))
             .child(close);
         rows::draggable_tab(tab, drag, i, s.label.clone().into(), reorder, cx)
             .context_menu(move |m, window, cx| menu(m, window, cx))
