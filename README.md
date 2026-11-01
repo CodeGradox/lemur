@@ -123,7 +123,7 @@ CLI: `lemur ls`, `lemur new <base> <name> [--branch <branch>] [--from <branch>]`
 
 ### Status dots
 
-Each session's dot comes from Claude Code itself: Claude reports what it's doing to the terminal it runs in, and herdr-core tells Lemur at once. Where it doesn't, each refresh runs `claude agents --json` on the host, which lists each running Claude with its process and status, and Lemur matches the process to its terminal; that's also where Lemur learns each Claude's conversation, to resume it. No setup needed; `claude agents` needs Claude Code 2.1.139 or later, on `PATH` or in `~/.local/bin`.
+Each session's dot comes from Claude Code itself: Claude reports what it's doing to the terminal it runs in, and herdr-core tells Lemur at once. Where it doesn't, Lemur runs `claude agents --json` on the host, at most every 30 seconds, which lists each running Claude with its process and status, and Lemur matches the process to its terminal; that's also where Lemur learns each Claude's conversation, to resume it. No setup needed; `claude agents` needs Claude Code 2.1.139 or later, on `PATH` or in `~/.local/bin`.
 
 - **Green, breathing:** Claude is working.
 - **Yellow:** Claude needs input (a question or permission prompt); hover the dot for what it's asking.
@@ -134,7 +134,7 @@ Each session's dot comes from Claude Code itself: Claude reports what it's doing
 
 When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. It names the project and worktree under the session's name. **Show** brings Lemur forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too, and so does coming back to Lemur while it's the session on show. A popup never keeps the keyboard: if `⌘Tab` back to Lemur hands it to one, it goes on to the main window.
 
-What Claude reports arrives at once. The refresh, for worktrees, servers, hosts' load and `claude agents`, runs every 3 seconds while Lemur is in front, and every 15 seconds while it's in the background.
+What Claude reports arrives at once. The refresh, for worktrees, servers and hosts' load, runs every 3 seconds while Lemur is in front, and every 15 seconds while it's in the background; `claude agents` runs with it at most every 30 seconds, as it costs each host a moment of CPU.
 
 ## Trademarks
 
