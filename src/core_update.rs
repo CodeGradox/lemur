@@ -3,6 +3,7 @@
 //! `hc update` and `hc machine update` to bring them up to it. Terminals
 //! keep running through an update.
 
+use crate::config::Config;
 use crate::hc;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -83,15 +84,43 @@ pub enum Target {
     Machine(String),
 }
 
+/// The herdr-cores the config has Lemur use on this Mac: the local host's
+/// session (`hc_session`; herdr-core's default without one), and the
+/// default one, which reaches the other hosts, if there are any.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Cores {
+    pub here: Option<String>,
+    pub machines: bool,
+}
+
+impl Cores {
+    pub fn of(cfg: &Config) -> Cores {
+        let (local, far): (Vec<_>, Vec<_>) = cfg.hosts.iter().partition(|h| h.ssh == "local");
+        Cores {
+            here: local.first().and_then(|h| h.hc_session.clone()),
+            machines: !far.is_empty(),
+        }
+    }
+}
+
 /// Asks this Mac's herdr-core and the release site what runs and what's
 /// out. The latest is left unknown when the site can't be reached.
-pub fn check() -> Result<Versions> {
-    let core = hc::core(None)?;
-    let status = core.call("server.status", serde_json::json!({}))?;
-    let machines = core.call("machine.list", serde_json::json!({}))?;
-    let mut versions = read(&status, &machines);
+pub fn check(cores: &Cores) -> Result<Versions> {
+    let mut versions = installed(cores)?;
     versions.latest = latest().ok();
     Ok(versions)
+}
+
+/// What runs: asking only the cores Lemur uses, as asking one starts it.
+fn installed(cores: &Cores) -> Result<Versions> {
+    let core = hc::core(cores.here.as_deref())?;
+    let status = core.call("server.status", serde_json::json!({}))?;
+    let machines = if cores.machines {
+        hc::core(None)?.call("machine.list", serde_json::json!({}))?
+    } else {
+        serde_json::json!({})
+    };
+    Ok(read(&status, &machines))
 }
 
 /// This Mac's version and the machines', from herdr-core's answers.
@@ -137,14 +166,19 @@ fn latest_in(json: &str) -> Result<String> {
 }
 
 /// Updates each of `targets` in turn, this Mac first: what it did.
-pub fn update(targets: &[Target]) -> Result<String> {
+pub fn update(targets: &[Target], cores: &Cores) -> Result<String> {
     let mut done = vec![];
     for target in targets {
         let (args, what): (Vec<&str>, String) = match target {
             Target::Here => (vec!["update"], "this Mac".into()),
             Target::Machine(name) => (vec!["machine", "update", name], name.clone()),
         };
-        let out = Command::new(hc::binary())
+        let mut command = Command::new(hc::binary());
+        // `hc update` restarts the core of its session, Lemur's here.
+        if let (Target::Here, Some(session)) = (target, &cores.here) {
+            command.env("HC_SESSION", session);
+        }
+        let out = command
             .args(&args)
             .output()
             .with_context(|| format!("running hc {}", args.join(" ")))?;
@@ -172,6 +206,35 @@ pub fn newer(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Lemur asks only the cores it uses, as asking one starts it: with
+    /// this Mac its one host, in a session of its own, that session's, not
+    /// herdr-core's default.
+    #[test]
+    fn only_the_cores_lemur_uses_are_asked() {
+        let server = crate::test_support::HcServer::new("update-cores");
+        let cfg = server.config();
+        let cores = Cores::of(&cfg);
+        assert_eq!(
+            cores,
+            Cores {
+                here: Some(server.session.clone()),
+                machines: false
+            }
+        );
+        let v = installed(&cores).unwrap();
+        assert!(v.here.is_some(), "{v:?}");
+        assert!(v.machines.is_empty());
+
+        let far = server.far_config("box");
+        assert_eq!(
+            Cores::of(&far),
+            Cores {
+                here: None,
+                machines: true
+            }
+        );
+    }
 
     #[test]
     fn versions_compare_by_number() {

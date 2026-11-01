@@ -36,6 +36,9 @@ pub struct Prefs {
     pub terminal: Terminal,
     /// Whether the sidebar shows how much of Claude's plan is used.
     pub claude_usage: bool,
+    /// The herdr-cores Lemur uses on this Mac, whose versions Settings
+    /// shows.
+    pub cores: core_update::Cores,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
     /// Why the last change couldn't be saved.
@@ -51,6 +54,7 @@ impl Prefs {
             dictation_language: cfg.dictation_language,
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
+            cores: core_update::Cores::of(cfg),
             file,
             error: None,
         }
@@ -449,8 +453,11 @@ impl SettingsView {
     fn check_core(&mut self, cx: &mut Context<Self>) {
         self.core = None;
         cx.notify();
+        let cores = Prefs::get(cx).cores.clone();
         cx.spawn(async move |this, cx| {
-            let versions = cx.background_spawn(async { core_update::check() }).await;
+            let versions = cx
+                .background_spawn(async move { core_update::check(&cores) })
+                .await;
             this.update(cx, |this, cx| {
                 this.core = Some(versions.map_err(|e| format!("{e:#}")));
                 cx.notify();
@@ -472,9 +479,10 @@ impl SettingsView {
         self.updating = true;
         self.core_note = None;
         cx.notify();
+        let cores = Prefs::get(cx).cores.clone();
         cx.spawn(async move |this, cx| {
             let done = cx
-                .background_spawn(async move { core_update::update(&outdated) })
+                .background_spawn(async move { core_update::update(&outdated, &cores) })
                 .await;
             this.update(cx, |this, cx| {
                 this.updating = false;

@@ -1274,7 +1274,8 @@ impl Lemur {
         if cfg!(test) {
             return;
         }
-        self.in_background(cx, crate::core_update::check, |this, versions, _, cx| {
+        let cores = crate::core_update::Cores::of(&self.cfg);
+        self.in_background(cx, move || crate::core_update::check(&cores), |this, versions, _, cx| {
             let Ok(versions) = versions else { return };
             let outdated = versions.outdated();
             if let (false, Some(latest)) = (outdated.is_empty(), &versions.latest) {
@@ -1293,10 +1294,11 @@ impl Lemur {
     fn update_core(&mut self, cx: &mut Context<Self>) {
         self.status = Some(("Updating herdr-core…".into(), Kind::Progress));
         cx.notify();
+        let cores = crate::core_update::Cores::of(&self.cfg);
         self.in_background(
             cx,
-            || {
-                let versions = crate::core_update::check()?;
+            move || {
+                let versions = crate::core_update::check(&cores)?;
                 if versions.latest.is_none() {
                     anyhow::bail!("couldn't ask for herdr-core's latest release");
                 }
@@ -1307,7 +1309,7 @@ impl Lemur {
                         versions.here.unwrap_or_default()
                     ));
                 }
-                crate::core_update::update(&outdated)
+                crate::core_update::update(&outdated, &cores)
             },
             |this, done, _, cx| match done {
                 Ok(note) => this.note(note, cx),
