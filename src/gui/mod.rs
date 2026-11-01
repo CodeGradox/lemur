@@ -4351,6 +4351,29 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// A list whose every thread is put away still shows them, under "Put
+    /// away", with their way back.
+    #[gpui::test]
+    fn a_list_of_threads_all_put_away_still_shows_them(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("all-away");
+        let a = server.run("/", &["lemur.label=a"], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| app.update(cx, |app, cx| app.put_away(key(&a), window, cx)));
+        let away = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&a)).is_some_and(|s| s.away)
+            })
+        });
+        assert!(away, "put away");
+        assert!(cx.debug_bounds("away").is_some(), "under Put away");
+        let_attaches_end(&app, cx);
+    }
+
     /// ⌘⇧P lists every command; what's typed narrows them, ↓ picks the
     /// next, and ⏎ runs it as its key would. Esc closes it.
     #[gpui::test]

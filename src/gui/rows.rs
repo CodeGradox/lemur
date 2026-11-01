@@ -468,7 +468,8 @@ fn worktree(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let has_threads = !threads.rows.is_empty() || !threads.gone.is_empty();
+    let has_threads =
+        !threads.rows.is_empty() || !threads.gone.is_empty() || !threads.away.is_empty();
     let is_open = has_threads && !look.folded;
     let toggle = look.toggle;
     let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -603,7 +604,8 @@ fn host(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let has_threads = !threads.rows.is_empty() || !threads.gone.is_empty();
+    let has_threads =
+        !threads.rows.is_empty() || !threads.gone.is_empty() || !threads.away.is_empty();
     let icon = match local {
         true => super::icons::monitor(),
         false => super::icons::server(),
