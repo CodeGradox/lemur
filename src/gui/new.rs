@@ -15,7 +15,7 @@ impl Lemur {
     /// ⌘T: a terminal where the thread on show runs: its worktree, or its
     /// folder outside every worktree.
     pub(super) fn new_terminal_here(&mut self, cx: &mut Context<Self>) {
-        if self.prompt.is_some() || self.picker.is_some() {
+        if self.overlaid() {
             return;
         }
         let Some(key) = self.active.clone() else {

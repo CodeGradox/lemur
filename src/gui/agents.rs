@@ -55,6 +55,9 @@ impl Lemur {
     /// ⌘] and ⌘[: shows the next agent, or the one before, in the agents
     /// panel's order, as Herdr's do: from the thread on show, or the first.
     pub(super) fn next_agent(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlaid() {
+            return;
+        }
         let agents: Vec<Key> = self.agents().into_iter().map(|(h, s)| key(h, s)).collect();
         if agents.is_empty() {
             self.note("No Claude threads".into(), cx);

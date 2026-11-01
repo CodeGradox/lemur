@@ -125,7 +125,7 @@ impl Lemur {
 
     /// ⌘P: the spotlight, to go to any thread.
     pub(super) fn find_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prompt.is_none() && self.picker.is_none() {
+        if !self.overlaid() {
             self.ask_name(Ask::Find, window, cx);
         }
     }

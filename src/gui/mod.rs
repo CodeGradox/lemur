@@ -1068,6 +1068,13 @@ impl Lemur {
         cx.notify();
     }
 
+    /// A spotlight, the folder picker or the palette is over the window:
+    /// what would open another over it, or move the keyboard from it,
+    /// waits until it's gone.
+    fn overlaid(&self) -> bool {
+        self.prompt.is_some() || self.picker.is_some() || self.palette.is_some()
+    }
+
     /// Tells the thread on show's program it's no longer shown, unless it's
     /// `next`.
     fn hide_shown(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
@@ -1190,7 +1197,7 @@ impl Lemur {
 
     /// ⌘W: asks whether to close the thread on show.
     fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prompt.is_some() || self.picker.is_some() {
+        if self.overlaid() {
             return;
         }
         // The peek is in front, not the thread on show under it.
@@ -4684,6 +4691,43 @@ mod tests {
 
         cx.simulate_keystrokes("cmd-shift-p escape");
         assert_eq!(open(cx), (false, true, false));
+
+        // A key that would open a spotlight waits until the palette's gone:
+        // it would open under it, and take the keyboard from it.
+        cx.simulate_keystrokes("cmd-shift-p cmd-p");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.palette.is_some() && app.prompt.is_none());
+        });
+    }
+
+    /// Renaming a thread lists no threads to go to: a click on one would
+    /// drop the name typed.
+    #[gpui::test]
+    fn a_rename_lists_no_threads(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("rename-rows");
+        let [a, _b] = ["claude", "claude two"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        assert!(wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.session_of(&key(&a)).is_some())
+        }));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let ask = Ask::Rename {
+                    host: "local".into(),
+                    session: a.clone(),
+                };
+                app.ask_name(ask, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.prompt.is_some()));
+        assert!(cx.debug_bounds("go 0").is_none(), "no threads listed");
+        let_attaches_end(&app, cx);
     }
 
     /// ⌘] and ⌘[ go through the agents in the panel's order, round and

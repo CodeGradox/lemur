@@ -50,7 +50,7 @@ impl Lemur {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.prompt.is_some() || self.picker.is_some() {
+        if self.overlaid() {
             return;
         }
         let Some(active) = self.active.clone() else {

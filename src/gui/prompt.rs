@@ -240,7 +240,9 @@ impl Lemur {
                     .p_1()
                     .child(Input::new(&prompt.input).appearance(false)),
             )
-            .children(self.match_rows(prompt, cx))
+            // A rename or a new worktree's name isn't a thread to go to:
+            // a click on one would drop what's typed.
+            .when(listed, |card| card.children(self.match_rows(prompt, cx)))
             .when_some(prompt.worktree.as_ref(), |card, fields| {
                 card.child(
                     v_flex()
@@ -292,7 +294,7 @@ impl Lemur {
     /// ⌘J: asks for a new Claude thread or shell in the worktree of the one
     /// on show.
     pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prompt.is_some() || self.picker.is_some() {
+        if self.overlaid() {
             return;
         }
         let Some((host, session)) = self.active.clone() else {
