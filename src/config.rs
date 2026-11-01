@@ -252,6 +252,10 @@ pub struct ClaudeThread {
     /// What the sidebar calls it; threads from before had it in `session`.
     #[serde(default)]
     pub label: Option<String>,
+    /// The Linear issue pinned to it, by its key, pinned again when it's
+    /// resumed.
+    #[serde(default)]
+    pub issue: Option<String>,
 }
 
 impl ClaudeThread {
@@ -576,6 +580,9 @@ impl Config {
             ];
             if let Some(label) = &thread.label {
                 fields.push(("label", label));
+            }
+            if let Some(issue) = &thread.issue {
+                fields.push(("issue", issue));
             }
             push_table(doc, "threads", &fields)
         })
@@ -944,6 +951,7 @@ collapsed = true
             path: "/srv/api".into(),
             claude_session: id.into(),
             label: Some("review".into()),
+            issue: (id == "3").then(|| "LAFT-3184".into()),
         };
         let threads = |path: &Path| -> Vec<ClaudeThread> {
             toml::from_str::<Config>(&std::fs::read_to_string(path).unwrap())

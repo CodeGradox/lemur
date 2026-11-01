@@ -14,6 +14,7 @@ mod folder_picker;
 mod goto;
 mod icons;
 pub(crate) mod keys;
+mod linear_panel;
 mod links;
 mod meter;
 mod new;
@@ -57,7 +58,7 @@ use snackbar::Kind;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use terminal_view::{StatusChanged, TerminalView};
+use terminal_view::{Pasted, StatusChanged, TerminalView};
 
 actions!(
     lemur,
@@ -72,6 +73,7 @@ actions!(
         CommandPalette,
         PutAway,
         ToggleChanges,
+        ToggleLinear,
         UpdateCore,
         OpenSettings,
         AddProject,
@@ -140,6 +142,7 @@ const AWAY: u32 = 5;
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Right {
     Notes,
+    Linear,
     Changes,
     Agents,
 }
@@ -257,6 +260,8 @@ struct Lemur {
     agents: Entity<agents::AgentsView>,
     /// The worktree on show's changes, to commit.
     changes_panel: Entity<changes_panel::ChangesPanel>,
+    /// The Linear issue pinned to the thread on show, and issues to pin.
+    linear_panel: Entity<linear_panel::LinearPanel>,
     /// Which of them shows on the right, if any; one at a time.
     right: Option<Right>,
     /// The one that showed last, which ⌘R brings back.
@@ -343,6 +348,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),
                     MenuItem::action("Toggle Right Panel", ToggleRightPanel),
                     MenuItem::action("Toggle Notes", ToggleNotes),
+                    MenuItem::action("Toggle Linear", ToggleLinear),
                     MenuItem::action("Toggle Changes", ToggleChanges),
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::separator(),
@@ -420,6 +426,24 @@ impl Lemur {
         cx.subscribe(
             &changes_panel,
             |this, _, _: &changes_panel::Committed, cx| this.ask_changes(cx),
+        )
+        .detach();
+        // Tests set their own stand-in for Linear first.
+        if cx.try_global::<linear_panel::LinearAccount>().is_none() {
+            linear_panel::init(crate::linear::Linear::new(), cx);
+        }
+        let linear_panel = cx.new(|cx| linear_panel::LinearPanel::new(window, cx));
+        cx.subscribe_in(
+            &linear_panel,
+            window,
+            |this, _, event: &linear_panel::LinearEvent, window, cx| match event {
+                linear_panel::LinearEvent::Pin(key, issue) => {
+                    this.pin_issue(key.clone(), issue.clone(), cx)
+                }
+                linear_panel::LinearEvent::Send(key, text) => {
+                    this.paste_into(key, text, window, cx)
+                }
+            },
         )
         .detach();
         let sidebar_follows = cx.observe_self(|this, cx| {
@@ -573,6 +597,7 @@ impl Lemur {
             notes,
             agents,
             changes_panel,
+            linear_panel,
             right: None,
             right_last: Right::Notes,
             picker: None,
@@ -782,6 +807,7 @@ impl Lemur {
             self.check_core_updates(cx);
         }
         self.keep_claude_ids(cx);
+        self.follow_linear(cx);
         self.notify_news(news, window, cx);
         if let Some((host, session)) = restore.or(instead) {
             self.open(host, session, window, cx);
@@ -909,6 +935,11 @@ impl Lemur {
                 // Its message shows in the window's snackbars.
                 cx.subscribe(&view, |_, _, _: &StatusChanged, cx| cx.notify())
                     .detach();
+                let pasted_in = key.clone();
+                cx.subscribe(&view, move |this, _, Pasted(text): &Pasted, cx| {
+                    this.pasted(&pasted_in, text, cx)
+                })
+                .detach();
                 view
             })
             .clone();
@@ -941,6 +972,7 @@ impl Lemur {
         if self.right == Some(Right::Changes) {
             self.show_changes(cx);
         }
+        self.follow_linear(cx);
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
             self.notes
                 .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
@@ -1129,9 +1161,9 @@ impl Lemur {
         cx.notify();
     }
 
-    /// The notes, the changes and the agents take turns on the right, as
-    /// Herdr's Files and Changes do: showing one hides the other, and
-    /// showing the one that shows hides it.
+    /// The notes, Linear, the changes and the agents take turns on the
+    /// right, as Herdr's Files and Changes do: showing one hides the other,
+    /// and showing the one that shows hides it.
     fn toggle_right(&mut self, which: Right, cx: &mut Context<Self>) {
         if self.right == Some(which) {
             self.right = None;
@@ -1140,6 +1172,9 @@ impl Lemur {
             self.right_last = which;
             if which == Right::Changes {
                 self.show_changes(cx);
+            }
+            if which == Right::Linear {
+                self.follow_linear(cx);
             }
         }
         cx.notify();
@@ -1232,6 +1267,77 @@ impl Lemur {
         });
     }
 
+    /// Points the Linear panel at the thread on show, while it shows.
+    fn follow_linear(&mut self, cx: &mut Context<Self>) {
+        if self.right != Some(Right::Linear) {
+            return;
+        }
+        let thread = self.active.clone().map(|key| {
+            let (label, issue) = match self.session_of(&key) {
+                Some(s) => (s.label.clone(), s.issue.clone()),
+                None => (self.label_of(&key.0, &key.1), None),
+            };
+            (key, label, issue)
+        });
+        self.linear_panel.update(cx, |p, cx| p.show(thread, cx));
+    }
+
+    /// Pins the Linear issue `issue` (its key) to thread `key`, or with
+    /// `None` unpins its issue: shown at once, and herdr-core keeps it.
+    fn pin_issue(&mut self, key: Key, issue: Option<String>, cx: &mut Context<Self>) {
+        if let Some(s) = self.session_mut(&key) {
+            s.issue = issue.clone();
+        }
+        self.changes += 1;
+        self.follow_linear(cx);
+        cx.notify();
+        let cfg = self.cfg.clone();
+        self.in_background(
+            cx,
+            move || actions::set_issue(&cfg, &key.0, &key.1, issue.as_deref()),
+            |this, saved, _, cx| {
+                // Refreshes that started before herdr-core had it are stale too.
+                this.changes += 1;
+                if let Err(e) = saved {
+                    this.fail(e, cx);
+                }
+                this.refresh(cx).detach();
+            },
+        )
+        .detach();
+    }
+
+    /// A link to a Linear issue pasted into a thread pins that issue to
+    /// it, unless it has one.
+    fn pasted(&mut self, key: &Key, text: &str, cx: &mut Context<Self>) {
+        let Some(issue) = crate::linear::issue_in(text) else {
+            return;
+        };
+        if self.session_of(key).is_some_and(|s| s.issue.is_none()) {
+            self.pin_issue(key.clone(), Some(issue), cx);
+        }
+    }
+
+    /// Pastes `text` at thread `key`'s prompt, as if typed there, and gives
+    /// it the keyboard; Enter is left to you.
+    fn paste_into(&mut self, key: &Key, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.terminals.get(key) else {
+            return;
+        };
+        view.read(cx).paste_text(text);
+        view.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    fn session_mut(&mut self, (host, name): &Key) -> Option<&mut Session> {
+        let h = self.snap.hosts.iter_mut().find(|h| &h.name == host)?;
+        h.bases
+            .iter_mut()
+            .flat_map(|b| b.worktrees.iter_mut())
+            .flat_map(|w| w.sessions.iter_mut())
+            .chain(h.other.iter_mut())
+            .find(|s| &s.name == name)
+    }
+
     /// Follows the pointer (`x`) dragging a side panel's edge across the
     /// window (`bounds`).
     fn resize_panel(
@@ -1309,6 +1415,16 @@ impl Lemur {
                     .selected(self.right == Some(Right::Notes))
                     .tooltip("Toggle notes")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_notes(cx))),
+            )
+            .child(
+                Button::new("toggle-linear")
+                    .icon(icons::ticket())
+                    .label("Linear")
+                    .ghost()
+                    .small()
+                    .selected(self.right == Some(Right::Linear))
+                    .tooltip("Toggle Linear")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right(Right::Linear, cx))),
             )
             .child(
                 Button::new("toggle-changes")
@@ -1431,6 +1547,9 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &ToggleChanges, _, cx| this.toggle_right(Right::Changes, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &ToggleLinear, _, cx| this.toggle_right(Right::Linear, cx)),
+            )
             .on_action(cx.listener(|this, _: &UpdateCore, _, cx| this.update_core(cx)))
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
@@ -1544,6 +1663,7 @@ impl Render for Lemur {
                                     Right::Notes => self.notes.clone().into(),
                                     Right::Agents => self.agents.clone().into(),
                                     Right::Changes => self.changes_panel.clone().into(),
+                                    Right::Linear => self.linear_panel.clone().into(),
                                 };
                                 this.child(
                                     div()
@@ -1700,6 +1820,7 @@ mod tests {
                 running: true,
                 helpers: vec![],
                 away: false,
+                issue: None,
             })
             .collect();
         Snapshot {
@@ -3707,6 +3828,140 @@ mod tests {
         open(&app, &clean, cx);
         assert!(!counted(cx), "the main checkout has none");
         let_attaches_end(&app, cx);
+    }
+
+    /// The Linear panel lists your issues, and a click pins one to the
+    /// thread on show: herdr-core keeps it, and the sidebar shows it. Send
+    /// to agent pastes its link at the thread's prompt; Unpin unpins it. A
+    /// link to an issue pasted into a thread with none pins that one.
+    #[gpui::test]
+    fn linear_issues_pin_to_the_thread_on_show(cx: &mut gpui::TestAppContext) {
+        use crate::linear::{Linear, Store};
+        use crate::test_support::FakeLinear;
+        use gpui_kit::ClipboardItem;
+        use serde_json::json;
+        let api = FakeLinear::new(|r| {
+            let issue = json!({
+                "identifier": "LAFT-1",
+                "title": "Fix lease rounding",
+                "url": "https://linear.app/laft/issue/LAFT-1/fix",
+                "branchName": "magnus/laft-1-fix",
+                "priorityLabel": "High",
+                "description": "Round *down*.",
+                "state": { "name": "Todo", "color": "#e2e2e2", "type": "unstarted" },
+                "assignee": { "name": "Magnus" },
+            });
+            let data = if r.body.contains("assignedIssues") {
+                json!({ "viewer": { "assignedIssues": { "nodes": [issue] } } })
+            } else if r.body.contains("issue(id") {
+                json!({ "issue": issue })
+            } else {
+                json!({ "viewer": { "name": "Magnus" }, "organization": { "name": "Laft" } })
+            };
+            (200, json!({ "data": data }).to_string())
+        });
+        let dir = TempDir::new("linear-gui");
+        let linear = Linear::at(&api.url, Store::File(dir.join("tokens")));
+        linear.sign_in_as("a").unwrap();
+        let server = HcServer::new("linear-gui");
+        let t = server.run("/", &["lemur.label=fix"], &["cat"]);
+        cx.update(|cx| super::linear_panel::init(linear, cx));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1400.0), px(800.0)));
+        assert!(wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.session_of(&key(&t)).is_some())
+        }));
+        open(&app, &t, cx);
+        let view = app.read_with(cx, |app, _| app.terminals[&key(&t)].clone());
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.screen_size()).is_some()
+        }));
+        // Hidden, it asks Linear nothing; signed in, Lemur asked who for.
+        let asked = api.requests();
+        assert!(asked.iter().any(|r| r.body.contains("viewer { name }")));
+        assert!(!asked.iter().any(|r| r.body.contains("assignedIssues")));
+        cx.dispatch_action(super::ToggleLinear);
+        let shows = |selector: &'static str, cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(5), || {
+                cx.run_until_parked();
+                cx.debug_bounds(selector).is_some()
+            })
+        };
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        let pinned = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&t)).and_then(|s| s.issue.clone())
+            })
+        };
+        let kept = || {
+            server
+                .core()
+                .terminals()
+                .into_iter()
+                .find(|x| x.address == t)
+                .and_then(|x| x.labels.get(snapshot::ISSUE).cloned())
+        };
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| app.linear_panel.read(cx).shown().cloned())
+        };
+        assert!(shows("issue 0", cx), "your issues");
+        assert_eq!(shown(cx), Some((key(&t), "fix".to_string(), None)));
+        click("issue 0", cx);
+        assert_eq!(pinned(cx).as_deref(), Some("LAFT-1"));
+        assert_eq!(shown(cx).and_then(|s| s.2).as_deref(), Some("LAFT-1"));
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            kept().as_deref() == Some("LAFT-1")
+        }));
+
+        assert!(shows("send to agent", cx), "its card");
+        click("send to agent", cx);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                server
+                    .hc(&["read", &t])
+                    .contains("https://linear.app/laft/issue/LAFT-1/fix")
+            }),
+            "{}",
+            server.hc(&["read", &t])
+        );
+        click("unpin", cx);
+        assert_eq!(pinned(cx), None);
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            kept().is_none()
+        }));
+
+        // Pasted: pinned, but not over one pinned already.
+        let paste = |text: &str, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| app.update(cx, |app, cx| app.focus_terminal(window, cx)));
+            cx.write_to_clipboard(ClipboardItem::new_string(text.into()));
+            cx.simulate_keystrokes("cmd-v");
+            cx.run_until_parked();
+        };
+        paste("see https://linear.app/laft/issue/LAFT-9/rounding", cx);
+        assert_eq!(pinned(cx).as_deref(), Some("LAFT-9"));
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            kept().as_deref() == Some("LAFT-9")
+        }));
+        paste("and https://linear.app/laft/issue/LAFT-10", cx);
+        assert_eq!(pinned(cx).as_deref(), Some("LAFT-9"));
+        paste("no link", cx);
+        assert_eq!(pinned(cx).as_deref(), Some("LAFT-9"));
+        let asked = api.requests();
+        assert!(
+            asked
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some("Bearer a"))
+        );
     }
 
     /// The Changes panel lists the worktree on show's changes, and a click

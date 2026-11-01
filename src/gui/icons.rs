@@ -22,3 +22,8 @@ pub fn monitor() -> Icon {
 pub fn file_diff() -> Icon {
     Icon::empty().data(include_bytes!("icons/file-diff.svg"))
 }
+
+/// A Linear issue.
+pub fn ticket() -> Icon {
+    Icon::empty().data(include_bytes!("icons/ticket.svg"))
+}

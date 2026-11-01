@@ -3644,6 +3644,7 @@ dependencies = [
  "gpui-pre",
  "lsp-types",
  "png 0.18.1",
+ "security-framework",
  "serde",
  "serde_json",
  "toml 1.1.8+spec-1.1.0",

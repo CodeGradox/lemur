@@ -422,6 +422,7 @@ impl Lemur {
         let breathes = self.breathes(s.activity);
         let (dot, tip) = self.activity(&key, s, cx);
         let detail = age(s.idle_secs);
+        let issue = s.issue.clone();
         let muted = cx.theme().muted_foreground;
         // Click opens; a double click (its second click) starts a rename.
         let open = {
@@ -518,6 +519,12 @@ impl Lemur {
             h_flex()
                 .gap_1()
                 .items_center()
+                // The Linear issue pinned to it.
+                .children(
+                    issue
+                        .clone()
+                        .map(|issue| div().text_xs().text_color(muted).child(issue)),
+                )
                 .children(helpers)
                 .child(div().text_xs().text_color(muted).child(detail.clone()))
                 .child(status)

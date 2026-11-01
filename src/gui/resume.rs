@@ -66,6 +66,7 @@ impl Lemur {
                     path: run.path.clone(),
                     claude_session: run.id.clone(),
                     label: Some(s.label.clone()),
+                    issue: s.issue.clone(),
                 })
             })
             .collect();

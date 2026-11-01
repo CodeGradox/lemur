@@ -1,8 +1,9 @@
 //! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font,
-//! scrollback and colors, the language dictation listens for, and whether to show Claude's
-//! plan usage. Changes apply at once in every window and are saved to the
-//! config file.
+//! scrollback and colors, the language dictation listens for, whether to
+//! show Claude's plan usage, and Lemur's Linear sign-in. Changes apply at
+//! once in every window and are saved to the config file.
 
+use super::linear_panel::{self, LinearAccount};
 use super::meter::ClaudeFound;
 use super::sidebar::claude_icon;
 use super::terminal::{Palette, SLOTS, Slot, set_color};
@@ -139,6 +140,7 @@ struct SettingsView {
     focus: FocusHandle,
     _prefs: Subscription,
     _found: Subscription,
+    _linear: Subscription,
     /// herdr-core's versions here and on each machine, once asked.
     core: Option<Result<Versions, String>>,
     /// Updating it, and then what that did, or why it didn't.
@@ -200,6 +202,7 @@ impl SettingsView {
                 cx.notify();
             }),
             _found: cx.observe_global::<ClaudeFound>(|_, cx| cx.notify()),
+            _linear: cx.observe_global::<LinearAccount>(|_, cx| cx.notify()),
             core: None,
             updating: false,
             core_note: None,
@@ -333,6 +336,29 @@ impl Render for SettingsView {
             "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, \
              then turn this on."
         });
+        let (status, error) = linear_panel::settings_status(cx);
+        let (action, act) = linear_panel::settings_action(cx);
+        let linear = SettingItem::new(
+            "Account",
+            SettingField::render(move |_, _, _| {
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().text_sm().child(status.clone()))
+                    .child(
+                        Button::new("linear-account")
+                            .small()
+                            .label(action)
+                            .on_click(move |_, _, cx| act(cx)),
+                    )
+            }),
+        )
+        .description(error.unwrap_or_else(|| {
+            "Lemur signs in with its own Linear app, and only reads: it searches issues and \
+             shows the one pinned to a thread. The sign-in is kept in your Keychain, where \
+             only Lemur can read it."
+                .into()
+        }));
         let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
             SettingPage::new("Appearance").icon(IconName::Sun).group(
                 SettingGroup::new().item(
@@ -390,6 +416,9 @@ impl Render for SettingsView {
                             }
                         }))
                 })),
+            SettingPage::new("Linear")
+                .icon(super::icons::ticket())
+                .group(SettingGroup::new().item(linear)),
         ]);
         let error = Prefs::get(cx).error.clone();
         let danger = cx.theme().danger;

@@ -7,6 +7,7 @@ mod core_update;
 mod dictate;
 mod gui;
 mod hc;
+mod linear;
 mod login_path;
 mod machine;
 mod notes;

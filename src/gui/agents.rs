@@ -121,10 +121,13 @@ impl Lemur {
         let k = key(host, s);
         let shown = self.active.as_ref() == Some(&k);
         let (color, tip) = self.activity(&k, s, cx);
-        let place = match self.project_of(host, &s.name) {
+        let mut place = match self.project_of(host, &s.name) {
             Some((base, w)) => format!("{} · {}", self.cfg.bases[base].name(), worktree_label(w)),
             None => host.to_string(),
         };
+        if let Some(issue) = &s.issue {
+            place = format!("{place} · {issue}");
+        }
         let open = {
             let (host, name) = (host.to_string(), s.name.clone());
             cx.listener(move |this, _: &ClickEvent, window, cx| {

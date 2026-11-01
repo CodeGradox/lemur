@@ -116,6 +116,8 @@ pub struct Session {
     /// Put away: listed after the rest, and out of the sidebar's lists and
     /// the tabs.
     pub away: bool,
+    /// The Linear issue pinned to it, by its key.
+    pub issue: Option<String>,
 }
 
 /// Something a thread runs to help it: one of Claude Code's subagents, as
@@ -168,6 +170,8 @@ pub const ORDER: &str = "lemur.order";
 /// Set on a thread put away: out of the sidebar's lists and the tabs while
 /// it runs, until it needs you or is opened.
 pub const AWAY: &str = "lemur.away";
+/// The Linear issue pinned to a thread, by its key (`LAFT-3184`).
+pub const ISSUE: &str = "lemur.issue";
 
 /// What Claude is doing. `claude agents` lists every running session with
 /// its pid and status; the process tree (`@@ps`) ties each one to the
@@ -555,6 +559,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         running: t.pid.is_some(),
         helpers: vec![],
         away: label(AWAY).is_some(),
+        issue: label(ISSUE).cloned(),
     }
 }
 
@@ -1115,6 +1120,7 @@ mod tests {
             path: path.into(),
             claude_session: "0fdfabeb-ca80-4916-a103-275bbb5e8614".into(),
             label: None,
+            issue: None,
         };
         let auth = "/home/agent/projects/api/.claude/worktrees/auth";
         cfg.threads = vec![

@@ -179,6 +179,107 @@ pub fn fake_dictate(dir: &Path, script: &str) -> PathBuf {
     path
 }
 
+/// A request a `FakeLinear` got.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub path: String,
+    pub authorization: Option<String>,
+    pub body: String,
+}
+
+type Answer = Box<dyn Fn(&Request) -> (u16, String) + Send>;
+
+/// A stand-in for Linear's API on 127.0.0.1: it answers each request as
+/// `answer` says, and keeps them in order. Dropping it stops it.
+pub struct FakeLinear {
+    pub url: String,
+    requests: Arc<std::sync::Mutex<Vec<Request>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FakeLinear {
+    pub fn new(answer: impl Fn(&Request) -> (u16, String) + Send + 'static) -> FakeLinear {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port for Linear");
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(vec![]));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (kept, stopped) = (requests.clone(), stop.clone());
+        let answer: Answer = Box::new(answer);
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Some(request) = serve(stream, &answer) {
+                            kept.lock().unwrap().push(request);
+                        }
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        FakeLinear {
+            url,
+            requests,
+            stop,
+        }
+    }
+
+    /// What it was asked, in order.
+    pub fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for FakeLinear {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reads one HTTP request from `stream` and answers it.
+fn serve(mut stream: std::net::TcpStream, answer: &Answer) -> Option<Request> {
+    use std::io::{Read, Write};
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut data = vec![];
+    let mut buf = [0; 8192];
+    let head_end = loop {
+        if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let n = stream.read(&mut buf).ok().filter(|n| *n > 0)?;
+        data.extend_from_slice(&buf[..n]);
+    };
+    let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
+    let header = |name: &str| {
+        head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+        })
+    };
+    let length: usize = header("content-length")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(0);
+    while data.len() < head_end + length {
+        let n = stream.read(&mut buf).ok().filter(|n| *n > 0)?;
+        data.extend_from_slice(&buf[..n]);
+    }
+    let request = Request {
+        path: head.split(' ').nth(1)?.to_string(),
+        authorization: header("authorization"),
+        body: String::from_utf8_lossy(&data[head_end..head_end + length]).into_owned(),
+    };
+    let (status, body) = answer(&request);
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    Some(request)
+}
+
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.
 pub fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;

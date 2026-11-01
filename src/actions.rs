@@ -2,7 +2,7 @@ use crate::attach::Active;
 use crate::config::{ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
-use crate::snapshot::{AWAY, KIND, LABEL, ORDER, WORKTREE};
+use crate::snapshot::{AWAY, ISSUE, KIND, LABEL, ORDER, WORKTREE};
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
 use std::collections::BTreeMap;
@@ -262,7 +262,7 @@ pub fn start_in(cfg: &Config, host: &str, dir: &str, label: &str, shell: bool) -
     }
     Ok(Started {
         host: host.name.clone(),
-        session: start_thread(host, dir, label, None)?,
+        session: start_thread(host, dir, label, None, None)?,
         claude: None,
     })
 }
@@ -272,7 +272,7 @@ pub fn start_in(cfg: &Config, host: &str, dir: &str, label: &str, shell: bool) -
 fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
     let id = random_uuid();
     let command = format!("{} --session-id {id}", host.claude);
-    let address = start_thread(host, dir, label, Some(&command))?;
+    let address = start_thread(host, dir, label, Some(&command), None)?;
     Ok(Started {
         host: host.name.clone(),
         session: address.clone(),
@@ -282,6 +282,7 @@ fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
             path: dir.to_string(),
             claude_session: id,
             label: Some(label.to_string()),
+            issue: None,
         }),
     })
 }
@@ -289,16 +290,25 @@ fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
 /// Starts a thread labelled `label` in `dir` on `host`: the host's shell,
 /// and with `claude`, the command that starts Claude typed into it, so the
 /// shell has set up PATH first. The terminal's labels file it under `dir`
-/// and give its icon. Returns its address.
-fn start_thread(host: &Host, dir: &str, label: &str, claude: Option<&str>) -> Result<String> {
+/// and give its icon, and pin `issue` to it. Returns its address.
+fn start_thread(
+    host: &Host,
+    dir: &str,
+    label: &str,
+    claude: Option<&str>,
+    issue: Option<&str>,
+) -> Result<String> {
     validate_name(label)?;
     let (core, on) = hc::for_host(host)?;
     let kind = if claude.is_some() { "claude" } else { "shell" };
-    let labels = BTreeMap::from([
+    let mut labels = BTreeMap::from([
         (LABEL.to_string(), label.to_string()),
         (KIND.to_string(), kind.to_string()),
         (WORKTREE.to_string(), dir.to_string()),
     ]);
+    if let Some(issue) = issue {
+        labels.insert(ISSUE.to_string(), issue.to_string());
+    }
     let address = core.run(on.as_deref(), dir, &[], &labels)?;
     if let Some(command) = claude {
         core.type_line(&address, command)?;
@@ -328,7 +338,13 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         .filter(|l| validate_name(l).is_ok())
         .unwrap_or_else(|| "claude".into());
     let resume = format!("{} --resume {}", host.claude, thread.claude_session);
-    start_thread(host, &thread.path, &label, Some(&resume))
+    start_thread(
+        host,
+        &thread.path,
+        &label,
+        Some(&resume),
+        thread.issue.as_deref(),
+    )
 }
 
 /// Records the order threads were dragged into: `lemur.order` 0, 1, 2, …
@@ -336,6 +352,13 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
 pub fn set_away(cfg: &Config, host: &str, session: &str, away: bool) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
     core.label(session, &[(AWAY, if away { "1" } else { "" })])
+}
+
+/// Pins the Linear issue `issue` (its key) to a thread, or with `None`
+/// unpins the one pinned.
+pub fn set_issue(cfg: &Config, host: &str, session: &str, issue: Option<&str>) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(ISSUE, issue.unwrap_or_default())])
 }
 
 pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
@@ -996,7 +1019,12 @@ mod tests {
         assert!(wait_until(Duration::from_secs(5), || !server
             .addresses()
             .contains(&started.session)));
-        let again = resume_thread(&cfg, &claude).unwrap();
+        // Resumed with the Linear issue pinned to it.
+        let pinned = ClaudeThread {
+            issue: Some("LAFT-3184".into()),
+            ..claude.clone()
+        };
+        let again = resume_thread(&cfg, &pinned).unwrap();
         assert_ne!(again, started.session, "a new terminal");
         let resumed = format!("claude color=truecolor --resume {}", claude.claude_session);
         assert!(typed(&again, &resumed), "{resumed} never ran");
@@ -1005,6 +1033,7 @@ mod tests {
         assert_eq!(t.cwd, path);
         assert_eq!(t.labels.get(KIND).map(String::as_str), Some("claude"));
         assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("claude"));
+        assert_eq!(t.labels.get(ISSUE).map(String::as_str), Some("LAFT-3184"));
 
         // Nothing starts where its folder was, or with an ID that isn't one.
         let before = server.addresses().len();

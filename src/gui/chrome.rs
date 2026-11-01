@@ -207,6 +207,12 @@ impl Lemur {
             .on_click(open)
             .child(thread_icon(s).small())
             .child(div().max_w(px(200.0)).truncate().child(s.label.clone()))
+            .children(s.issue.clone().map(|issue| {
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(issue)
+            }))
             .child(status_dot(&key, dot, breathes, tip))
             .child(close);
         rows::draggable_tab(tab, drag, i, s.label.clone().into(), reorder, cx)

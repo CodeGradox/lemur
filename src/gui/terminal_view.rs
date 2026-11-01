@@ -102,6 +102,11 @@ pub struct StatusChanged;
 
 impl EventEmitter<StatusChanged> for TerminalView {}
 
+/// Text pasted with ⌘V, as it was on the clipboard.
+pub struct Pasted(pub String);
+
+impl EventEmitter<Pasted> for TerminalView {}
+
 /// The colors and cell size the terminal shows in, as the core answers
 /// programs that ask (a theme picks light or dark by the background).
 /// Compared each frame, so it's only sent when it changes.
@@ -538,6 +543,7 @@ impl TerminalView {
             self.upload(vec![], image, cx);
         } else if let Some(text) = text {
             self.paste_text(&text);
+            cx.emit(Pasted(text));
         }
     }
 
