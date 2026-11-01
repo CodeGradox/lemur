@@ -167,6 +167,18 @@ fn latest_in(json: &str) -> Result<String> {
 
 /// Updates each of `targets` in turn, this Mac first: what it did.
 pub fn update(targets: &[Target], cores: &Cores) -> Result<String> {
+    // One at a time: Settings' Update and the menu's each start one.
+    static UPDATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    struct Updating;
+    impl Drop for Updating {
+        fn drop(&mut self) {
+            UPDATING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    if UPDATING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        bail!("herdr-core is being updated already");
+    }
+    let _updating = Updating;
     let mut done = vec![];
     for target in targets {
         let (args, what): (Vec<&str>, String) = match target {
