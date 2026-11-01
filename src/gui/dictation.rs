@@ -75,7 +75,7 @@ impl Lemur {
         // The text stays until it has somewhere to go.
         if view.read(cx).exited() {
             self.note(
-                "This thread is disconnected; click it to reconnect".into(),
+                "This thread is disconnected; it reconnects on its own, or click it".into(),
                 cx,
             );
             return;

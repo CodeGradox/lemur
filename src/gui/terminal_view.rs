@@ -29,6 +29,9 @@ use std::time::Instant;
 /// Key context for terminal-only key bindings.
 pub const CONTEXT: &str = "Terminal";
 
+/// The least time between attaching again on its own after a drop.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Where this view is with its terminal's byte stream.
 enum Attachment {
     Attaching,
@@ -70,6 +73,12 @@ pub struct TerminalView {
     told_focus: Option<bool>,
     /// Shown in the window's snackbars while this terminal is.
     status: Option<(String, Kind)>,
+    /// The stream dropped while its program may still run: the line to its
+    /// host or to herdr-core went, or herdr-core is restarting a kept
+    /// program. Lemur attaches again once the terminal runs (`reconnect`).
+    lost: bool,
+    /// When it last tried to attach.
+    tried: Option<Instant>,
     _reader: Option<Task<()>>,
     /// Shows a synchronized update that never said it was done.
     _sync: Option<Task<()>>,
@@ -128,6 +137,8 @@ impl TerminalView {
             told_display: None,
             told_focus: None,
             status: None,
+            lost: false,
+            tried: None,
             _reader: None,
             _sync: None,
             _prefs: cx.observe_global::<Prefs>(|this, cx| {
@@ -184,15 +195,32 @@ impl TerminalView {
         })
     }
 
+    /// Whether its stream dropped while its program may still run.
+    pub fn disconnected(&self) -> bool {
+        self.lost && matches!(self.attachment, Attachment::Ended)
+    }
+
+    /// Attaches again after the stream dropped, as Herdr does, once its
+    /// terminal runs again; at most every `RETRY`, while attaching fails.
+    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.disconnected() && self.tried.is_none_or(|t| t.elapsed() >= RETRY) {
+            self.connect(cx);
+        }
+    }
+
     /// (Re)attaches to this session's terminal, e.g. after the line to its
     /// host dropped. The core paints its screen and scrollback first.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         self.detach();
         self.screen = Some(Screen::new(self.cell));
         self.attachment = Attachment::Attaching;
+        self.tried = Some(Instant::now());
         self.told_display = None;
         self.told_focus = None;
-        self.set_status(None, cx);
+        // Reconnecting, it still says so until it's back.
+        if !self.lost {
+            self.set_status(None, cx);
+        }
         let (host, session) = (self.host.clone(), self.session.clone());
         let (cols, lines) = (self.cell.cols, self.cell.lines);
         let display = self.display(cx);
@@ -217,8 +245,10 @@ impl TerminalView {
                 }
                 Err(e) => {
                     this.update(cx, |this, cx| {
+                        // Tried again once the terminal runs.
                         this.attachment = Attachment::Ended;
-                        let error = format!("{e:#}");
+                        this.lost = true;
+                        let error = format!("{e:#} · trying again");
                         this.set_status(Some((error, Kind::Error)), cx);
                         cx.notify();
                     })
@@ -253,6 +283,9 @@ impl TerminalView {
         // goes by a viewer's size only once the viewer says something.
         core.resize(channel, self.cell.cols, self.cell.lines);
         self.attachment = Attachment::Attached(core, channel);
+        if std::mem::take(&mut self.lost) {
+            self.set_status(None, cx);
+        }
         cx.notify();
     }
 
@@ -308,7 +341,8 @@ impl TerminalView {
         }
         if !open {
             self.attachment = Attachment::Ended;
-            let note = (!over).then(|| ("disconnected · click to reconnect".into(), Kind::Warning));
+            self.lost = !over;
+            let note = (!over).then(|| ("disconnected · reconnecting…".into(), Kind::Warning));
             self.set_status(note, cx);
         }
         cx.notify();

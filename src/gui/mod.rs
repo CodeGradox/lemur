@@ -487,6 +487,21 @@ impl Lemur {
         }
     }
 
+    /// Attaches again each terminal whose stream dropped, once its program
+    /// runs again, as Herdr does: after the line to its host or to
+    /// herdr-core comes back, or a kept program's new shell starts.
+    fn reconnect_terminals(&self, cx: &mut Context<Self>) {
+        let running: HashSet<Key> = sessions(&self.snap)
+            .filter(|(_, s)| s.running)
+            .map(|(h, s)| key(h, s))
+            .collect();
+        for (k, view) in &self.terminals {
+            if running.contains(k) && view.read(cx).disconnected() {
+                view.update(cx, |v, cx| v.reconnect(cx));
+            }
+        }
+    }
+
     /// Runs `work` off the main thread, then `then` with its result on the
     /// main window; that's skipped if the window has closed.
     fn in_background<R: Send + 'static>(
@@ -581,8 +596,18 @@ impl Lemur {
             !now.contains_key(k) && *left > 0
         });
         // Forget terminals whose session is gone (killed, or ended elsewhere).
+        // A host that couldn't be reached keeps its own: they aren't known
+        // to be gone, and reattach once it's back.
         let fresh = &self.fresh;
-        let live = |k: &Key| now.contains_key(k) || fresh.contains_key(k);
+        let unreached: HashSet<&str> = snap
+            .hosts
+            .iter()
+            .filter(|h| h.error.is_some())
+            .map(|h| h.name.as_str())
+            .collect();
+        let live = |k: &Key| {
+            now.contains_key(k) || fresh.contains_key(k) || unreached.contains(k.0.as_str())
+        };
         self.terminals.retain(|k, _| live(k));
         // The thread on show ended: another takes its place.
         let mut instead = None;
@@ -620,6 +645,7 @@ impl Lemur {
             self.close_popup(&k, cx);
         }
         self.snap = snap;
+        self.reconnect_terminals(cx);
         self.note_claude(cx);
         self.follow_loads();
         // With the hosts known, the meter can ask now, not at its next tick.
@@ -1373,6 +1399,7 @@ mod tests {
                 started: 0,
                 claude: None,
                 busy: false,
+                running: true,
             })
             .collect();
         Snapshot {
@@ -3357,6 +3384,96 @@ mod tests {
         refresh(cx);
         assert_eq!(shown(cx), Some(key(&c)));
         assert!(focused(cx), "the neighbour has the keyboard");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A terminal whose stream dropped while its program may still run
+    /// attaches again on its own once the program runs, as Herdr's do: here
+    /// a kept terminal's shell dies by a signal and herdr-core starts a new
+    /// one, as a host's terminals come back with its line. No click.
+    #[gpui::test]
+    fn a_dropped_terminal_reattaches_on_its_own(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("reattach");
+        let a = server.run("/", &["lemur.label=a"], &["sh"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        let view = app.read_with(cx, |app, _| app.terminals[&key(&a)].clone());
+        let attached = |cx: &mut VisualTestContext| view.read_with(cx, |v, _| v.is_attached());
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            attached(cx)
+        }));
+
+        let pid = server
+            .core()
+            .terminals()
+            .into_iter()
+            .find(|t| t.address == a)
+            .and_then(|t| t.pid)
+            .expect("its shell's pid");
+        let killed = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                view.read_with(cx, |v, _| v.disconnected())
+            }),
+            "its stream dropped"
+        );
+        let back = wait_until(Duration::from_secs(20), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            attached(cx)
+        });
+        assert!(back, "attached again on its own");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active.clone()),
+            Some(key(&a))
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.status().is_none()),
+            "and says nothing"
+        );
+        let_attaches_end(&app, cx);
+    }
+
+    /// While a host can't be reached, the thread on show stays, terminal
+    /// and all: its threads aren't known to be gone. Reached again without
+    /// it, it goes.
+    #[gpui::test]
+    fn an_unreached_host_keeps_its_terminals(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("unreached");
+        let a = server.run("/", &["lemur.label=a"], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                (app.active.clone(), app.terminals.contains_key(&key(&a)))
+            })
+        };
+        assert_eq!(shown(cx), (Some(key(&a)), true));
+
+        let mut unreached = app.read_with(cx, |app, _| app.snap.clone());
+        unreached.hosts[0].error = Some("the line dropped".into());
+        unreached.hosts[0].other.clear();
+        unreached.hosts[0].bases.clear();
+        cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(unreached, window, cx)));
+        assert_eq!(shown(cx), (Some(key(&a)), true));
+
+        server.hc(&["keep", &a, "--off"]);
+        server.hc(&["kill", &a]);
+        let gone = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            shown(cx) == (None, false)
+        });
+        assert!(gone, "{:?}", shown(cx));
         let_attaches_end(&app, cx);
     }
 

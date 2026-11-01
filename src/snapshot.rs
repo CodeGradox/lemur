@@ -107,6 +107,9 @@ pub struct Session {
     /// Something other than its shell at its prompt runs in it, as Claude
     /// or a server, or herdr-core hasn't said what does yet.
     pub busy: bool,
+    /// Its program runs: herdr-core knows its pid. A kept terminal whose
+    /// program was lost has none until its new shell starts.
+    pub running: bool,
 }
 
 /// A Claude conversation running in a session: its ID, and the folder it
@@ -465,6 +468,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         started: t.created_ms,
         claude: None,
         busy: busy(t),
+        running: t.pid.is_some(),
     }
 }
 
