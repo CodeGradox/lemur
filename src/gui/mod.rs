@@ -245,6 +245,10 @@ struct Lemur {
     /// The agents in the order ⌘] and ⌘[ go through them, from the first
     /// press on.
     agent_walk: Vec<Key>,
+    /// Lists whose dragged order is being written to herdr-core, a label at
+    /// a time, and the order dragged meanwhile, written next. Snapshots
+    /// meanwhile would show it half written: they're dropped.
+    ordering: HashMap<List, Option<Vec<String>>>,
     /// The tabs' and the peek card's dots, by where and whose.
     dots: std::cell::RefCell<HashMap<(&'static str, Key), Entity<sidebar::DotView>>>,
     /// Shown in a snackbar over the terminal.
@@ -626,6 +630,7 @@ impl Lemur {
             seen: HashMap::new(),
             agent_walk: vec![],
             dots: Default::default(),
+            ordering: HashMap::new(),
             status: None,
             restore,
             window: window.window_handle(),
@@ -737,7 +742,7 @@ impl Lemur {
                 (data, snap)
             },
             move |this, (data, snap), window, cx| {
-                if this.changes == changes {
+                if this.changes == changes && this.ordering.is_empty() {
                     this.data = data;
                     this.set_snapshot(snap, window, cx)
                 }
@@ -757,7 +762,7 @@ impl Lemur {
             cx,
             move || snapshot::compose(&cfg, &data),
             move |this, snap, window, cx| {
-                if this.changes == changes {
+                if this.changes == changes && this.ordering.is_empty() {
                     this.set_snapshot(snap, window, cx)
                 }
             },
@@ -1174,18 +1179,38 @@ impl Lemur {
         let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
         self.changes += 1;
         cx.notify();
+        match self.ordering.get_mut(&list) {
+            // One order at a time, the latest next: two written at once
+            // would interleave their labels.
+            Some(next) => *next = Some(names),
+            None => {
+                self.ordering.insert(list.clone(), None);
+                self.write_order(list, names, cx);
+            }
+        }
+    }
+
+    /// Writes the order dragged into `list` to herdr-core, a label a
+    /// thread, then the one dragged meanwhile, if any.
+    fn write_order(&mut self, list: List, names: Vec<String>, cx: &mut Context<Self>) {
         let cfg = self.cfg.clone();
-        let host = list.0;
+        let host = list.0.clone();
         self.in_background(
             cx,
             move || actions::set_order(&cfg, &host, &names),
-            |this, saved, _, cx| {
+            move |this, saved, _, cx| {
                 // Refreshes that started before herdr-core had the order are stale too.
                 this.changes += 1;
                 if let Err(e) = saved {
                     this.fail(e, cx);
                 }
-                this.refresh(cx).detach();
+                match this.ordering.get_mut(&list).and_then(Option::take) {
+                    Some(next) => this.write_order(list, next, cx),
+                    None => {
+                        this.ordering.remove(&list);
+                        this.refresh(cx).detach();
+                    }
+                }
             },
         )
         .detach();
@@ -2079,6 +2104,39 @@ mod tests {
             [b.as_str(), &c, &a],
             "the refresh after the move agrees"
         );
+    }
+
+    /// Two drags in a row are written one after the other: herdr-core keeps
+    /// the second's order, not a mix of the two.
+    #[gpui::test]
+    fn two_drags_in_a_row_keep_the_second(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("drag-twice");
+        let t: Vec<String> = (0..8)
+            .map(|_| server.run("/", &[], &["sleep", "600"]))
+            .collect();
+        let (app, cx) = rooted(server.config(), cx);
+        cx.run_until_parked();
+        let list: super::List = ("local".into(), None);
+        app.update(cx, |app, cx| {
+            app.reorder(list.clone(), 0, 7, cx);
+            app.reorder(list.clone(), 0, 7, cx);
+        });
+        let mut expected = t.clone();
+        expected.rotate_left(2);
+        let kept = |cfg: &Config| -> Vec<String> {
+            snapshot::fetch(cfg).hosts[0]
+                .other
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        let cfg = server.config();
+        let written = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.ordering.is_empty())
+        });
+        assert!(written);
+        assert_eq!(kept(&cfg), expected);
     }
 
     /// Dropping a tab on another moves it to that one's place, and its
