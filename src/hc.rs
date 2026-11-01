@@ -298,9 +298,18 @@ pub struct Core {
     lost: Arc<AtomicBool>,
     next_id: AtomicU64,
     child: Mutex<Child>,
-    /// The core's name for each host, by lemur's.
-    machines: Mutex<HashMap<String, String>>,
+    /// What the core said of each host, by lemur's name: its machine's
+    /// name, or why it couldn't add it, and when. Each host has a lock of
+    /// its own, so one being dialled (an offline host takes some 20 s)
+    /// doesn't hold up the others.
+    machines: Mutex<HashMap<String, Arc<Mutex<Option<Machine>>>>>,
 }
+
+type Machine = std::result::Result<String, (std::time::Instant, String)>;
+
+/// How long a host the core couldn't add isn't asked again: each refresh
+/// would dial it again.
+const MACHINE_RETRY: Duration = Duration::from_secs(30);
 
 fn encode(channel: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + payload.len());
@@ -555,11 +564,30 @@ impl Core {
     /// The core's name for `host`, which it reaches over SSH; it learns
     /// the host the first time.
     pub fn machine(&self, host: &Host) -> Result<String> {
-        // Held throughout, so two threads asking at once add a host once.
-        let mut known = self.machines.lock().unwrap();
-        if let Some(name) = known.get(&host.name) {
-            return Ok(name.clone());
+        let entry = self
+            .machines
+            .lock()
+            .unwrap()
+            .entry(host.name.clone())
+            .or_default()
+            .clone();
+        // Held while asking, so two threads asking at once add a host once.
+        let mut known = entry.lock().unwrap();
+        match &*known {
+            Some(Ok(name)) => return Ok(name.clone()),
+            Some(Err((at, why))) if at.elapsed() < MACHINE_RETRY => bail!("{why}"),
+            _ => {}
         }
+        let found = self.find_machine(host);
+        *known = Some(match &found {
+            Ok(name) => Ok(name.clone()),
+            Err(e) => Err((std::time::Instant::now(), format!("{e:#}"))),
+        });
+        found
+    }
+
+    /// Finds the core's machine for `host`, or adds it.
+    fn find_machine(&self, host: &Host) -> Result<String> {
         let list = self.call("machine.list", json!({}))?;
         let machines = list["machines"].as_array().cloned().unwrap_or_default();
         let wanted = machine_name(&host.name);
@@ -604,7 +632,6 @@ impl Core {
                 added["name"].as_str().unwrap_or(&wanted).to_string()
             }
         };
-        known.insert(host.name.clone(), name.clone());
         Ok(name)
     }
 
@@ -977,6 +1004,12 @@ mod tests {
         other.hc_session = Some("another".into());
         let e = core.machine(&other).unwrap_err();
         assert!(format!("{e:#}").contains("machine box reaches"), "{e:#}");
+
+        // Kept a while, so each refresh doesn't ask, or dial, again.
+        let kept = core.machines.lock().unwrap()["box"].clone();
+        assert!(matches!(&*kept.lock().unwrap(), Some(Err(_))));
+        let again = core.machine(&other).unwrap_err();
+        assert_eq!(format!("{again:#}"), format!("{e:#}"));
     }
 
     /// A `herdr-core connect` that fails the handshake is ended and reaped,
