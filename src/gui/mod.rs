@@ -1091,8 +1091,19 @@ impl Lemur {
         view
     }
 
+    /// Shows a thread with the keyboard, unless something's over the window,
+    /// as when it took a while to start or a popup's Show was clicked: that
+    /// keeps it, and hands it over once it's gone.
     fn open(&mut self, host: String, session: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_thread(host, session, true, window, cx);
+        if self
+            .peek
+            .as_ref()
+            .is_some_and(|k| k.0 == host && k.1 == session)
+        {
+            self.peek = None;
+        }
+        let focus = !self.overlaid();
+        self.show_thread(host, session, focus, window, cx);
     }
 
     /// Shows a thread, and with `focus` gives it the keyboard.
@@ -5886,6 +5897,49 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert!(server.addresses().contains(&a), "a still runs");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A thread that lands under a spotlight, as one that took a while to
+    /// start, or a popup's Show, shows under it. The spotlight keeps the
+    /// keyboard, and hands it to that thread once it's gone.
+    #[gpui::test]
+    fn a_thread_opened_under_a_spotlight_leaves_it_the_keyboard(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("open-under");
+        let [a, b] =
+            ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-p");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_fresh("local".into(), b.clone(), window, cx)
+            })
+        });
+        cx.run_until_parked();
+        let b_has_it = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let view = app.read(cx).terminals[&key(&b)].clone();
+                gpui_kit::Focusable::focus_handle(view.read(cx), cx).is_focused(window)
+            })
+        };
+        app.read_with(cx, |app, _| assert_eq!(app.active, Some(key(&b))));
+        assert!(!b_has_it(cx), "the spotlight keeps the keyboard");
+        cx.simulate_keystrokes("x");
+        let typed = app.read_with(cx, |app, cx| {
+            app.prompt
+                .as_ref()
+                .map(|p| p.input.read(cx).value().to_string())
+        });
+        assert_eq!(typed.as_deref(), Some("x"));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
+        assert!(b_has_it(cx), "handed over once it's gone");
         let_attaches_end(&app, cx);
     }
 
