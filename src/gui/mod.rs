@@ -6138,6 +6138,55 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// The diff over the window goes as soon as the panel moves to another
+    /// worktree, not once that answers, which on a hung host could take
+    /// minutes with keys going nowhere. With no diff, none opens.
+    #[gpui::test]
+    fn a_diff_over_the_window_goes_with_its_worktree(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("preview-moves");
+        let dir = TempDir::new("preview-moves");
+        let (api, web) = (repo_at(&dir.join("api")), repo_at(&dir.join("web")));
+        std::fs::write(dir.join("api/new.txt"), "one\n").unwrap();
+        let a = server.run(&api, &["lemur.label=a"], &["sleep", "600"]);
+        let mut cfg = server.config();
+        cfg.bases = vec![Base::new("local", &api), Base::new("local", &web)];
+        let host = cfg.hosts[0].clone();
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        open(&app, &a, cx);
+        cx.dispatch_action(super::ToggleChanges);
+        let previewing =
+            |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.diff_preview.is_some());
+        let listed = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            cx.debug_bounds("change 0").is_some()
+        });
+        assert!(listed);
+
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_diff_preview(window, cx)));
+        assert!(!previewing(cx), "no diff shows yet");
+
+        let at = cx.debug_bounds("change 0").unwrap().center();
+        cx.simulate_click(at, Modifiers::none());
+        let shown = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            cx.debug_bounds("changes-preview").is_some()
+        });
+        assert!(shown);
+        let at = cx.debug_bounds("changes-preview").unwrap().center();
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+        assert!(previewing(cx));
+
+        let panel = app.read_with(cx, |app, _| app.changes_panel.clone());
+        panel.update(cx, |p, cx| p.show(host, web.clone(), "web".into(), cx));
+        // Nothing has run in the background yet.
+        assert!(!previewing(cx), "it goes at once");
+        cx.run_until_parked();
+        let_attaches_end(&app, cx);
+    }
+
     /// A repository at `path`, with one commit.
     fn repo_at(path: &std::path::Path) -> String {
         std::fs::create_dir(path).unwrap();

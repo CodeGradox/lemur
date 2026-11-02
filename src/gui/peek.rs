@@ -39,6 +39,9 @@ fn over_window(card: Div, close: impl Fn(&mut Window, &mut App) + 'static) -> Di
 impl Lemur {
     /// Shows the Changes panel's diff over the window.
     pub(super) fn open_diff_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changes_panel.read(cx).shown_diff().is_none() {
+            return;
+        }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.diff_preview = Some(DiffPreview {

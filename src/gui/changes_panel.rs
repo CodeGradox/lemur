@@ -126,6 +126,8 @@ impl ChangesPanel {
             self.lines.clear();
             self.error = None;
             self.note = None;
+            // A diff over the window goes now, not once this is asked.
+            cx.notify();
         }
         self.place = Some((host, path, label));
         self.refresh(cx);
@@ -209,6 +211,8 @@ impl ChangesPanel {
                     Err(e) => {
                         this.error = Some(e);
                         this.files.clear();
+                        this.open = None;
+                        this.lines.clear();
                     }
                 }
                 // Still the file shown: it may have been hidden meanwhile.
