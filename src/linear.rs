@@ -403,6 +403,13 @@ impl Linear {
                 Ok(access)
             }
             Err(e) if e.downcast_ref::<Refused>().is_some() => {
+                // Another Lemur may have just used the same refresh token,
+                // and kept what it got for it, which forgetting would delete.
+                if let Some(stored) = self.stored_since(&tokens) {
+                    let access = stored.access.clone();
+                    *kept = Some(Some(stored));
+                    return Ok(access);
+                }
                 self.forget(&mut kept)?;
                 Err(SignedOut.into())
             }
@@ -1220,6 +1227,33 @@ mod tests {
             .filter(|r| r.path == "/oauth/token")
             .count();
         assert_eq!(refreshed, 1);
+    }
+
+    /// Two Lemurs refreshing at once: the one Linear refuses takes what the
+    /// other kept, rather than deleting it and signing out.
+    #[test]
+    fn a_refresh_lost_to_another_lemur_takes_its_tokens() {
+        let dir = TempDir::new("linear-race");
+        let file = dir.join("tokens");
+        let winner = Store::File(file.clone());
+        let api = FakeLinear::new(move |r| match r.path.as_str() {
+            "/oauth/token" => {
+                // The other Lemur got there first.
+                winner.save(&tokens("a2", "r2", now() + 86399)).unwrap();
+                (400, json!({ "error": "invalid_grant" }).to_string())
+            }
+            _ if r.authorization.as_deref() == Some("Bearer a2") => (
+                200,
+                json!({ "data": { "issue": issue_json("LAFT-1", "One") } }).to_string(),
+            ),
+            _ => (401, json!({ "errors": [{ "message": "no" }] }).to_string()),
+        });
+        let store = Store::File(file.clone());
+        store.save(&tokens("a1", "r1", now() + 10)).unwrap();
+        let linear = Linear::at(&api.url, store);
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        assert!(linear.signed_in().unwrap());
+        assert!(file.exists(), "what the other kept stays");
     }
 
     /// Search asks Linear's search, or for the issue when the term is its
