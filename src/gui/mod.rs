@@ -3749,6 +3749,11 @@ mod tests {
         drag("worktree-0", "worktree-2", cx);
         assert_eq!(names(cx), ["a", "b", "main"]);
 
+        // What a thread changing brings, before any refresh.
+        app.update(cx, |app, cx| app.recompose(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(names(cx), ["a", "b", "main"]);
+
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert_eq!(

@@ -243,11 +243,29 @@ pub struct HostData {
 }
 
 impl HostData {
+    /// Puts project `index`'s worktrees in the order dragged, as the next
+    /// refresh would: a recompose builds from this.
+    pub fn sort_worktrees(&mut self, index: usize, order: &[String]) {
+        for b in self.bases.iter_mut().filter(|b| b.index == index) {
+            sort_worktrees(b, order);
+        }
+    }
+
     /// Renumbers its projects' views as the config's bases move, dropping
     /// those `renumber` says are gone: they point into the bases by index.
     pub fn renumber_bases(&mut self, renumber: impl Fn(usize) -> Option<usize>) {
         renumber_views(&mut self.bases, renumber);
     }
+}
+
+/// Puts a project's worktrees in `order`; those not in it follow as they are.
+fn sort_worktrees(b: &mut BaseView, order: &[String]) {
+    b.worktrees.sort_by_key(|w| {
+        order
+            .iter()
+            .position(|p| *p == w.path)
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// Renumbers projects' views as the config's bases move, dropping those
@@ -507,13 +525,7 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
     }
     // Worktrees dragged into an order keep it; others follow in git's.
     for b in &mut bases {
-        let order = &cfg.bases[b.index].worktree_order;
-        b.worktrees.sort_by_key(|w| {
-            order
-                .iter()
-                .position(|p| *p == w.path)
-                .unwrap_or(usize::MAX)
-        });
+        sort_worktrees(b, &cfg.bases[b.index].worktree_order);
     }
     HostData {
         name: host.name.clone(),

@@ -203,8 +203,11 @@ impl Lemur {
         if !move_item(&mut view.worktrees, from, to) {
             return;
         }
-        self.cfg.bases[index].worktree_order =
-            view.worktrees.iter().map(|w| w.path.clone()).collect();
+        let order: Vec<String> = view.worktrees.iter().map(|w| w.path.clone()).collect();
+        for data in &mut self.data {
+            data.sort_worktrees(index, &order);
+        }
+        self.cfg.bases[index].worktree_order = order;
         // A refresh already under way sorts by the old order.
         self.changes += 1;
         self.save_look(index, cx);
