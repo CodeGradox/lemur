@@ -1048,12 +1048,21 @@ pub fn machine_name(name: &str) -> String {
 /// The core that runs `host`'s terminals, and its name for the host: None
 /// for this Mac.
 pub fn for_host(host: &Host) -> Result<(Arc<Core>, Option<String>)> {
+    let core = core_of(host)?;
     if host.ssh == "local" {
-        return Ok((core(host.hc_session.as_deref())?, None));
+        return Ok((core, None));
     }
-    let core = core(machines_session(host).as_deref())?;
     let machine = core.machine(host)?;
     Ok((core, Some(machine)))
+}
+
+/// The core that runs `host`'s terminals, without dialing the host.
+pub fn core_of(host: &Host) -> Result<Arc<Core>> {
+    if host.ssh == "local" {
+        core(host.hc_session.as_deref())
+    } else {
+        core(machines_session(host).as_deref())
+    }
 }
 
 /// The session of the core on this Mac that reaches the other hosts, as

@@ -604,9 +604,9 @@ impl Lemur {
                     cx.background_executor().timer(REFRESH).await;
                     continue;
                 }
-                // Each core's changes, then word that it's lost; with a host
+                // Each core's changes, then word that it's lost; with a core
                 // not reached, word to look again in a while. Watching again
-                // connects to them, while the other cores' changes go on.
+                // connects to it.
                 let mut streams: Vec<futures::stream::LocalBoxStream<'static, bool>> = cores
                     .iter()
                     .map(|c| {
@@ -625,6 +625,11 @@ impl Lemur {
                     streams.push(futures::stream::once(again).boxed_local());
                 }
                 let mut changes = futures::stream::select_all(streams);
+                // What changed while nothing watched.
+                let Ok(recomposed) = this.update(cx, |this, cx| this.recompose(cx)) else {
+                    return;
+                };
+                recomposed.await;
                 while let Some(true) = changes.next().await {
                     // A burst of changes makes one new snapshot.
                     cx.background_executor().timer(BURST).await;
@@ -2106,8 +2111,10 @@ fn watched(cfg: &Config) -> (Vec<std::sync::Arc<hc::Core>>, bool) {
     let mut cores: Vec<std::sync::Arc<hc::Core>> = vec![];
     let mut all = true;
     for host in &cfg.hosts {
-        match hc::for_host(host) {
-            Ok((core, _)) => {
+        // Not dialing the host: its core tells of it once it's reached, and
+        // one being dialled would hold up the others' changes.
+        match hc::core_of(host) {
+            Ok(core) => {
                 if !cores.iter().any(|c| std::sync::Arc::ptr_eq(c, &core)) {
                     cores.push(core);
                 }
@@ -6199,6 +6206,21 @@ mod tests {
         assert!(!previewing(cx), "it goes at once");
         cx.run_until_parked();
         let_attaches_end(&app, cx);
+    }
+
+    /// Watching a core doesn't dial its hosts: a host down, or not added
+    /// yet, doesn't drop what's watched to look for it again.
+    #[gpui::test]
+    fn watching_doesnt_wait_for_a_host(_cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("watch-down");
+        let mut cfg = server.config();
+        cfg.hosts.push(Host::new("down-box", "me@down-box"));
+        crate::hc::set_test_route("down-box", &server.session);
+        // What a host that can't be added leaves.
+        server.core().needed_you("down-box");
+        let (cores, all) = super::watched(&cfg);
+        assert_eq!(cores.len(), 1, "the one core");
+        assert!(all, "none to look for again");
     }
 
     /// A repository at `path`, with one commit.
