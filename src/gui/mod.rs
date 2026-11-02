@@ -98,6 +98,9 @@ actions!(
 #[action(namespace = lemur, no_json)]
 pub struct GoToTab(usize);
 
+/// How many tabs have a key, and a number to show for it.
+const NUMBERED_TABS: usize = 9;
+
 /// lemur's keys; menus show them next to their items.
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -130,7 +133,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
         KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
     ]);
-    cx.bind_keys((1..=9).map(|n| KeyBinding::new(&format!("cmd-{n}"), GoToTab(n - 1), None)));
+    cx.bind_keys(
+        (1..=NUMBERED_TABS).map(|n| KeyBinding::new(&format!("cmd-{n}"), GoToTab(n - 1), None)),
+    );
     dictation::bind_keys(cx);
     folder_picker::bind_keys(cx);
     notes::bind_keys(cx);
@@ -4171,6 +4176,38 @@ mod tests {
         }));
         cx.simulate_keystrokes("cmd-9");
         assert_eq!(shown(cx), tabs[4], "no ninth tab now");
+        let_attaches_end(&app, cx);
+    }
+
+    /// The first nine tabs show the number ⌘ goes to them with; a tenth has
+    /// no key, so no number.
+    #[gpui::test]
+    fn the_tabs_show_their_numbers(cx: &mut gpui::TestAppContext) {
+        assert_eq!(super::chrome::tab_number(0).as_deref(), Some("1"));
+        assert_eq!(super::chrome::tab_number(8).as_deref(), Some("9"));
+        assert_eq!(super::chrome::tab_number(9), None);
+
+        let server = HcServer::new("tab-numbers");
+        let threads: [String; 10] =
+            std::array::from_fn(|_| server.run("/", &[], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(3000.0), px(600.0)));
+        cx.run_until_parked();
+        open(&app, &threads[0], cx);
+        cx.run_until_parked();
+        let bounds = |name: String, cx: &mut VisualTestContext| {
+            cx.debug_bounds(Box::leak(name.into_boxed_str()))
+        };
+        for i in 0..9 {
+            let tab = bounds(format!("tab-{i}"), cx).expect("a tab");
+            let number = bounds(format!("tab-number-{i}"), cx).expect("its number");
+            assert!(
+                tab.contains(&number.center()),
+                "tab {i}: {tab:?} {number:?}"
+            );
+        }
+        assert!(bounds("tab-9".into(), cx).is_some());
+        assert!(bounds("tab-number-9".into(), cx).is_none());
         let_attaches_end(&app, cx);
     }
 

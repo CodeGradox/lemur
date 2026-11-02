@@ -5,7 +5,9 @@
 use super::settings::Prefs;
 use super::sidebar::thread_icon;
 use super::terminal::Palette;
-use super::{Ask, CloseThread, Key, Lemur, List, NewTerminal, icons, rows, sessions};
+use super::{
+    Ask, CloseThread, Key, Lemur, List, NUMBERED_TABS, NewTerminal, icons, rows, sessions,
+};
 use crate::machine::{self, Load};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -19,6 +21,12 @@ use std::rc::Rc;
 /// The status bar's height, and the terminal header's.
 const STATUS_HEIGHT: Pixels = px(28.0);
 const HEADER_HEIGHT: Pixels = px(30.0);
+
+/// The number on the tab at `i`, which with ⌘ shows that tab; tabs past
+/// those with a key have none.
+pub(super) fn tab_number(i: usize) -> Option<String> {
+    (i < NUMBERED_TABS).then(|| (i + 1).to_string())
+}
 
 /// The window has no title bar: its buttons sit at the left of the top
 /// row, at `WINDOW_BUTTONS_AT`, which leaves this much room for them.
@@ -222,6 +230,13 @@ impl Lemur {
                 }
             })
             .on_click(open)
+            .children(tab_number(i).map(|number| {
+                div()
+                    .debug_selector(move || format!("tab-number-{i}"))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(number)
+            }))
             .child(thread_icon(s).small())
             .child(div().max_w(px(200.0)).truncate().child(s.label.clone()))
             .children(s.issue.clone().map(|issue| {
