@@ -860,6 +860,9 @@ mod tests {
     use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla, update_summary};
     use crate::config::ThemeChoice;
     use crate::core_update::Versions;
+    use crate::gui::terminal::{DARK, Palette, Slot, set_color};
+    use gpui_kit::component::ActiveTheme;
+    use gpui_kit::{Keystroke, hsla};
 
     /// With nothing Lemur can update, Update says why, though this Mac's
     /// herdr-core is behind: a package manager updates it.
@@ -890,9 +893,6 @@ mod tests {
             "Updates this Mac 0.1.15, agent 0.1.15."
         );
     }
-    use crate::gui::terminal::{DARK, Palette, Slot, set_color};
-    use gpui_kit::component::ActiveTheme;
-    use gpui_kit::{Keystroke, hsla};
 
     /// A color picked in Settings becomes that slot's color and is kept;
     /// a reset puts lemur's own back, in the picker too.
