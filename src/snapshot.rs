@@ -744,10 +744,6 @@ const SHELLS: [&str; 12] = [
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
 ];
 
-/// Whether anything but a shell at its prompt runs in `t`: in the
-/// foreground is something other than its own program, or that program
-/// isn't a shell. herdr-core reads that about twice a second; until it
-/// has, a live terminal counts as busy.
 /// Whether `t` came back from its host restarting as a fresh shell at its
 /// prompt, where lemur saw another shell run it.
 pub fn came_back(t: &Terminal) -> bool {
@@ -755,6 +751,10 @@ pub fn came_back(t: &Terminal) -> bool {
     noted.is_some_and(|noted| t.pid.is_some_and(|pid| pid != noted)) && !busy(t)
 }
 
+/// Whether anything but a shell at its prompt runs in `t`: in the
+/// foreground is something other than its own program, or that program
+/// isn't a shell. herdr-core reads that about twice a second; until it
+/// has, a live terminal counts as busy.
 fn busy(t: &Terminal) -> bool {
     match &t.foreground {
         Some(f) => t.pid != Some(f.pid) || !SHELLS.contains(&f.name.trim_start_matches('-')),
