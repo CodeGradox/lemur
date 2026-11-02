@@ -16,6 +16,7 @@ use gpui_kit::component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, 
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
+use unicode_width::UnicodeWidthStr;
 
 /// The most diff lines shown of one file.
 const MOST_LINES: usize = 3000;
@@ -554,11 +555,7 @@ pub(super) fn diff_list(
         theme.danger.opacity(0.15),
         theme.info,
     );
-    let longest = lines
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, line)| line.len())
-        .map(|(i, _)| i);
+    let longest = widest(&lines);
     let count = lines.len();
     let row_font = font.clone();
     uniform_list(id, count, move |range, _, _| {
@@ -596,6 +593,17 @@ pub(super) fn diff_list(
     .debug_selector(move || id.to_string())
     .font_family(font)
     .text_xs()
+}
+
+/// Which of a diff's lines draws widest: the one to measure for how far it
+/// scrolls. Not the one with the most bytes: a ruler of `─` has three to a
+/// column.
+fn widest(lines: &[SharedString]) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, line)| line.width())
+        .map(|(i, _)| i)
 }
 
 /// The worktree's changes since its last commit, staged or not, new files
@@ -789,7 +797,7 @@ fn xargs_word(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's `test` would stand in for the plain one.
-    use super::{changes_in, commit_in, diff_lines, diff_of, parse_changes, to_add};
+    use super::{changes_in, commit_in, diff_lines, diff_of, parse_changes, to_add, widest};
     use crate::test_support::{TempDir, git_in};
 
     #[test]
@@ -820,6 +828,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A ruler of `─` has more bytes than a longer line of plain text, and
+    /// a line of wide characters draws wider than it has characters.
+    #[test]
+    fn the_widest_line_is_the_one_that_draws_widest() {
+        let line = |s: String| gpui_kit::SharedString::from(s);
+        let ruler = line(format!("# {}", "─".repeat(70)));
+        let long = line("x".repeat(150));
+        let wide = line("字".repeat(80));
+        assert_eq!(widest(&[ruler.clone(), long.clone()]), Some(1));
+        assert_eq!(widest(&[long, ruler, wide]), Some(2));
+        assert_eq!(widest(&[]), None);
     }
 
     #[test]
