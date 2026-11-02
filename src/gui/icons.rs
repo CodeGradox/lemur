@@ -28,6 +28,11 @@ pub fn ticket() -> Icon {
     Icon::empty().data(include_bytes!("icons/ticket.svg"))
 }
 
+/// A Claude artifact.
+pub fn artifact() -> Icon {
+    Icon::empty().data(include_bytes!("icons/shapes.svg"))
+}
+
 /// The language dictation listens for.
 pub fn languages() -> Icon {
     Icon::empty().data(include_bytes!("icons/languages.svg"))

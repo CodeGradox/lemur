@@ -40,7 +40,13 @@ impl HcServer {
             ("XDG_STATE_HOME".into(), at("state")),
             ("XDG_CONFIG_HOME".into(), at("config")),
             ("HC_SESSION".into(), self.session.clone()),
+            ("CLAUDE_CONFIG_DIR".into(), at("claude")),
         ]
+    }
+
+    /// Where Claude Code's logs are, as scripts this core runs find them.
+    pub fn claude_config(&self) -> PathBuf {
+        self.dir.join("claude")
     }
 
     /// lemur's connection to this core.

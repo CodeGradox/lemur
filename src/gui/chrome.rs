@@ -81,7 +81,7 @@ impl Lemur {
 
     /// Where a thread runs, for what starts beside it: its worktree and the
     /// project it's in, or its folder outside every worktree.
-    fn place_of(&self, key: &Key) -> Option<(String, Option<usize>)> {
+    pub(super) fn place_of(&self, key: &Key) -> Option<(String, Option<usize>)> {
         match self.project_of(&key.0, &key.1) {
             Some((base, w)) => Some((w.path.clone(), Some(base))),
             None => Some((self.session_of(key)?.path.clone(), None)),

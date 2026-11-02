@@ -4,6 +4,7 @@
 //! herdr-core, so switching is instant and scrollback survives.
 
 mod agents;
+mod artifacts_panel;
 mod away;
 mod changes;
 mod changes_panel;
@@ -74,6 +75,7 @@ actions!(
         PutAway,
         ToggleChanges,
         ToggleLinear,
+        ToggleArtifacts,
         UpdateCore,
         OpenSettings,
         AddProject,
@@ -158,6 +160,7 @@ enum Right {
     Notes,
     Linear,
     Changes,
+    Artifacts,
     Agents,
 }
 
@@ -295,6 +298,7 @@ struct Lemur {
     agents: Entity<agents::AgentsView>,
     /// The worktree on show's changes, to commit.
     changes_panel: Entity<changes_panel::ChangesPanel>,
+    artifacts_panel: Entity<artifacts_panel::ArtifactsPanel>,
     /// The Linear issue pinned to the thread on show, and issues to pin.
     linear_panel: Entity<linear_panel::LinearPanel>,
     /// Which of them shows on the right, if any; one at a time.
@@ -385,6 +389,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("Toggle Notes", ToggleNotes),
                     MenuItem::action("Toggle Linear", ToggleLinear),
                     MenuItem::action("Toggle Changes", ToggleChanges),
+                    MenuItem::action("Toggle Artifacts", ToggleArtifacts),
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::separator(),
                     MenuItem::action("Next Thread in Worktree", NextThread),
@@ -458,6 +463,11 @@ impl Lemur {
         let sidebar = cx.new(|_| SidebarView::new(lemur.clone()));
         let agents = cx.new(|_| agents::AgentsView::new(lemur));
         let changes_panel = cx.new(|cx| changes_panel::ChangesPanel::new(window, cx));
+        let artifacts_file = state_file
+            .as_deref()
+            .and_then(|file| file.parent())
+            .map(|dir| dir.join("artifacts.json"));
+        let artifacts_panel = cx.new(|_| artifacts_panel::ArtifactsPanel::new(artifacts_file));
         cx.subscribe(
             &changes_panel,
             |this, _, _: &changes_panel::Committed, cx| this.ask_changes(cx),
@@ -560,6 +570,9 @@ impl Lemur {
                                 this.ask_changes(cx);
                                 if this.right == Some(Right::Changes) {
                                     this.changes_panel.update(cx, |p, cx| p.refresh(cx));
+                                }
+                                if this.right == Some(Right::Artifacts) {
+                                    this.show_artifacts(cx);
                                 }
                             }
                         })
@@ -683,6 +696,7 @@ impl Lemur {
             notes,
             agents,
             changes_panel,
+            artifacts_panel,
             linear_panel,
             right: None,
             right_last: Right::Notes,
@@ -1114,6 +1128,9 @@ impl Lemur {
         if self.right == Some(Right::Changes) {
             self.show_changes(cx);
         }
+        if self.right == Some(Right::Artifacts) {
+            self.show_artifacts(cx);
+        }
         self.follow_linear(cx);
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
             self.notes
@@ -1395,6 +1412,9 @@ impl Lemur {
             if which == Right::Changes {
                 self.show_changes(cx);
             }
+            if which == Right::Artifacts {
+                self.show_artifacts(cx);
+            }
             if which == Right::Linear {
                 self.follow_linear(cx);
             }
@@ -1487,6 +1507,24 @@ impl Lemur {
         });
         self.changes_panel.update(cx, |p, cx| match place {
             Some((h, path, label)) => p.show(h, path, label, cx),
+            None => p.clear(cx),
+        });
+    }
+
+    /// Points the Artifacts panel at where the thread on show runs: its
+    /// worktree, or its folder outside every worktree.
+    fn show_artifacts(&mut self, cx: &mut Context<Self>) {
+        let place = self.active.clone().and_then(|key| {
+            let (path, _) = self.place_of(&key)?;
+            let host = self.cfg.host(&key.0)?.clone();
+            let label = match self.project_of(&key.0, &key.1) {
+                Some((_, w)) => worktree_label(w),
+                None => crate::config::leaf(&path).to_string(),
+            };
+            Some((host, path, label))
+        });
+        self.artifacts_panel.update(cx, |p, cx| match place {
+            Some((host, path, label)) => p.show(host, path, label, cx),
             None => p.clear(cx),
         });
     }
@@ -1673,6 +1711,18 @@ impl Lemur {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_right(Right::Changes, cx))),
             )
             .child(
+                Button::new("toggle-artifacts")
+                    .icon(icons::artifact())
+                    .label("Artifacts")
+                    .ghost()
+                    .small()
+                    .selected(self.right == Some(Right::Artifacts))
+                    .tooltip("Toggle artifacts")
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.toggle_right(Right::Artifacts, cx)),
+                    ),
+            )
+            .child(
                 Button::new("toggle-agents")
                     .icon(gpui_kit::assets::IconName::Bot)
                     .label("Agents")
@@ -1787,6 +1837,9 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &ToggleLinear, _, cx| this.toggle_right(Right::Linear, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleArtifacts, _, cx| {
+                this.toggle_right(Right::Artifacts, cx)
+            }))
             .on_action(cx.listener(|this, _: &UpdateCore, _, cx| this.update_core(cx)))
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
@@ -1907,6 +1960,7 @@ impl Render for Lemur {
                                     Right::Agents => self.agents.clone().into(),
                                     Right::Changes => self.changes_panel.clone().into(),
                                     Right::Linear => self.linear_panel.clone().into(),
+                                    Right::Artifacts => self.artifacts_panel.clone().into(),
                                 };
                                 this.child(
                                     div()
@@ -4319,7 +4373,7 @@ mod tests {
             std::array::from_fn(|_| server.run("/", &[], &["sleep", "600"]));
         let (app, cx) = rooted(server.config(), cx);
         cx.update(|_, cx| super::bind_keys(cx));
-        cx.simulate_resize(size(px(800.0), px(600.0)));
+        cx.simulate_resize(size(px(900.0), px(600.0)));
         cx.run_until_parked();
         open(&app, &threads[0], cx);
         cx.run_until_parked();
@@ -4359,10 +4413,10 @@ mod tests {
         cx.simulate_keystrokes("cmd-9");
         assert!(in_view(8, cx), "shown again, it snaps back");
 
-        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.simulate_resize(size(px(1100.0), px(600.0)));
         open(&app, &last, cx);
         assert!(in_view(11, cx), "opened again");
-        cx.simulate_resize(size(px(850.0), px(600.0)));
+        cx.simulate_resize(size(px(950.0), px(600.0)));
         assert!(in_view(11, cx), "in a narrower window");
 
         let new = server.run("/", &[], &["sleep", "600"]);
@@ -4513,6 +4567,67 @@ mod tests {
             }),
             "its change ended"
         );
+        let_attaches_end(&app, cx);
+    }
+
+    /// **Artifacts** points its panel at the worktree on show, and at
+    /// another's once a thread there shows.
+    #[gpui::test]
+    fn the_artifacts_panel_follows_the_worktree_on_show(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("artifacts-gui");
+        let dir = TempDir::new("artifacts-gui");
+        let (api, web) = (dir.join("api"), dir.join("web"));
+        for repo in [&api, &web] {
+            std::fs::create_dir(repo).unwrap();
+            git_in(repo, &["init", "-q", "-b", "main"]);
+            git_in(repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        }
+        let mut threads = vec![];
+        let mut cfg_bases = vec![];
+        for (repo, id, title) in [
+            (&api, "1hJWkh1hjNLMZjGxLk1zCD", "Handover"),
+            (&web, "2VWjSVh3UGph6KPNmbpbzY", "Report"),
+        ] {
+            let path = repo.to_string_lossy().into_owned();
+            threads.push(server.run(&path, &[], &["sleep", "600"]));
+            cfg_bases.push(Base::new("local", &path));
+            let folder: String = path
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let logs = server.claude_config().join("projects").join(folder);
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(
+                logs.join("a.jsonl"),
+                format!(
+                    "{{\"text\":\"[{title}](https://claude.ai/artifact/{id})\",\"type\":\"assistant\",\"timestamp\":\"t\"}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut cfg = server.config();
+        cfg.bases = cfg_bases;
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        open(&app, &threads[0], cx);
+        cx.run_until_parked();
+
+        let listed = |selector: &'static str, cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                cx.debug_bounds(selector).is_some()
+            })
+        };
+        cx.dispatch_action(super::ToggleArtifacts);
+        assert!(listed("artifact 0 Handover", cx));
+        open(&app, &threads[1], cx);
+        assert!(listed("artifact 0 Report", cx));
+        assert!(cx.debug_bounds("artifact 0 Handover").is_none());
+        cx.dispatch_action(super::ToggleArtifacts);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("artifact 0 Report").is_none(), "hidden");
+
         let_attaches_end(&app, cx);
     }
 

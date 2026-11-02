@@ -1,4 +1,5 @@
 mod actions;
+mod artifacts;
 mod attach;
 mod browse;
 mod clip;
