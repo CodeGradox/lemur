@@ -7,7 +7,9 @@ use super::linear_panel::{self, LinearAccount};
 use super::meter::ClaudeFound;
 use super::sidebar::claude_icon;
 use super::terminal::{Palette, SLOTS, Slot, set_color};
-use crate::config::{Config, FONT_SIZES, Language, SCROLLBACKS, Terminal, ThemeChoice};
+use crate::config::{
+    Config, FONT_SIZES, Language, SCROLLBACKS, Terminal, ThemeChoice, ThreadOrder,
+};
 use crate::core_update::{self, Versions};
 use alacritty_terminal::vte::ansi::Rgb;
 use gpui_kit::component::Disableable;
@@ -33,6 +35,7 @@ pub const CONTEXT: &str = "Settings";
 pub struct Prefs {
     pub theme: ThemeChoice,
     pub dictation_language: Language,
+    pub thread_order: ThreadOrder,
     pub terminal: Terminal,
     /// Whether the sidebar shows how much of Claude's plan is used.
     pub claude_usage: bool,
@@ -52,6 +55,7 @@ impl Prefs {
         Prefs {
             theme: cfg.theme,
             dictation_language: cfg.dictation_language,
+            thread_order: cfg.thread_order,
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
             cores: core_update::Cores::of(cfg),
@@ -88,6 +92,7 @@ impl Prefs {
                 path,
                 prefs.theme,
                 prefs.dictation_language,
+                prefs.thread_order,
                 &prefs.terminal,
                 prefs.claude_usage,
             )
@@ -327,6 +332,21 @@ impl Render for SettingsView {
             },
         )
         .default_value(Language::default().as_str());
+        let thread_orders = ThreadOrder::ALL
+            .map(|o| (o.as_str().into(), thread_order_label(o).into()))
+            .to_vec();
+        let thread_order = SettingField::dropdown(
+            thread_orders,
+            |cx| Prefs::get(cx).thread_order.as_str().into(),
+            |value: SharedString, cx| {
+                let order = ThreadOrder::ALL
+                    .into_iter()
+                    .find(|o| o.as_str() == value.as_ref())
+                    .unwrap_or_default();
+                Prefs::update(cx, |p| p.thread_order = order);
+            },
+        )
+        .default_value(ThreadOrder::default().as_str());
         // Offered once Lemur has seen Claude Code; turned on, it can be
         // turned off whatever happens.
         let found = cx.try_global::<ClaudeFound>().is_some_and(|f| f.0);
@@ -413,6 +433,13 @@ impl Render for SettingsView {
                 .group(self.core_group(cx)),
             SettingPage::new("Shortcuts")
                 .icon(super::icons::keyboard())
+                .group(SettingGroup::new().item(
+                    SettingItem::new("Thread order", thread_order).description(
+                        "The order ⌃Tab goes through the worktree's threads in, and ⌃⇧Tab \
+                         back, and which one shows when you close one. By last opened starts \
+                         with the thread opened before this one, as ⌘Tab does with apps.",
+                    ),
+                ))
                 .groups(SHORTCUTS.iter().map(|(title, shortcuts)| {
                     SettingGroup::new()
                         .title(*title)
@@ -699,9 +726,7 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             Shortcut {
                 what: "Next thread in the worktree",
                 how: Press::Keys(&["ctrl-tab"]),
-                more: Some(
-                    "The one opened before it; hold ⌃ and press Tab again to go further back.",
-                ),
+                more: Some("In the order set above; hold ⌃ and press Tab again to go further."),
             },
             keys("Previous thread in the worktree", &["ctrl-shift-tab"]),
             Shortcut {
@@ -826,6 +851,13 @@ pub fn language_label(language: Language) -> &'static str {
     match language {
         Language::English => "English",
         Language::Norwegian => "Norwegian Bokmål",
+    }
+}
+
+fn thread_order_label(order: ThreadOrder) -> &'static str {
+    match order {
+        ThreadOrder::Tabs => "Along the tabs",
+        ThreadOrder::Recent => "By last opened",
     }
 }
 

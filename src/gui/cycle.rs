@@ -1,8 +1,11 @@
-//! ⌃Tab: going through the threads of the worktree on show, the one
-//! opened last first, the way ⌘Tab goes through apps. While ⌃ is held each
-//! Tab goes one further; letting go of it settles on the thread on show.
+//! ⌃Tab: going through the threads of the worktree on show, along the tabs
+//! or, as Settings can say, the one opened last first, the way ⌘Tab goes
+//! through apps. While ⌃ is held each Tab goes one further; letting go of it
+//! settles on the thread on show.
 
+use super::settings::Prefs;
 use super::{Key, Lemur};
+use crate::config::ThreadOrder;
 use crate::snapshot::Session;
 use gpui_kit::*;
 
@@ -43,7 +46,7 @@ impl Lemur {
     }
 
     /// Shows the next thread of the worktree on show, or with `back` the
-    /// one before, in the order they were last opened.
+    /// one before, in the order Settings says.
     pub(super) fn cycle_threads(
         &mut self,
         back: bool,
@@ -57,7 +60,11 @@ impl Lemur {
             return;
         };
         if self.cycling.is_none() {
-            let order = by_recent(self.siblings(&active), &self.recent);
+            let threads = self.siblings(&active);
+            let order = match Prefs::get(cx).thread_order {
+                ThreadOrder::Tabs => threads,
+                ThreadOrder::Recent => by_recent(threads, &self.recent),
+            };
             if order.len() < 2 {
                 return;
             }

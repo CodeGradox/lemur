@@ -37,6 +37,9 @@ pub struct Config {
     pub theme: ThemeChoice,
     #[serde(default)]
     pub dictation_language: Language,
+    /// The order ⌃Tab, and ⌃⇧Tab back, go through a worktree's threads in.
+    #[serde(default)]
+    pub thread_order: ThreadOrder,
     /// The sidebar's width in pixels, as last dragged; unset is lemur's own.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
@@ -84,6 +87,29 @@ impl ThemeChoice {
             ThemeChoice::System => "system",
             ThemeChoice::Light => "light",
             ThemeChoice::Dark => "dark",
+        }
+    }
+}
+
+/// The order ⌃Tab, and ⌃⇧Tab back, go through a worktree's threads in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadOrder {
+    /// Along the tabs, from left to right.
+    #[default]
+    Tabs,
+    /// By when they were last opened, the latest first.
+    Recent,
+}
+
+impl ThreadOrder {
+    pub const ALL: [ThreadOrder; 2] = [ThreadOrder::Tabs, ThreadOrder::Recent];
+
+    /// The name the config file uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreadOrder::Tabs => "tabs",
+            ThreadOrder::Recent => "recent",
         }
     }
 }
@@ -372,11 +398,12 @@ impl Config {
 
     /// Writes the settings the Settings window changes into the config file
     /// at `path`, leaving everything else in it, comments included, as is.
-    /// The default dictation language is left out of it.
+    /// The default dictation language and thread order are left out of it.
     pub fn save_settings(
         path: &Path,
         theme: ThemeChoice,
         language: Language,
+        thread_order: ThreadOrder,
         terminal: &Terminal,
         claude_usage: bool,
     ) -> Result<()> {
@@ -386,6 +413,11 @@ impl Config {
                 doc.remove("dictation_language");
             } else {
                 doc["dictation_language"] = toml_edit::value(language.as_str());
+            }
+            if thread_order == ThreadOrder::default() {
+                doc.remove("thread_order");
+            } else {
+                doc["thread_order"] = toml_edit::value(thread_order.as_str());
             }
             if claude_usage {
                 doc["claude_usage"] = toml_edit::value(true);
@@ -737,6 +769,18 @@ mod tests {
     }
 
     #[test]
+    fn thread_order_defaults_to_tabs() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.thread_order, ThreadOrder::Tabs);
+        for order in ThreadOrder::ALL {
+            let cfg: Config =
+                toml::from_str(&format!("thread_order = \"{}\"", order.as_str())).unwrap();
+            assert_eq!(cfg.thread_order, order);
+        }
+        assert!(toml::from_str::<Config>("thread_order = \"xx\"").is_err());
+    }
+
+    #[test]
     fn dictation_language_defaults_to_english() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.dictation_language, Language::English);
@@ -807,6 +851,7 @@ path = \"~/projects/api\"
             &path,
             ThemeChoice::Dark,
             Language::Norwegian,
+            ThreadOrder::Recent,
             &terminal,
             true,
         )
@@ -821,6 +866,7 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::Dark);
         assert_eq!(cfg.dictation_language, Language::Norwegian);
+        assert_eq!(cfg.thread_order, ThreadOrder::Recent);
         assert!(cfg.claude_usage);
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
@@ -836,6 +882,7 @@ path = \"~/projects/api\"
             &path,
             ThemeChoice::System,
             Language::English,
+            ThreadOrder::default(),
             &terminal,
             false,
         )
@@ -843,6 +890,7 @@ path = \"~/projects/api\"
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved.matches("font_size").count(), 1, "{saved}");
         assert!(!saved.contains("dictation_language"), "{saved}");
+        assert!(!saved.contains("thread_order"), "{saved}");
         assert!(!saved.contains("scrollback"), "{saved}");
         assert!(
             !saved.contains("claude_usage"),

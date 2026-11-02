@@ -6,6 +6,7 @@
 
 use super::{Key, Lemur, key};
 use crate::actions;
+use crate::config::ThreadOrder;
 use crate::snapshot::Session;
 use gpui_kit::*;
 
@@ -15,7 +16,7 @@ impl Lemur {
     pub(super) fn put_away(&mut self, k: Key, window: &mut Window, cx: &mut Context<Self>) {
         self.mark_away(&k, true);
         if self.active.as_ref() == Some(&k) {
-            let next = self.successor(&k, |other| {
+            let next = self.successor(&k, ThreadOrder::Recent, |other| {
                 *other != k && self.session_of(other).is_some_and(|s| !s.away)
             });
             self.hide_shown(None, cx);

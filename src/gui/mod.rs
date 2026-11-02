@@ -36,7 +36,7 @@ mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::config::{Config, Host, ThemeChoice, leaf};
+use crate::config::{Config, Host, ThemeChoice, ThreadOrder, leaf};
 use crate::dictate;
 use crate::hc;
 use crate::snapshot::{self, Activity, HostData, Session, Snapshot, Worktree};
@@ -926,7 +926,7 @@ impl Lemur {
         let mut instead = None;
         if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
             self.active = None;
-            instead = self.successor(&gone, showable);
+            instead = self.successor(&gone, Prefs::get(cx).thread_order, showable);
         }
         // What each thread did last. A host that can't be reached keeps its
         // own: back, its threads haven't just finished or come to need you.
@@ -1036,11 +1036,17 @@ impl Lemur {
         }
     }
 
-    /// What shows once `gone`, the thread on show, has ended: the one opened
-    /// last among the threads it was with (its worktree's, or its host's
-    /// outside every worktree), else its neighbour there, else the one
-    /// opened last anywhere. `live` says what still runs.
-    fn successor(&self, gone: &Key, live: impl Fn(&Key) -> bool) -> Option<Key> {
+    /// What shows once `gone`, the thread on show, has ended: by `order` the
+    /// one opened last among the threads it was with (its worktree's, or its
+    /// host's outside every worktree); else, and along the tabs, its neighbour
+    /// there, the next tab first; else the one opened last anywhere. `live`
+    /// says what still runs.
+    fn successor(
+        &self,
+        gone: &Key,
+        order: ThreadOrder,
+        live: impl Fn(&Key) -> bool,
+    ) -> Option<Key> {
         let with = self.siblings(gone);
         let at = with.iter().position(|k| k == gone).unwrap_or(with.len());
         let after = with.iter().skip(at + 1);
@@ -1048,7 +1054,7 @@ impl Lemur {
         self.recent
             .iter()
             .filter(|k| *k != gone && live(k))
-            .find(|k| with.contains(k))
+            .find(|k| order == ThreadOrder::Recent && with.contains(k))
             .or_else(|| after.chain(before).find(|k| live(k)))
             .or_else(|| self.recent.iter().find(|k| *k != gone && live(k)))
             .cloned()
@@ -2190,7 +2196,7 @@ mod tests {
         Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
         Right, SIDEBAR_WIDTH, meter, move_item, moved_to,
     };
-    use crate::config::{Base, Config, Host};
+    use crate::config::{Base, Config, Host, ThreadOrder};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{HcServer, TempDir, fake_dictate, git_in, wait_until};
     use gpui::VisualTestContext;
@@ -2611,15 +2617,59 @@ mod tests {
         assert_eq!(cx.pending_prompt(), Some((version, String::new())));
     }
 
-    /// ⌃Tab goes through the threads, the one opened last first: holding ⌃
-    /// goes further, letting go settles there, and ⌃⇧Tab goes back. From
-    /// the menu, with no ⌃, it goes one and settles.
+    /// ⌃Tab goes along the tabs and ⌃⇧Tab back, going round at the ends:
+    /// holding ⌃ goes further, letting go settles there. From the menu, with
+    /// no ⌃, each goes one and settles.
     #[gpui::test]
-    fn ctrl_tab_goes_through_threads_by_when_they_were_opened(cx: &mut gpui::TestAppContext) {
-        let server = HcServer::new("cycle");
+    fn ctrl_tab_goes_along_the_tabs(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("cycle-tabs");
         let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &[], &["sleep", "600"]));
         let (app, cx) = rooted(server.config(), cx);
         cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        for name in [a.as_str(), &b, &c] {
+            open(&app, name, cx);
+        }
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| app.active.clone().map(|(_, s)| s))
+        };
+        let (a, b, c) = (Some(a), Some(b), Some(c));
+
+        // By when they were opened, each of these would show another thread.
+        cx.simulate_modifiers_change(Modifiers::control());
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(shown(cx), a, "round to the first tab");
+        cx.simulate_keystrokes("ctrl-tab");
+        assert_eq!(shown(cx), b);
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        assert_eq!(shown(cx), a, "back, with ⌃ still held");
+        cx.simulate_modifiers_change(Modifiers::none());
+        cx.simulate_modifiers_change(Modifiers::control_shift());
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        assert_eq!(shown(cx), c, "back round to the last tab");
+        cx.simulate_modifiers_change(Modifiers::none());
+
+        cx.dispatch_action(super::NextThread);
+        assert_eq!(shown(cx), a);
+        cx.dispatch_action(super::PreviousThread);
+        assert_eq!(shown(cx), c);
+        app.read_with(cx, |app, _| assert!(app.cycling.is_none(), "settled"));
+        let_attaches_end(&app, cx);
+    }
+
+    /// Settings can have ⌃Tab go by when threads were opened, the one opened
+    /// last first: holding ⌃ goes further, letting go settles there, and ⌃⇧Tab
+    /// goes back. From the menu, with no ⌃, it goes one and settles.
+    #[gpui::test]
+    fn ctrl_tab_can_go_by_when_threads_were_opened(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("cycle");
+        let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &[], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| {
+            super::bind_keys(cx);
+            Prefs::update(cx, |p| p.thread_order = ThreadOrder::Recent);
+        });
         cx.simulate_resize(size(px(1000.0), px(600.0)));
         cx.run_until_parked();
         for name in [a.as_str(), &b, &c] {
@@ -4496,8 +4546,10 @@ mod tests {
         assert!(in_view(8, cx), "by key");
         cx.simulate_keystrokes("cmd-1");
         assert!(in_view(0, cx), "by key, back");
-        cx.dispatch_action(super::NextThread);
-        assert!(in_view(8, cx), "the next thread");
+        cx.dispatch_action(super::PreviousThread);
+        assert!(in_view(11, cx), "the previous thread, round the end");
+        cx.simulate_keystrokes("cmd-1");
+        assert!(in_view(0, cx), "by key, back again");
 
         let last = app.read_with(cx, |app, _| {
             let active = app.active.clone().unwrap();
@@ -5191,16 +5243,86 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
-    /// ⌘W asks before closing the thread on show; closed, or ended any
-    /// other way, the one opened before it in its worktree shows instead,
-    /// else its neighbour there.
+    /// Along the tabs, as at first, closing the thread on show, with ⌘W or
+    /// its ×, shows the next tab, or the one before if it was the last. By
+    /// when they were opened, the next tab wouldn't be the one in either case.
+    #[gpui::test]
+    fn closing_a_thread_shows_the_next_tab(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("close-tabs");
+        let [a, b, c, d] = ["a", "b", "c", "d"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        for t in [&c, &b, &a, &d] {
+            open(&app, t, cx);
+        }
+        let shows = |want: &str, cx: &mut VisualTestContext| {
+            let switched = wait_until(Duration::from_secs(5), || {
+                cx.executor().advance_clock(super::BURST);
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.active == Some(key(want)))
+            });
+            assert!(
+                switched,
+                "{:?}",
+                app.read_with(cx, |app, _| app.active.clone())
+            );
+        };
+
+        // d is the last tab; by when they were opened, a.
+        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes("enter");
+        shows(&c, cx);
+
+        // Tabs a, b and c, on b; by when they were opened, a.
+        open(&app, &a, cx);
+        open(&app, &b, cx);
+        let tab = cx.debug_bounds("tab-1").expect("b's tab");
+        cx.simulate_click(
+            point(tab.right() - px(10.0), tab.center().y),
+            Modifiers::none(),
+        );
+        cx.simulate_keystrokes("enter");
+        shows(&c, cx);
+        let_attaches_end(&app, cx);
+    }
+
+    /// Whatever the order set, a thread put away leaves the one opened before
+    /// it on show, not the next tab.
+    #[gpui::test]
+    fn putting_a_thread_away_shows_the_one_opened_before(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("away-order");
+        let [a, b, c] = ["a", "b", "c"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        for t in [&c, &a, &b] {
+            open(&app, t, cx);
+        }
+        cx.dispatch_action(super::PutAway);
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active.clone()),
+            Some(key(&a))
+        );
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘W asks before closing the thread on show. By when they were opened,
+    /// closed or ended any other way, the one opened before it in its worktree
+    /// shows instead, else its neighbour there.
     #[gpui::test]
     fn closing_a_thread_shows_another(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("close");
         let [a, b, c] = ["a", "b", "c"]
             .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
         let (app, cx) = rooted(server.config(), cx);
-        cx.update(|_, cx| super::bind_keys(cx));
+        cx.update(|_, cx| {
+            super::bind_keys(cx);
+            Prefs::update(cx, |p| p.thread_order = ThreadOrder::Recent);
+        });
         cx.simulate_resize(size(px(1200.0), px(700.0)));
         for t in [&c, &a, &b] {
             open(&app, t, cx);
