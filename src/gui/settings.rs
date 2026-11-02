@@ -405,8 +405,7 @@ impl Render for SettingsView {
                 .icon(super::icons::server())
                 .group(self.core_group(cx)),
             SettingPage::new("Shortcuts")
-                // Not among gpui-component's own icons; the full set has it.
-                .icon(gpui_kit::assets::IconName::Keyboard)
+                .icon(super::icons::keyboard())
                 .groups(SHORTCUTS.iter().map(|(title, shortcuts)| {
                     SettingGroup::new()
                         .title(*title)

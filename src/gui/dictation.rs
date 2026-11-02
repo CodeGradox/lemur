@@ -11,7 +11,7 @@ use crate::dictate::{Heard, Recording};
 use futures::StreamExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Enter, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -319,7 +319,7 @@ impl Render for DictationBar {
             .child(
                 Button::new("dictation-language")
                     .label(language_label(language))
-                    .icon(gpui_kit::assets::IconName::Languages)
+                    .icon(super::icons::languages())
                     .ghost()
                     .xsmall()
                     .tooltip(format!(
@@ -331,9 +331,9 @@ impl Render for DictationBar {
             .child(
                 Button::new("dictation-record")
                     .icon(if listening {
-                        gpui_kit::assets::IconName::CircleStop
+                        super::icons::circle_stop()
                     } else {
-                        gpui_kit::assets::IconName::Mic
+                        Icon::new(gpui_kit::assets::IconName::Mic)
                     })
                     .ghost()
                     .xsmall()
