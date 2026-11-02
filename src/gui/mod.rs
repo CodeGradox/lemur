@@ -1143,14 +1143,16 @@ impl Lemur {
         cx.notify();
     }
 
-    /// A spotlight, the folder picker, the palette or a diff is over the window:
-    /// what would open another over it, or move the keyboard from it,
-    /// waits until it's gone.
+    /// A spotlight, the folder picker, the palette, a diff or a peek is over
+    /// the window: what would open another over it, or move the keyboard
+    /// from it, waits until it's gone. A host's set-up in the peek may be
+    /// asking for a password, which mustn't go to a thread under it.
     fn overlaid(&self) -> bool {
         self.prompt.is_some()
             || self.picker.is_some()
             || self.palette.is_some()
             || self.diff_preview.is_some()
+            || self.peek.is_some()
     }
 
     /// Tells the thread on show's program it's no longer shown, unless it's
@@ -1216,9 +1218,11 @@ impl Lemur {
         cx.notify();
     }
 
-    /// Gives the keyboard back to the session on show, after a spotlight.
+    /// Gives the keyboard back to the session on show, after a spotlight,
+    /// or to the one peeked at over it.
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active.as_ref().and_then(|k| self.terminals.get(k)) {
+        let front = self.peek.as_ref().or(self.active.as_ref());
+        match front.and_then(|k| self.terminals.get(k)) {
             Some(view) => view.read(cx).focus_handle(cx).focus(window, cx),
             None => self.focus.focus(window, cx),
         }
@@ -1300,12 +1304,14 @@ impl Lemur {
             self.close_diff_preview(window, cx);
             return;
         }
-        if self.overlaid() {
+        // The peek is in front, not the thread on show under it.
+        if self.peek.is_some() && self.prompt.is_none() && self.picker.is_none() {
+            if self.palette.is_none() {
+                self.close_peek(window, cx);
+            }
             return;
         }
-        // The peek is in front, not the thread on show under it.
-        if self.peek.is_some() {
-            self.close_peek(window, cx);
+        if self.overlaid() {
             return;
         }
         if let Some(key) = self.active.clone() {
@@ -5878,6 +5884,47 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert!(server.addresses().contains(&a), "a still runs");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A peek, or a host's set-up where a password may be asked for, keeps
+    /// the keyboard: ⌘1 to ⌘9, ⌘] and ⌃Tab don't show another thread under
+    /// it, ⌘P doesn't open under it, and whatever hands the keyboard back
+    /// hands it to the terminal in front.
+    #[gpui::test]
+    fn a_peek_keeps_the_keyboard(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("peek-keys");
+        let [a, b, c] = ["a", "b", "c"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &a, cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| app.update(cx, |app, cx| app.peek(key(&c), window, cx)));
+        cx.run_until_parked();
+        let c_has_it = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let view = app.read(cx).terminals[&key(&c)].clone();
+                gpui_kit::Focusable::focus_handle(view.read(cx), cx).is_focused(window)
+            })
+        };
+        assert!(c_has_it(cx));
+        for keys in ["cmd-2", "cmd-]", "ctrl-tab", "cmd-p", "cmd-t", "cmd-j"] {
+            cx.simulate_keystrokes(keys);
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                assert_eq!(app.active, Some(key(&a)), "{keys}");
+                assert_eq!(app.peek, Some(key(&c)), "{keys}");
+                assert!(app.prompt.is_none(), "{keys}");
+                assert_eq!(app.terminals.len(), 2, "{keys}");
+            });
+            assert!(c_has_it(cx), "{keys}");
+        }
+        assert!(server.addresses().contains(&b));
+
+        cx.update(|window, cx| app.update(cx, |app, cx| app.focus_terminal(window, cx)));
+        assert!(c_has_it(cx), "handed back to the peek");
         let_attaches_end(&app, cx);
     }
 
