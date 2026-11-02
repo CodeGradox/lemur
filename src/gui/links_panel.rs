@@ -26,7 +26,8 @@ pub(super) struct LinksPanel {
     store: Store,
     /// The host and folder shown, and what it's called.
     place: Option<(Host, String, String)>,
-    loading: bool,
+    /// The host and folder being read.
+    loading: Option<(String, String)>,
     /// Why the logs couldn't be read.
     error: Option<String>,
     /// `gh`, and why it can't say anything.
@@ -50,7 +51,7 @@ impl LinksPanel {
             file,
             store,
             place: None,
-            loading: false,
+            loading: None,
             error: None,
             // Tests have a stand-in, and never the real one.
             gh: PathBuf::from(if cfg!(test) { "/nonexistent/gh" } else { "gh" }),
@@ -98,16 +99,18 @@ impl LinksPanel {
     }
 
     /// Reads the logs of the folder on show, those written since the last
-    /// time, and asks `gh` about its pull requests. What they say goes to the
-    /// folder asked of, whichever shows by then.
+    /// time, and asks `gh` about its pull requests. Another folder being read
+    /// is left to ask again when it shows: it may be taking a while, as
+    /// with the network down.
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some((host, path, _)) = self.place.clone() else {
             return;
         };
-        if self.loading {
+        let asked = (host.name.clone(), path.clone());
+        if self.loading.as_ref() == Some(&asked) {
             return;
         }
-        self.loading = true;
+        self.loading = Some(asked);
         self.asked = Some(Instant::now());
         let started = now();
         let known = self.store.place(&host.name, &path);
@@ -134,7 +137,7 @@ impl LinksPanel {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.loading = false;
+                this.loading = None;
                 let shown = this.shows(&host.name, &path);
                 match found {
                     Ok((scan, looked)) => {
@@ -154,10 +157,6 @@ impl LinksPanel {
                     }
                     Err(e) if shown => this.error = Some(format!("{e:#}")),
                     Err(_) => {}
-                }
-                // Another folder shows now: its links, not these.
-                if !shown {
-                    this.refresh(cx);
                 }
                 cx.notify();
             })
@@ -202,13 +201,13 @@ impl LinksPanel {
     #[cfg(test)]
     pub(super) fn listed(&self) -> (bool, Vec<String>) {
         let names = self.links().iter().map(|a| a.name().to_string()).collect();
-        (self.loading, names)
+        (self.loading.is_some(), names)
     }
 
     #[cfg(test)]
     fn listed_prs(&self) -> (bool, Vec<(u64, State)>) {
         let prs = self.prs().iter().map(|pr| (pr.number, pr.state)).collect();
-        (self.loading, prs)
+        (self.loading.is_some(), prs)
     }
 
     /// A pull request's row: its state, number and title.
@@ -301,7 +300,7 @@ impl Render for LinksPanel {
         let empty = match (&self.place, &self.error) {
             (None, _) => Some("Open a thread to see its worktree's links.".to_string()),
             (_, Some(e)) => Some(e.clone()),
-            _ if count == 0 && self.loading => Some("Looking for links…".into()),
+            _ if count == 0 && self.loading.is_some() => Some("Looking for links…".into()),
             _ if count == 0 => Some(
                 "No links here yet. This branch's pull requests, and the artifacts and pull requests agents use or post, show up here."
                     .into(),
@@ -436,6 +435,23 @@ mod tests {
     /// Links in a worktree's logs on its host list by themselves, each to
     /// its own worktree, and open with a click. One taken off stays off,
     /// the next time Lemur starts too, though the log still has it.
+    #[gpui::test]
+    fn another_folder_doesnt_wait_for_the_one_being_read(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let server = HcServer::new("links-wait");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("links-wait");
+        let (panel, cx) = opened(dir.join("links.json"), cx);
+        panel.update(cx, |p, cx| {
+            p.show(host.clone(), "/srv/slow".into(), "slow".into(), cx);
+            p.show(host.clone(), "/srv/next".into(), "next".into(), cx);
+            let reading = p.loading.as_ref().map(|(_, path)| path.as_str());
+            assert_eq!(reading, Some("/srv/next"), "asked at once");
+        });
+        cx.run_until_parked();
+    }
+
     #[gpui::test]
     fn links_list_by_themselves_and_stay_off_once_removed(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
