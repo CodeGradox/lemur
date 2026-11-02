@@ -412,7 +412,7 @@ impl Lemur {
 
     /// Under the terminal: where the thread on show runs (its host, and its
     /// worktree's branch, its lines added and removed, and its servers),
-    /// and how many agents there are.
+    /// and how many agents need you.
     pub(super) fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let item = |icon: Icon, text: SharedString| {
@@ -462,32 +462,20 @@ impl Lemur {
                 );
             }
         }
-        let all: Vec<&Session> = sessions(&self.snap)
-            .map(|(_, s)| s)
-            .filter(|s| s.runs_claude())
-            .collect();
-        let needs = all
-            .iter()
-            .filter(|s| s.activity == Activity::NeedsInput)
+        let needs = sessions(&self.snap)
+            .filter(|(_, s)| s.runs_claude() && s.activity == Activity::NeedsInput)
             .count();
-        let agents = format!(
-            "{} agent{}",
-            all.len(),
-            if all.len() == 1 { "" } else { "s" }
-        );
-        bar.child(
-            h_flex()
-                .gap_1p5()
-                .items_center()
-                .child(div().size_1p5().rounded_full().bg(theme.muted_foreground))
-                .child(agents)
-                .when(needs > 0, |this| {
-                    this.child(div().text_color(theme.warning).child(format!(
-                        "· {needs} need{} you",
+        bar.when(needs > 0, |bar| {
+            bar.child(
+                div()
+                    .debug_selector(|| "needs-you".into())
+                    .text_color(theme.warning)
+                    .child(format!(
+                        "{needs} need{} you",
                         if needs == 1 { "s" } else { "" }
-                    )))
-                }),
-        )
+                    )),
+            )
+        })
     }
 
     /// The worktree's servers, by port: a link to each one that can be

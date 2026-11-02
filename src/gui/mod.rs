@@ -4516,6 +4516,27 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// The status bar doesn't count the agents; it says how many need you,
+    /// when any do.
+    #[gpui::test]
+    fn the_status_bar_says_how_many_need_you(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("needs-you");
+        let t = server.run("/", &[], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        open(&app, &t, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("needs-you").is_none(), "none do");
+        app.update(cx, |app, cx| {
+            app.snap.hosts[0].other[0].activity = Activity::NeedsInput;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("needs-you").is_some(), "one does");
+        let_attaches_end(&app, cx);
+    }
+
     /// A tab is as narrow with a long name as with a short one: hovered it
     /// says the name, and the terminal's header names the thread on show.
     #[gpui::test]
