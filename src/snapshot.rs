@@ -166,10 +166,18 @@ impl Session {
             && !self.busy
     }
 
-    /// A Claude thread whose shell lemur hasn't noted yet.
+    /// The shell of a Claude thread that lemur hasn't noted: one started
+    /// for Claude, one Claude was found running in, typed by hand, or one
+    /// back from its host restarting once Claude runs in it again. Until
+    /// then it's still to resume.
     pub fn shell_to_note(&self) -> Option<u32> {
-        self.pid
-            .filter(|_| self.started_claude && self.shell.is_none())
+        let pid = self.pid?;
+        let claude_runs = self.activity != Activity::Unknown || self.claude.is_some();
+        match self.shell {
+            None if self.started_claude || claude_runs => Some(pid),
+            Some(noted) if noted != pid && claude_runs => Some(pid),
+            _ => None,
+        }
     }
 }
 
@@ -1211,6 +1219,45 @@ mod tests {
         let shown = |t: Terminal| view(&cfg, &cfg.hosts[0], &data, &[t]).other[0].activity;
         assert_eq!(shown(left("claude", 200)), Activity::Working);
         assert_eq!(shown(left("zsh", 100)), Activity::Unknown);
+    }
+
+    /// Which shell is noted, to tell when a host restarted: one started for
+    /// Claude at once, one with a Claude typed by hand once that's found,
+    /// and one back from a restart only once Claude runs in it again.
+    #[test]
+    fn a_claude_threads_shell_is_noted_as_it_runs() {
+        let cfg = cfg();
+        let data = parse(&cfg, &cfg.hosts[0], "");
+        let session = |labels: &[(&str, &str)]| {
+            let t = terminal("agent/t1", "/tmp", 100, labels);
+            view(&cfg, &cfg.hosts[0], &data, &[t]).other.remove(0)
+        };
+        let run = || {
+            Some(ClaudeRun {
+                id: "id".into(),
+                path: "/tmp".into(),
+            })
+        };
+        assert_eq!(
+            session(&[("lemur.kind", "claude")]).shell_to_note(),
+            Some(100)
+        );
+        let plain = session(&[("lemur.kind", "shell")]);
+        assert_eq!(plain.shell_to_note(), None, "only a shell");
+        let typed = Session {
+            claude: run(),
+            ..plain
+        };
+        assert_eq!(typed.shell_to_note(), Some(100), "Claude typed by hand");
+        let noted = session(&[("lemur.kind", "claude"), ("lemur.shell", "100")]);
+        assert_eq!(noted.shell_to_note(), None, "noted already");
+        let back = session(&[("lemur.kind", "claude"), ("lemur.shell", "99")]);
+        assert_eq!(back.shell_to_note(), None, "still to resume");
+        let resumed = Session {
+            claude: run(),
+            ..back
+        };
+        assert_eq!(resumed.shell_to_note(), Some(100), "resumed there");
     }
 
     /// A terminal lemur didn't label is called by what it shows.

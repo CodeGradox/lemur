@@ -365,9 +365,13 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         .filter(|l| validate_name(l).is_ok())
         .unwrap_or_else(|| "claude".into());
     let resume = format!("{} --resume {}", host.claude, thread.claude_session);
-    if let Some(pid) = back {
-        core.type_line(&thread.session, &resume)?;
-        core.label(&thread.session, &[(SHELL, &pid.to_string())])?;
+    if back.is_some() {
+        // Where it ran: Claude would go on in whatever folder the shell is,
+        // and the shell notes itself once Claude runs, so that a resume that
+        // fails still offers another.
+        let there = format!("cd {} && {resume}", quote(&thread.path));
+        core.type_line(&thread.session, &there)?;
+        wait_for_program(&core, &thread.session);
         return Ok(thread.session.clone());
     }
     start_thread(
@@ -377,6 +381,20 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         Some(&resume),
         thread.issue.as_deref(),
     )
+}
+
+/// Waits a moment for what was typed into the shell of terminal `address`
+/// to run, so what's asked next finds the thread running.
+fn wait_for_program(core: &hc::Core, address: &str) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        let terminals = core.terminals();
+        let t = terminals.iter().find(|t| t.address == address);
+        if t.is_none_or(|t| !crate::snapshot::came_back(t)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Notes the shell `pid` a Claude thread runs in, to tell when its host
@@ -1178,7 +1196,7 @@ mod tests {
     fn a_thread_back_from_a_restart_resumes_in_its_terminal() {
         let server = HcServer::new("resume-back");
         let (dir, mut cfg) = cloned("resume-back", &server);
-        cfg.hosts[0].claude = r#"sh -c 'echo "claude $*"' claude"#.into();
+        cfg.hosts[0].claude = r#"sh -c 'echo "claude $* in $PWD"; exec sleep 600' claude"#.into();
         let path = dir.join("repo").canonicalize().unwrap();
         let path = path.to_string_lossy().into_owned();
         let started = new_thread_in(&cfg, 0, &path, "claude", false).unwrap();
@@ -1218,9 +1236,11 @@ mod tests {
         });
         assert!(back, "a fresh shell at {t}");
         assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (false, true)));
+        // However far its shell went, it resumes where it ran.
+        server.hc(&["send", &t, "cd /"]);
         let count = server.addresses().len();
         assert_eq!(resume_thread(&cfg, &thread).unwrap(), t, "in its terminal");
-        let resumed = format!("claude --resume {}", thread.claude_session);
+        let resumed = format!("claude --resume {} in {path}", thread.claude_session);
         assert!(
             wait_until(Duration::from_secs(10), || server
                 .hc(&["read", &t])
