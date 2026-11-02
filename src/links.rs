@@ -259,12 +259,14 @@ fn parse(out: &str) -> Result<Scan> {
                 artifact.at = at.to_string();
             }
             undated = 0;
-        } else if let Some(i) = line.find("claude.ai/") {
+        } else if let Some(i) = line.rfind("claude.ai/") {
+            // The last: a link's text may name its address too, and that
+            // says nothing the address doesn't.
             let title = line
                 .strip_prefix('[')
                 .and_then(|l| l.split_once("]("))
                 .map(|(text, _)| text.replace(['*', '`'], "").trim().to_string())
-                .filter(|text| !text.is_empty());
+                .filter(|text| !text.is_empty() && !text.contains("claude.ai/"));
             found.push(Artifact {
                 url: format!("https://{}", &line[i..]),
                 title,
@@ -339,6 +341,22 @@ mod tests {
         assert_eq!(
             logs_folder("/Users/me/laft-web/.worktrees/a_b/web"),
             "-Users-me-laft-web--worktrees-a-b-web"
+        );
+    }
+
+    /// A Markdown link whose text is its address, or names the site, goes by
+    /// its address, and has no title.
+    #[test]
+    fn a_links_text_can_name_its_address() {
+        let out = format!(
+            "[https://claude.ai/artifact/{ONE}](https://claude.ai/artifact/{ONE}\n\
+             [see claude.ai/artifact docs](https://claude.ai/artifact/{TWO}\n@@end\n"
+        );
+        let found = parse(&out).unwrap().artifacts;
+        assert_eq!(
+            found,
+            [link(ONE, ""), link(TWO, "")],
+            "the addresses, no titles"
         );
     }
 
