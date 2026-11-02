@@ -110,6 +110,12 @@ impl ChangesPanel {
         self.message.focus_handle(cx).focus(window, cx);
     }
 
+    /// How many files are in conflict: committing them would commit their
+    /// markers, and conclude a merge or a step of a rebase with them.
+    fn in_conflict(&self) -> usize {
+        self.files.iter().filter(|f| f.status == 'U').count()
+    }
+
     /// The file whose diff shows, and its lines.
     pub(super) fn shown_diff(&self) -> Option<(&Change, &[SharedString])> {
         let open = self.open.as_ref()?;
@@ -290,7 +296,11 @@ impl ChangesPanel {
         let Some((host, path, label)) = self.place.clone() else {
             return;
         };
-        if message.is_empty() || self.files.is_empty() || self.committing.is_some() {
+        if message.is_empty()
+            || self.files.is_empty()
+            || self.committing.is_some()
+            || self.in_conflict() > 0
+        {
             return;
         }
         let files = to_add(&self.files);
@@ -472,6 +482,7 @@ impl Render for ChangesPanel {
         });
         let can_commit = !self.files.is_empty()
             && self.committing.is_none()
+            && self.in_conflict() == 0
             && !self.message.read(cx).value().trim().is_empty();
         let commit = v_flex()
             .flex_shrink_0()
@@ -501,6 +512,18 @@ impl Render for ChangesPanel {
                         ),
                     ),
             )
+            .when(self.in_conflict() > 0, |commit| {
+                commit.child(
+                    div()
+                        .debug_selector(|| "changes-conflict".into())
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(match self.in_conflict() {
+                            1 => "A file is in conflict: resolve it to commit.".to_string(),
+                            n => format!("{n} files are in conflict: resolve them to commit."),
+                        }),
+                )
+            })
             .children(self.note.as_ref().map(|(note, failed)| {
                 div()
                     .text_xs()
@@ -978,6 +1001,56 @@ mod tests {
             assert_eq!(p.message.read(cx).value().to_string(), "For the other");
             assert_eq!(p.listed().0, [("a.txt".to_string(), '?')]);
         });
+    }
+
+    /// With a file in conflict, Enter doesn't commit its markers, and the
+    /// panel says why.
+    #[gpui::test]
+    fn files_in_conflict_arent_committed(cx: &mut gpui::TestAppContext) {
+        let server = crate::test_support::HcServer::new("changes-conflict");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-conflict");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| git_in(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(repo.join("a.txt"), "theirs\n").unwrap();
+        git(&["commit", "-q", "-am", "theirs"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(repo.join("a.txt"), "ours\n").unwrap();
+        git(&["commit", "-q", "-am", "ours"]);
+        let merged = std::process::Command::new("git")
+            .args(["merge", "other"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(!merged.status.success(), "it conflicts");
+        let head = || {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let before = head();
+        let (panel, cx) = panel_on(&repo, host, cx);
+        settled(&panel, cx);
+        panel.read_with(cx, |p, _| assert_eq!(p.in_conflict(), 1));
+        assert!(cx.debug_bounds("changes-conflict").is_some(), "it says so");
+        cx.update(|window, cx| {
+            panel.update(cx, |p, cx| {
+                p.message
+                    .update(cx, |m, cx| m.set_value("Merge", window, cx));
+                p.commit(window, cx);
+            })
+        });
+        settled(&panel, cx);
+        assert_eq!(head(), before, "nothing went in");
     }
 
     /// A click on a file shows its diff, and another hides it, for good even
