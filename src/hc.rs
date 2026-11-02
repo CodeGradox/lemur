@@ -443,14 +443,21 @@ impl Drop for Connecting {
     }
 }
 
+/// How long a core gets to say hello, with time to start.
+const HANDSHAKE: Duration = Duration::from_secs(30);
+
 impl Core {
     /// Connects to the core of `session` (hc's default without one),
     /// starting it if needed, and follows its terminals.
     fn connect(session: Option<&str>) -> Result<Arc<Core>> {
-        Core::connect_with(binary(), session)
+        Core::connect_with(binary(), session, HANDSHAKE)
     }
 
-    fn connect_with(binary: PathBuf, session: Option<&str>) -> Result<Arc<Core>> {
+    fn connect_with(
+        binary: PathBuf,
+        session: Option<&str>,
+        handshake: Duration,
+    ) -> Result<Arc<Core>> {
         let mut command = Command::new(binary);
         command.arg("connect");
         if let Some(session) = session {
@@ -471,8 +478,20 @@ impl Core {
         let hello = json!({"jsonrpc": "2.0", "id": 0, "method": "hello",
             "params": {"framed": true, "generation": GENERATION}});
         stdin.write_all(format!("{hello}\n").as_bytes())?;
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        // On a thread: one that says nothing would hold this up for good.
+        // Given up on, the child ending ends its read.
+        let (read, answer) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("hc-hello".into())
+            .spawn(move || {
+                let mut line = String::new();
+                let result = reader.read_line(&mut line);
+                let _ = read.send((reader, line, result));
+            })?;
+        let (mut reader, line, result) = answer
+            .recv_timeout(handshake)
+            .map_err(|_| anyhow!("herdr-core didn't say hello in time"))?;
+        result?;
         let hello: Value = serde_json::from_str(&line).context("herdr-core didn't say hello")?;
         if let Some(e) = hello.get("error") {
             bail!("herdr-core refused lemur: {}", RpcError(e.clone()));
@@ -961,16 +980,25 @@ pub fn core(session: Option<&str>) -> Result<Arc<Core>> {
         session.is_some(),
         "a test reached herdr-core's default session: use an HcServer's"
     );
-    static CORES: OnceLock<Mutex<HashMap<Option<String>, Arc<Core>>>> = OnceLock::new();
-    let mut cores = CORES.get_or_init(Default::default).lock().unwrap();
-    let key = session.map(str::to_owned);
-    if let Some(core) = cores.get(&key)
+    type Slot = Arc<Mutex<Option<Arc<Core>>>>;
+    static CORES: OnceLock<Mutex<HashMap<Option<String>, Slot>>> = OnceLock::new();
+    let slot = CORES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(session.map(str::to_owned))
+        .or_default()
+        .clone();
+    // Each session has a lock of its own, held while connecting, so two
+    // threads connect once, and a core slow to answer holds up only its own.
+    let mut slot = slot.lock().unwrap();
+    if let Some(core) = &*slot
         && !core.is_lost()
     {
         return Ok(core.clone());
     }
     let core = Core::connect(session)?;
-    cores.insert(key, core.clone());
+    *slot = Some(core.clone());
     Ok(core)
 }
 
@@ -1211,6 +1239,8 @@ mod tests {
             ),
             // Gone at once, as when the core can't start.
             ("gone", "exit 1"),
+            // Never answering.
+            ("mute", "cat >/dev/null"),
         ] {
             let pid_file = dir.join(format!("{name}.pid"));
             let fake = dir.join(format!("herdr-core-{name}"));
@@ -1220,7 +1250,9 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(Core::connect_with(fake, None).is_err(), "{name}");
+            // Long enough for the stand-in to start, on a busy machine.
+            let time = Duration::from_secs(2);
+            assert!(Core::connect_with(fake, None, time).is_err(), "{name}");
             let pid = std::fs::read_to_string(&pid_file).unwrap();
             let stat = Command::new("ps")
                 .args(["-o", "stat=", "-p", pid.trim()])
