@@ -119,7 +119,7 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the 
 **Links:** **Links** at the top right lists the worktree on show's pull requests and Claude artifacts (outside every worktree, the thread's folder's). Click one to open it in your browser; its **×** takes it off the list for good, and leaves what it links to alone. The list is kept in `~/.lemur/links.json`.
 
 - **Pull requests** each show their state (Open, Draft, Merged or Closed), number and title, the open ones first: those of the worktree's branch, whoever made them, and those agents linked to, of the repository of its `origin` only, not another project's they mention. They come from GitHub's [`gh`](https://cli.github.com) on this Mac, signed in with `gh auth login`; hosts don't need it. A pull request made from a fork, in a clone whose `origin` is the fork, doesn't show as the branch's.
-- **Artifacts** are the links to Claude artifacts that agents used or posted, the latest first, under the name the agent gave a link, if it did. A link you pasted shows once an agent uses it.
+- **Artifacts** are the links to Claude artifacts that agents used or posted, the latest first, under the name the agent gave a link, if it did. Its pencil gives it a name of your own, which stays whatever agents call it; emptied, theirs shows again. A link you pasted shows once an agent uses it.
 
 Links come from Claude Code's session logs on the host (`~/.claude/projects`), every session run in that worktree, whether Lemur started it or not, and only from what agents wrote. While the panel shows, Lemur reads the logs and asks `gh` every 30 seconds, after the first look only the logs written since the last time.
 

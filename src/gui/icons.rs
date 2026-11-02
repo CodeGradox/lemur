@@ -23,6 +23,11 @@ pub fn file_diff() -> Icon {
     Icon::empty().data(include_bytes!("icons/file-diff.svg"))
 }
 
+/// Giving something another name.
+pub fn pencil() -> Icon {
+    Icon::empty().data(include_bytes!("icons/pencil.svg"))
+}
+
 /// A Linear issue.
 pub fn ticket() -> Icon {
     Icon::empty().data(include_bytes!("icons/ticket.svg"))

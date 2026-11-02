@@ -3,12 +3,14 @@
 //! linked to, with what `gh` says of them; and the Claude artifacts agents
 //! used or posted there, the latest first (see `links`). A click opens one;
 //! its × takes it off the list for good, and leaves what it links to alone.
+//! An artifact's pencil gives it a name of your own.
 
 use super::icons;
 use crate::config::Host;
 use crate::gh::{self, Problem, PullRequest, State};
 use crate::links::{self, Artifact, Place, Store};
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -35,7 +37,16 @@ pub(super) struct LinksPanel {
     gh_problem: Option<Problem>,
     /// When they were last asked for.
     asked: Option<Instant>,
+    /// The artifact being given a name.
+    renaming: Option<Renaming>,
     _task: Option<Task<()>>,
+}
+
+/// An artifact being given a name: its link, and the field for it.
+struct Renaming {
+    url: String,
+    input: Entity<InputState>,
+    _events: Subscription,
 }
 
 fn now() -> u64 {
@@ -57,6 +68,7 @@ impl LinksPanel {
             gh: PathBuf::from(if cfg!(test) { "/nonexistent/gh" } else { "gh" }),
             gh_problem: None,
             asked: None,
+            renaming: None,
             _task: None,
         }
     }
@@ -69,6 +81,7 @@ impl LinksPanel {
         if !same {
             self.error = None;
             self.gh_problem = None;
+            self.renaming = None;
         }
         if !same || self.asked.is_none_or(|at| at.elapsed() >= EVERY) {
             self.refresh(cx);
@@ -81,6 +94,7 @@ impl LinksPanel {
         if self.place.take().is_some() {
             self.error = None;
             self.gh_problem = None;
+            self.renaming = None;
             cx.notify();
         }
     }
@@ -198,9 +212,65 @@ impl LinksPanel {
         cx.notify();
     }
 
+    /// Asks for a name for the artifact `url`, in its row. Enter, or the
+    /// keyboard going elsewhere, keeps what's typed; Esc doesn't. Once the
+    /// field is gone, the keyboard goes back to the thread on show.
+    fn start_renaming(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let place = self.shown();
+        let artifact = place.and_then(|p| p.links.iter().find(|l| l.url == url));
+        let name = place
+            .zip(artifact)
+            .map(|(place, artifact)| place.name_of(artifact).to_string())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let events =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, _, cx| match event {
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.finish_renaming(true, cx)
+                    }
+                    _ => {}
+                },
+            );
+        input.update(cx, |i, cx| {
+            i.focus(window, cx);
+            i.select_all(window, cx);
+        });
+        self.renaming = Some(Renaming {
+            url,
+            input,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    /// Done with the name asked for; with `keep`, it's kept.
+    fn finish_renaming(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        if keep && let Some((host, path, _)) = &self.place {
+            let name = renaming.input.read(cx).value().to_string();
+            self.store
+                .place_mut(&host.name, path)
+                .rename(&renaming.url, &name, now());
+            self.save();
+        }
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(super) fn listed(&self) -> (bool, Vec<String>) {
-        let names = self.links().iter().map(|a| a.name().to_string()).collect();
+        let names = match self.shown() {
+            Some(place) => place
+                .links
+                .iter()
+                .map(|a| place.name_of(a).to_string())
+                .collect(),
+            None => vec![],
+        };
         (self.loading.is_some(), names)
     }
 
@@ -317,13 +387,39 @@ impl Render for LinksPanel {
             .enumerate()
             .map(|(i, pr)| self.pr_row(i, pr, cx))
             .collect();
+        let names: Vec<String> = links
+            .iter()
+            .map(|a| self.shown().map_or(a.name(), |p| p.name_of(a)).to_string())
+            .collect();
         let rows = links.iter().enumerate().map(|(i, artifact)| {
-            let (open, tip, remove) = (
+            if let Some(renaming) = self.renaming.as_ref().filter(|r| r.url == artifact.url) {
+                return h_flex()
+                    .id(SharedString::from(format!("artifact-{i}")))
+                    .debug_selector(move || format!("artifact-renaming {i}"))
+                    .px_2()
+                    .py_0p5()
+                    .gap_2()
+                    .items_center()
+                    .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                        if e.keystroke.key == "escape" {
+                            this.finish_renaming(false, cx);
+                        }
+                    }))
+                    .child(icons::artifact().small())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&renaming.input).small()),
+                    );
+            }
+            let (open, tip, remove, rename) = (
                 artifact.url.clone(),
                 SharedString::from(artifact.url.clone()),
                 artifact.url.clone(),
+                artifact.url.clone(),
             );
-            let name = artifact.name().to_string();
+            let name = names[i].clone();
             let selector = format!("artifact {i} {name}");
             h_flex()
                 .id(SharedString::from(format!("artifact-{i}")))
@@ -340,6 +436,21 @@ impl Render for LinksPanel {
                 .on_click(move |_, _, cx| cx.open_url(&open))
                 .child(icons::artifact().small())
                 .child(div().flex_1().min_w_0().truncate().child(name))
+                .child(
+                    div()
+                        .debug_selector(move || format!("artifact-rename {i}"))
+                        .child(
+                            Button::new(SharedString::from(format!("artifact-rename-{i}")))
+                                .icon(icons::pencil())
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Give it a name of your own")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.start_renaming(rename.clone(), window, cx);
+                                })),
+                        ),
+                )
                 .child(
                     div()
                         .debug_selector(move || format!("artifact-remove {i}"))
@@ -435,6 +546,63 @@ mod tests {
     /// Links in a worktree's logs on its host list by themselves, each to
     /// its own worktree, and open with a click. One taken off stays off,
     /// the next time Lemur starts too, though the log still has it.
+    #[gpui::test]
+    fn an_artifact_can_be_given_a_name(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let server = HcServer::new("links-name");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("links-name");
+        let file = dir.join("links.json");
+        let logs = server.claude_config().join("projects/-srv-api");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = format!(
+            "{{\"message\":{{\"content\":\"[Handover](https://claude.ai/artifact/{ONE})\"}},\
+             \"type\":\"assistant\",\"timestamp\":\"2026-11-01\"}}\n"
+        );
+        std::fs::write(logs.join("a.jsonl"), log).unwrap();
+        let (panel, cx) = opened(file.clone(), cx);
+        panel.update(cx, |p, cx| {
+            p.show(host.clone(), "/srv/api".into(), "api".into(), cx)
+        });
+        let shows = |name: &str, cx: &mut gpui::VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                panel.read_with(cx, |p, _| p.listed().1 == [name])
+            })
+        };
+        assert!(shows("Handover", cx));
+        let click = |selector: &str, cx: &mut gpui::VisualTestContext| {
+            let selector: &'static str = selector.to_string().leak();
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        // Esc leaves it as it was.
+        click("artifact-rename 0", cx);
+        assert!(cx.debug_bounds("artifact-renaming 0").is_some(), "it asks");
+        cx.simulate_input("Not this");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("artifact-renaming 0").is_none());
+        assert!(shows("Handover", cx));
+
+        // What's typed takes the place of what was there.
+        click("artifact-rename 0", cx);
+        cx.simulate_input("My doc");
+        cx.simulate_keystrokes("enter");
+        assert!(shows("My doc", cx));
+        assert!(cx.debug_bounds("artifact 0 My doc").is_some());
+        let kept = std::fs::read_to_string(&file).unwrap();
+        assert!(kept.contains("My doc"), "{kept}");
+
+        // Emptied, it goes back to what the agent called it.
+        click("artifact-rename 0", cx);
+        cx.simulate_keystrokes("backspace enter");
+        assert!(shows("Handover", cx));
+    }
+
     #[gpui::test]
     fn another_folder_doesnt_wait_for_the_one_being_read(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();

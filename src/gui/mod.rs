@@ -4736,6 +4736,55 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// Naming an artifact ends with the keyboard back on the thread on show.
+    #[gpui::test]
+    fn the_keyboard_comes_back_from_naming_an_artifact(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("name-keys");
+        let dir = TempDir::new("name-keys");
+        let api = repo_at(&dir.join("api"));
+        let folder: String = api
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let logs = server.claude_config().join("projects").join(folder);
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("a.jsonl"),
+            "{\"text\":\"https://claude.ai/artifact/1hJWkh1hjNLMZjGxLk1zCD\",\
+             \"type\":\"assistant\",\"timestamp\":\"2026-11-01\"}\n",
+        )
+        .unwrap();
+        let t = server.run(&api, &[], &["sleep", "600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &api));
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        open(&app, &t, cx);
+        cx.dispatch_action(super::ToggleLinks);
+        let listed = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            cx.debug_bounds("artifact-rename 0").is_some()
+        });
+        assert!(listed);
+        let has_keyboard = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let view = app.read(cx).terminals[&key(&t)].clone();
+                gpui_kit::Focusable::focus_handle(view.read(cx), cx).is_focused(window)
+            })
+        };
+        let at = cx.debug_bounds("artifact-rename 0").unwrap().center();
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+        assert!(!has_keyboard(cx), "the field has it");
+        cx.simulate_input("Mine");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("artifact 0 Mine").is_some());
+        assert!(has_keyboard(cx), "back to the terminal");
+        let_attaches_end(&app, cx);
+    }
+
     /// The status bar doesn't count the agents; it says how many need you,
     /// when any do.
     #[gpui::test]

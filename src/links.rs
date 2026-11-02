@@ -31,6 +31,14 @@ impl Artifact {
     }
 }
 
+/// A name you gave a link, and when, in seconds since the epoch. Empty, it
+/// goes back to what agents call it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Given {
+    name: String,
+    at: u64,
+}
+
 /// A folder's links, the latest first; its pull requests, the ones still
 /// open first; the links taken off the list, which stay off though the logs
 /// still have them; and when its logs were last read, in seconds since the
@@ -45,6 +53,10 @@ pub struct Place {
     pending: Vec<u64>,
     #[serde(default)]
     removed: Vec<String>,
+    /// The names you gave links, by their links: what agents call them
+    /// doesn't change these.
+    #[serde(default)]
+    names: BTreeMap<String, Given>,
     #[serde(default)]
     pub looked: Option<u64>,
 }
@@ -72,10 +84,26 @@ impl Place {
         self.links.sort_by(|a, b| b.at.cmp(&a.at));
     }
 
+    /// Gives a link a name of yours at `now`; with none, it goes back to
+    /// what agents call it.
+    pub fn rename(&mut self, url: &str, name: &str, now: u64) {
+        let name = name.trim().to_string();
+        self.names.insert(url.to_string(), Given { name, at: now });
+    }
+
+    /// What to call `artifact`: the name you gave it, else what agents do.
+    pub fn name_of<'a>(&'a self, artifact: &'a Artifact) -> &'a str {
+        match self.names.get(&artifact.url) {
+            Some(given) if !given.name.is_empty() => &given.name,
+            _ => artifact.name(),
+        }
+    }
+
     /// Takes a link off the list for good.
     pub fn remove(&mut self, url: &str) {
         self.links.retain(|l| l.url != url);
         self.prs.retain(|pr| pr.url != url);
+        self.names.remove(url);
         if !self.removed.iter().any(|r| r == url) {
             self.removed.push(url.to_string());
         }
@@ -168,6 +196,12 @@ impl Store {
                 Some(mine) => {
                     for url in &theirs.removed {
                         mine.remove(url);
+                    }
+                    for (url, given) in theirs.names {
+                        let newer = mine.names.get(&url).is_none_or(|m| given.at > m.at);
+                        if newer && !mine.removed.contains(&url) {
+                            mine.names.insert(url, given);
+                        }
                     }
                 }
                 None => {
@@ -357,6 +391,68 @@ mod tests {
         assert_eq!(
             logs_folder("/Users/me/laft-web/.worktrees/a_b/web"),
             "-Users-me-laft-web--worktrees-a-b-web"
+        );
+    }
+
+    /// A name you give stays whatever agents call the link later, goes with
+    /// it, and with none, what they call it shows again. Two Lemurs keep the
+    /// newer of what they gave it.
+    #[test]
+    fn a_name_you_give_a_link_stays() {
+        let url = link(ONE, "").url;
+        let mut place = Place::default();
+        place.add(vec![Artifact {
+            title: Some("Handover".into()),
+            ..link(ONE, "1")
+        }]);
+        let shown = |p: &Place| p.name_of(&p.links[0]).to_string();
+        assert_eq!(shown(&place), "Handover");
+        place.rename(&url, "  My doc ", 10);
+        assert_eq!(shown(&place), "My doc");
+        place.add(vec![Artifact {
+            title: Some("Another".into()),
+            ..link(ONE, "2")
+        }]);
+        assert_eq!(shown(&place), "My doc", "what agents say doesn't change it");
+        place.rename(&url, " ", 11);
+        assert_eq!(shown(&place), "Handover");
+
+        let dir = TempDir::new("links-names");
+        let file = dir.join("links.json");
+        let mut first = Store::default();
+        let of = |s: &mut Store| s.place_mut("agent", "/srv/api").rename(&url, "Mine", 20);
+        first
+            .place_mut("agent", "/srv/api")
+            .add(vec![link(ONE, "1")]);
+        of(&mut first);
+        first.save(&file).unwrap();
+        let mut second = Store::load(&file);
+        let place = |s: &Store, url: &str| {
+            let place = s.place("agent", "/srv/api").unwrap();
+            let link = place.links.iter().find(|l| l.url == url).unwrap().clone();
+            place.name_of(&link).to_string()
+        };
+        assert_eq!(place(&second, &url), "Mine", "kept in the file");
+
+        first
+            .place_mut("agent", "/srv/api")
+            .rename(&url, "Newer", 30);
+        first.save(&file).unwrap();
+        second.save(&file).unwrap();
+        assert_eq!(place(&Store::load(&file), &url), "Newer");
+        // Put back to what it was, in the same second it was named.
+        let mut third = Store::load(&file);
+        third.place_mut("agent", "/srv/api").rename(&url, "", 30);
+        third.save(&file).unwrap();
+        assert_eq!(place(&Store::load(&file), &url), ONE);
+
+        let mut gone = Store::load(&file);
+        gone.place_mut("agent", "/srv/api").remove(&url);
+        gone.save(&file).unwrap();
+        assert!(
+            !std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"names\":{\"http")
         );
     }
 
