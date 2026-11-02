@@ -4211,6 +4211,45 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// A tab is as narrow with a long name as with a short one: hovered it
+    /// says the name, and the terminal's header names the thread on show.
+    #[gpui::test]
+    fn a_threads_name_is_on_hover_and_in_the_header(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("tab-names");
+        let long = "a-name-long-enough-to-make-a-titled-tab-wide";
+        let a = server.run("/", &["lemur.label=ab"], &["sleep", "600"]);
+        server.run("/", &[&format!("lemur.label={long}")], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        cx.run_until_parked();
+        open(&app, &a, cx);
+        cx.run_until_parked();
+
+        let (short_tab, long_tab) = (
+            cx.debug_bounds("tab-0").unwrap(),
+            cx.debug_bounds("tab-1").unwrap(),
+        );
+        assert!(
+            (long_tab.size.width - short_tab.size.width).abs() < px(4.0),
+            "{short_tab:?} {long_tab:?}"
+        );
+
+        assert!(cx.debug_bounds("header-name ab").is_some());
+        let tip = Box::leak(format!("tab-name {long}").into_boxed_str());
+        assert!(cx.debug_bounds(tip).is_none(), "not hovered yet");
+        let number = cx.debug_bounds("tab-number-1").unwrap().center();
+        cx.simulate_mouse_move(number, None, Modifiers::none());
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(tip).is_some(), "hovered");
+
+        cx.simulate_click(number, Modifiers::none());
+        let header = Box::leak(format!("header-name {long}").into_boxed_str());
+        assert!(cx.debug_bounds(header).is_some());
+        assert!(cx.debug_bounds("header-name ab").is_none());
+        let_attaches_end(&app, cx);
+    }
+
     /// Beside the branch, the status bar counts the lines added and removed
     /// in the worktree on show since its last commit; nothing while it has
     /// none.

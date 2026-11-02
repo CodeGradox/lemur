@@ -13,7 +13,7 @@ use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::rc::Rc;
@@ -230,6 +230,19 @@ impl Lemur {
                 }
             })
             .on_click(open)
+            // No title, to keep it narrow: the name shows on hover, and in
+            // the terminal's header on show.
+            .tooltip({
+                let name = s.label.clone();
+                move |window, cx| {
+                    let name = name.clone();
+                    Tooltip::element(move |_, _| {
+                        let selector = format!("tab-name {name}");
+                        div().debug_selector(move || selector).child(name.clone())
+                    })
+                    .build(window, cx)
+                }
+            })
             .children(tab_number(i).map(|number| {
                 div()
                     .debug_selector(move || format!("tab-number-{i}"))
@@ -238,7 +251,6 @@ impl Lemur {
                     .child(number)
             }))
             .child(thread_icon(s).small())
-            .child(div().max_w(px(200.0)).truncate().child(s.label.clone()))
             .children(s.issue.clone().map(|issue| {
                 div()
                     .text_xs()
@@ -315,7 +327,7 @@ impl Lemur {
         )
     }
 
-    /// Over the terminal: what runs in it, and where.
+    /// Over the terminal: what runs in it, its name, and where.
     pub(super) fn pane_header(&self, cx: &App) -> Option<Div> {
         let s = self.session_of(self.active.as_ref()?)?;
         let what = if s.runs_claude() {
@@ -335,6 +347,14 @@ impl Lemur {
                 .text_sm()
                 .child(thread_icon(s).small())
                 .child(div().flex_shrink_0().child(what))
+                .child(
+                    div()
+                        .debug_selector(|| format!("header-name {}", s.label))
+                        .min_w_0()
+                        .truncate()
+                        .font_semibold()
+                        .child(s.label.clone()),
+                )
                 .child(
                     div()
                         .min_w_0()
