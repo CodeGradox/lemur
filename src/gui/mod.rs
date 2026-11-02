@@ -296,6 +296,9 @@ struct Lemur {
     changes: u64,
     /// The notes of the last worktree opened, beside the terminal.
     notes: Entity<NotesPanel>,
+    /// The thread on show, when no snapshot listed it yet: its worktree's
+    /// notes show once one does.
+    notes_wait: Option<Key>,
     /// Every Claude thread and what it runs.
     agents: Entity<agents::AgentsView>,
     /// The worktree on show's changes, to commit.
@@ -699,6 +702,7 @@ impl Lemur {
             diffs: changes::Changes::default(),
             changes: 0,
             notes,
+            notes_wait: None,
             agents,
             changes_panel,
             links_panel,
@@ -967,15 +971,40 @@ impl Lemur {
             let focus = had_keyboard || (typing && now_in != shown_in);
             self.show_thread(host, session, focus, window, cx);
         }
-        self.follow_nothing(cx);
+        self.follow_shown(cx);
+        // The notes of a thread that wasn't listed when it showed.
+        if let Some(k) = self
+            .notes_wait
+            .clone()
+            .filter(|k| self.active.as_ref() == Some(k))
+            && let Some((worktree, label)) = self.worktree_of(&k.0, &k.1)
+        {
+            self.notes_wait = None;
+            self.notes
+                .update(cx, |n, cx| n.show(&k.0, &worktree, &label, window, cx));
+        }
         cx.notify();
     }
 
-    /// With no thread on show, the Changes panel says so, rather than
-    /// showing, and committing in, the worktree of the one that was.
-    fn follow_nothing(&mut self, cx: &mut Context<Self>) {
-        if self.active.is_none() && self.right == Some(Right::Changes) {
-            self.show_changes(cx);
+    /// The Changes and Links panels go by the thread on show. With none,
+    /// they say so, rather than showing, and committing in, the worktree of
+    /// the one that was. One just started isn't listed yet when it shows:
+    /// once it is, they show where it runs.
+    fn follow_shown(&mut self, cx: &mut Context<Self>) {
+        let on = self.active.is_none();
+        if self.right == Some(Right::Changes) {
+            let place = self.active_worktree().map(|(h, w)| (h, w.path.as_str()));
+            if on || place.is_some_and(|p| !self.changes_panel.read(cx).is_on(Some(p))) {
+                self.show_changes(cx);
+            }
+        }
+        if self.right == Some(Right::Links) {
+            let path = self.active.as_ref().and_then(|k| self.place_of(k));
+            let place = self.active.as_ref().zip(path.as_ref());
+            let place = place.map(|(k, (path, _))| (k.0.as_str(), path.as_str()));
+            if on || place.is_some_and(|p| !self.links_panel.read(cx).is_on(Some(p))) {
+                self.show_links(cx);
+            }
         }
     }
 
@@ -1165,9 +1194,12 @@ impl Lemur {
             self.show_links(cx);
         }
         self.follow_linear(cx);
-        if let Some((worktree, label)) = self.worktree_of(&host, &session) {
-            self.notes
-                .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx));
+        self.notes_wait = None;
+        match self.worktree_of(&host, &session) {
+            Some((worktree, label)) => self
+                .notes
+                .update(cx, |n, cx| n.show(&host, &worktree, &label, window, cx)),
+            None => self.notes_wait = Some((host.clone(), session.clone())),
         }
         self.remember(host, session);
         if focus {
@@ -1244,6 +1276,7 @@ impl Lemur {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.notes_wait = None;
         self.notes
             .update(cx, |n, cx| n.show(host, worktree, label, window, cx));
         self.right = Some(Right::Notes);
@@ -6054,6 +6087,54 @@ mod tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
         assert!(b_has_it(cx), "handed over once it's gone");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A thread just started isn't listed yet when it shows: the Changes
+    /// panel and the notes go to its worktree once it is, and with nothing
+    /// left on show, the Changes and Links panels say so.
+    #[gpui::test]
+    fn the_panels_follow_a_thread_once_its_listed(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("just-started");
+        let dir = TempDir::new("just-started");
+        let (api, web) = (repo_at(&dir.join("api")), repo_at(&dir.join("web")));
+        let a = server.run(&api, &["lemur.label=a"], &["sleep", "600"]);
+        let mut cfg = server.config();
+        cfg.bases = vec![Base::new("local", &api), Base::new("local", &web)];
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        open(&app, &a, cx);
+        cx.dispatch_action(super::ToggleChanges);
+        cx.run_until_parked();
+
+        let b = server.run(&web, &["lemur.label=b"], &["sleep", "600"]);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_fresh("local".into(), b.clone(), window, cx)
+            })
+        });
+        app.read_with(cx, |app, cx| {
+            let panel = app.changes_panel.read(cx);
+            assert!(panel.is_on(None), "not listed yet");
+        });
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            assert!(app.changes_panel.read(cx).is_on(Some(("local", &web))));
+            assert_eq!(app.notes.read(cx).worktree(), Some(web.as_str()));
+        });
+
+        cx.dispatch_action(super::ToggleLinks);
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            assert!(app.links_panel.read(cx).is_on(Some(("local", &web))));
+        });
+        apply(&app, &[], cx);
+        app.read_with(cx, |app, cx| {
+            assert_eq!(app.active, None);
+            assert!(app.links_panel.read(cx).is_on(None), "nothing on show");
+        });
         let_attaches_end(&app, cx);
     }
 

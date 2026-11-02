@@ -141,6 +141,13 @@ impl ChangesPanel {
         (files, self.lines.iter().map(|l| l.to_string()).collect())
     }
 
+    /// Whether it shows worktree `on`, by its host and path; with None,
+    /// nothing.
+    pub(super) fn is_on(&self, on: Option<(&str, &str)>) -> bool {
+        let place = self.place.as_ref();
+        place.map(|(h, p, _)| (h.name.as_str(), p.as_str())) == on
+    }
+
     /// Nothing on show to tell changes of.
     pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
         if self.place.is_none() {

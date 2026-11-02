@@ -84,6 +84,13 @@ impl LinksPanel {
         }
     }
 
+    /// Whether it shows folder `on`, by its host and path; with None,
+    /// nothing.
+    pub(super) fn is_on(&self, on: Option<(&str, &str)>) -> bool {
+        let place = self.place.as_ref();
+        place.map(|(h, p, _)| (h.name.as_str(), p.as_str())) == on
+    }
+
     fn shows(&self, host: &str, path: &str) -> bool {
         self.place
             .as_ref()
