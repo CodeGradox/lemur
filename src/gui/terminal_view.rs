@@ -24,7 +24,7 @@ use gpui_kit::*;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Key context for terminal-only key bindings.
 pub const CONTEXT: &str = "Terminal";
@@ -98,12 +98,29 @@ pub struct TerminalView {
     /// screen, a paste as the program's modes then say (bracketed in
     /// Claude). Dropped if the attach fails.
     held: std::cell::RefCell<Vec<Held>>,
+    /// The core's first paint is over, which it doesn't say: its stream has
+    /// gone quiet a while (`PAINT_QUIET`). It sets the program's modes as it
+    /// goes, some after the scrollback.
+    painted: bool,
+    /// When its stream last brought anything, during the first paint.
+    last_output: Option<Instant>,
+    _paint: Option<Task<()>>,
     /// Draws output that came since the last frame, at `OUTPUT_EVERY`.
     _redraw: Option<Task<()>>,
     #[cfg(test)]
     renders: usize,
     _prefs: Subscription,
 }
+
+/// How long a terminal's stream stays quiet before its first paint counts as
+/// over: at least this, however quick the line...
+const PAINT_QUIET: Duration = Duration::from_millis(100);
+/// ...and at most this, however slow.
+const PAINT_QUIET_MOST: Duration = Duration::from_secs(1);
+/// How long input waits for it at most.
+const PAINT_LONGEST: Duration = Duration::from_secs(5);
+/// How often it looks.
+const PAINT_LOOK: Duration = Duration::from_millis(25);
 
 /// An attach until its view takes it. Dropped first, as when the view went
 /// while it attached, it lets go of the terminal, which the core would
@@ -194,6 +211,9 @@ impl TerminalView {
             screen: None,
             fresh: None,
             attachment: Attachment::Ended,
+            painted: false,
+            last_output: None,
+            _paint: None,
             focus: cx.focus_handle(),
             bounds: Bounds::default(),
             cell_size: size(px(8.0), px(16.0)),
@@ -313,6 +333,9 @@ impl TerminalView {
             None => self.screen = Some(fresh),
         }
         self.attachment = Attachment::Attaching;
+        self.painted = false;
+        self.last_output = None;
+        self._paint = None;
         self.held.borrow_mut().clear();
         self.tried = Some(Instant::now());
         self.told_display = None;
@@ -389,6 +412,7 @@ impl TerminalView {
         // goes by a viewer's size only once the viewer says something.
         core.resize(channel, self.cell.cols, self.cell.lines);
         self.attachment = Attachment::Attached(core, channel);
+        self.wait_for_paint(cx);
         if let Some(mut fresh) = self.fresh.take() {
             fresh.resize(self.cell);
             self.screen = Some(fresh);
@@ -397,6 +421,34 @@ impl TerminalView {
             self.set_status(None, cx);
         }
         cx.notify();
+    }
+
+    /// Sends what waited once the first paint is over: its stream has been
+    /// quiet a while, longer on a slower line, or it's taking too long, as
+    /// with a program that prints without end. In real time: tests' clocks
+    /// don't move on their own, and their terminals are real.
+    fn wait_for_paint(&mut self, cx: &mut Context<Self>) {
+        let answered_in = self.tried.map_or(Duration::ZERO, |t| t.elapsed());
+        let quiet = (answered_in * 2).clamp(PAINT_QUIET, PAINT_QUIET_MOST);
+        let started = Instant::now();
+        self._paint = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_spawn(async { std::thread::sleep(PAINT_LOOK) })
+                    .await;
+                let over = this.update(cx, |this, _| {
+                    let over = this.last_output.is_some_and(|t| t.elapsed() >= quiet)
+                        || started.elapsed() >= PAINT_LONGEST;
+                    if over {
+                        this.painted = true;
+                        this.send_held();
+                    }
+                    over
+                });
+                if !matches!(over, Ok(false)) {
+                    return;
+                }
+            }
+        }));
     }
 
     /// Feeds relayed bytes in; false once the stream is over.
@@ -414,6 +466,7 @@ impl TerminalView {
                     if let Attachment::Attached(core, channel) = &self.attachment {
                         core.credit(*channel, bytes.len());
                     }
+                    self.last_output = Some(Instant::now());
                 }
                 Stream::Closed(why) => {
                     open = false;
@@ -422,11 +475,6 @@ impl TerminalView {
                 Stream::Lost => open = false,
             }
         }
-        // The first paint has set the program's modes: what waited goes now.
-        self.send_held();
-        let Some(screen) = &mut self.screen else {
-            return false;
-        };
         let events = screen.events();
         let deadline = screen.sync_deadline();
         for event in events {
@@ -527,14 +575,21 @@ impl TerminalView {
     fn write(&self, bytes: Vec<u8>) {
         self.typed_at.set(Some(Instant::now()));
         match &self.attachment {
-            Attachment::Attached(core, channel) => core.input(*channel, &bytes),
-            Attachment::Attaching => self.held.borrow_mut().push(Held::Bytes(bytes)),
+            Attachment::Attached(core, channel) if self.painted => core.input(*channel, &bytes),
+            Attachment::Attaching | Attachment::Attached(..) => {
+                self.held.borrow_mut().push(Held::Bytes(bytes))
+            }
             Attachment::Ended => {}
         }
     }
 
     pub fn paste_text(&self, text: &str) {
-        if matches!(self.attachment, Attachment::Attaching) {
+        let waiting = match &self.attachment {
+            Attachment::Attaching => true,
+            Attachment::Attached(..) => !self.painted,
+            Attachment::Ended => false,
+        };
+        if waiting {
             self.held.borrow_mut().push(Held::Paste(text.to_string()));
             return;
         }
@@ -544,7 +599,7 @@ impl TerminalView {
         ));
     }
 
-    /// Sends the input that waited for the terminal to attach.
+    /// Sends the input that waited for the terminal to attach and paint.
     fn send_held(&self) {
         if !matches!(self.attachment, Attachment::Attached(..)) {
             return;
@@ -1574,7 +1629,7 @@ impl Render for TerminalView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{OUTPUT_EVERY, TerminalInput, TerminalView, block, snapshot};
+    use super::{Attachment, OUTPUT_EVERY, TerminalInput, TerminalView, block, snapshot};
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Screen, Size};
     use crate::hc::Stream;
@@ -1699,6 +1754,46 @@ mod tests {
             shown(&view, cx).contains("^[[200~hello^[[201~!")
         });
         assert!(echoed, "{}", shown(&view, cx));
+    }
+
+    /// Input given as the paint comes goes once it's over, however it's
+    /// split: herdr-core sets a program's modes after its scrollback, so a
+    /// paste sent after the first frame would go out unbracketed, and its
+    /// newlines act as Enter. It keeps its order with what's typed after it.
+    #[gpui::test]
+    fn input_waits_for_the_whole_first_paint(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("paint-modes");
+        let (view, _, cx) = attach(&server, &["sh", "-c", "exec cat -v"], cx);
+        let settled = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.painted)
+        });
+        assert!(settled);
+        view.update(cx, |v, cx| {
+            // As if attached just now, with the paint under way.
+            let Attachment::Attached(core, channel) = &v.attachment else {
+                panic!("attached");
+            };
+            let (core, channel) = (core.clone(), *channel);
+            v.painted = false;
+            v.last_output = None;
+            v.attached(core, channel, cx);
+            v.ingest(vec![Stream::Data(b"\x1b[?2004l".to_vec())], cx);
+            v.paste_text("a\nb");
+            v.write(b"!".to_vec());
+            assert_eq!(v.held.borrow().len(), 2, "both wait");
+            v.ingest(vec![Stream::Data(b"\x1b[?2004h".to_vec())], cx);
+        });
+        let echoed = wait_until(Duration::from_secs(10), || {
+            shown(&view, cx).contains("^[[200~a")
+        });
+        assert!(echoed, "{}", shown(&view, cx));
+        assert!(
+            wait_until(Duration::from_secs(5), || shown(&view, cx)
+                .contains("b^[[201~!")),
+            "{}",
+            shown(&view, cx)
+        );
     }
 
     /// What `view` shows, row by row, without trailing blanks.
