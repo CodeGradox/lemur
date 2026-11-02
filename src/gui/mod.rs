@@ -266,6 +266,8 @@ struct Lemur {
     /// Terminals setting up a host (`hc machine add`), shown in the peek
     /// card until it's put away, and the host each sets up.
     setups: HashMap<Key, Host>,
+    /// Gone threads being resumed, by host and session.
+    resuming: HashSet<Key>,
     /// Hosts a set-up is starting for: a second click starts no other.
     setting_up: HashSet<String>,
     /// The tabs' and the peek card's dots, by where and whose.
@@ -697,6 +699,7 @@ impl Lemur {
             diff_preview: None,
             setups: HashMap::new(),
             setting_up: HashSet::new(),
+            resuming: HashSet::new(),
             ordering: HashMap::new(),
             status: None,
             restore,
@@ -6387,6 +6390,43 @@ mod tests {
             })
         });
         cx.run_until_parked();
+        let_attaches_end(&app, cx);
+    }
+
+    /// A double click on a gone thread resumes it once: two Claudes would
+    /// work on one conversation.
+    #[gpui::test]
+    fn a_double_click_resumes_a_thread_once(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("resume-once");
+        let dir = TempDir::new("resume-once");
+        let api = repo_at(&dir.join("api"));
+        let mut cfg = server.config();
+        cfg.hosts[0].claude = "sh -c 'exec sleep 600' claude".into();
+        cfg.bases = vec![Base::new("local", &api)];
+        let thread = crate::config::ClaudeThread {
+            host: "local".into(),
+            session: "t99".into(),
+            path: api.clone(),
+            claude_session: "e7f3a2c4-1b5d-4c8e-9f0a-2d3b4c5d6e7f".into(),
+            label: Some("gone".into()),
+            issue: None,
+        };
+        cfg.threads.push(thread.clone());
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        cx.run_until_parked();
+        let before = server.addresses().len();
+        app.update(cx, |app, cx| {
+            app.resume(vec![thread.clone()], cx);
+            app.resume(vec![thread.clone()], cx);
+        });
+        let done = wait_until(Duration::from_secs(20), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.resuming.is_empty())
+        });
+        assert!(done);
+        cx.run_until_parked();
+        assert_eq!(server.addresses().len(), before + 1, "one terminal");
         let_attaches_end(&app, cx);
     }
 

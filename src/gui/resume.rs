@@ -115,6 +115,12 @@ impl Lemur {
     /// Starts gone threads' sessions again, each resuming its Claude
     /// conversation; one alone opens.
     pub(super) fn resume(&mut self, threads: Vec<ClaudeThread>, cx: &mut Context<Self>) {
+        // Not one being resumed, as with a double click, or ▶ then Resume
+        // all: two Claudes would work on one conversation.
+        let threads: Vec<ClaudeThread> = threads
+            .into_iter()
+            .filter(|t| self.resuming.insert((t.host.clone(), t.session.clone())))
+            .collect();
         let what = match threads.as_slice() {
             [] => return,
             [one] => one.shown(),
@@ -138,6 +144,8 @@ impl Lemur {
                 this.status = None;
                 let mut resumed = vec![];
                 for (thread, result) in results {
+                    this.resuming
+                        .remove(&(thread.host.clone(), thread.session.clone()));
                     match result {
                         // It goes on in a terminal of its own.
                         Ok(session) => {
