@@ -634,7 +634,15 @@ impl Core {
         self.send(0, DATA, request.to_string().as_bytes());
         match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(anyhow::Error::new(RpcError(e)).context(method.to_owned())),
+            Ok(Err(e)) => {
+                let refused = RpcError(e);
+                // Removed or renamed meanwhile, as with `hc machine rm`:
+                // what's known of the machines is out of date.
+                if refused.kind() == Some("machine_unknown") {
+                    self.machines.lock().unwrap().clear();
+                }
+                Err(anyhow::Error::new(refused).context(method.to_owned()))
+            }
             Err(_) => {
                 self.routes.lock().unwrap().replies.remove(&id);
                 Err(anyhow!("{method}: no answer from herdr-core"))
@@ -1224,6 +1232,24 @@ mod tests {
                 "{name}: pid {pid}"
             );
         }
+    }
+
+    /// A machine removed while Lemur runs is looked for again, not asked
+    /// for by the name it had until Lemur restarts.
+    #[test]
+    fn a_machine_removed_is_looked_for_again() {
+        let server = HcServer::new("machine-rm");
+        let cfg = server.far_config("rm-box");
+        let core = server.core();
+        assert_eq!(core.machine(&cfg.hosts[0]).unwrap(), "rm-box");
+        assert!(!core.machines.lock().unwrap().is_empty());
+        server.hc(&["machine", "rm", "rm-box"]);
+        let e = core
+            .exec(Some("rm-box"), &["true"], None, Duration::from_secs(5))
+            .err()
+            .expect("it's gone");
+        assert_eq!(error_kind(&e), Some("machine_unknown"), "{e:#}");
+        assert!(core.machines.lock().unwrap().is_empty(), "forgotten");
     }
 
     /// A paste bigger than a frame takes doesn't end the connection, and
