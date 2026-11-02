@@ -19,7 +19,10 @@ use std::rc::Rc;
 /// A worktree to remove, and the threads to close first.
 #[derive(Clone)]
 pub(super) struct Removal {
-    base: usize,
+    /// Its project, by host and path: projects can be removed or moved while
+    /// this runs, or waits for an answer, so their place isn't kept.
+    host: String,
+    project: String,
     worktree: String,
     label: String,
     pub(super) sessions: Vec<String>,
@@ -317,15 +320,16 @@ impl Lemur {
 
     /// What removing a worktree takes with it: the threads running there.
     pub(super) fn removal(&self, base: usize, worktree: String, label: String) -> Removal {
-        let host = &self.cfg.bases[base].host;
+        let project = &self.cfg.bases[base];
         let sessions = self
             .snap
-            .worktrees(host)
+            .worktrees(&project.host)
             .filter(|w| w.path == worktree)
             .flat_map(|w| w.sessions.iter().map(|s| s.name.clone()))
             .collect();
         Removal {
-            base,
+            host: project.host.clone(),
+            project: project.path.clone(),
             worktree,
             label,
             sessions,
@@ -346,11 +350,12 @@ impl Lemur {
         cx: &mut Context<Self>,
     ) {
         let Removal {
-            base,
+            host,
             worktree,
             label,
             sessions,
             delete,
+            ..
         } = &removal;
         let force = matches!(
             kept,
@@ -359,7 +364,6 @@ impl Lemur {
         // The first time asks whether to delete the folder too.
         let mut ask_delete = None;
         let mut close = sessions.clone();
-        let host = &self.cfg.bases[*base].host;
         let named = |list: &[String]| -> Vec<String> {
             list.iter().map(|s| self.label_of(host, s)).collect()
         };
@@ -445,8 +449,13 @@ impl Lemur {
         self.status = Some((format!("removing {}…", removal.label), Kind::Progress));
         cx.notify();
         let cfg = self.cfg.clone();
+        // Asked while it was still there.
+        let Some(base) = self.project_of_removal(&removal) else {
+            self.status = None;
+            self.note(format!("{}'s project has gone", removal.label), cx);
+            return;
+        };
         let Removal {
-            base,
             worktree,
             sessions,
             delete,
@@ -458,7 +467,11 @@ impl Lemur {
             move |this, removed, window, cx| {
                 this.status = None;
                 match removed {
-                    Ok(()) => this.forget_worktree(removal.base, &removal.worktree, cx),
+                    Ok(()) => {
+                        if let Some(base) = this.project_of_removal(&removal) {
+                            this.forget_worktree(base, &removal.worktree, cx);
+                        }
+                    }
                     // Threads it wasn't to close keep it until you say; git
                     // keeps a locked or changed worktree unless forced.
                     Err(e) => match (force, actions::why_kept(&e)) {
@@ -473,6 +486,14 @@ impl Lemur {
             },
         )
         .detach();
+    }
+
+    /// Where a worktree being removed's project is in the config by now.
+    fn project_of_removal(&self, removal: &Removal) -> Option<usize> {
+        self.cfg
+            .bases
+            .iter()
+            .position(|b| b.host == removal.host && b.path == removal.project)
     }
 
     /// Forgets a removed worktree's color, place in the order, that it was

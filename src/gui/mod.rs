@@ -6346,6 +6346,50 @@ mod tests {
         }
     }
 
+    /// A worktree's removal goes by its project, not where that was in the
+    /// config: projects moved meanwhile, it removes the right worktree; its
+    /// project removed, nothing, where asking again would have panicked.
+    #[gpui::test]
+    fn removing_a_worktree_goes_by_its_project(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("removal-moved");
+        let dir = TempDir::new("removal-moved");
+        let (api, web) = (repo_at(&dir.join("api")), repo_at(&dir.join("web")));
+        git_in(
+            std::path::Path::new(&web),
+            &["worktree", "add", "-q", "-b", "x", "wt/x"],
+        );
+        let wt = format!("{web}/wt/x");
+        let mut cfg = server.config();
+        cfg.bases = vec![Base::new("local", &api), Base::new("local", &web)];
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        cx.run_until_parked();
+        let removal = app.read_with(cx, |app, _| app.removal(1, wt.clone(), "x".into()));
+        app.update(cx, |app, cx| app.reorder_projects(0, 1, cx));
+        app.update(cx, |app, cx| {
+            app.remove_worktree(removal.clone(), false, cx)
+        });
+        let gone = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            !std::path::Path::new(&wt).join(".git").exists()
+        });
+        assert!(gone, "web's worktree went");
+
+        let removal = removal.clone();
+        let project = app.read_with(cx, |app, _| app.cfg.bases[0].clone());
+        assert_eq!(project.path, web);
+        app.update(cx, |app, cx| app.remove_project(&project, cx));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let kept = Some(crate::actions::Kept::Changes);
+                app.confirm_remove_worktree(removal.clone(), kept, window, cx);
+                app.remove_worktree(removal, false, cx);
+            })
+        });
+        cx.run_until_parked();
+        let_attaches_end(&app, cx);
+    }
+
     /// A repository at `path`, with one commit.
     fn repo_at(path: &std::path::Path) -> String {
         std::fs::create_dir(path).unwrap();
