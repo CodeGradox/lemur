@@ -58,14 +58,16 @@ pub(super) struct ChangesPanel {
     lines: Vec<SharedString>,
     pub(super) diff_scroll: UniformListScrollHandle,
     message: Entity<InputState>,
-    committing: bool,
+    /// The host and worktree a commit is going in, while it is.
+    committing: Option<(String, String)>,
     /// What the last commit did, or why it didn't.
     note: Option<(String, bool)>,
     _message: Subscription,
-    /// Asking the worktree for its changes; apart from the diff and the
-    /// commit, so neither cancels it.
+    /// Asking the worktree for its changes, for a file's diff, and
+    /// committing, each apart, so none cancels another.
     _refresh: Option<Task<()>>,
-    _task: Option<Task<()>>,
+    _diff: Option<Task<()>>,
+    _commit: Option<Task<()>>,
 }
 
 impl ChangesPanel {
@@ -89,11 +91,12 @@ impl ChangesPanel {
             lines: vec![],
             diff_scroll: UniformListScrollHandle::new(),
             message,
-            committing: false,
+            committing: None,
             note: None,
             _message: events,
             _refresh: None,
-            _task: None,
+            _diff: None,
+            _commit: None,
         }
     }
 
@@ -167,13 +170,15 @@ impl ChangesPanel {
         let Some((host, path, _)) = self.place.clone() else {
             return;
         };
-        if self.loading || self.committing {
+        // A commit going in here changes what there is to list; it asks
+        // again once it's in.
+        let asked = (host.name.clone(), path.clone());
+        if self.loading || self.committing.as_ref() == Some(&asked) {
             return;
         }
         self.loading = true;
         let open = self.open.clone();
         let diffed = open.clone();
-        let asked = (host.name.clone(), path.clone());
         self._refresh = Some(cx.spawn(async move |this, cx| {
             let (files, diff) = cx
                 .background_spawn(async move {
@@ -264,7 +269,7 @@ impl ChangesPanel {
         self.lines = vec!["Loading…".into()];
         cx.notify();
         let asked = (host.name.clone(), root.clone());
-        self._task = Some(cx.spawn(async move |this, cx| {
+        self._diff = Some(cx.spawn(async move |this, cx| {
             let diff = cx
                 .background_spawn(async move { diff_of(&host, &root, &file) })
                 .await;
@@ -282,31 +287,47 @@ impl ChangesPanel {
     /// Commits every change listed, with the message typed.
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = self.message.read(cx).value().trim().to_string();
-        let Some((host, path, _)) = self.place.clone() else {
+        let Some((host, path, label)) = self.place.clone() else {
             return;
         };
-        if message.is_empty() || self.files.is_empty() || self.committing {
+        if message.is_empty() || self.files.is_empty() || self.committing.is_some() {
             return;
         }
         let files = to_add(&self.files);
-        self.committing = true;
+        let asked = (host.name.clone(), path.clone());
+        self.committing = Some(asked.clone());
         self.note = None;
         cx.notify();
-        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+        self._commit = Some(cx.spawn_in(window, async move |this, cx| {
+            let typed = message.clone();
             let done = cx
-                .background_spawn(async move { commit_in(&host, &path, &message, &files) })
+                .background_spawn(async move { commit_in(&host, &path, &typed, &files) })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                this.committing = false;
+                this.committing = None;
+                // Another worktree may show by now: what's typed and shown
+                // there is its own, and this says whose this was.
+                let here = this.shows(&asked);
+                let said = |text: String| {
+                    if here {
+                        text
+                    } else {
+                        format!("{label}: {text}")
+                    }
+                };
                 match done {
                     Ok(summary) => {
-                        this.note = Some((summary, false));
-                        this.open = None;
-                        this.lines.clear();
-                        this.message.update(cx, |m, cx| m.set_value("", window, cx));
+                        this.note = Some((said(summary), false));
+                        if here {
+                            this.open = None;
+                            this.lines.clear();
+                            if this.message.read(cx).value().trim() == message {
+                                this.message.update(cx, |m, cx| m.set_value("", window, cx));
+                            }
+                        }
                         cx.emit(Committed);
                     }
-                    Err(e) => this.note = Some((format!("Commit failed: {e}"), true)),
+                    Err(e) => this.note = Some((said(format!("Commit failed: {e}")), true)),
                 }
                 this.refresh(cx);
                 cx.notify();
@@ -450,7 +471,7 @@ impl Render for ChangesPanel {
                 )
         });
         let can_commit = !self.files.is_empty()
-            && !self.committing
+            && self.committing.is_none()
             && !self.message.read(cx).value().trim().is_empty();
         let commit = v_flex()
             .flex_shrink_0()
@@ -467,7 +488,7 @@ impl Render for ChangesPanel {
                             Button::new("commit")
                                 .small()
                                 .primary()
-                                .label(if self.committing {
+                                .label(if self.committing.is_some() {
                                     "Committing…"
                                 } else {
                                     "Commit"
@@ -859,6 +880,104 @@ mod tests {
             listed(cx).1.len() == 2
         });
         assert!(again, "{:?}", listed(cx));
+    }
+
+    /// A window with just the panel, on the repository at `repo`.
+    fn panel_on<'a>(
+        repo: &std::path::Path,
+        host: crate::config::Host,
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (
+        gpui_kit::Entity<super::ChangesPanel>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        use gpui_kit::AppContext;
+        let path = repo.to_string_lossy().into_owned();
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let mut panel = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| super::ChangesPanel::new(window, cx));
+            panel = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let panel = panel.unwrap();
+        panel.update(cx, |p, cx| p.show(host, path, "repo".into(), cx));
+        (panel, cx)
+    }
+
+    /// Waits until the panel has answered, and no commit is under way.
+    fn settled(panel: &gpui_kit::Entity<super::ChangesPanel>, cx: &mut gpui::VisualTestContext) {
+        let done = crate::test_support::wait_until(std::time::Duration::from_secs(20), || {
+            cx.run_until_parked();
+            panel.read_with(cx, |p, _| !p.loading && p.committing.is_none())
+        });
+        assert!(done, "the panel settles");
+    }
+
+    /// A click on a file while a commit goes in leaves the commit to finish:
+    /// the panel doesn't stay on "Committing…" for good.
+    #[gpui::test]
+    fn a_click_during_a_commit_leaves_it_to_finish(cx: &mut gpui::TestAppContext) {
+        let server = crate::test_support::HcServer::new("changes-click");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-click");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let (panel, cx) = panel_on(&repo, host, cx);
+        settled(&panel, cx);
+        cx.update(|window, cx| {
+            panel.update(cx, |p, cx| {
+                p.message.update(cx, |m, cx| m.set_value("Add", window, cx));
+                p.commit(window, cx);
+                p.open_file("a.txt".into(), cx);
+            })
+        });
+        settled(&panel, cx);
+        panel.read_with(cx, |p, cx| {
+            assert!(p.committing.is_none());
+            assert!(p.files.is_empty(), "{:?}", p.files);
+            assert_eq!(p.message.read(cx).value().to_string(), "", "it's in");
+            let note = p.note.as_ref().expect("what it did");
+            assert!(note.0.ends_with("Add"), "{note:?}");
+        });
+    }
+
+    /// A commit's answer goes to its own worktree's: another shown meanwhile
+    /// lists its changes, and keeps what's typed and shown there.
+    #[gpui::test]
+    fn a_commit_finishing_leaves_another_worktree_alone(cx: &mut gpui::TestAppContext) {
+        let server = crate::test_support::HcServer::new("changes-other");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-other");
+        let (repo, other) = (dir.join("repo"), dir.join("other"));
+        for r in [&repo, &other] {
+            std::fs::create_dir(r).unwrap();
+            git_in(r, &["init", "-q", "-b", "main"]);
+            std::fs::write(r.join("a.txt"), "one\n").unwrap();
+        }
+        let (panel, cx) = panel_on(&repo, host.clone(), cx);
+        settled(&panel, cx);
+        let other = other.to_string_lossy().into_owned();
+        cx.update(|window, cx| {
+            panel.update(cx, |p, cx| {
+                p.message.update(cx, |m, cx| m.set_value("Add", window, cx));
+                p.commit(window, cx);
+                p.show(host, other.clone(), "other".into(), cx);
+                assert!(p.loading, "it asks the other, as the commit goes in");
+                p.message
+                    .update(cx, |m, cx| m.set_value("For the other", window, cx));
+            })
+        });
+        settled(&panel, cx);
+        panel.read_with(cx, |p, cx| {
+            let note = p.note.as_ref().expect("what it did");
+            assert!(note.0.starts_with("repo: Committed "), "{note:?}");
+            assert_eq!(p.message.read(cx).value().to_string(), "For the other");
+            assert_eq!(p.listed().0, [("a.txt".to_string(), '?')]);
+        });
     }
 
     /// A click on a file shows its diff, and another hides it, for good even
