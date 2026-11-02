@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 /// How long `gh` gets to answer: it runs on the network.
 const TIME: Duration = Duration::from_secs(20);
+/// How long its output gets at least, once `gh` has ended.
+const PIPES: Duration = Duration::from_millis(500);
 /// What's asked of a pull request.
 const FIELDS: &str = "number,title,state,isDraft,url";
 
@@ -163,14 +165,17 @@ fn ask(gh: &Path, args: &[&str], time: Duration) -> Result<String, Failed> {
             std::io::ErrorKind::NotFound => Failed::Problem(Problem::Missing),
             _ => Failed::Other,
         })?;
+    // Each pipe on a thread, so neither fills up and holds `gh` back.
     let read = |pipe: Option<Box<dyn Read + Send>>| {
+        let (read, said) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = vec![];
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            String::from_utf8_lossy(&bytes).into_owned()
-        })
+            let _ = read.send(String::from_utf8_lossy(&bytes).into_owned());
+        });
+        said
     };
     let out = read(child.stdout.take().map(|p| Box::new(p) as _));
     let err = read(child.stderr.take().map(|p| Box::new(p) as _));
@@ -188,10 +193,12 @@ fn ask(gh: &Path, args: &[&str], time: Duration) -> Result<String, Failed> {
             }
         }
     };
+    // Something it left running can hold its pipes open after it's gone.
+    let left = time.saturating_sub(started.elapsed()).max(PIPES);
     if status.success() {
-        return out.join().map_err(|_| Failed::Other);
+        return out.recv_timeout(left).map_err(|_| Failed::TimedOut);
     }
-    let said = err.join().unwrap_or_default();
+    let said = err.recv_timeout(left).unwrap_or_default();
     Err(if said.contains("gh auth login") {
         Failed::Problem(Problem::SignedOut)
     } else if said.contains("Could not resolve to a PullRequest") {
@@ -338,6 +345,19 @@ esac"#
             Err(Failed::TimedOut)
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// What `gh` leaves running, holding its output open, isn't waited for.
+    #[test]
+    fn what_gh_leaves_running_isnt_waited_for() {
+        let dir = TempDir::new("gh-left");
+        let gh = fake_gh(&dir, "sleep 30 & echo '[]'; exit 0");
+        let started = Instant::now();
+        assert_eq!(
+            ask(&gh, &["pr"], Duration::from_secs(3)),
+            Err(Failed::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     /// With no answer in time the rest aren't asked, one after the other:
