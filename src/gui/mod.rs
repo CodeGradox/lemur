@@ -3299,6 +3299,64 @@ mod tests {
         });
     }
 
+    /// A folded worktree's long name ends before what runs in it, and
+    /// before its buttons, which take that place on hover.
+    #[gpui::test]
+    fn a_long_worktree_name_stops_before_what_sits_beside_it(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("long-name");
+        let dir = TempDir::new("long-name");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        let branch = "fix/a-branch-name-long-enough-to-reach-what-sits-beside-it";
+        git_in(&repo, &["init", "-q", "-b", branch]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let path = repo.to_string_lossy().into_owned();
+        // An agent and a shell, as counts wider than its buttons.
+        server.run(&path, &["lemur.kind=claude"], &["sleep", "600"]);
+        server.run(&path, &[], &["sleep", "600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &path));
+        let (_app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        let row = cx.debug_bounds("worktree-0").expect("the worktree");
+        cx.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let bounds = |what: &str, cx: &mut VisualTestContext| {
+            let selector = Box::leak(format!("{what} {branch}").into_boxed_str());
+            cx.debug_bounds(selector).expect(selector)
+        };
+        let label = bounds("label", cx);
+        let counts = bounds("counts", cx);
+        let buttons = bounds("buttons", cx);
+        assert!(label.right() <= counts.left(), "{label:?} {counts:?}");
+        assert!(label.right() <= buttons.left(), "{label:?} {buttons:?}");
+        assert!(counts.right() <= row.right() && buttons.right() <= row.right());
+    }
+
+    /// A small dot separates what a thread's row says of it, as its Linear
+    /// issue from its age; with only its age there's none.
+    #[gpui::test]
+    fn a_threads_indicators_are_separated(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("separators");
+        server.run(
+            "/",
+            &["lemur.label=pinned", "lemur.issue=ENG-1"],
+            &["sleep", "600"],
+        );
+        server.run("/", &["lemur.label=plain"], &["sleep", "600"]);
+        let (_app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thread-1").is_some(), "both threads show");
+        assert!(cx.debug_bounds("separator pinned 1").is_some());
+        assert!(cx.debug_bounds("separator pinned 0").is_none());
+        assert!(cx.debug_bounds("separator pinned 2").is_none());
+        assert!(cx.debug_bounds("separator plain 0").is_none());
+        assert!(cx.debug_bounds("separator plain 1").is_none());
+    }
+
     /// Clicking a worktree folds its threads away and back; its + starts
     /// a terminal there, or opens its notes, and leaves it open.
     #[gpui::test]

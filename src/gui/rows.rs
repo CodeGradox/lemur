@@ -411,6 +411,7 @@ fn row(
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let name = label.clone();
     let (hover, active_bg, accent_text) = (
         theme.sidebar_accent.opacity(0.8),
         theme.tokens.sidebar_accent,
@@ -439,7 +440,14 @@ fn row(
                 .gap_x_2()
                 .justify_between()
                 .overflow_x_hidden()
-                .child(h_flex().flex_1().overflow_x_hidden().child(label))
+                .child(
+                    div()
+                        .debug_selector(move || format!("label {name}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(label),
+                )
                 .child(suffix),
         )
 }
@@ -486,12 +494,17 @@ fn worktree(
     // what runs in it there instead.
     let hovered = SharedString::from(format!("{id}-row"));
     let buttons = format!("buttons {label}");
+    // Both in one cell, as wide as the wider, so the label ends before either.
     let suffix = div()
-        .relative()
+        .grid()
+        .grid_cols_max_content(1)
         .child(
             h_flex()
                 .id("suffix")
                 .debug_selector(move || buttons)
+                .col_start(1)
+                .row_start(1)
+                .justify_end()
                 .invisible()
                 .group_hover(hovered.clone(), |style| style.visible())
                 .on_click(|_, _, cx| cx.stop_propagation())
@@ -500,10 +513,8 @@ fn worktree(
         .when(look.folded && has_threads, |this| {
             this.child(
                 counts(look.counts, &label, cx)
-                    .absolute()
-                    .right_0()
-                    .top_0()
-                    .bottom_0()
+                    .col_start(1)
+                    .row_start(1)
                     .group_hover(hovered.clone(), |style| style.invisible()),
             )
         });

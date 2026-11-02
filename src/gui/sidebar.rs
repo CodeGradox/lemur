@@ -496,6 +496,7 @@ impl Lemur {
             (s.helpers.len(), SharedString::from(names.join("\n")))
         });
         let selector = format!("helpers {label}");
+        let separator = format!("separator {label}");
         let suffix = move |_: &mut Window, _: &mut App| {
             let this = this.clone();
             let key = key.clone();
@@ -526,19 +527,40 @@ impl Lemur {
                     })
                     .ok();
                 });
-            h_flex()
-                .gap_1()
-                .items_center()
-                // The Linear issue pinned to it.
-                .children(
-                    issue
-                        .clone()
-                        .map(|issue| div().text_xs().text_color(muted).child(issue)),
-                )
-                .children(helpers)
-                .child(div().text_xs().text_color(muted).child(detail.clone()))
-                .child(status)
-                .child(close)
+            // The Linear issue pinned to it, what helps it, and its age, with
+            // a small dot between them.
+            let said = [
+                issue.clone().map(|issue| {
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(issue)
+                        .into_any_element()
+                }),
+                helpers.map(IntoElement::into_any_element),
+                Some(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(detail.clone())
+                        .into_any_element(),
+                ),
+            ];
+            let mut suffix = h_flex().gap_1().items_center();
+            for (i, item) in said.into_iter().flatten().enumerate() {
+                if i > 0 {
+                    let separator = separator.clone();
+                    suffix = suffix.child(
+                        div()
+                            .debug_selector(move || format!("{separator} {i}"))
+                            .text_xs()
+                            .text_color(muted)
+                            .child("·"),
+                    );
+                }
+                suffix = suffix.child(item);
+            }
+            suffix.child(status).child(close)
         };
         rows::Thread {
             icon: thread_icon(s),
