@@ -60,6 +60,13 @@ impl Prefs {
         }
     }
 
+    /// A host was added: Settings asks and updates the cores it takes.
+    pub fn hosts_changed(cfg: &Config, cx: &mut App) {
+        if cx.has_global::<Prefs>() {
+            cx.global_mut::<Prefs>().cores = core_update::Cores::of(cfg);
+        }
+    }
+
     /// The config file changes are saved to; tests have none.
     pub fn config_file(&self) -> Option<&std::path::Path> {
         self.file.as_deref()

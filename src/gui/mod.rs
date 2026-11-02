@@ -6430,6 +6430,32 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// A first host added through the picker counts for Settings' herdr-core
+    /// page at once, not after a restart: it would say all's up to date.
+    #[gpui::test]
+    fn settings_ask_a_host_once_its_added(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("prefs-host");
+        let cfg = server.config();
+        let far = server.far_config("prefs-box").hosts.remove(0);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Prefs::new(&cfg, None));
+        });
+        let (app, cx) = rooted(cfg, cx);
+        let machines =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| Prefs::get(cx).cores.machines);
+        assert!(!machines(cx));
+        app.update(cx, |app, cx| {
+            let choice = HostChoice {
+                host: far,
+                configured: false,
+            };
+            app.add_folder(choice, "/".into(), cx);
+        });
+        assert!(machines(cx));
+        cx.run_until_parked();
+    }
+
     /// A repository at `path`, with one commit.
     fn repo_at(path: &std::path::Path) -> String {
         std::fs::create_dir(path).unwrap();

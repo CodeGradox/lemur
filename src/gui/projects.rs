@@ -77,6 +77,7 @@ impl Lemur {
         }
         if new_host {
             self.cfg.hosts.push(host);
+            Prefs::hosts_changed(&self.cfg, cx);
         }
         self.cfg.bases.push(base);
         self.refresh(cx).detach();
