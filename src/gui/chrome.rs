@@ -145,6 +145,19 @@ impl Lemur {
             .children(add)
     }
 
+    /// ⌘1 to ⌘9: shows the tab at `i` of the tab bar, if it has one.
+    pub(super) fn go_to_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlaid() {
+            return;
+        }
+        let Some(active) = &self.active else {
+            return;
+        };
+        if let Some((host, session)) = self.siblings(active).into_iter().nth(i) {
+            self.open(host, session, window, cx);
+        }
+    }
+
     /// The tab at `i` of the tab bar `drag`, which a drop reorders.
     fn tab(
         &self,

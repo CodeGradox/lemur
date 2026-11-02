@@ -698,6 +698,11 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
                 ),
             },
             keys("Previous thread in the worktree", &["ctrl-shift-tab"]),
+            Shortcut {
+                what: "Go to a tab",
+                how: Press::Keys(&["cmd-1", "cmd-9"]),
+                more: Some("⌘1 shows the first tab, ⌘2 the second, and so on up to the ninth."),
+            },
         ],
     ),
     (

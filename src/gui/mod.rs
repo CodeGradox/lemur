@@ -93,6 +93,11 @@ actions!(
     ]
 );
 
+/// ⌘1 to ⌘9: shows the tab at this place in the tab bar, counted from 0.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = lemur, no_json)]
+pub struct GoToTab(usize);
+
 /// lemur's keys; menus show them next to their items.
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -125,6 +130,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", NoAction, Some(terminal_view::CONTEXT)),
         KeyBinding::new("shift-tab", NoAction, Some(terminal_view::CONTEXT)),
     ]);
+    cx.bind_keys((1..=9).map(|n| KeyBinding::new(&format!("cmd-{n}"), GoToTab(n - 1), None)));
     dictation::bind_keys(cx);
     folder_picker::bind_keys(cx);
     notes::bind_keys(cx);
@@ -1777,6 +1783,9 @@ impl Render for Lemur {
             .on_action(cx.listener(|this, _: &PreviousThread, window, cx| {
                 this.cycle_threads(true, window, cx)
             }))
+            .on_action(
+                cx.listener(|this, tab: &GoToTab, window, cx| this.go_to_tab(tab.0, window, cx)),
+            )
             .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, _| {
                 if !e.modifiers.control {
                     this.end_cycle();
@@ -4113,6 +4122,55 @@ mod tests {
         app.update(cx, |app, cx| app.refresh(cx).detach());
         cx.run_until_parked();
         assert!(tab(0, cx).is_some() && tab(1, cx).is_none());
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘1 to ⌘9 show what the tabs at those places show when clicked, from
+    /// the terminal with the keyboard. With no tab at the place, or the
+    /// palette up, nothing changes.
+    #[gpui::test]
+    fn cmd_digits_show_the_tabs_by_their_place(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("cmd-digits");
+        let threads: [String; 9] = std::array::from_fn(|_| server.run("/", &[], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        // Wide enough to show all nine, to click.
+        cx.simulate_resize(size(px(3000.0), px(600.0)));
+        cx.run_until_parked();
+        open(&app, &threads[4], cx);
+        cx.run_until_parked();
+        let shown = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| app.active.clone().map(|(_, s)| s).unwrap())
+        };
+        let tabs: Vec<String> = (0..9)
+            .map(|i| {
+                let selector = Box::leak(format!("tab-{i}").into_boxed_str());
+                let tab = cx.debug_bounds(selector).expect(selector);
+                cx.simulate_click(tab.center(), Modifiers::none());
+                shown(cx)
+            })
+            .collect();
+        for thread in &threads {
+            assert!(tabs.contains(thread), "{thread} isn't on a tab: {tabs:?}");
+        }
+
+        for i in [8, 0, 3, 7, 1, 6, 2, 5, 4] {
+            cx.simulate_keystrokes(&format!("cmd-{}", i + 1));
+            assert_eq!(shown(cx), tabs[i], "cmd-{}", i + 1);
+        }
+
+        cx.simulate_keystrokes("cmd-shift-p cmd-1");
+        assert_eq!(shown(cx), tabs[4], "the palette is up");
+        cx.simulate_keystrokes("escape");
+
+        server.core().kill(&tabs[8]).unwrap();
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            cx.debug_bounds("tab-8").is_none()
+        }));
+        cx.simulate_keystrokes("cmd-9");
+        assert_eq!(shown(cx), tabs[4], "no ninth tab now");
         let_attaches_end(&app, cx);
     }
 
