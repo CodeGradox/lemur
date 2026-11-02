@@ -192,6 +192,10 @@ pub enum Activity {
     NeedsInput,
 }
 
+/// What files a terminal under a space and a tab in Herdr, which shows only
+/// those that have them. Each machine has ids of its own.
+pub const HERDR_SPACE: &str = "herdr.space";
+pub const HERDR_TAB: &str = "herdr.tab";
 /// The labels lemur puts on the terminals it starts.
 pub const LABEL: &str = "lemur.label";
 pub const KIND: &str = "lemur.kind";

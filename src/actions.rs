@@ -2,7 +2,7 @@ use crate::attach::Active;
 use crate::config::{ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
-use crate::snapshot::{AWAY, ISSUE, KIND, LABEL, ORDER, SHELL, WORKTREE};
+use crate::snapshot::{AWAY, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, WORKTREE};
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
 use std::collections::BTreeMap;
@@ -309,11 +309,41 @@ fn start_thread(
     if let Some(issue) = issue {
         labels.insert(ISSUE.to_string(), issue.to_string());
     }
+    let terminals = core.terminals();
+    let on_host = terminals.iter().filter(|t| hc::on_host(t, on.as_deref()));
+    labels.insert(HERDR_SPACE.to_string(), herdr_space(on_host, dir));
+    labels.insert(HERDR_TAB.to_string(), new_herdr_id("tb"));
     let address = core.run(on.as_deref(), dir, &[], &labels)?;
     if let Some(command) = claude {
         core.type_line(&address, command)?;
     }
     Ok(address)
+}
+
+/// The Herdr space for a thread started in `dir`: that of a terminal running
+/// there, so it joins them as a tab, else one made from the folder, which Herdr
+/// makes on seeing it, and threads started there later share.
+fn herdr_space<'a>(terminals: impl Iterator<Item = &'a hc::Terminal>, dir: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let inside = format!("{dir}/");
+    let there = |t: &&hc::Terminal| t.cwd == dir || t.cwd.starts_with(&inside);
+    let known = terminals
+        .filter(there)
+        .find_map(|t| t.labels.get(HERDR_SPACE).filter(|s| !s.is_empty()));
+    if let Some(space) = known {
+        return space.clone();
+    }
+    let part = |salt: u8| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (salt, dir).hash(&mut hash);
+        hash.finish()
+    };
+    format!("sp{:016x}{:016x}", part(0), part(1))
+}
+
+/// A new id for Herdr, as it makes them: `prefix`, then 32 hex digits.
+fn new_herdr_id(prefix: &str) -> String {
+    format!("{prefix}{}", random_uuid().replace('-', ""))
 }
 
 /// Resumes a thread's Claude conversation once its Claude is gone: in its
@@ -1248,6 +1278,71 @@ mod tests {
         );
         assert_eq!(server.addresses().len(), count, "no second terminal");
         assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (true, false)));
+    }
+
+    /// A thread started shows in Herdr too: a tab of its own, in the space of
+    /// what runs in its folder, else in one for that folder, on this machine
+    /// or another, by that machine's ids.
+    #[test]
+    fn threads_are_filed_for_herdr() {
+        let server = HcServer::new("herdr-labels");
+        let dir = TempDir::new("herdr-labels");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (a, b) = (
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        );
+        let cfg = server.config();
+        // Once the core's stream has told of it, which the next start reads.
+        let labels = |address: &str| {
+            let told = wait_until(Duration::from_secs(5), || {
+                let terminals = server.core().terminals();
+                terminals.iter().any(|t| t.address == address)
+            });
+            assert!(told, "{address} never showed up");
+            let terminals = server.core().terminals();
+            let t = terminals.iter().find(|t| t.address == address).unwrap();
+            let get = |k: &str| t.labels.get(k).cloned().unwrap_or_default();
+            (get(HERDR_SPACE), get(HERDR_TAB))
+        };
+        let start = |dir: &str| start_in(&cfg, "local", dir, "shell", true).unwrap().session;
+
+        let one = start(&a);
+        let (space, tab) = labels(&one);
+        assert!(space.starts_with("sp") && space.len() == 34, "{space}");
+        assert!(tab.starts_with("tb") && tab.len() == 34, "{tab}");
+        let two = start(&a);
+        let (same, other) = labels(&two);
+        assert_eq!(same, space, "one space for the folder");
+        assert_ne!(other, tab, "each its own tab");
+
+        // Herdr's own in another folder: its space is the one joined.
+        let args = [
+            "--label",
+            "herdr.space=spherdrs",
+            "--label",
+            "herdr.tab=tbherdrs",
+        ];
+        let theirs = server.hc(&[
+            &["run", "--bg", "--json", "--keep", "--cwd", b.as_str()][..],
+            &args[..],
+            &["--", "sleep", "600"],
+        ]
+        .concat());
+        let theirs: serde_json::Value = serde_json::from_str(&theirs).unwrap();
+        labels(theirs["address"].as_str().unwrap());
+        let three = start(&b);
+        assert_eq!(labels(&three).0, "spherdrs");
+
+        // Another machine's space isn't this one's, in a folder of that name.
+        let far = server.far_config("herdr-box");
+        let there = start_in(&far, "herdr-box", &b, "shell", true)
+            .unwrap()
+            .session;
+        let (space, _) = labels(&there);
+        assert!(space.starts_with("sp") && space != "spherdrs", "{space}");
     }
 
     /// Setting up a host runs `hc machine add` for it, under the name
