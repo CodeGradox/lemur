@@ -81,11 +81,13 @@ impl Place {
         }
     }
 
-    /// The pull requests to ask `gh` about: those it might say something new
-    /// of (a merged one stays merged), and those linked to that it hasn't
-    /// told of yet.
+    /// The pull requests to ask `gh` about every time: those still open, and
+    /// those linked to that it hasn't told of yet. Not the merged ones, which
+    /// stay merged, or the closed: rarely reopened, and asked again once
+    /// agents link to one again.
     pub fn wanted(&self) -> Vec<u64> {
-        let known = self.prs.iter().filter(|pr| pr.state != State::Merged);
+        let open = |pr: &&PullRequest| matches!(pr.state, State::Open | State::Draft);
+        let known = self.prs.iter().filter(open);
         let mut wanted: Vec<u64> = known.map(|pr| pr.number).collect();
         wanted.extend(&self.pending);
         wanted

@@ -80,8 +80,10 @@ enum Failed {
     Problem(Problem),
     /// There's no pull request by that number: it won't be, asked again.
     NoSuchPullRequest,
-    /// Anything else, as the network: it may be, asked again.
+    /// Anything else: it may be, asked again.
     Other,
+    /// No answer in time: the rest would take as long, and wait for this.
+    TimedOut,
 }
 
 /// What `gh` said of a repository's pull requests.
@@ -97,15 +99,26 @@ pub struct Looked {
 /// The pull requests of `branch` in `repo`, if it's given, and those
 /// numbered `numbers`.
 pub fn look(gh: &Path, repo: &str, branch: Option<&str>, numbers: &[u64]) -> Looked {
+    look_within(gh, repo, branch, numbers, TIME)
+}
+
+fn look_within(
+    gh: &Path,
+    repo: &str,
+    branch: Option<&str>,
+    numbers: &[u64],
+    time: Duration,
+) -> Looked {
     let mut looked = Looked::default();
     if let Some(branch) = branch {
         let args = [
             "pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--limit", "5",
             "--json", FIELDS,
         ];
-        match ask(gh, &args, TIME).map(|out| serde_json::from_str::<Vec<Told>>(&out)) {
+        match ask(gh, &args, time).map(|out| serde_json::from_str::<Vec<Told>>(&out)) {
             Ok(Ok(told)) => looked.prs.extend(told.into_iter().map(PullRequest::from)),
             Ok(Err(_)) | Err(Failed::Other) | Err(Failed::NoSuchPullRequest) => {}
+            Err(Failed::TimedOut) => return looked,
             Err(Failed::Problem(problem)) => {
                 looked.problem = Some(problem);
                 return looked;
@@ -119,13 +132,14 @@ pub fn look(gh: &Path, repo: &str, branch: Option<&str>, numbers: &[u64]) -> Loo
         }
         let number_text = number.to_string();
         let args = ["pr", "view", &number_text, "--repo", repo, "--json", FIELDS];
-        match ask(gh, &args, TIME).map(|out| serde_json::from_str::<Told>(&out)) {
+        match ask(gh, &args, time).map(|out| serde_json::from_str::<Told>(&out)) {
             Ok(Ok(told)) => {
                 looked.prs.push(told.into());
                 looked.settled.push(number);
             }
             Err(Failed::NoSuchPullRequest) => looked.settled.push(number),
             Ok(Err(_)) | Err(Failed::Other) => {}
+            Err(Failed::TimedOut) => return looked,
             Err(Failed::Problem(problem)) => {
                 looked.problem = Some(problem);
                 return looked;
@@ -170,7 +184,7 @@ fn ask(gh: &Path, args: &[&str], time: Duration) -> Result<String, Failed> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Failed::Other);
+                return Err(Failed::TimedOut);
             }
         }
     };
@@ -321,8 +335,26 @@ esac"#
         let started = Instant::now();
         assert_eq!(
             ask(&gh, &["pr"], Duration::from_millis(100)),
-            Err(Failed::Other)
+            Err(Failed::TimedOut)
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// With no answer in time the rest aren't asked, one after the other:
+    /// they'd take as long, and other worktrees' links would wait for them.
+    #[test]
+    fn a_look_stops_at_the_first_that_takes_too_long() {
+        let dir = TempDir::new("gh-stop");
+        let gh = fake_gh(&dir, "exec sleep 30");
+        let looked = look_within(&gh, "o/r", None, &[1, 2, 3], Duration::from_secs(2));
+        assert_eq!(looked.settled, Vec::<u64>::new());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "only the first was asked"
+        );
     }
 }
