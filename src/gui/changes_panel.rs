@@ -97,6 +97,16 @@ impl ChangesPanel {
         }
     }
 
+    /// Whether the commit message has the keyboard.
+    pub(super) fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.message.focus_handle(cx).is_focused(window)
+    }
+
+    #[cfg(test)]
+    pub(super) fn focus_message(&self, window: &mut Window, cx: &mut App) {
+        self.message.focus_handle(cx).focus(window, cx);
+    }
+
     /// The file whose diff shows, and its lines.
     pub(super) fn shown_diff(&self) -> Option<(&Change, &[SharedString])> {
         let open = self.open.as_ref()?;

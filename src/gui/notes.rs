@@ -109,6 +109,11 @@ impl NotesPanel {
     }
 
     /// Shows a worktree's notes; `label` names it in the header.
+    /// Whether the editor has the keyboard.
+    pub fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.editor.focus_handle(cx).is_focused(window)
+    }
+
     pub fn show(
         &mut self,
         host: &str,

@@ -879,6 +879,13 @@ impl Lemur {
             .as_ref()
             .and_then(|k| self.terminals.get(k))
             .is_some_and(|v| v.read(cx).focus_handle(cx).is_focused(window));
+        // And where it runs, and whether you're typing beside it.
+        let shown_in = self
+            .active
+            .as_ref()
+            .and_then(|(h, s)| Some((h.clone(), self.worktree_of(h, s)?.0)));
+        let typing = self.changes_panel.read(cx).typing(window, cx)
+            || self.notes.read(cx).typing(window, cx);
         self.terminals.retain(|k, _| live(k));
         if self.peek.as_ref().is_some_and(|k| !live(k)) {
             self.peek = None;
@@ -950,9 +957,15 @@ impl Lemur {
         if let Some((host, session)) = restore {
             self.open(host, session, window, cx);
         } else if let Some((host, session)) = instead {
-            // It takes the keyboard only from the one that ended: typing in
-            // the notes, a commit message or a spotlight goes on there.
-            self.show_thread(host, session, had_keyboard, window, cx);
+            // It takes the keyboard from the one that ended. Typing in a
+            // spotlight goes on there, as in the notes or a commit message
+            // of the same worktree; those of another would save or commit
+            // what's typed there.
+            let now_in = self
+                .worktree_of(&host, &session)
+                .map(|(w, _)| (host.clone(), w));
+            let focus = had_keyboard || (typing && now_in != shown_in);
+            self.show_thread(host, session, focus, window, cx);
         }
         self.follow_nothing(cx);
         cx.notify();
@@ -6041,6 +6054,72 @@ mod tests {
         cx.run_until_parked();
         app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
         assert!(b_has_it(cx), "handed over once it's gone");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A repository at `path`, with one commit.
+    fn repo_at(path: &std::path::Path) -> String {
+        std::fs::create_dir(path).unwrap();
+        git_in(path, &["init", "-q", "-b", "main"]);
+        git_in(path, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The thread on show ending while you type a commit message leaves
+    /// the keyboard there if the next is in the same worktree. In another,
+    /// whose changes the panel lists now, Enter would commit those.
+    #[gpui::test]
+    fn a_commit_message_keeps_the_keyboard_only_in_its_worktree(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("typing-moves");
+        let dir = TempDir::new("typing-moves");
+        let (api, web) = (repo_at(&dir.join("api")), repo_at(&dir.join("web")));
+        std::fs::write(dir.join("web/new.txt"), "not ready\n").unwrap();
+        let [a, c] = ["a", "c"].map(|l| server.run(&api, &[&format!("lemur.label={l}")], &["sh"]));
+        let b = server.run(&web, &["lemur.label=b"], &["sh"]);
+        let mut cfg = server.config();
+        cfg.bases = vec![Base::new("local", &api), Base::new("local", &web)];
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1400.0), px(900.0)));
+        cx.run_until_parked();
+        for t in [&b, &c, &a] {
+            open(&app, t, cx);
+            cx.run_until_parked();
+        }
+        cx.dispatch_action(super::ToggleChanges);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let panel = app.read(cx).changes_panel.clone();
+            panel.update(cx, |p, cx| p.focus_message(window, cx));
+        });
+        let typing = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let panel = app.read(cx).changes_panel.clone();
+                panel.read(cx).typing(window, cx)
+            })
+        };
+        assert!(typing(cx));
+        let shows = |t: &str, cx: &mut VisualTestContext| {
+            let t = key(t);
+            wait_until(Duration::from_secs(5), || {
+                cx.executor().advance_clock(super::BURST);
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.active.as_ref() == Some(&t))
+            })
+        };
+
+        server.hc(&["kill", &a]);
+        assert!(shows(&c, cx), "c shows instead");
+        assert!(typing(cx), "in the same worktree, typing goes on");
+
+        server.hc(&["kill", &c]);
+        assert!(shows(&b, cx), "b shows instead");
+        assert!(!typing(cx), "in another, it doesn't");
+        let b_has_it = cx.update(|window, cx| {
+            let view = app.read(cx).terminals[&key(&b)].clone();
+            gpui_kit::Focusable::focus_handle(view.read(cx), cx).is_focused(window)
+        });
+        assert!(b_has_it);
         let_attaches_end(&app, cx);
     }
 
