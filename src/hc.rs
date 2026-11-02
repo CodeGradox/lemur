@@ -378,6 +378,9 @@ fn asks_you(e: &anyhow::Error, host: &Host) -> bool {
 /// would dial it again.
 const MACHINE_RETRY: Duration = Duration::from_secs(30);
 
+/// The most input a frame carries.
+const INPUT_PART: usize = 4 << 20;
+
 fn encode(channel: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + payload.len());
     out.extend_from_slice(&channel.to_le_bytes());
@@ -863,10 +866,11 @@ impl Core {
         })
     }
 
-    /// Keys and pastes for an attached terminal's program.
+    /// Keys and pastes for an attached terminal's program: in parts, as a
+    /// frame over 16 MiB ends the whole connection.
     pub fn input(&self, channel: u32, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.send(channel, DATA, bytes);
+        for part in bytes.chunks(INPUT_PART) {
+            self.send(channel, DATA, part);
         }
     }
 
@@ -1220,6 +1224,28 @@ mod tests {
                 "{name}: pid {pid}"
             );
         }
+    }
+
+    /// A paste bigger than a frame takes doesn't end the connection, and
+    /// all of it arrives.
+    #[test]
+    fn a_huge_paste_goes_in_parts() {
+        let server = HcServer::new("huge-paste");
+        let dir = TempDir::new("huge-paste");
+        let out = dir.join("out");
+        let script = format!("stty -icanon; cat > '{}'", out.display());
+        let t = server.run("/", &[], &["sh", "-c", &script]);
+        let core = server.core();
+        let attached = core.attach(&t, 80, 24, 0, json!({})).unwrap();
+        let size = (17 << 20) + 5;
+        let paste = vec![b'x'; size];
+        core.input(attached.channel, &paste);
+        core.flush().expect("the connection stands");
+        assert!(!core.is_lost());
+        let arrived = crate::test_support::wait_until(Duration::from_secs(60), || {
+            std::fs::metadata(&out).is_ok_and(|m| m.len() >= size as u64)
+        });
+        assert!(arrived, "{:?}", std::fs::metadata(&out).map(|m| m.len()));
     }
 
     #[test]
