@@ -29,6 +29,9 @@ pub(super) struct Removal {
 
 impl Lemur {
     pub(super) fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlaid() {
+            return;
+        }
         let hosts = host_choices(&self.cfg);
         let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
         let events = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {

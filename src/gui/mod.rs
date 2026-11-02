@@ -5887,6 +5887,22 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// ⌘O and ⌘D wait under what's over the window, as ⌘P does: the folder
+    /// picker would open beneath the palette and take the keyboard, and
+    /// dictation would listen with its bar hidden.
+    #[gpui::test]
+    fn the_picker_and_dictation_wait_under_the_palette(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_keystrokes("cmd-shift-p cmd-o cmd-d");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.palette.is_some());
+            assert!(app.picker.is_none(), "no picker under it");
+            assert!(app.dictation.is_none(), "no dictation under it");
+        });
+    }
+
     /// A peek, or a host's set-up where a password may be asked for, keeps
     /// the keyboard: ⌘1 to ⌘9, ⌘] and ⌃Tab don't show another thread under
     /// it, ⌘P doesn't open under it, and whatever hands the keyboard back

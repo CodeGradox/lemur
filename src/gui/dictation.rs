@@ -39,6 +39,9 @@ impl EventEmitter<DictationEvent> for DictationBar {}
 impl Lemur {
     /// ⌘D: opens the bar listening, or has it start or stop listening.
     pub(super) fn dictate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlaid() {
+            return;
+        }
         let bar = match &self.dictation {
             Some((bar, _)) => bar.clone(),
             None => {
