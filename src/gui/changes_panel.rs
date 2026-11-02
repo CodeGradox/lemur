@@ -15,7 +15,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The most diff lines shown of one file.
 const MOST_LINES: usize = 3000;
@@ -728,11 +728,17 @@ fn diff_lines(out: &str, new: bool) -> (Vec<String>, Option<u64>) {
 
 /// The files Commit adds before committing: those with changes not staged.
 /// What's staged as it is, a removal or a rename too, `git add` may not
-/// even name any more.
+/// even name any more. A file removed from git but kept on disk lists twice,
+/// removed and new: adding it would undo the removal.
 fn to_add(files: &[Change]) -> Vec<String> {
+    let removed: HashSet<&str> = files
+        .iter()
+        .filter(|f| f.status == 'D' && !f.unstaged)
+        .map(|f| f.path.as_str())
+        .collect();
     files
         .iter()
-        .filter(|f| f.unstaged)
+        .filter(|f| f.unstaged && !removed.contains(f.path.as_str()))
         .map(|f| f.path.clone())
         .collect()
 }
@@ -1187,6 +1193,40 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&shown.stdout), "and more\n");
         assert!(changes_in(&host, &root).unwrap().is_empty());
+    }
+
+    /// A file removed from git but kept on disk is committed as removed,
+    /// and goes on listed as new; with nothing else staged, too.
+    #[test]
+    fn a_file_kept_on_disk_commits_as_removed() {
+        let server = crate::test_support::HcServer::new("changes-rm");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-rm-cached");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("secrets.yml"), "x\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        git_in(&repo, &["rm", "-q", "--cached", "secrets.yml"]);
+        let root = repo.to_string_lossy().into_owned();
+
+        let files = to_add(&changes_in(&host, &root).unwrap());
+        assert!(files.is_empty(), "{files:?}");
+        let said = commit_in(&host, &root, "Forget it", &files).unwrap();
+        assert!(said.ends_with("Forget it"), "{said}");
+        let tree = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&tree.stdout), "");
+        let left: Vec<(String, char)> = changes_in(&host, &root)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.path, c.status))
+            .collect();
+        assert_eq!(left, [("secrets.yml".to_string(), '?')]);
     }
 
     /// Listing changes and showing a diff leave the index as it is, a file
