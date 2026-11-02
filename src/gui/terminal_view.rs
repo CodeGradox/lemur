@@ -974,8 +974,14 @@ impl TerminalView {
                 keys::MouseButton::WheelDown
             };
             self.report_mouse(button, false, mods(event.modifiers), at, true, notches);
-        } else if mode.contains(TermMode::ALT_SCREEN) {
-            let arrow: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+        } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+            // Arrow keys, as the program's cursor key mode has them.
+            let arrow: &[u8] = match (mode.contains(TermMode::APP_CURSOR), lines > 0) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1bOB",
+                (false, true) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+            };
             self.write(arrow.repeat(notches));
         } else if let Some(screen) = &self.screen {
             screen.term.lock().scroll_display(Scroll::Delta(lines));
@@ -1794,6 +1800,54 @@ mod tests {
             "{}",
             shown(&view, cx)
         );
+    }
+
+    /// The wheel on the other screen is arrow keys, as the program's cursor
+    /// key mode has them, unless it turned that off (`?1007l`).
+    #[gpui::test]
+    fn the_wheel_sends_the_arrow_keys_a_program_asked_for(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("wheel-keys");
+        let script = r"printf '\033[?1049h\033[?1h'; exec cat -v";
+        let (view, _, cx) = attach(&server, &["sh", "-c", script], cx);
+        let ready = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| {
+                v.painted
+                    && v.mode().contains(
+                        alacritty_terminal::term::TermMode::ALT_SCREEN
+                            | alacritty_terminal::term::TermMode::APP_CURSOR,
+                    )
+            })
+        });
+        assert!(ready);
+        let wheel = |up: bool, cx: &mut gpui::VisualTestContext| {
+            let position = view.read_with(cx, |v, _| {
+                v.bounds.origin + point(v.cell_size.width * 2.5, v.cell_size.height * 2.5)
+            });
+            let lines = if up { 1.0 } else { -1.0 };
+            cx.simulate_event(gpui_kit::ScrollWheelEvent {
+                position,
+                delta: gpui_kit::ScrollDelta::Lines(point(0.0, lines)),
+                ..Default::default()
+            });
+        };
+        let echoes = |text: &str, cx: &mut gpui::VisualTestContext| {
+            wait_until(Duration::from_secs(5), || shown(&view, cx).contains(text))
+        };
+        wheel(true, cx);
+        assert!(echoes("^[OA", cx), "{}", shown(&view, cx));
+        view.update(cx, |v, cx| {
+            v.ingest(vec![Stream::Data(b"\x1b[?1l".to_vec())], cx);
+        });
+        wheel(false, cx);
+        assert!(echoes("^[[B", cx), "{}", shown(&view, cx));
+        view.update(cx, |v, cx| {
+            v.ingest(vec![Stream::Data(b"\x1b[?1007l".to_vec())], cx);
+        });
+        wheel(true, cx);
+        // What comes after shows that nothing came before it.
+        view.update(cx, |v, _| v.write(b"!".to_vec()));
+        assert!(echoes("^[[B!", cx), "{}", shown(&view, cx));
     }
 
     /// What `view` shows, row by row, without trailing blanks.
