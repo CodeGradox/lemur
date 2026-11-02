@@ -194,7 +194,7 @@ pub struct Scan {
 /// What's in the logs of folder `path` on `host`, those written in the last
 /// `minutes` if given, and its repository and branch.
 pub fn scan(host: &Host, path: &str, minutes: Option<u64>) -> Result<Scan> {
-    parse(&Remote::new(host).run(&script(path, minutes))?)
+    parse(&Remote::new(host).run_whole(&script(path, minutes))?)
 }
 
 /// What Claude Code calls a folder's logs: its path with all but letters
@@ -207,7 +207,9 @@ fn logs_folder(path: &str) -> String {
 
 /// Prints the folder's repository and branch; then each link in what agents
 /// wrote, as a Markdown link's text and link when it's an artifact's, and
-/// each record's time after its links; then `@@end`.
+/// the time of each record with one after its links; then `@@end`. Records
+/// with none print nothing: a time for each would pass what herdr-core keeps
+/// of the output at some 3 GB of logs.
 fn script(path: &str, minutes: Option<u64>) -> String {
     let recent = minutes.map_or(String::new(), |m| format!("-mmin -{m} "));
     format!(
@@ -219,6 +221,7 @@ fn script(path: &str, minutes: Option<u64>) -> String {
          d=\"${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}/projects/{folder}\"\n\
          [ -d \"$d\" ] && find \"$d\" -type f -name '*.jsonl' {recent}\
          -exec grep -h '\"type\":\"assistant\"' {{}} + | \
+         grep -E 'claude\\.ai/|github\\.com/' | \
          grep -oE '(\\[[^]\"\\\\]{{1,120}}\\]\\()?(https://)?claude\\.ai/(code/)?artifact/[A-Za-z0-9-]{{16,}}|https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+|\"timestamp\":\"[^\"]*\"'\n\
          echo @@end\n",
         dir = sh_path(path),
@@ -342,6 +345,32 @@ mod tests {
             logs_folder("/Users/me/laft-web/.worktrees/a_b/web"),
             "-Users-me-laft-web--worktrees-a-b-web"
         );
+    }
+
+    /// Records with no link print nothing, not even their time.
+    #[test]
+    fn records_without_a_link_print_nothing() {
+        let config = TempDir::new("artifact-quiet");
+        let logs = config.join("projects/-srv-api");
+        std::fs::create_dir_all(&logs).unwrap();
+        let record = |text: String, at: &str| {
+            format!("{{\"message\":\"{text}\",\"type\":\"assistant\",\"timestamp\":\"{at}\"}}")
+        };
+        let log = [
+            record("nothing here".into(), "T1"),
+            record(format!("see https://claude.ai/artifact/{ONE}"), "T2"),
+        ]
+        .join("\n");
+        std::fs::write(logs.join("a.jsonl"), log + "\n").unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script("/srv/api", None))
+            .env("CLAUDE_CONFIG_DIR", &*config)
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(!printed.contains("T1"), "{printed}");
+        assert!(printed.contains("T2"), "{printed}");
     }
 
     /// A Markdown link whose text is its address, or names the site, goes by

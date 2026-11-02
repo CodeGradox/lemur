@@ -33,6 +33,21 @@ impl<'a> Remote<'a> {
     /// (bash, zsh, fish...) never has to parse it. A non-interactive shell
     /// often lacks `~/.local/bin` (where Claude Code installs) on PATH.
     pub fn run(&self, script: &str) -> Result<String> {
+        let out = self.exec(script)?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// `run`, for a script whose output is no use unless it's all there:
+    /// herdr-core keeps the first 8 MB.
+    pub fn run_whole(&self, script: &str) -> Result<String> {
+        let out = self.exec(script)?;
+        if out.truncated {
+            bail!("{}: printed more than herdr-core keeps", self.host.name);
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn exec(&self, script: &str) -> Result<Output> {
         let (core, on) = hc::for_host(self.host)?;
         let script = format!("PATH=\"$HOME/.local/bin:$PATH\"\n{script}");
         let out = core
@@ -44,7 +59,7 @@ impl<'a> Remote<'a> {
             )
             .with_context(|| format!("running a script on {}", self.host.name))?;
         check(&out, &self.host.name)?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(out)
     }
 
     /// Copies a local file to a path on the host: absolute, or from home.
@@ -140,6 +155,22 @@ pub fn sh_path(p: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Output past what herdr-core keeps is cut, which `run_whole` says.
+    #[test]
+    fn output_cut_short_is_told_of() {
+        let server = crate::test_support::HcServer::new("cut-short");
+        let host = server.config().hosts.remove(0);
+        let remote = super::Remote::new(&host);
+        let script = "head -c 9000000 /dev/zero; echo @@end\n";
+        assert!(!remote.run(script).unwrap().contains("@@end"), "it's cut");
+        let e = remote.run_whole(script).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("more than herdr-core keeps"),
+            "{e:#}"
+        );
+        assert_eq!(remote.run_whole("echo all\n").unwrap(), "all\n");
+    }
+
     use super::*;
 
     #[test]
