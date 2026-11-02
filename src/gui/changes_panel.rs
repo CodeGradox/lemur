@@ -1,6 +1,7 @@
 //! The Changes panel, on the right as the notes and the agents are, as
 //! Herdr's: the files changed in the worktree on show since its last
-//! commit, each with its lines added and removed; a click shows its diff.
+//! commit, each with its lines added and removed; a click shows its diff,
+//! and another hides it.
 //! Under them, a message and Commit commit the files listed. Other
 //! repositories inside the worktree, as worktrees kept in a project's
 //! folder, are neither listed nor committed.
@@ -137,6 +138,7 @@ impl ChangesPanel {
         }
         self.loading = true;
         let open = self.open.clone();
+        let diffed = open.clone();
         let asked = (host.name.clone(), path.clone());
         self._refresh = Some(cx.spawn(async move |this, cx| {
             let (files, diff) = cx
@@ -177,7 +179,8 @@ impl ChangesPanel {
                         this.files.clear();
                     }
                 }
-                if let Some(diff) = diff {
+                // Still the file shown: it may have been hidden meanwhile.
+                if let Some(diff) = diff.filter(|_| this.open == diffed) {
                     this.set_diff(diff);
                 }
                 cx.notify();
@@ -200,6 +203,17 @@ impl ChangesPanel {
             f.added = Some(added);
         }
         self.lines = lines.into_iter().map(SharedString::from).collect();
+    }
+
+    /// A click on file `path`: shows its diff, or hides it if it's on show.
+    fn toggle_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.open.as_ref() == Some(&path) {
+            self.open = None;
+            self.lines.clear();
+            cx.notify();
+        } else {
+            self.open_file(path, cx);
+        }
     }
 
     /// Shows file `path`'s diff.
@@ -334,7 +348,7 @@ impl Render for ChangesPanel {
                         row.hover(|row| row.bg(theme.sidebar_accent.opacity(0.5)))
                     }
                 })
-                .on_click(cx.listener(move |this, _, _, cx| this.open_file(path.clone(), cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(path.clone(), cx)))
                 .child(div().w_3().text_color(color).child(f.status.to_string()))
                 .child(
                     h_flex()
@@ -758,6 +772,79 @@ mod tests {
             listed(cx).1.len() == 2
         });
         assert!(again, "{:?}", listed(cx));
+    }
+
+    /// A click on a file shows its diff, and another hides it, for good even
+    /// with an ask for that diff under way; one on another file moves it.
+    #[gpui::test]
+    fn a_click_on_a_file_shows_its_diff_and_another_hides_it(cx: &mut gpui::TestAppContext) {
+        use super::ChangesPanel;
+        use crate::test_support::wait_until;
+        use gpui_kit::{AppContext, Modifiers};
+        use std::time::Duration;
+        let server = crate::test_support::HcServer::new("changes-toggle");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-toggle");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "one\n").unwrap();
+        git_in(&repo, &["add", "a.txt", "b.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "three\n").unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        cx.executor().allow_parking();
+        cx.update(gpui_kit::init);
+        let mut panel = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| ChangesPanel::new(window, cx));
+            panel = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let panel = panel.unwrap();
+        panel.update(cx, |p, cx| p.show(host, path, "main".into(), cx));
+        let settled = |cx: &mut gpui::VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                panel.read_with(cx, |p, _| !p.loading && !p.files.is_empty())
+            })
+        };
+        assert!(settled(cx));
+        let files: Vec<String> =
+            panel.read_with(cx, |p, _| p.listed().0.into_iter().map(|f| f.0).collect());
+        assert_eq!(files, ["a.txt", "b.txt"]);
+
+        let lines = |cx: &mut gpui::VisualTestContext| panel.read_with(cx, |p, _| p.listed().1);
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+        };
+        let shows = |line: &str, cx: &mut gpui::VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                lines(cx).iter().any(|l| l == line)
+            })
+        };
+
+        click("change 0", cx);
+        assert!(shows("+two", cx), "{:?}", lines(cx));
+        click("change 0", cx);
+        assert!(lines(cx).is_empty(), "hidden: {:?}", lines(cx));
+        click("change 0", cx);
+        assert!(shows("+two", cx), "shown again: {:?}", lines(cx));
+
+        click("change 1", cx);
+        assert!(shows("+three", cx), "{:?}", lines(cx));
+        assert!(!lines(cx).iter().any(|l| l == "+two"), "{:?}", lines(cx));
+
+        panel.update(cx, |p, cx| {
+            p.refresh(cx);
+            p.toggle_file("b.txt".into(), cx);
+        });
+        assert!(settled(cx));
+        assert!(lines(cx).is_empty(), "came back: {:?}", lines(cx));
     }
 
     /// What's staged commits as staged: a removal (of an ignored file too)
