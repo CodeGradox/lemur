@@ -118,6 +118,25 @@ impl Lemur {
         self.dots
             .borrow_mut()
             .retain(|(place, key), _| *place != "tab" || siblings.contains(key));
+        // Asked each time, so a new tab or a narrower window keeps it in view
+        // too; it only scrolls if the tab is out of view.
+        if self.tab_follows
+            && let Some(i) = siblings.iter().position(|key| *key == active)
+        {
+            self.tab_scroll.scroll_to_item(i);
+        }
+        // That goes by the bar's width a frame ago: one more if this frame
+        // changes it, as a narrower window or the sidebar coming back do.
+        let width = self.tab_scroll.bounds().size.width;
+        let this = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            this.update(cx, |this, cx| {
+                if this.tab_follows && this.tab_scroll.bounds().size.width != width {
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
         let tabs: Vec<AnyElement> = siblings
             .into_iter()
             .enumerate()
@@ -145,6 +164,8 @@ impl Lemur {
                     .min_w_0()
                     .gap_1()
                     .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .on_scroll_wheel(cx.listener(|this, _, _, _| this.tab_follows = false))
                     // A press here is the tabs', to click or drag, not the
                     // title bar's (see `title_bar`).
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())

@@ -265,6 +265,10 @@ struct Lemur {
     setups: HashMap<Key, Host>,
     /// The tabs' and the peek card's dots, by where and whose.
     dots: std::cell::RefCell<HashMap<(&'static str, Key), Entity<sidebar::DotView>>>,
+    /// The tab bar's scroll, and whether it keeps the tab on show in view:
+    /// not once scrolled by hand, until a thread is shown again.
+    tab_scroll: ScrollHandle,
+    tab_follows: bool,
     /// Shown in a snackbar over the terminal.
     status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
@@ -644,6 +648,8 @@ impl Lemur {
             seen: HashMap::new(),
             agent_walk: vec![],
             dots: Default::default(),
+            tab_scroll: ScrollHandle::new(),
+            tab_follows: true,
             setups: HashMap::new(),
             ordering: HashMap::new(),
             status: None,
@@ -1083,6 +1089,7 @@ impl Lemur {
         }
         self.bring_back(&key, cx);
         self.active = Some(key);
+        self.tab_follows = true;
         self.ask_changes(cx);
         if self.right == Some(Right::Changes) {
             self.show_changes(cx);
@@ -4208,6 +4215,73 @@ mod tests {
         }
         assert!(bounds("tab-9".into(), cx).is_some());
         assert!(bounds("tab-number-9".into(), cx).is_none());
+        let_attaches_end(&app, cx);
+    }
+
+    /// With more tabs than fit, the one on show scrolls into view: by key,
+    /// opened some other way, new, or in a narrower window. Scrolled by hand
+    /// it can leave, and stays out of view until a thread is shown again.
+    #[gpui::test]
+    fn the_tab_on_show_stays_in_view(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("tab-view");
+        let threads: [String; 12] =
+            std::array::from_fn(|_| server.run("/", &[], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(800.0), px(600.0)));
+        cx.run_until_parked();
+        open(&app, &threads[0], cx);
+        cx.run_until_parked();
+        let in_view = |i: usize, cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            let selector = Box::leak(format!("tab-{i}").into_boxed_str());
+            let tab = cx.debug_bounds(selector).expect(selector);
+            let bar = app.read_with(cx, |app, _| app.tab_scroll.bounds());
+            bar.left() <= tab.left() && tab.right() <= bar.right()
+        };
+        assert!(in_view(0, cx), "the first tab");
+        assert!(!in_view(11, cx), "more tabs than fit");
+
+        cx.simulate_keystrokes("cmd-9");
+        assert!(in_view(8, cx), "by key");
+        cx.simulate_keystrokes("cmd-1");
+        assert!(in_view(0, cx), "by key, back");
+        cx.dispatch_action(super::NextThread);
+        assert!(in_view(8, cx), "the next thread");
+
+        let last = app.read_with(cx, |app, _| {
+            let active = app.active.clone().unwrap();
+            app.siblings(&active).last().unwrap().1.clone()
+        });
+        open(&app, &last, cx);
+        assert!(in_view(11, cx), "opened some other way");
+
+        let at = cx.debug_bounds("tab-11").unwrap().center();
+        cx.simulate_event(gpui_kit::ScrollWheelEvent {
+            position: at,
+            delta: gpui_kit::ScrollDelta::Pixels(point(px(5000.0), px(0.0))),
+            ..Default::default()
+        });
+        assert!(!in_view(11, cx), "scrolled away by hand");
+        app.update(cx, |_, cx| cx.notify());
+        assert!(!in_view(11, cx), "and left there");
+        cx.simulate_keystrokes("cmd-9");
+        assert!(in_view(8, cx), "shown again, it snaps back");
+
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        open(&app, &last, cx);
+        assert!(in_view(11, cx), "opened again");
+        cx.simulate_resize(size(px(850.0), px(600.0)));
+        assert!(in_view(11, cx), "in a narrower window");
+
+        let new = server.run("/", &[], &["sleep", "600"]);
+        open(&app, &new, cx);
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            cx.debug_bounds("tab-12").is_some()
+        }));
+        assert!(in_view(12, cx), "a new tab");
         let_attaches_end(&app, cx);
     }
 
