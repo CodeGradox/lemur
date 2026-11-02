@@ -143,12 +143,15 @@ impl RpcError {
     pub fn kind(&self) -> Option<&str> {
         self.0.pointer("/data/kind").and_then(Value::as_str)
     }
+
+    fn message(&self) -> Option<&str> {
+        self.0.get("message").and_then(Value::as_str)
+    }
 }
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = self.0.get("message").and_then(Value::as_str);
-        write!(f, "{}", message.unwrap_or("herdr-core refused"))?;
+        write!(f, "{}", self.message().unwrap_or("herdr-core refused"))?;
         if let Some(hint) = self.0.pointer("/data/hint").and_then(Value::as_str) {
             write!(f, " ({hint})")?;
         }
@@ -339,9 +342,14 @@ pub fn needs_you(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<NeedsYou>().is_some())
 }
 
-/// Whether herdr-core's answer to adding a host asks for what only you can
-/// give, as Herdr tells: then `hc machine add` asks in a terminal.
-fn asks_you(e: &anyhow::Error) -> bool {
+/// Whether herdr-core's answer to adding `host` asks for what only you can
+/// give, as Herdr tells: then `hc machine add` asks in a terminal. By what
+/// it says itself: its hint for a host that's only down speaks of passwords
+/// too, and a host may be called `login01`.
+fn asks_you(e: &anyhow::Error, host: &Host) -> bool {
+    let Some(refused) = e.chain().find_map(|c| c.downcast_ref::<RpcError>()) else {
+        return false;
+    };
     let kinds = [
         "hc_missing",
         "incompatible",
@@ -349,8 +357,12 @@ fn asks_you(e: &anyhow::Error) -> bool {
         "auth_failed",
         "host_key",
     ];
-    let said = format!("{e:#}").to_lowercase();
-    error_kind(e).is_some_and(|k| kinds.contains(&k))
+    let mut said = refused.message().unwrap_or_default().to_lowercase();
+    let host_part = host.ssh.rsplit('@').next().unwrap_or_default();
+    for name in [host.ssh.as_str(), host_part, host.name.as_str()] {
+        said = said.replace(&name.to_lowercase(), "");
+    }
+    refused.kind().is_some_and(|k| kinds.contains(&k))
         || [
             "password",
             "passphrase",
@@ -656,7 +668,7 @@ impl Core {
                 Ok(name)
             }
             Err(e) => {
-                let (why, needs) = (format!("{e:#}"), asks_you(&e));
+                let (why, needs) = (format!("{e:#}"), asks_you(&e, host));
                 *known = Some(Err((std::time::Instant::now(), why.clone(), needs)));
                 Err(failed(why, needs))
             }
@@ -1103,20 +1115,34 @@ mod tests {
     /// in a terminal; a host that's just down isn't that.
     #[test]
     fn what_only_you_can_give_is_told_apart() {
-        let refused = |kind: &str| {
-            anyhow::Error::new(RpcError(json!({"message": "no", "data": {"kind": kind}})))
-                .context("adding agent to herdr-core")
+        let host = Host::new("login01", "me@login01.example");
+        let said = |kind: &str, message: &str| {
+            let hint = "check that `ssh me@login01.example` logs in without a password prompt";
+            anyhow::Error::new(RpcError(
+                json!({"message": message, "data": {"kind": kind, "hint": hint}}),
+            ))
+            .context("adding login01 to herdr-core")
         };
-        assert!(asks_you(&refused("hc_missing")));
-        assert!(asks_you(&refused("incompatible")));
-        assert!(asks_you(&refused("host_key")));
-        assert!(!asks_you(&refused("unreachable")));
-        assert!(asks_you(&anyhow!(
-            "Permission denied (publickey,password)."
-        )));
-        assert!(!asks_you(&anyhow!(
-            "ssh: connect to host agent port 22: Operation timed out"
-        )));
+        for kind in ["hc_missing", "incompatible", "host_key"] {
+            assert!(asks_you(&said(kind, "no"), &host), "{kind}");
+        }
+        for down in [
+            "no",
+            "cannot reach me@login01.example: ssh: connect to host login01.example port 22: \
+             Operation timed out",
+        ] {
+            assert!(!asks_you(&said("unreachable", down), &host), "{down}");
+        }
+        assert!(asks_you(
+            &said("unreachable", "Permission denied (publickey,password)."),
+            &host
+        ));
+        assert!(asks_you(
+            &said("other", "login01 needs a login typed by a person"),
+            &host
+        ));
+        // Its own words, as the machine by the host's name going elsewhere.
+        assert!(!asks_you(&anyhow!("it reaches login02"), &host));
         assert!(needs_you(
             &anyhow::Error::new(NeedsYou("x".into())).context("refreshing")
         ));
