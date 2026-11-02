@@ -579,8 +579,8 @@ pub fn set_up_host(host: &Host) -> Result<(String, Host)> {
 /// `hc machine add` for `host`, to the core of `session` here.
 fn set_up_argv(host: &Host, session: Option<&str>) -> Vec<String> {
     #[cfg(test)]
-    if let Some(argv) = SET_UP.lock().unwrap().clone() {
-        return argv;
+    if let Some((_, argv)) = SET_UP.lock().unwrap().iter().find(|(h, _)| *h == host.name) {
+        return argv.clone();
     }
     let mut argv = vec![];
     if let Some(session) = session {
@@ -595,9 +595,10 @@ fn set_up_argv(host: &Host, session: Option<&str>) -> Vec<String> {
     argv
 }
 
-/// What tests run in place of `hc machine add`, which would dial a host.
+/// What tests run in place of `hc machine add`, which would dial a host,
+/// by the host's name: tests run at once.
 #[cfg(test)]
-pub static SET_UP: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+pub static SET_UP: std::sync::Mutex<Vec<(String, Vec<String>)>> = std::sync::Mutex::new(vec![]);
 
 /// Ends a thread's terminal.
 pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {

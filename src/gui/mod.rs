@@ -5371,11 +5371,14 @@ mod tests {
         let cfg = server.far_config("set-box");
         let host = cfg.hosts[0].clone();
         // In place of `hc machine add`, which would dial the host.
-        *crate::actions::SET_UP.lock().unwrap() = Some(vec![
-            "sh".into(),
-            "-c".into(),
-            "echo set-box now has hc; exec sleep 600".into(),
-        ]);
+        crate::actions::SET_UP.lock().unwrap().push((
+            "set-box".into(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "echo set-box now has hc; exec sleep 600".into(),
+            ],
+        ));
         let (app, cx) = rooted(cfg, cx);
         cx.simulate_resize(size(px(1200.0), px(700.0)));
         app.update(cx, |app, cx| app.set_up_host(host, cx));
@@ -5404,7 +5407,6 @@ mod tests {
         });
         assert!(ended, "its terminal ended");
         assert!(app.read_with(cx, |app, _| app.setups.is_empty()));
-        *crate::actions::SET_UP.lock().unwrap() = None;
     }
 
     /// A list whose every thread is put away still shows them, under "Put
