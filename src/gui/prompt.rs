@@ -202,19 +202,14 @@ impl Lemur {
                 )
             }
             Ask::NewThread {
-                base,
-                worktree,
-                agent,
+                host, dir, agent, ..
             } => {
                 // While a thread is picked, what to start isn't.
                 kind = Some(*agent).filter(|_| prompt.go.is_none());
                 listed = true;
                 (
                     IconName::Plus,
-                    format!(
-                        "New in {}, or go to",
-                        self.worktree_name(&self.cfg.bases[*base].host, worktree)
-                    ),
+                    format!("New in {}, or go to", self.worktree_name(host, dir)),
                     "↑↓ Claude, Codex, shell or a thread · ⏎ start or go · esc cancel",
                 )
             }
@@ -309,35 +304,30 @@ impl Lemur {
         cx.notify();
     }
 
-    /// ⌘J: asks for a new agent's thread or shell in the worktree of the one
-    /// on show.
+    /// ⌘J: asks for a new agent's thread or shell where the one on show runs:
+    /// its worktree, or its folder outside every worktree.
     pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlaid() {
             return;
         }
-        let Some((host, session)) = self.active.clone() else {
+        let Some(key) = self.active.clone() else {
             return;
         };
-        // Outside every worktree there's nowhere to start, only to go to.
-        let Some((worktree, _)) = self.worktree_of(&host, &session) else {
-            return self.ask_name(Ask::Find, window, cx);
+        let (dir, base) = match self.project_of(&key.0, &key.1) {
+            Some((base, worktree)) => (worktree.path.clone(), Some(base)),
+            None => match self.session_of(&key) {
+                Some(s) => (s.path.clone(), None),
+                // Not listed yet: there's no telling where it runs.
+                None => return self.ask_name(Ask::Find, window, cx),
+            },
         };
-        let base = self
-            .snap
-            .hosts
-            .iter()
-            .filter(|h| h.name == host)
-            .flat_map(|h| h.bases.iter())
-            .find(|b| b.worktrees.iter().any(|w| w.path == worktree))
-            .map(|b| b.index);
-        if let Some(base) = base {
-            let ask = Ask::NewThread {
-                base,
-                worktree,
-                agent: Some(Agent::Claude),
-            };
-            self.ask_name(ask, window, cx);
-        }
+        let ask = Ask::NewThread {
+            host: key.0,
+            base,
+            dir,
+            agent: Some(Agent::Claude),
+        };
+        self.ask_name(ask, window, cx);
     }
 
     pub(super) fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -391,10 +381,8 @@ impl Lemur {
                 )
                 .map(|(started, note)| Done::Started(started, note)),
                 Ask::NewThread {
-                    base,
-                    worktree,
-                    agent,
-                } => actions::new_thread_in(&cfg, base, &worktree, &name, agent)
+                    host, dir, agent, ..
+                } => actions::start_in(&cfg, &host, &dir, &name, agent)
                     .map(|started| Done::Started(started, None)),
                 Ask::Find => unreachable!("going to a thread starts nothing"),
                 Ask::Rename { host, session } => {

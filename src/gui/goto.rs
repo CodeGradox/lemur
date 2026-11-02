@@ -23,8 +23,8 @@ pub(super) struct Match {
 impl Lemur {
     /// The threads to go to for what's typed in `prompt`: each word of it
     /// is in a thread's name, place or host. ⌘J lists the threads of its
-    /// worktree first, then its project's; ⌘P those opened last, the one
-    /// on show at the end.
+    /// worktree or folder first, then its project's; ⌘P those opened last, the
+    /// one on show at the end.
     pub(super) fn matches(&self, prompt: &Prompt, cx: &App) -> Vec<Match> {
         let typed = prompt.input.read(cx).value().to_lowercase();
         let query = match &prompt.what {
@@ -39,13 +39,19 @@ impl Lemur {
                 let (place, label) = self.titles(host, &s.name);
                 let place = place.unwrap_or_else(|| host.to_string());
                 let rank = match &prompt.what {
-                    Ask::NewThread { base, worktree, .. } => {
+                    Ask::NewThread {
+                        host: here,
+                        base,
+                        dir,
+                        ..
+                    } => {
                         let in_project = self
                             .project_of(host, &s.name)
-                            .map(|(index, w)| (index == *base, w.path == *worktree));
+                            .map(|(index, w)| (Some(index) == *base, w.path == *dir));
                         match in_project {
                             Some((_, true)) => 0,
                             Some((true, false)) => 1,
+                            None if host == here && s.path == *dir => 0,
                             _ => 2,
                         }
                     }

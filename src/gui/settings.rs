@@ -736,9 +736,7 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             Shortcut {
                 what: "New Claude or Codex thread or shell, or go to one",
                 how: Press::Keys(&["cmd-j"]),
-                more: Some(
-                    "Named, in the worktree of the thread on show; type to find another thread.",
-                ),
+                more: Some("Named, where the thread on show runs; type to find another thread."),
             },
             keys("Go to a thread", &["cmd-p"]),
             Shortcut {

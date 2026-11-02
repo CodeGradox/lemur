@@ -109,15 +109,16 @@ impl Lemur {
                 let Some(base) = base else {
                     return menu;
                 };
-                let (this, worktree) = (this.clone(), dir.clone());
+                let (this, host, worktree) = (this.clone(), host.clone(), dir.clone());
                 menu.item(
                     PopupMenuItem::new("Claude, Codex or shell, named…")
                         .icon(IconName::Plus)
                         .action(Box::new(NewThreadHere))
                         .on_click(move |_, window, cx| {
                             let ask = Ask::NewThread {
-                                base,
-                                worktree: worktree.clone(),
+                                host: host.clone(),
+                                base: Some(base),
+                                dir: worktree.clone(),
                                 agent: Some(Agent::Claude),
                             };
                             this.update(cx, |this, cx| this.ask_name(ask, window, cx))

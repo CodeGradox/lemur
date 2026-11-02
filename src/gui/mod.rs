@@ -199,10 +199,12 @@ enum Ask {
         base: usize,
         agent: Option<Agent>,
     },
-    /// `agent`, or with none just a shell, in an existing worktree.
+    /// `agent`, or with none just a shell, in `dir` on `host`: a worktree of
+    /// project `base`, or the folder of a thread outside every project.
     NewThread {
-        base: usize,
-        worktree: String,
+        host: String,
+        base: Option<usize>,
+        dir: String,
         agent: Option<Agent>,
     },
     Rename {
@@ -3271,8 +3273,9 @@ mod tests {
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let ask = Ask::NewThread {
-                    base: 0,
-                    worktree: path.clone(),
+                    host: "local".into(),
+                    base: Some(0),
+                    dir: path.clone(),
                     agent: Some(Agent::Claude),
                 };
                 app.ask_name(ask, window, cx)
@@ -3431,13 +3434,10 @@ mod tests {
         let asked = |cx: &mut VisualTestContext| {
             app.read_with(cx, |app, cx| {
                 let prompt = app.prompt.as_ref().expect("asking");
-                let Ask::NewThread {
-                    worktree, agent, ..
-                } = &prompt.what
-                else {
+                let Ask::NewThread { dir, agent, .. } = &prompt.what else {
                     panic!("not a new thread");
                 };
-                assert_eq!(worktree, wt);
+                assert_eq!(dir, wt);
                 (*agent, prompt.input.read(cx).value().to_string())
             })
         };
@@ -3472,6 +3472,87 @@ mod tests {
                 app.terminals.values().all(|t| t.read(cx).exited())
             })
         });
+    }
+
+    /// Outside every project, ⌘J starts where the thread on show runs, as it
+    /// does in a worktree, with the threads there first among those to go to.
+    #[gpui::test]
+    fn cmd_j_starts_beside_a_thread_outside_every_project(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("cmd-j-other");
+        let dir = TempDir::new("cmd-j-other");
+        let here = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        let elsewhere = server.run("/", &["lemur.label=elsewhere"], &["sleep", "600"]);
+        let mine = server.run(&here, &["lemur.label=mine"], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        let listed = wait_until(Duration::from_secs(5), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.session_of(&key(&mine)).is_some() && app.session_of(&key(&elsewhere)).is_some()
+            })
+        });
+        assert!(listed);
+        open(&app, &mine, cx);
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-j");
+        cx.run_until_parked();
+        let (asked, listed) = app.read_with(cx, |app, cx| {
+            let prompt = app.prompt.as_ref().expect("asking");
+            let Ask::NewThread {
+                host,
+                base,
+                dir,
+                agent,
+            } = &prompt.what
+            else {
+                panic!("only going to a thread");
+            };
+            let listed: Vec<String> = app
+                .matches(prompt, cx)
+                .into_iter()
+                .map(|m| m.key.1)
+                .collect();
+            ((host.clone(), *base, dir.clone(), *agent), listed)
+        });
+        assert_eq!(
+            asked,
+            ("local".to_string(), None, here.clone(), Some(Agent::Claude))
+        );
+        assert_eq!(
+            listed,
+            [mine.clone(), elsewhere.clone()],
+            "those here first"
+        );
+
+        cx.simulate_keystrokes("down down");
+        cx.simulate_input("beside");
+        cx.simulate_keystrokes("enter");
+        let started = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            server.addresses().len() == 3
+        });
+        assert!(
+            started,
+            "{:?}",
+            app.read_with(cx, |app, _| app.status.clone())
+        );
+        let terminals = server.core().terminals();
+        let new = terminals
+            .iter()
+            .find(|t| t.address != mine && t.address != elsewhere)
+            .unwrap();
+        assert_eq!(new.cwd, here);
+        let label = |key: &str| new.labels.get(key).map(String::as_str);
+        assert_eq!(label(crate::snapshot::LABEL), Some("beside"));
+        assert_eq!(label(crate::snapshot::KIND), Some("shell"));
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active == Some(key(&new.address)))
+        }));
+        let_attaches_end(&app, cx);
     }
 
     /// Names are asked for in the spotlight: a bad one is explained there
@@ -5495,8 +5576,9 @@ mod tests {
             app.read_with(cx, |app, _| app.status.clone().unwrap().0)
         };
         let thread = |agent: Agent| Ask::NewThread {
-            base: 0,
-            worktree: path.clone(),
+            host: "local".into(),
+            base: Some(0),
+            dir: path.clone(),
             agent: Some(agent),
         };
         for (agent, said) in [
@@ -5526,8 +5608,9 @@ mod tests {
 
         // Lemur goes on: a shell starts.
         let shell = Ask::NewThread {
-            base: 0,
-            worktree: path.clone(),
+            host: "local".into(),
+            base: Some(0),
+            dir: path.clone(),
             agent: None,
         };
         start(shell, cx);
