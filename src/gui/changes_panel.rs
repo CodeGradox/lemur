@@ -747,15 +747,19 @@ fn to_add(files: &[Change]) -> Vec<String> {
 /// `files` (those with changes not staged) as they are now; what git said
 /// of it.
 fn commit_in(host: &Host, path: &str, message: &str, files: &[String]) -> Result<String, String> {
-    // From stdin, as many as there are: on the command line, some 15,000
-    // paths are too many. Literal, so a file named like `:(glob)*` is that
-    // file; each C-quoted, so no name ends the list early.
+    // Through `xargs`, as many as there are: on the command line, some
+    // 15,000 paths are too many, and only git 2.25 on reads them from stdin.
+    // Literal, so a file named like `:(glob)*` is that file; each escaped,
+    // so no name ends the list early.
     let add = if files.is_empty() {
         String::new()
     } else {
-        let listed: String = files.iter().map(|f| format!("{}\n", c_quoted(f))).collect();
+        let listed: String = files
+            .iter()
+            .map(|f| format!("{}\n", xargs_word(f)))
+            .collect();
         format!(
-            "git --literal-pathspecs add -A --pathspec-from-file=- <<'LEMUR_PATHS' || exit 1\n{listed}LEMUR_PATHS\n"
+            "xargs git --literal-pathspecs add -A -- <<'LEMUR_PATHS' || exit 1\n{listed}LEMUR_PATHS\n"
         )
     };
     let script = format!(
@@ -769,25 +773,17 @@ fn commit_in(host: &Host, path: &str, message: &str, files: &[String]) -> Result
         .map_err(|e| format!("{e:#}"))
 }
 
-/// `path` in double quotes, as git reads a path in a list of them: `\`
-/// and `"` escaped, and control characters as octal escapes.
-fn c_quoted(path: &str) -> String {
-    let mut quoted = String::from("\"");
+/// `path` as `xargs` reads one word: a backslash before all it could take
+/// for something else, a newline too.
+fn xargs_word(path: &str) -> String {
+    let mut word = String::new();
     for c in path.chars() {
-        match c {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            c if c.is_control() => {
-                let mut bytes = [0; 4];
-                for b in c.encode_utf8(&mut bytes).bytes() {
-                    quoted.push_str(&format!("\\{b:03o}"));
-                }
-            }
-            c => quoted.push(c),
+        if c.is_ascii() && !c.is_ascii_alphanumeric() {
+            word.push('\\');
         }
+        word.push(c);
     }
-    quoted.push('"');
-    quoted
+    word
 }
 
 #[cfg(test)]
@@ -1156,7 +1152,17 @@ mod tests {
         std::fs::write(repo.join("a.txt"), "staged\n").unwrap();
         git(&["add", "a.txt"]);
         std::fs::write(repo.join("a.txt"), "and more\n").unwrap();
-        for name in ["new\nline.txt", "say \"hi\".txt", "back\\slash.txt"] {
+        for name in [
+            "new\nline.txt",
+            "say \"hi\".txt",
+            "back\\slash.txt",
+            "it's.txt",
+            " spaced .txt",
+            "-dash.txt",
+            ":(glob)*.txt",
+            "æøå.txt",
+            "_",
+        ] {
             std::fs::write(repo.join(name), "x\n").unwrap();
         }
         let root = repo.to_string_lossy().into_owned();
@@ -1178,12 +1184,18 @@ mod tests {
         assert_eq!(
             tree,
             [
+                " spaced .txt",
+                "-dash.txt",
                 ".gitignore",
+                ":(glob)*.txt",
+                "_",
                 "a.txt",
                 "back\\slash.txt",
                 "e.txt",
+                "it's.txt",
                 "new\nline.txt",
-                "say \"hi\".txt"
+                "say \"hi\".txt",
+                "æøå.txt"
             ]
         );
         let shown = std::process::Command::new("git")
