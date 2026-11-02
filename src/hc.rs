@@ -1069,18 +1069,22 @@ pub fn machine_name(name: &str) -> String {
         .chars()
         .take(32)
         .collect();
-    // herdr-core's ids: t, then 1-9, then its own digits.
-    let id_shaped = name.strip_prefix('t').is_some_and(|rest| {
+    match name.as_str() {
+        "" => "host".into(),
+        _ if is_terminal_id(&name) => format!("host-{}", &name[..name.len().min(27)]),
+        _ => name,
+    }
+}
+
+/// Whether `name` is shaped like herdr-core's terminal ids: t, then 1-9,
+/// then its own digits.
+pub fn is_terminal_id(name: &str) -> bool {
+    name.strip_prefix('t').is_some_and(|rest| {
         rest.starts_with(|c: char| matches!(c, '1'..='9'))
             && rest
                 .bytes()
                 .all(|b| b"0123456789bcdfghjkmnpqrstvwxyz".contains(&b))
-    });
-    match name.as_str() {
-        "" => "host".into(),
-        _ if id_shaped => format!("host-{}", &name[..name.len().min(27)]),
-        _ => name,
-    }
+    })
 }
 
 /// The core that runs `host`'s terminals, and its name for the host: None

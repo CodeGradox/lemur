@@ -418,9 +418,7 @@ pub fn shell_jobs(cfg: &Config, host: &str, pid: Option<u32>) -> Result<usize> {
 /// Whether `session` is a herdr-core address (`t7`, `agent/t7`), not a tmux
 /// session's name from before.
 fn is_address(session: &str) -> bool {
-    let leaf = session.rsplit('/').next().unwrap_or(session);
-    leaf.strip_prefix('t')
-        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    hc::is_terminal_id(session.rsplit('/').next().unwrap_or(session))
 }
 
 /// Records the order threads were dragged into: `lemur.order` 0, 1, 2, …
@@ -1328,6 +1326,10 @@ mod tests {
         drop(socket);
         assert!(resume_thread(&cfg, &thread).is_ok());
         assert!(is_address("t7") && is_address("agent/t12"));
+        assert!(
+            is_address("t1b") && is_address("agent/t2p"),
+            "its own digits"
+        );
         assert!(!is_address(name) && !is_address("agent/t") && !is_address("tx"));
     }
 
