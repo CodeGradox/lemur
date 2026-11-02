@@ -58,7 +58,13 @@ impl Lemur {
         if self.overlaid() {
             return;
         }
-        let now: Vec<Key> = self.agents().into_iter().map(|(h, s)| key(h, s)).collect();
+        // Not one put away: showing it would bring it back for good.
+        let now: Vec<Key> = self
+            .agents()
+            .into_iter()
+            .filter(|(_, s)| !s.away)
+            .map(|(h, s)| key(h, s))
+            .collect();
         // ⌘] after ⌘] keeps to the order it started from: an agent done
         // while you looked away leaves that rank once opened, which would
         // skip the next one. A new agent, or one that ends, starts over.

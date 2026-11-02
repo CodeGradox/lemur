@@ -5684,6 +5684,20 @@ mod tests {
             seen.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
         }
         assert_eq!(seen, ["asks", "works", "idle", "asks", "idle", "works"]);
+
+        // One put away is left out, and stays away.
+        app.update(cx, |app, cx| {
+            app.snap.hosts[0].other[0].away = true;
+            cx.notify();
+        });
+        let mut seen = vec![];
+        for _ in 0..3 {
+            cx.simulate_keystrokes("cmd-]");
+            seen.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
+        }
+        assert!(!seen.contains(&"idle".to_string()), "{seen:?}");
+        let away = app.read_with(cx, |app, _| app.snap.hosts[0].other[0].away);
+        assert!(away);
         let_attaches_end(&app, cx);
     }
 
