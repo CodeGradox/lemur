@@ -115,9 +115,6 @@ fn bind_keys(cx: &mut App) {
         // As Zed's right dock; Refresh does without a key.
         KeyBinding::new("cmd-r", ToggleRightPanel, None),
         KeyBinding::new("cmd-shift-a", ToggleAgents, None),
-        // As Herdr's; the notes indent with them, as they take them first.
-        KeyBinding::new("cmd-]", NextAgent, None),
-        KeyBinding::new("cmd-[", PreviousAgent, None),
         KeyBinding::new("cmd-shift-p", CommandPalette, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
@@ -256,8 +253,8 @@ struct Lemur {
     /// What each thread was doing at the last snapshot, or before its host
     /// couldn't be reached.
     seen: HashMap<Key, Activity>,
-    /// The agents in the order ⌘] and ⌘[ go through them, from the first
-    /// press on.
+    /// The agents in the order Next and Previous Agent go through them, from
+    /// the first use on.
     agent_walk: Vec<Key>,
     /// Lists whose dragged order is being written to herdr-core, a label at
     /// a time, and the order dragged meanwhile, written next. Snapshots
@@ -939,7 +936,7 @@ impl Lemur {
                 && matches!(s.activity, Activity::Idle | Activity::Unknown);
             if finished && self.active.as_ref() != Some(k) {
                 self.done.insert(k.clone());
-                // It ranks among the done now: ⌘] starts over.
+                // It ranks among the done now: Next Agent starts over.
                 self.agent_walk.clear();
             }
             if finished || (s.activity == Activity::NeedsInput && was != Activity::NeedsInput) {
@@ -5602,7 +5599,7 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
-    /// ⌘] goes through the agents done while you looked away one by one,
+    /// Next Agent goes through the agents done while you looked away one by one,
     /// then the rest: opening one doesn't skip the next.
     #[gpui::test]
     fn next_agent_goes_through_each_done_one(cx: &mut gpui::TestAppContext) {
@@ -5867,10 +5864,10 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
-    /// ⌘] and ⌘[ go through the agents in the panel's order, round and
-    /// round, starting from the first.
+    /// Next and Previous Agent go through the agents in the panel's order,
+    /// round and round, starting from the first. They have no keys.
     #[gpui::test]
-    fn cmd_brackets_go_through_the_agents(cx: &mut gpui::TestAppContext) {
+    fn next_and_previous_agent_go_through_the_agents(cx: &mut gpui::TestAppContext) {
         let server = HcServer::new("next-agent");
         let (app, cx) = rooted(server.config(), cx);
         cx.update(|_, cx| super::bind_keys(cx));
@@ -5884,9 +5881,15 @@ mod tests {
             ],
             cx,
         );
+        cx.simulate_keystrokes("cmd-] cmd-[");
+        app.read_with(cx, |app, _| assert_eq!(app.active, None, "no keys"));
         let mut seen = vec![];
-        for keys in ["cmd-]", "cmd-]", "cmd-]", "cmd-]", "cmd-[", "cmd-["] {
-            cx.simulate_keystrokes(keys);
+        for back in [false, false, false, false, true, true] {
+            if back {
+                cx.dispatch_action(super::PreviousAgent);
+            } else {
+                cx.dispatch_action(super::NextAgent);
+            }
             seen.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
         }
         assert_eq!(seen, ["asks", "works", "idle", "asks", "idle", "works"]);
@@ -5898,7 +5901,7 @@ mod tests {
         });
         let mut seen = vec![];
         for _ in 0..3 {
-            cx.simulate_keystrokes("cmd-]");
+            cx.dispatch_action(super::NextAgent);
             seen.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
         }
         assert!(!seen.contains(&"idle".to_string()), "{seen:?}");
@@ -6710,7 +6713,7 @@ mod tests {
     }
 
     /// A peek, or a host's set-up where a password may be asked for, keeps
-    /// the keyboard: ⌘1 to ⌘9, ⌘] and ⌃Tab don't show another thread under
+    /// the keyboard: ⌘1 to ⌘9, Next Agent and ⌃Tab don't show another thread under
     /// it, ⌘P doesn't open under it, and whatever hands the keyboard back
     /// hands it to the terminal in front.
     #[gpui::test]
@@ -6732,7 +6735,10 @@ mod tests {
             })
         };
         assert!(c_has_it(cx));
-        for keys in ["cmd-2", "cmd-]", "ctrl-tab", "cmd-p", "cmd-t", "cmd-j"] {
+        cx.dispatch_action(super::NextAgent);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.active, Some(key(&a))));
+        for keys in ["cmd-2", "ctrl-tab", "cmd-p", "cmd-t", "cmd-j"] {
             cx.simulate_keystrokes(keys);
             cx.run_until_parked();
             app.read_with(cx, |app, _| {

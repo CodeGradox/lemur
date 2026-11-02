@@ -689,11 +689,6 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
                 more: Some("The panel that showed last: the notes at first."),
             },
             keys("Toggle the agents", &["cmd-shift-a"]),
-            Shortcut {
-                what: "Next agent, or the one before",
-                how: Press::Keys(&["cmd-]", "cmd-["]),
-                more: Some("In the agents panel's order: the ones needing you first."),
-            },
             keys("Add a project", &["cmd-o"]),
             keys("Settings", &["cmd-,"]),
             keys("Close Settings", &["cmd-w"]),

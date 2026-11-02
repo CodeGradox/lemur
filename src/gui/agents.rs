@@ -52,8 +52,8 @@ impl Lemur {
         agents
     }
 
-    /// ⌘] and ⌘[: shows the next agent, or the one before, in the agents
-    /// panel's order, as Herdr's do: from the thread on show, or the first.
+    /// Shows the next agent, or the one before, in the agents panel's order,
+    /// as Herdr's ⌘] and ⌘[ do: from the thread on show, or the first.
     pub(super) fn next_agent(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlaid() {
             return;
@@ -65,7 +65,7 @@ impl Lemur {
             .filter(|(_, s)| !s.away)
             .map(|(h, s)| key(h, s))
             .collect();
-        // ⌘] after ⌘] keeps to the order it started from: an agent done
+        // Next after next keeps to the order it started from: an agent done
         // while you looked away leaves that rank once opened, which would
         // skip the next one. A new agent, or one that ends, starts over.
         let same = |walk: &[Key]| walk.len() == now.len() && now.iter().all(|k| walk.contains(k));
