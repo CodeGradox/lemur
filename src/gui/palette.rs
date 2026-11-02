@@ -77,7 +77,7 @@ fn matching(typed: &str) -> Vec<(&'static str, Box<dyn Action>)> {
 impl Lemur {
     /// ⌘⇧P: opens the palette, over the window.
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prompt.is_some() || self.picker.is_some() || self.palette.is_some() {
+        if self.overlaid() {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Run a command…"));

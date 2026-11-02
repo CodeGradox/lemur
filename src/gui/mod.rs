@@ -269,6 +269,8 @@ struct Lemur {
     /// not once scrolled by hand, until a thread is shown again.
     tab_scroll: ScrollHandle,
     tab_follows: bool,
+    /// The Changes panel's diff, shown over the window.
+    diff_preview: Option<peek::DiffPreview>,
     /// Shown in a snackbar over the terminal.
     status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
@@ -461,6 +463,23 @@ impl Lemur {
             |this, _, _: &changes_panel::Committed, cx| this.ask_changes(cx),
         )
         .detach();
+        cx.subscribe_in(
+            &changes_panel,
+            window,
+            |this, _, _: &changes_panel::Preview, window, cx| this.open_diff_preview(window, cx),
+        )
+        .detach();
+        // The preview shows the panel's diff, and goes with it.
+        cx.observe_in(&changes_panel, window, |this, panel, window, cx| {
+            if this.diff_preview.is_some() {
+                if panel.read(cx).shown_diff().is_some() {
+                    cx.notify();
+                } else {
+                    this.close_diff_preview(window, cx);
+                }
+            }
+        })
+        .detach();
         // Tests set their own stand-in for Linear first.
         if cx.try_global::<linear_panel::LinearAccount>().is_none() {
             linear_panel::init(crate::linear::Linear::new(), cx);
@@ -650,6 +669,7 @@ impl Lemur {
             dots: Default::default(),
             tab_scroll: ScrollHandle::new(),
             tab_follows: true,
+            diff_preview: None,
             setups: HashMap::new(),
             ordering: HashMap::new(),
             status: None,
@@ -1106,11 +1126,14 @@ impl Lemur {
         cx.notify();
     }
 
-    /// A spotlight, the folder picker or the palette is over the window:
+    /// A spotlight, the folder picker, the palette or a diff is over the window:
     /// what would open another over it, or move the keyboard from it,
     /// waits until it's gone.
     fn overlaid(&self) -> bool {
-        self.prompt.is_some() || self.picker.is_some() || self.palette.is_some()
+        self.prompt.is_some()
+            || self.picker.is_some()
+            || self.palette.is_some()
+            || self.diff_preview.is_some()
     }
 
     /// Tells the thread on show's program it's no longer shown, unless it's
@@ -1255,6 +1278,11 @@ impl Lemur {
 
     /// ⌘W: asks whether to close the thread on show.
     fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // In front of the thread on show.
+        if self.diff_preview.is_some() {
+            self.close_diff_preview(window, cx);
+            return;
+        }
         if self.overlaid() {
             return;
         }
@@ -1736,6 +1764,7 @@ impl Render for Lemur {
             })
         });
         let peek = self.peek_card(cx);
+        let diff_preview = self.diff_preview_card(cx);
         let palette = self.palette_card(window, cx).map(|card| {
             let this = this.clone();
             spotlight::overlay(card, move |window, cx| {
@@ -1809,6 +1838,9 @@ impl Render for Lemur {
                     cx.stop_propagation();
                 } else if e.keystroke.key == "escape" && this.palette.is_some() {
                     this.close_palette(window, cx);
+                    cx.stop_propagation();
+                } else if e.keystroke.key == "escape" && this.diff_preview.is_some() {
+                    this.close_diff_preview(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -1895,6 +1927,7 @@ impl Render for Lemur {
             )
             .children(picker)
             .children(peek)
+            .children(diff_preview)
             .children(prompt)
             .children(palette)
             // Holds the window's focus with no terminal open. It takes no room
@@ -4340,6 +4373,146 @@ mod tests {
             cx.debug_bounds("tab-12").is_some()
         }));
         assert!(in_view(12, cx), "a new tab");
+        let_attaches_end(&app, cx);
+    }
+
+    /// A diff scrolls both ways in the panel, and starts over for another
+    /// file. Its button shows it over the window, scrolling both ways too;
+    /// Esc, ⌘W, ×, a click outside or the file's change ending close that,
+    /// and ⌘W leaves the thread under it alone.
+    #[gpui::test]
+    fn a_diff_shows_over_the_window_and_scrolls_both_ways(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("diff-preview");
+        let dir = TempDir::new("diff-preview");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("long.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("short.txt"), "one\n").unwrap();
+        git_in(&repo, &["add", "long.txt", "short.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        // Wider and taller than the window.
+        let line = "x".repeat(1000);
+        std::fs::write(repo.join("long.txt"), vec![line; 300].join("\n")).unwrap();
+        std::fs::write(repo.join("short.txt"), "two\n").unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let t = server.run(&path, &[], &["sleep", "600"]);
+        let mut cfg = server.config();
+        cfg.bases.push(Base::new("local", &path));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        open(&app, &t, cx);
+        app.update(cx, |app, cx| app.toggle_right(Right::Changes, cx));
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            cx.debug_bounds("change 1").is_some()
+        }));
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        let wheel = |selector: &'static str, cx: &mut VisualTestContext| {
+            let position = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_mouse_move(position, None, Modifiers::none());
+            // One axis at a time: gpui takes a wheel's larger one.
+            for delta in [point(px(-200.0), px(0.0)), point(px(0.0), px(-200.0))] {
+                cx.simulate_event(gpui_kit::ScrollWheelEvent {
+                    position,
+                    delta: gpui_kit::ScrollDelta::Pixels(delta),
+                    ..Default::default()
+                });
+            }
+            cx.run_until_parked();
+        };
+        let panel_offset = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, cx| {
+                let panel = app.changes_panel.read(cx);
+                panel.diff_scroll.0.borrow().base_handle.offset()
+            })
+        };
+        let long_diff = |cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, cx| {
+                    let panel = app.changes_panel.read(cx);
+                    panel.shown_diff().is_some_and(|(_, l)| l.len() > 100)
+                })
+            })
+        };
+
+        click("change 0", cx);
+        assert!(long_diff(cx));
+        wheel("changes-diff", cx);
+        let scrolled = panel_offset(cx);
+        assert!(scrolled.x < px(0.0) && scrolled.y < px(0.0), "{scrolled:?}");
+        click("change 1", cx);
+        assert_eq!(panel_offset(cx), Default::default(), "another file");
+        click("change 0", cx);
+        assert!(long_diff(cx));
+
+        let previewing =
+            |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.diff_preview.is_some());
+        click("changes-preview", cx);
+        assert!(previewing(cx));
+        let card = cx.debug_bounds("diff-preview").expect("the card");
+        assert!(
+            card.size.width > px(1100.0) && card.size.height > px(700.0),
+            "{card:?}"
+        );
+        wheel("changes-diff-preview", cx);
+        let scrolled = app.read_with(cx, |app, _| {
+            let preview = app.diff_preview.as_ref().unwrap();
+            preview.scroll.0.borrow().base_handle.offset()
+        });
+        assert!(scrolled.x < px(0.0) && scrolled.y < px(0.0), "{scrolled:?}");
+
+        let has_keyboard = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let view = app.read(cx).terminals[&key(&t)].clone();
+                gpui_kit::Focusable::focus_handle(view.read(cx), cx).is_focused(window)
+            })
+        };
+        assert!(!has_keyboard(cx), "the terminal under it");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!previewing(cx), "Esc");
+        assert!(has_keyboard(cx), "back to the terminal");
+
+        click("changes-preview", cx);
+        assert!(previewing(cx));
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        assert!(!previewing(cx), "⌘W");
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the thread under it stays"
+        );
+
+        click("changes-preview", cx);
+        click("diff-preview-close", cx);
+        assert!(!previewing(cx), "×");
+
+        click("changes-preview", cx);
+        cx.simulate_click(point(px(4.0), px(4.0)), Modifiers::none());
+        cx.run_until_parked();
+        assert!(!previewing(cx), "a click outside");
+
+        click("changes-preview", cx);
+        assert!(previewing(cx));
+        std::fs::write(repo.join("long.txt"), "one\n").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                app.update(cx, |app, cx| {
+                    app.changes_panel.update(cx, |p, cx| p.refresh(cx))
+                });
+                cx.run_until_parked();
+                !previewing(cx)
+            }),
+            "its change ended"
+        );
         let_attaches_end(&app, cx);
     }
 

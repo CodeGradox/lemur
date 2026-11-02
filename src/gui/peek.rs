@@ -1,8 +1,10 @@
 //! Peeking at a thread, as Herdr peeks at a sub-agent: its terminal over
 //! the one on show, live, without switching to it. ↗ shows it instead;
 //! × or a click outside puts the one on show back. Setting up a host shows
-//! its terminal the same way.
+//! its terminal the same way, and the Changes panel a file's diff, nearly
+//! as wide and tall as the window.
 
+use super::changes_panel::diff_list;
 use super::sidebar::thread_icon;
 use super::{Key, Lemur, worktree_label};
 use crate::actions;
@@ -13,7 +15,107 @@ use gpui_kit::component::{ActiveTheme, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
+/// The diff shown over the window: the Changes panel's, which it follows.
+/// It has the keyboard, so that nothing typed goes to the terminal under it.
+pub(super) struct DiffPreview {
+    focus: FocusHandle,
+    pub(super) scroll: UniformListScrollHandle,
+}
+
+/// `card` over the window, which a click outside it closes.
+fn over_window(card: Div, close: impl Fn(&mut Window, &mut App) + 'static) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui_kit::black().opacity(0.25))
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| close(window, cx))
+        .child(card.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
+}
+
 impl Lemur {
+    /// Shows the Changes panel's diff over the window.
+    pub(super) fn open_diff_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.diff_preview = Some(DiffPreview {
+            focus,
+            scroll: UniformListScrollHandle::new(),
+        });
+        cx.notify();
+    }
+
+    pub(super) fn close_diff_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff_preview = None;
+        self.focus_terminal(window, cx);
+    }
+
+    /// The diff over the window: which file, and its lines.
+    pub(super) fn diff_preview_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let preview = self.diff_preview.as_ref()?;
+        let (file, lines) = self.changes_panel.read(cx).shown_diff()?;
+        let (path, added, removed) = (file.path.clone(), file.added, file.removed);
+        let list = diff_list("changes-diff-preview", lines.to_vec(), &preview.scroll, cx);
+        let theme = cx.theme().clone();
+        let header = h_flex()
+            .h_10()
+            .flex_shrink_0()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().flex_1().min_w_0().truncate().text_sm().child(path))
+            .children(added.map(|n| {
+                div()
+                    .text_xs()
+                    .text_color(theme.success)
+                    .child(format!("+{n}"))
+            }))
+            .children(removed.map(|n| {
+                div()
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .child(format!("-{n}"))
+            }))
+            .child(
+                div().debug_selector(|| "diff-preview-close".into()).child(
+                    Button::new("diff-preview-close")
+                        .icon(IconName::Close)
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Close")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.close_diff_preview(window, cx)),
+                        ),
+                ),
+            );
+        let card = v_flex()
+            .debug_selector(|| "diff-preview".into())
+            .track_focus(&preview.focus)
+            .size_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .shadow_lg()
+            .overflow_hidden()
+            .child(header)
+            .child(list.flex_1().min_h_0());
+        let this = cx.entity().downgrade();
+        Some(
+            over_window(card, move |window, cx| {
+                this.update(cx, |this, cx| this.close_diff_preview(window, cx))
+                    .ok();
+            })
+            .p_4()
+            .into_any_element(),
+        )
+    }
+
     /// Peeks at thread `key`: a helper's terminal, or another thread.
     pub(super) fn peek(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
         if self.active.as_ref() == Some(&key) {
@@ -181,19 +283,10 @@ impl Lemur {
             );
         let this = cx.entity().downgrade();
         Some(
-            div()
-                .absolute()
-                .inset_0()
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui_kit::black().opacity(0.25))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    this.update(cx, |this, cx| this.close_peek(window, cx)).ok();
-                })
-                .child(card.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
-                .into_any_element(),
+            over_window(card, move |window, cx| {
+                this.update(cx, |this, cx| this.close_peek(window, cx)).ok();
+            })
+            .into_any_element(),
         )
     }
 }

@@ -1,7 +1,8 @@
 //! The Changes panel, on the right as the notes and the agents are, as
 //! Herdr's: the files changed in the worktree on show since its last
 //! commit, each with its lines added and removed; a click shows its diff,
-//! and another hides it.
+//! and another hides it, and it scrolls both ways. Its button shows it over
+//! the window (`peek`).
 //! Under them, a message and Commit commit the files listed. Other
 //! repositories inside the worktree, as worktrees kept in a project's
 //! folder, are neither listed nor committed.
@@ -40,6 +41,11 @@ pub(super) struct Committed;
 
 impl EventEmitter<Committed> for ChangesPanel {}
 
+/// Its diff is to show over the window.
+pub(super) struct Preview;
+
+impl EventEmitter<Preview> for ChangesPanel {}
+
 pub(super) struct ChangesPanel {
     /// The host and worktree shown, and what it's called.
     place: Option<(Host, String, String)>,
@@ -50,6 +56,7 @@ pub(super) struct ChangesPanel {
     /// The file whose diff shows, and its lines.
     open: Option<String>,
     lines: Vec<SharedString>,
+    pub(super) diff_scroll: UniformListScrollHandle,
     message: Entity<InputState>,
     committing: bool,
     /// What the last commit did, or why it didn't.
@@ -80,6 +87,7 @@ impl ChangesPanel {
             loading: false,
             open: None,
             lines: vec![],
+            diff_scroll: UniformListScrollHandle::new(),
             message,
             committing: false,
             note: None,
@@ -87,6 +95,13 @@ impl ChangesPanel {
             _refresh: None,
             _task: None,
         }
+    }
+
+    /// The file whose diff shows, and its lines.
+    pub(super) fn shown_diff(&self) -> Option<(&Change, &[SharedString])> {
+        let open = self.open.as_ref()?;
+        let file = self.files.iter().find(|f| f.path == *open)?;
+        Some((file, &self.lines))
     }
 
     /// Shows worktree `path` on `host`, called `label`, and asks it again.
@@ -284,7 +299,6 @@ impl Render for ChangesPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let font = Prefs::get(cx).terminal.font_family.clone();
         let title = match &self.place {
             Some((_, _, label)) => format!("Changes · {label}"),
             None => "Changes".to_string(),
@@ -375,50 +389,44 @@ impl Render for ChangesPanel {
             .overflow_y_scroll()
             .children(files)
             .children(empty.map(|e| div().p_1().text_sm().text_color(muted).child(e)));
-        let lines = self.lines.clone();
-        let (added, removed, hunk) = (
-            theme.success.opacity(0.15),
-            theme.danger.opacity(0.15),
-            theme.info,
-        );
-        let diff = (!lines.is_empty()).then(|| {
-            let count = lines.len();
-            let row_font = font.clone();
-            uniform_list("changes-diff", count, move |range, _, _| {
-                range
-                    .map(|i| {
-                        let line = lines[i].clone();
-                        // Its own size and font: the list measures a line
-                        // apart from the panel's text style.
-                        div()
-                            .w_full()
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .px_2()
-                            .text_xs()
-                            .font_family(row_font.clone())
-                            .whitespace_nowrap()
-                            .map(|row| match line.chars().next() {
-                                Some('+') => row.bg(added),
-                                Some('-') => row.bg(removed),
-                                Some('@') => row.text_color(hunk),
-                                _ => row,
-                            })
-                            .child(if line.is_empty() {
-                                SharedString::from(" ")
-                            } else {
-                                line
-                            })
-                    })
-                    .collect()
-            })
-            .flex_1()
-            .min_h_0()
-            .border_t_1()
-            .border_color(theme.border)
-            .font_family(font.clone())
-            .text_xs()
+        let diff = (!self.lines.is_empty()).then(|| {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    h_flex()
+                        .h_7()
+                        .flex_shrink_0()
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(self.open.clone().unwrap_or_default()),
+                        )
+                        .child(
+                            div().debug_selector(|| "changes-preview".into()).child(
+                                Button::new("changes-preview")
+                                    .icon(gpui_kit::assets::IconName::Maximize)
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Show it over the window")
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Preview))),
+                            ),
+                        ),
+                )
+                .child(
+                    diff_list("changes-diff", self.lines.clone(), &self.diff_scroll, cx)
+                        .flex_1()
+                        .min_h_0(),
+                )
         });
         let can_commit = !self.files.is_empty()
             && !self.committing
@@ -465,6 +473,64 @@ impl Render for ChangesPanel {
             .when(self.lines.is_empty(), |panel| panel.child(div().flex_1()))
             .when(self.place.is_some(), |panel| panel.child(commit))
     }
+}
+
+/// A diff's lines, scrolling both ways: across as far as the longest goes.
+pub(super) fn diff_list(
+    id: &'static str,
+    lines: Vec<SharedString>,
+    scroll: &UniformListScrollHandle,
+    cx: &App,
+) -> UniformList {
+    let theme = cx.theme();
+    let font = Prefs::get(cx).terminal.font_family.clone();
+    let (added, removed, hunk) = (
+        theme.success.opacity(0.15),
+        theme.danger.opacity(0.15),
+        theme.info,
+    );
+    let longest = lines
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, line)| line.len())
+        .map(|(i, _)| i);
+    let count = lines.len();
+    let row_font = font.clone();
+    uniform_list(id, count, move |range, _, _| {
+        range
+            .map(|i| {
+                let line = lines[i].clone();
+                // Its own size and font: the list measures a line
+                // apart from the panel's text style.
+                div()
+                    .w_full()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .text_xs()
+                    .font_family(row_font.clone())
+                    .whitespace_nowrap()
+                    .map(|row| match line.chars().next() {
+                        Some('+') => row.bg(added),
+                        Some('-') => row.bg(removed),
+                        Some('@') => row.text_color(hunk),
+                        _ => row,
+                    })
+                    .child(if line.is_empty() {
+                        SharedString::from(" ")
+                    } else {
+                        line
+                    })
+            })
+            .collect()
+    })
+    .with_width_from_item(longest)
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .track_scroll(scroll)
+    .debug_selector(move || id.to_string())
+    .font_family(font)
+    .text_xs()
 }
 
 /// The worktree's changes since its last commit, staged or not, new files
