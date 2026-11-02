@@ -574,7 +574,10 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
     if let Some(claude) = claude_activity(&data.agents, &pids, &data.parents) {
         for s in &mut sessions {
             let found = claude.get(&s.name);
+            // An answer up to `AGENTS_EVERY` old: not of a Claude gone since,
+            // its shell back at its prompt.
             if s.activity == Activity::Unknown
+                && s.busy
                 && let Some(f) = found
             {
                 (s.activity, s.waiting_for) = (f.activity, f.waiting_for.clone());
@@ -683,10 +686,13 @@ fn helpers(t: &Terminal, all: &[Terminal], depth: usize) -> Vec<Helper> {
     if depth > 3 {
         return vec![];
     }
+    // A Claude killed can't say its subagents ended: with its shell back
+    // at its prompt, what they last said is over too.
     let mut out: Vec<Helper> = t
         .records
         .iter()
         .flatten()
+        .filter(|_| busy(t))
         .map(|(id, r)| Helper {
             id: id.clone(),
             label: [&r.title, &r.msg]
@@ -712,6 +718,7 @@ fn helpers(t: &Terminal, all: &[Terminal], depth: usize) -> Vec<Helper> {
             activity: c
                 .status
                 .as_ref()
+                .filter(|_| busy(c))
                 .map_or(Activity::Unknown, |s| activity(&s.state)),
             terminal: true,
             depth,
@@ -1258,6 +1265,62 @@ mod tests {
             ..back
         };
         assert_eq!(resumed.shell_to_note(), Some(100), "resumed there");
+    }
+
+    /// A Claude killed leaves what it last said with herdr-core, and in
+    /// `claude agents`' last answer: with its shell back at its prompt,
+    /// neither it nor its subagents show as working.
+    #[test]
+    fn a_dead_claude_says_nothing_more() {
+        let cfg = cfg();
+        let mut data = parse(&cfg, &cfg.hosts[0], "");
+        data.agents =
+            r#"[{"kind":"interactive","pid":200,"sessionId":"s1","cwd":"/tmp","status":"busy"}]"#
+                .into();
+        data.parents = HashMap::from([(200, 100)]);
+        let left = |program: &str, pid: u32| Terminal {
+            records: Some(BTreeMap::from([(
+                "a1".to_string(),
+                Status {
+                    state: "working".into(),
+                    ..Default::default()
+                },
+            )])),
+            foreground: Some(Foreground {
+                pid,
+                name: program.into(),
+                ..Default::default()
+            }),
+            ..terminal("agent/t1", "/tmp", 100, &[])
+        };
+        let shown = |t: Terminal| {
+            let s = view(&cfg, &cfg.hosts[0], &data, &[t]).other.remove(0);
+            (s.activity, s.helpers.len())
+        };
+        assert_eq!(shown(left("claude", 200)), (Activity::Working, 1));
+        assert_eq!(shown(left("zsh", 100)), (Activity::Unknown, 0));
+
+        // A helper's terminal is the same.
+        let helper = |program: &str, pid: u32| Terminal {
+            parent: Some("agent/t1".into()),
+            status: Some(Status {
+                state: "working".into(),
+                ..Default::default()
+            }),
+            foreground: Some(Foreground {
+                pid,
+                name: program.into(),
+                ..Default::default()
+            }),
+            ..terminal("agent/t2", "/tmp", 300, &[])
+        };
+        let of = |t: Terminal| {
+            let main = terminal("agent/t1", "/tmp", 100, &[]);
+            let shown = view(&cfg, &cfg.hosts[0], &data, &[main, t]);
+            shown.other[0].helpers[0].activity
+        };
+        assert_eq!(of(helper("claude", 400)), Activity::Working);
+        assert_eq!(of(helper("zsh", 300)), Activity::Unknown);
     }
 
     /// A terminal lemur didn't label is called by what it shows.
