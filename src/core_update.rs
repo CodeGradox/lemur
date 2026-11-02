@@ -115,12 +115,27 @@ pub fn check(cores: &Cores) -> Result<Versions> {
 fn installed(cores: &Cores) -> Result<Versions> {
     let core = hc::core(cores.here.as_deref())?;
     let status = core.call("server.status", serde_json::json!({}))?;
-    let machines = if cores.machines {
-        hc::core(None)?.call("machine.list", serde_json::json!({}))?
-    } else {
-        serde_json::json!({})
-    };
-    Ok(read(&status, &machines))
+    if !cores.machines {
+        return Ok(read(&status, &serde_json::json!({})));
+    }
+    let default = hc::core(None)?;
+    let machines = default.call("machine.list", serde_json::json!({}))?;
+    let mut versions = read(&status, &machines);
+    // The local host in a session of its own: this Mac runs two, and is as
+    // up to date as the older.
+    if cores.here.is_some() {
+        let other = default.call("server.status", serde_json::json!({}))?;
+        versions.here = older(versions.here, read(&other, &machines).here);
+    }
+    Ok(versions)
+}
+
+/// The older of two versions, or the one known.
+fn older(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if newer(&a, &b) { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// This Mac's version and the machines', from herdr-core's answers.
@@ -185,22 +200,35 @@ pub fn update(targets: &[Target], cores: &Cores) -> Result<String> {
             Target::Here => (vec!["update"], "this Mac".into()),
             Target::Machine(name) => (vec!["machine", "update", name], name.clone()),
         };
-        let mut command = Command::new(hc::binary());
-        // `hc update` restarts the core of its session, Lemur's here.
-        if let (Target::Here, Some(session)) = (target, &cores.here) {
-            command.env("HC_SESSION", session);
-        }
-        let out = command
-            .args(&args)
-            .output()
-            .with_context(|| format!("running hc {}", args.join(" ")))?;
-        if !out.status.success() {
-            let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            bail!("updating herdr-core on {what}: {said}");
+        for session in sessions_for(target, cores) {
+            let mut command = Command::new(hc::binary());
+            if let Some(session) = session {
+                command.env("HC_SESSION", session);
+            }
+            let out = command
+                .args(&args)
+                .output()
+                .with_context(|| format!("running hc {}", args.join(" ")))?;
+            if !out.status.success() {
+                let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                bail!("updating herdr-core on {what}: {said}");
+            }
         }
         done.push(what);
     }
     Ok(format!("Updated herdr-core on {}", done.join(" and ")))
+}
+
+/// The sessions to run `target`'s update in. `hc update` restarts the core
+/// of its session, and any other that's older only when run in that one: with
+/// the local host in a session of its own, its own, then the default that
+/// reaches the other hosts, or those would go on through the old build.
+fn sessions_for<'a>(target: &Target, cores: &'a Cores) -> Vec<Option<&'a str>> {
+    match (target, cores.here.as_deref()) {
+        (Target::Here, Some(session)) if cores.machines => vec![Some(session), None],
+        (Target::Here, Some(session)) => vec![Some(session)],
+        _ => vec![None],
+    }
 }
 
 /// Whether version `a` is newer than `b`: `0.1.16` over `0.1.9`, and over
@@ -255,6 +283,39 @@ mod tests {
                 machines: true
             }
         );
+    }
+
+    /// With the local host in a session of its own and other hosts too, both
+    /// cores are updated, and this Mac is as up to date as the older.
+    #[test]
+    fn two_cores_here_are_updated_together() {
+        let both = Cores {
+            here: Some("lemur".into()),
+            machines: true,
+        };
+        assert_eq!(
+            sessions_for(&Target::Here, &both),
+            [Some("lemur"), None],
+            "its own, then the default"
+        );
+        let only = Cores {
+            here: Some("lemur".into()),
+            machines: false,
+        };
+        assert_eq!(sessions_for(&Target::Here, &only), [Some("lemur")]);
+        let default = Cores {
+            here: None,
+            machines: true,
+        };
+        assert_eq!(sessions_for(&Target::Here, &default), [None]);
+        let machine = Target::Machine("agent".into());
+        assert_eq!(sessions_for(&machine, &both), [None]);
+
+        let v = |s: &str| Some(s.to_string());
+        assert_eq!(older(v("0.1.16"), v("0.1.15")), v("0.1.15"));
+        assert_eq!(older(v("0.1.15"), v("0.1.16")), v("0.1.15"));
+        assert_eq!(older(None, v("0.1.16")), v("0.1.16"));
+        assert_eq!(older(v("0.1.16"), None), v("0.1.16"));
     }
 
     #[test]
