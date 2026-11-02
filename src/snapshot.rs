@@ -289,10 +289,24 @@ pub fn compose(cfg: &Config, data: &[HostData]) -> Snapshot {
         .filter_map(|d| {
             let host = cfg.host(&d.name)?;
             if let Some(e) = &d.error {
-                return Some(failed(host, e.clone(), d.needs_you));
+                // A host added before that asks for a login again.
+                let needs_login = || {
+                    let known = hc::core_of(host).ok();
+                    let down = known
+                        .as_ref()
+                        .and_then(|core| core.machine_down(&core.known_machine(host)?));
+                    down.is_some_and(|(_, needs_you)| needs_you)
+                };
+                let needs_you = d.needs_you || (host.ssh != "local" && needs_login());
+                return Some(failed(host, e.clone(), needs_you));
             }
             Some(match hc::for_host(host) {
                 Ok((core, machine)) => {
+                    if let Some((why, needs_you)) =
+                        machine.as_deref().and_then(|name| core.machine_down(name))
+                    {
+                        return Some(failed(host, why, needs_you));
+                    }
                     let terminals: Vec<Terminal> = core
                         .terminals()
                         .into_iter()

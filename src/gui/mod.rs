@@ -6223,6 +6223,64 @@ mod tests {
         assert!(all, "none to look for again");
     }
 
+    /// After a core restarts, a host's terminals come back only with its
+    /// line. Until then its threads aren't known to have ended: the one on
+    /// show stays, and the host says why it lists none.
+    #[gpui::test]
+    fn a_hosts_threads_outlast_its_line_being_down(cx: &mut gpui::TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let server = HcServer::new("line-down");
+        let dir = TempDir::new("line-down");
+        let off = dir.join("off");
+        let via = dir.join("via");
+        std::fs::write(
+            &via,
+            format!(
+                "#!/bin/sh\n[ -e '{}' ] && exit 1\nexec sh -c \"$1\"\n",
+                off.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&via, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = server.far_config_via("down-box", &via.to_string_lossy());
+        let args = ["run", "--bg", "--json", "--keep", "--on", "down-box"];
+        let out = server.hc(&[&args[..], &["--", "sleep", "600"]].concat());
+        let started: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let address = started["address"].as_str().unwrap().to_string();
+        let shown: Key = ("down-box".into(), address);
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let listed = wait_until(Duration::from_secs(10), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.session_of(&shown).is_some())
+        });
+        assert!(listed);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open(shown.0.clone(), shown.1.clone(), window, cx)
+            })
+        });
+        cx.run_until_parked();
+
+        std::fs::write(&off, "").unwrap();
+        server.hc(&["server", "restart"]);
+        let told = wait_until(Duration::from_secs(10), || {
+            app.update(cx, |app, cx| app.recompose(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.snap.hosts[0].error.is_some())
+        });
+        assert!(
+            told,
+            "{:?}",
+            app.read_with(cx, |app, _| app.snap.hosts.clone())
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.active.as_ref(), Some(&shown), "it stays on show");
+            assert!(app.terminals.contains_key(&shown), "its view stays");
+        });
+    }
+
     /// A repository at `path`, with one commit.
     fn repo_at(path: &std::path::Path) -> String {
         std::fs::create_dir(path).unwrap();

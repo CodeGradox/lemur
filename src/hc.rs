@@ -443,6 +443,24 @@ impl Drop for Connecting {
     }
 }
 
+/// What a machine as the core lists it says of its line, if it's not up, and
+/// whether that needs you.
+fn down_says(machine: &Value, name: &str) -> Option<(String, bool)> {
+    let why = machine["why"].as_str();
+    match machine["state"].as_str()? {
+        "connected" => None,
+        "needs_login" => Some((
+            why.map_or(format!("{name} needs a login"), str::to_owned),
+            true,
+        )),
+        "connecting" => Some((format!("connecting to {name}"), false)),
+        _ => Some((
+            why.map_or(format!("can't reach {name}"), str::to_owned),
+            false,
+        )),
+    }
+}
+
 /// How long a core gets to say hello, with time to start.
 const HANDSHAKE: Duration = Duration::from_secs(30);
 
@@ -723,6 +741,26 @@ impl Core {
             .lock()
             .unwrap()
             .insert(name.into(), Arc::new(Mutex::new(Some(said))));
+    }
+
+    /// Why the core can't tell of machine `name`'s terminals now, if so,
+    /// and whether that needs you: its line is down, or asks for a login.
+    /// Those it has none of then aren't known to have ended.
+    pub fn machine_down(&self, name: &str) -> Option<(String, bool)> {
+        let list = self.call("machine.list", json!({})).ok()?;
+        let machines = list["machines"].as_array()?;
+        down_says(machines.iter().find(|m| m["name"] == name)?, name)
+    }
+
+    /// Whether the core has a machine for `host` already, and its name.
+    pub fn known_machine(&self, host: &Host) -> Option<String> {
+        let list = self.call("machine.list", json!({})).ok()?;
+        let wanted = machine_name(&host.name);
+        let machines = list["machines"].as_array()?;
+        machines
+            .iter()
+            .find(|m| m["name"] == wanted.as_str())
+            .map(|_| wanted)
     }
 
     /// Forgets what the core said of `host`, as once it's been set up.
@@ -1305,6 +1343,27 @@ mod tests {
         core.flush().unwrap();
         let routes = core.routes.lock().unwrap();
         assert!(routes.early.is_empty(), "{:?}", routes.early.keys());
+    }
+
+    /// A machine's line says how it is; only a login needs you.
+    #[test]
+    fn a_machines_line_says_why_its_down() {
+        let says =
+            |state: &str, why: Value| down_says(&json!({"state": state, "why": why}), "agent");
+        assert_eq!(says("connected", Value::Null), None);
+        assert_eq!(
+            says("connecting", Value::Null),
+            Some(("connecting to agent".into(), false))
+        );
+        assert_eq!(
+            says("unreachable", "no route".into()),
+            Some(("no route".into(), false))
+        );
+        assert_eq!(
+            says("needs_login", Value::Null),
+            Some(("agent needs a login".into(), true))
+        );
+        assert_eq!(down_says(&json!({}), "agent"), None);
     }
 
     /// A machine removed while Lemur runs is looked for again, not asked

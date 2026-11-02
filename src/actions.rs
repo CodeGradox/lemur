@@ -572,12 +572,16 @@ pub fn set_up_host(host: &Host) -> Result<(String, Host)> {
     let (core, _) = hc::for_host(&here)?;
     let labels = BTreeMap::from([(LABEL.to_string(), format!("set up {}", host.name))]);
     let home = crate::config::home()?.to_string_lossy().into_owned();
-    let address = core.run(None, &home, &set_up_argv(host, session.as_deref()), &labels)?;
+    let added = core.known_machine(host);
+    let argv = set_up_argv(host, session.as_deref(), added.as_deref());
+    let address = core.run(None, &home, &argv, &labels)?;
     Ok((address, here))
 }
 
-/// `hc machine add` for `host`, to the core of `session` here.
-fn set_up_argv(host: &Host, session: Option<&str>) -> Vec<String> {
+/// `hc machine add` for `host`, to the core of `session` here, or with
+/// `added`, the machine's name once it has one, `hc machine login`: it would
+/// refuse to add it again.
+fn set_up_argv(host: &Host, session: Option<&str>, added: Option<&str>) -> Vec<String> {
     #[cfg(test)]
     if let Some((_, argv)) = SET_UP.lock().unwrap().iter().find(|(h, _)| *h == host.name) {
         return argv.clone();
@@ -587,6 +591,10 @@ fn set_up_argv(host: &Host, session: Option<&str>) -> Vec<String> {
         argv.extend(["env".to_string(), format!("HC_SESSION={session}")]);
     }
     argv.push(hc::binary().to_string_lossy().into_owned());
+    if let Some(name) = added {
+        argv.extend(["machine", "login", name].map(String::from));
+        return argv;
+    }
     argv.extend(["machine", "add", &host.ssh, "--name"].map(String::from));
     argv.push(hc::machine_name(&host.name));
     if let Some(theirs) = &host.hc_session {
@@ -1230,14 +1238,16 @@ mod tests {
     #[test]
     fn setting_up_a_host_adds_it_as_herdr_does() {
         let mut host = Host::new("Agent", "me@agent.example");
-        let argv = set_up_argv(&host, None);
+        let argv = set_up_argv(&host, None, None);
         assert_eq!(
             &argv[1..],
             ["machine", "add", "me@agent.example", "--name", "agent"]
         );
         assert!(argv[0].ends_with("herdr-core"), "{argv:?}");
+        let argv = set_up_argv(&host, None, Some("agent"));
+        assert_eq!(&argv[1..], ["machine", "login", "agent"], "added before");
         host.hc_session = Some("lemur".into());
-        let argv = set_up_argv(&host, Some("test"));
+        let argv = set_up_argv(&host, Some("test"), None);
         assert_eq!(&argv[..2], ["env", "HC_SESSION=test"]);
         assert_eq!(&argv[argv.len() - 2..], ["--session", "lemur"]);
     }

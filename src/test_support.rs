@@ -91,6 +91,11 @@ impl HcServer {
     /// machine: a core of its own on this Mac, run through `sh -c` where
     /// SSH would log in to another.
     pub fn far_config(&self, name: &str) -> Config {
+        self.far_config_via(name, "sh -c")
+    }
+
+    /// `far_config`, its line going through the command `via`.
+    pub fn far_config_via(&self, name: &str, via: &str) -> Config {
         let far = format!("{}-far", self.session);
         let added = Command::new(hc::binary())
             .args([
@@ -101,7 +106,7 @@ impl HcServer {
                 "--session",
                 &far,
                 "--via",
-                "sh -c",
+                via,
             ])
             .envs(self.env())
             .output()
