@@ -681,7 +681,7 @@ fn diff_of(host: &Host, root: &str, file: &Change) -> (Vec<String>, Option<u64>)
         )
     } else {
         format!(
-            "cd {} || exit 0\ngit --literal-pathspecs -c diff.autoRefreshIndex=false diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git --literal-pathspecs -c diff.autoRefreshIndex=false diff --cached --no-color -- {path}\n",
+            "cd {} || exit 0\ngit --literal-pathspecs -c diff.autoRefreshIndex=false diff HEAD --no-ext-diff --no-textconv --no-color -- {path} 2>/dev/null || git --literal-pathspecs -c diff.autoRefreshIndex=false diff --cached --no-ext-diff --no-textconv --no-color -- {path}\n",
             sh_path(root)
         )
     };
@@ -1272,6 +1272,27 @@ mod tests {
         assert_eq!(changes.len(), 1);
         diff_of(&host, &root, &changes[0]);
         assert_eq!(written(), before, "the index was written");
+    }
+
+    /// Before a repository's first commit, a staged file's diff is as plain
+    /// as after it, whatever external diff is set up.
+    #[test]
+    fn a_diff_before_the_first_commit_is_plain_too() {
+        let server = crate::test_support::HcServer::new("changes-first");
+        let host = server.config().hosts.remove(0);
+        let dir = TempDir::new("changes-first");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["config", "diff.external", "echo external"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        let root = repo.to_string_lossy().into_owned();
+        let changes = changes_in(&host, &root).unwrap();
+        assert_eq!(
+            diff_of(&host, &root, &changes[0]).0,
+            ["@@ -0,0 +1 @@", "+one"]
+        );
     }
 
     /// A file's diff is that file's, though its name reads as a pattern
