@@ -4,7 +4,6 @@
 //! herdr-core, so switching is instant and scrollback survives.
 
 mod agents;
-mod artifacts_panel;
 mod away;
 mod changes;
 mod changes_panel;
@@ -17,6 +16,7 @@ mod icons;
 pub(crate) mod keys;
 mod linear_panel;
 mod links;
+mod links_panel;
 mod meter;
 mod new;
 mod notes;
@@ -75,7 +75,7 @@ actions!(
         PutAway,
         ToggleChanges,
         ToggleLinear,
-        ToggleArtifacts,
+        ToggleLinks,
         UpdateCore,
         OpenSettings,
         AddProject,
@@ -160,7 +160,7 @@ enum Right {
     Notes,
     Linear,
     Changes,
-    Artifacts,
+    Links,
     Agents,
 }
 
@@ -298,7 +298,7 @@ struct Lemur {
     agents: Entity<agents::AgentsView>,
     /// The worktree on show's changes, to commit.
     changes_panel: Entity<changes_panel::ChangesPanel>,
-    artifacts_panel: Entity<artifacts_panel::ArtifactsPanel>,
+    links_panel: Entity<links_panel::LinksPanel>,
     /// The Linear issue pinned to the thread on show, and issues to pin.
     linear_panel: Entity<linear_panel::LinearPanel>,
     /// Which of them shows on the right, if any; one at a time.
@@ -389,7 +389,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::action("Toggle Notes", ToggleNotes),
                     MenuItem::action("Toggle Linear", ToggleLinear),
                     MenuItem::action("Toggle Changes", ToggleChanges),
-                    MenuItem::action("Toggle Artifacts", ToggleArtifacts),
+                    MenuItem::action("Toggle Links", ToggleLinks),
                     MenuItem::action("Toggle Agents", ToggleAgents),
                     MenuItem::separator(),
                     MenuItem::action("Next Thread in Worktree", NextThread),
@@ -463,11 +463,11 @@ impl Lemur {
         let sidebar = cx.new(|_| SidebarView::new(lemur.clone()));
         let agents = cx.new(|_| agents::AgentsView::new(lemur));
         let changes_panel = cx.new(|cx| changes_panel::ChangesPanel::new(window, cx));
-        let artifacts_file = state_file
+        let links_file = state_file
             .as_deref()
             .and_then(|file| file.parent())
-            .map(|dir| dir.join("artifacts.json"));
-        let artifacts_panel = cx.new(|_| artifacts_panel::ArtifactsPanel::new(artifacts_file));
+            .map(|dir| dir.join("links.json"));
+        let links_panel = cx.new(|_| links_panel::LinksPanel::new(links_file));
         cx.subscribe(
             &changes_panel,
             |this, _, _: &changes_panel::Committed, cx| this.ask_changes(cx),
@@ -571,8 +571,8 @@ impl Lemur {
                                 if this.right == Some(Right::Changes) {
                                     this.changes_panel.update(cx, |p, cx| p.refresh(cx));
                                 }
-                                if this.right == Some(Right::Artifacts) {
-                                    this.show_artifacts(cx);
+                                if this.right == Some(Right::Links) {
+                                    this.show_links(cx);
                                 }
                             }
                         })
@@ -696,7 +696,7 @@ impl Lemur {
             notes,
             agents,
             changes_panel,
-            artifacts_panel,
+            links_panel,
             linear_panel,
             right: None,
             right_last: Right::Notes,
@@ -1128,8 +1128,8 @@ impl Lemur {
         if self.right == Some(Right::Changes) {
             self.show_changes(cx);
         }
-        if self.right == Some(Right::Artifacts) {
-            self.show_artifacts(cx);
+        if self.right == Some(Right::Links) {
+            self.show_links(cx);
         }
         self.follow_linear(cx);
         if let Some((worktree, label)) = self.worktree_of(&host, &session) {
@@ -1412,8 +1412,8 @@ impl Lemur {
             if which == Right::Changes {
                 self.show_changes(cx);
             }
-            if which == Right::Artifacts {
-                self.show_artifacts(cx);
+            if which == Right::Links {
+                self.show_links(cx);
             }
             if which == Right::Linear {
                 self.follow_linear(cx);
@@ -1511,9 +1511,9 @@ impl Lemur {
         });
     }
 
-    /// Points the Artifacts panel at where the thread on show runs: its
+    /// Points the Links panel at where the thread on show runs: its
     /// worktree, or its folder outside every worktree.
-    fn show_artifacts(&mut self, cx: &mut Context<Self>) {
+    fn show_links(&mut self, cx: &mut Context<Self>) {
         let place = self.active.clone().and_then(|key| {
             let (path, _) = self.place_of(&key)?;
             let host = self.cfg.host(&key.0)?.clone();
@@ -1523,7 +1523,7 @@ impl Lemur {
             };
             Some((host, path, label))
         });
-        self.artifacts_panel.update(cx, |p, cx| match place {
+        self.links_panel.update(cx, |p, cx| match place {
             Some((host, path, label)) => p.show(host, path, label, cx),
             None => p.clear(cx),
         });
@@ -1711,16 +1711,14 @@ impl Lemur {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_right(Right::Changes, cx))),
             )
             .child(
-                Button::new("toggle-artifacts")
-                    .icon(icons::artifact())
-                    .label("Artifacts")
+                Button::new("toggle-links")
+                    .icon(icons::link())
+                    .label("Links")
                     .ghost()
                     .small()
-                    .selected(self.right == Some(Right::Artifacts))
-                    .tooltip("Toggle artifacts")
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.toggle_right(Right::Artifacts, cx)),
-                    ),
+                    .selected(self.right == Some(Right::Links))
+                    .tooltip("Toggle links")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right(Right::Links, cx))),
             )
             .child(
                 Button::new("toggle-agents")
@@ -1837,9 +1835,9 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &ToggleLinear, _, cx| this.toggle_right(Right::Linear, cx)),
             )
-            .on_action(cx.listener(|this, _: &ToggleArtifacts, _, cx| {
-                this.toggle_right(Right::Artifacts, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleLinks, _, cx| this.toggle_right(Right::Links, cx)),
+            )
             .on_action(cx.listener(|this, _: &UpdateCore, _, cx| this.update_core(cx)))
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
@@ -1960,7 +1958,7 @@ impl Render for Lemur {
                                     Right::Agents => self.agents.clone().into(),
                                     Right::Changes => self.changes_panel.clone().into(),
                                     Right::Linear => self.linear_panel.clone().into(),
-                                    Right::Artifacts => self.artifacts_panel.clone().into(),
+                                    Right::Links => self.links_panel.clone().into(),
                                 };
                                 this.child(
                                     div()
@@ -4570,12 +4568,12 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
-    /// **Artifacts** points its panel at the worktree on show, and at
-    /// another's once a thread there shows.
+    /// **Links** points its panel at the worktree on show, and at another's
+    /// once a thread there shows.
     #[gpui::test]
-    fn the_artifacts_panel_follows_the_worktree_on_show(cx: &mut gpui::TestAppContext) {
-        let server = HcServer::new("artifacts-gui");
-        let dir = TempDir::new("artifacts-gui");
+    fn the_links_panel_follows_the_worktree_on_show(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("links-gui");
+        let dir = TempDir::new("links-gui");
         let (api, web) = (dir.join("api"), dir.join("web"));
         for repo in [&api, &web] {
             std::fs::create_dir(repo).unwrap();
@@ -4619,12 +4617,12 @@ mod tests {
                 cx.debug_bounds(selector).is_some()
             })
         };
-        cx.dispatch_action(super::ToggleArtifacts);
+        cx.dispatch_action(super::ToggleLinks);
         assert!(listed("artifact 0 Handover", cx));
         open(&app, &threads[1], cx);
         assert!(listed("artifact 0 Report", cx));
         assert!(cx.debug_bounds("artifact 0 Handover").is_none());
-        cx.dispatch_action(super::ToggleArtifacts);
+        cx.dispatch_action(super::ToggleLinks);
         cx.run_until_parked();
         assert!(cx.debug_bounds("artifact 0 Report").is_none(), "hidden");
 

@@ -1,14 +1,15 @@
 mod actions;
-mod artifacts;
 mod attach;
 mod browse;
 mod clip;
 mod config;
 mod core_update;
 mod dictate;
+mod gh;
 mod gui;
 mod hc;
 mod linear;
+mod links;
 mod login_path;
 mod machine;
 mod notes;

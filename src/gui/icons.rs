@@ -28,6 +28,11 @@ pub fn ticket() -> Icon {
     Icon::empty().data(include_bytes!("icons/ticket.svg"))
 }
 
+/// Links: Claude artifacts and pull requests.
+pub fn link() -> Icon {
+    Icon::empty().data(include_bytes!("icons/link.svg"))
+}
+
 /// A Claude artifact.
 pub fn artifact() -> Icon {
     Icon::empty().data(include_bytes!("icons/shapes.svg"))

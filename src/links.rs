@@ -1,11 +1,13 @@
-//! Links to Claude artifacts that agents used or posted in a folder, read
-//! from Claude Code's session logs on its host: `.claude/projects/<the
-//! folder, by another name>/`, subagents' logs too. Only what agents wrote
-//! counts, their messages and tool calls: a tool's results name artifacts
-//! nobody is working on as well, as the ones it lists.
+//! Links to Claude artifacts and GitHub pull requests that agents used or
+//! posted in a folder, read from Claude Code's session logs on its host:
+//! `.claude/projects/<the folder, by another name>/`, subagents' logs too.
+//! Only what agents wrote counts, their messages and tool calls: a tool's
+//! results name artifacts nobody is working on as well, as the ones it
+//! lists. What's known of a pull request comes from `gh`.
 
 use crate::config::Host;
-use crate::remote::Remote;
+use crate::gh::{PullRequest, State};
+use crate::remote::{Remote, sh_path};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -29,12 +31,18 @@ impl Artifact {
     }
 }
 
-/// A folder's links, the latest first; the ones taken off the list, which
-/// stay off though the logs still have them; and when its logs were last
-/// read, in seconds since the epoch.
+/// A folder's links, the latest first; its pull requests, the ones still
+/// open first; the links taken off the list, which stay off though the logs
+/// still have them; and when its logs were last read, in seconds since the
+/// epoch.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Place {
     pub links: Vec<Artifact>,
+    #[serde(default)]
+    pub prs: Vec<PullRequest>,
+    /// Pull requests agents linked to that `gh` hasn't told of yet.
+    #[serde(default)]
+    pending: Vec<u64>,
     #[serde(default)]
     removed: Vec<String>,
     #[serde(default)]
@@ -67,9 +75,62 @@ impl Place {
     /// Takes a link off the list for good.
     pub fn remove(&mut self, url: &str) {
         self.links.retain(|l| l.url != url);
+        self.prs.retain(|pr| pr.url != url);
         if !self.removed.iter().any(|r| r == url) {
             self.removed.push(url.to_string());
         }
+    }
+
+    /// The pull requests to ask `gh` about: those it might say something new
+    /// of (a merged one stays merged), and those linked to that it hasn't
+    /// told of yet.
+    pub fn wanted(&self) -> Vec<u64> {
+        let known = self.prs.iter().filter(|pr| pr.state != State::Merged);
+        let mut wanted: Vec<u64> = known.map(|pr| pr.number).collect();
+        wanted.extend(&self.pending);
+        wanted
+    }
+
+    /// The pull requests not to ask `gh` about though agents link to them:
+    /// the merged ones, and those taken off the list.
+    pub fn finished(&self) -> Vec<u64> {
+        let merged = self.prs.iter().filter(|pr| pr.state == State::Merged);
+        let removed = self
+            .removed
+            .iter()
+            .filter_map(|url| url.rsplit_once("/pull/")?.1.parse().ok());
+        merged.map(|pr| pr.number).chain(removed).collect()
+    }
+
+    /// Notes pull requests agents linked to.
+    pub fn link_prs(&mut self, numbers: &[u64]) {
+        for &number in numbers {
+            let end = format!("/pull/{number}");
+            let known = self.pending.contains(&number)
+                || self.prs.iter().any(|pr| pr.number == number)
+                || self.removed.iter().any(|url| url.ends_with(&end));
+            if !known {
+                self.pending.push(number);
+            }
+        }
+    }
+
+    /// Takes in what `gh` told: `found`, new or as they are now, unless taken
+    /// off the list, and `settled`, no longer waiting for it.
+    pub fn add_prs(&mut self, found: Vec<PullRequest>, settled: &[u64]) {
+        self.pending.retain(|number| !settled.contains(number));
+        for pr in found {
+            if self.removed.contains(&pr.url) {
+                continue;
+            }
+            match self.prs.iter_mut().find(|known| known.url == pr.url) {
+                Some(known) => *known = pr,
+                None => self.prs.push(pr),
+            }
+        }
+        let finished = |pr: &PullRequest| matches!(pr.state, State::Merged | State::Closed);
+        self.prs
+            .sort_by_key(|pr| (finished(pr), std::cmp::Reverse(pr.number)));
     }
 
     /// How far back to read at `now`: logs written since the last look, with
@@ -117,9 +178,22 @@ fn key(host: &str, path: &str) -> String {
     format!("{host}\n{path}")
 }
 
-/// The links in the logs of folder `path` on `host`, those written in the
-/// last `minutes` if given.
-pub fn scan(host: &Host, path: &str, minutes: Option<u64>) -> Result<Vec<Artifact>> {
+/// What a look at a folder finds.
+#[derive(Debug, Default, PartialEq)]
+pub struct Scan {
+    pub artifacts: Vec<Artifact>,
+    /// The GitHub repository of its `origin`, as `gh --repo` takes it.
+    pub repo: Option<String>,
+    /// The branch checked out, unless it's the repository's default: that
+    /// isn't any pull request's.
+    pub branch: Option<String>,
+    /// The pull requests of `repo` agents linked to, by number.
+    pub prs: Vec<u64>,
+}
+
+/// What's in the logs of folder `path` on `host`, those written in the last
+/// `minutes` if given, and its repository and branch.
+pub fn scan(host: &Host, path: &str, minutes: Option<u64>) -> Result<Scan> {
     parse(&Remote::new(host).run(&script(path, minutes))?)
 }
 
@@ -131,30 +205,52 @@ fn logs_folder(path: &str) -> String {
         .collect()
 }
 
-/// Prints each link in what agents wrote, as a Markdown link's text and
-/// link when it's one, and each record's time after its links; then `@@end`.
+/// Prints the folder's repository and branch; then each link in what agents
+/// wrote, as a Markdown link's text and link when it's an artifact's, and
+/// each record's time after its links; then `@@end`.
 fn script(path: &str, minutes: Option<u64>) -> String {
     let recent = minutes.map_or(String::new(), |m| format!("-mmin -{m} "));
     format!(
-        "d=\"${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}/projects/{folder}\"\n\
+        "cd {dir} 2>/dev/null && {{\n\
+         echo \"@@origin $(git remote get-url origin 2>/dev/null)\"\n\
+         echo \"@@branch $(git symbolic-ref --short HEAD 2>/dev/null)\"\n\
+         echo \"@@default $(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)\"\n\
+         }}\n\
+         d=\"${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}/projects/{folder}\"\n\
          [ -d \"$d\" ] && find \"$d\" -type f -name '*.jsonl' {recent}\
          -exec grep -h '\"type\":\"assistant\"' {{}} + | \
-         grep -oE '(\\[[^]\"\\\\]{{1,120}}\\]\\()?(https://)?claude\\.ai/(code/)?artifact/[A-Za-z0-9-]{{16,}}|\"timestamp\":\"[^\"]*\"'\n\
+         grep -oE '(\\[[^]\"\\\\]{{1,120}}\\]\\()?(https://)?claude\\.ai/(code/)?artifact/[A-Za-z0-9-]{{16,}}|https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+|\"timestamp\":\"[^\"]*\"'\n\
          echo @@end\n",
+        dir = sh_path(path),
         folder = logs_folder(path),
     )
 }
 
 /// Reads what `script` prints: no `@@end`, and it didn't get to finish.
-fn parse(out: &str) -> Result<Vec<Artifact>> {
+fn parse(out: &str) -> Result<Scan> {
     let Some((lines, _)) = out.rsplit_once("@@end") else {
         bail!("couldn't read Claude's logs");
     };
     let mut found: Vec<Artifact> = vec![];
+    let (mut branch, mut default) = ("", "");
+    let mut repo = None;
+    let mut prs = vec![];
     // Those at the end of `found` still waiting for their record's time.
     let mut undated = 0;
     for line in lines.lines() {
-        if let Some(at) = line
+        if let Some(remote) = line.strip_prefix("@@origin ") {
+            repo = crate::gh::repo_of(remote);
+        } else if let Some(name) = line.strip_prefix("@@branch ") {
+            branch = name;
+        } else if let Some(name) = line.strip_prefix("@@default ") {
+            default = name.strip_prefix("origin/").unwrap_or(name);
+        } else if let Some(link) = line.strip_prefix("https://github.com/") {
+            if let Some((name, number)) = link.split_once("/pull/")
+                && let Ok(number) = number.parse::<u64>()
+            {
+                prs.push((name.to_string(), number));
+            }
+        } else if let Some(at) = line
             .strip_prefix("\"timestamp\":\"")
             .and_then(|l| l.strip_suffix('"'))
         {
@@ -177,7 +273,24 @@ fn parse(out: &str) -> Result<Vec<Artifact>> {
             undated += 1;
         }
     }
-    Ok(found)
+    // Without a word on the default, by what it usually is.
+    let is_default = match default {
+        "" => matches!(branch, "main" | "master"),
+        default => branch == default,
+    };
+    let mut numbers: Vec<u64> = prs
+        .into_iter()
+        .filter(|(name, _)| repo.as_ref().is_some_and(|r| r.eq_ignore_ascii_case(name)))
+        .map(|(_, number)| number)
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    Ok(Scan {
+        artifacts: found,
+        branch: (!branch.is_empty() && !is_default).then(|| branch.to_string()),
+        repo,
+        prs: numbers,
+    })
 }
 
 #[cfg(test)]
@@ -198,7 +311,7 @@ mod tests {
     }
 
     /// Runs the script on logs in `config`, as a host would.
-    fn run(config: &Path, path: &str, minutes: Option<u64>) -> Vec<Artifact> {
+    fn scanned(config: &Path, path: &str, minutes: Option<u64>) -> Scan {
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(script(path, minutes))
@@ -206,6 +319,19 @@ mod tests {
             .output()
             .unwrap();
         parse(&String::from_utf8_lossy(&out.stdout)).unwrap()
+    }
+
+    fn run(config: &Path, path: &str, minutes: Option<u64>) -> Vec<Artifact> {
+        scanned(config, path, minutes).artifacts
+    }
+
+    fn pr(number: u64, state: State) -> PullRequest {
+        PullRequest {
+            url: format!("https://github.com/o/r/pull/{number}"),
+            number,
+            title: format!("number {number}"),
+            state,
+        }
     }
 
     #[test]
@@ -324,7 +450,94 @@ mod tests {
     #[test]
     fn a_script_that_didnt_finish_says_so() {
         assert!(parse("").is_err());
-        assert_eq!(parse("@@end\n").unwrap(), []);
+        assert_eq!(parse("@@end\n").unwrap(), Scan::default());
+    }
+
+    /// A folder's repository and branch come from git, and the pull requests
+    /// agents linked to from the logs, only that repository's: an agent
+    /// mentioning another project's isn't working on it.
+    #[test]
+    fn a_folders_repository_and_pull_requests_are_read() {
+        let config = TempDir::new("pr-scan");
+        let dir = config.join("my repo");
+        std::fs::create_dir(&dir).unwrap();
+        let git = |args: &[&str]| crate::test_support::git_in(&dir, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let path = dir.to_string_lossy().into_owned();
+        let logs = config.join("projects").join(logs_folder(&path));
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("a.jsonl"),
+            "{\"text\":\"See https://github.com/Owner/Api/pull/12/files and [#3](https://github.com/owner/api/pull/3), not https://github.com/zed-industries/zed/pull/38639\",\"type\":\"assistant\",\"timestamp\":\"t\"}\n\
+             {\"text\":\"Nor one a person pasted: https://github.com/owner/api/pull/4\",\"type\":\"user\",\"timestamp\":\"t\"}\n\
+             {\"text\":\"https://github.com/owner/api/pull/12 again\",\"type\":\"assistant\",\"timestamp\":\"t\"}\n",
+        )
+        .unwrap();
+
+        let no_remote = scanned(&config, &path, None);
+        assert_eq!(no_remote.repo, None);
+        assert_eq!(no_remote.prs, [] as [u64; 0], "no repository to be of");
+        assert_eq!(no_remote.branch, None, "main, the usual default");
+
+        git(&["remote", "add", "origin", "git@github.com:owner/api.git"]);
+        let on_main = scanned(&config, &path, None);
+        assert_eq!(on_main.repo.as_deref(), Some("owner/api"));
+        assert_eq!(on_main.prs, [3, 12]);
+        assert_eq!(on_main.branch, None);
+
+        git(&["checkout", "-q", "-b", "fix/thing"]);
+        let on_branch = scanned(&config, &path, None);
+        assert_eq!(on_branch.branch.as_deref(), Some("fix/thing"));
+
+        // A repository whose default isn't main or master says so.
+        git(&["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ]);
+        git(&["checkout", "-q", "-b", "trunk"]);
+        assert_eq!(scanned(&config, &path, None).branch, None);
+        git(&["checkout", "-q", "main"]);
+        let main_here = scanned(&config, &path, None);
+        assert_eq!(main_here.branch.as_deref(), Some("main"));
+
+        let gone = scanned(&config, &config.join("gone").to_string_lossy(), None);
+        assert_eq!(gone, Scan::default());
+    }
+
+    /// A place's pull requests: the ones still open first, as `gh` last told;
+    /// a merged one isn't asked after again, and one taken off stays off.
+    #[test]
+    fn a_place_keeps_its_pull_requests_as_told() {
+        let mut place = Place::default();
+        place.link_prs(&[7, 8, 9]);
+        assert_eq!(place.wanted(), [7, 8, 9]);
+
+        place.add_prs(
+            vec![
+                pr(7, State::Merged),
+                pr(8, State::Draft),
+                pr(6, State::Open),
+            ],
+            &[7, 8],
+        );
+        let numbers = |place: &Place| place.prs.iter().map(|p| p.number).collect::<Vec<_>>();
+        assert_eq!(numbers(&place), [8, 6, 7], "the merged one last");
+        assert_eq!(place.wanted(), [8, 6, 9], "9 not told of yet; 7 is merged");
+
+        place.add_prs(vec![pr(8, State::Open)], &[8]);
+        assert_eq!(place.prs[0].state, State::Open, "as it is now");
+        assert_eq!(place.prs.len(), 3);
+
+        place.remove(&pr(8, State::Open).url);
+        assert_eq!(numbers(&place), [6, 7]);
+        place.add_prs(vec![pr(8, State::Open)], &[8]);
+        assert_eq!(numbers(&place), [6, 7], "it stays off");
+        place.link_prs(&[8, 6, 10]);
+        assert_eq!(place.wanted(), [6, 9, 10], "known or taken off aren't new");
+        assert_eq!(place.finished(), [7, 8], "merged, and taken off");
     }
 
     /// A link taken off stays off; one known keeps its first time, and takes
@@ -374,5 +587,27 @@ mod tests {
                 .place("a", "b")
                 .is_none()
         );
+
+        // What pull requests' fields came after still reads.
+        std::fs::write(
+            &file,
+            format!(
+                "{{\"agent\\n/srv/api\":{{\"links\":[{{\"url\":\"https://claude.ai/artifact/{ONE}\",\"title\":null,\"at\":\"a\"}}]}}}}"
+            ),
+        )
+        .unwrap();
+        let old = Store::load(&file);
+        let place = old.place("agent", "/srv/api").unwrap();
+        assert_eq!(place.links.len(), 1);
+        assert!(place.prs.is_empty());
+
+        let mut with_prs = Store::default();
+        with_prs
+            .place_mut("agent", "/srv/api")
+            .add_prs(vec![pr(5, State::Draft)], &[]);
+        with_prs.save(&file).unwrap();
+        let back = Store::load(&file);
+        let told = &back.place("agent", "/srv/api").unwrap().prs;
+        assert_eq!(*told, [pr(5, State::Draft)]);
     }
 }

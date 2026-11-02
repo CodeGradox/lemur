@@ -199,6 +199,19 @@ pub fn fake_dictate(dir: &Path, script: &str) -> PathBuf {
     path
 }
 
+/// A stand-in for `gh` in `dir` that notes each call in `dir/calls`, then
+/// runs the shell `script`.
+pub fn fake_gh(dir: &Path, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("gh");
+    let calls = dir.join("calls");
+    let notes = format!("echo \"$*\" >> '{}'\n", calls.display());
+    std::fs::write(&path, format!("#!/bin/sh\n{notes}{script}\n")).expect("writing the stand-in");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("making the stand-in runnable");
+    path
+}
+
 /// A request a `FakeLinear` got.
 #[derive(Debug, Clone)]
 pub struct Request {
