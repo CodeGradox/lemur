@@ -942,8 +942,12 @@ impl TerminalView {
         let Some((pressed, at)) = self.pressed else {
             return;
         };
+        // Only a program that asked for moves gets them: one asking only
+        // for clicks (`?1000`) could read them as more presses.
         if event.pressed_button.and_then(button) != Some(pressed)
-            || !Self::reports_mouse(self.mode())
+            || !self
+                .mode()
+                .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
         {
             return;
         }
@@ -2088,6 +2092,55 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(5), || read().contains(reports)),
             "it read {:?}",
+            read()
+        );
+    }
+
+    /// A press that moves is reported to a program that asked for moves
+    /// (`?1002`), and not to one that asked only for clicks (`?1000`).
+    #[gpui::test]
+    fn a_program_asking_only_for_clicks_gets_no_moves(cx: &mut gpui::TestAppContext) {
+        press_and_move("drag-1000", 1000, 12, "1b5b4d2023231b5b4d232623", cx);
+    }
+
+    #[gpui::test]
+    fn a_program_asking_for_moves_gets_a_presss(cx: &mut gpui::TestAppContext) {
+        let reports = "1b5b4d2023231b5b4d4026231b5b4d232623";
+        press_and_move("drag-1002", 1002, 18, reports, cx);
+    }
+
+    /// Presses a program that asked for mouse `mode`, moves three cells and
+    /// lets go; the first `count` bytes it gets are to be `reports`.
+    fn press_and_move(
+        tag: &str,
+        mode: u32,
+        count: u32,
+        reports: &str,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let server = HcServer::new(tag);
+        let script =
+            format!(r"printf '\033[?{mode}h'; stty raw -echo; head -c {count} | xxd -p -c 64");
+        let (view, t, cx) = attach(&server, &["sh", "-c", &script], cx);
+        let reporting = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
+        });
+        assert!(reporting, "the program never asked for mouse reports");
+        let cell = |col: f32, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |v, _| {
+                v.bounds.origin + point(v.cell_size.width * col, v.cell_size.height * 2.5)
+            })
+        };
+        let none = Modifiers::none();
+        let (from, to) = (cell(2.5, cx), cell(5.5, cx));
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), none);
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        let read = || server.hc(&["read", &t]);
+        assert!(
+            wait_until(Duration::from_secs(5), || read().contains(reports)),
+            "{tag} read {:?}",
             read()
         );
     }
