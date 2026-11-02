@@ -1,15 +1,16 @@
-//! How much of your Claude plan is used, above the hosts' load at the foot
-//! of the sidebar: each limit Claude Code's `/usage` lists, asked every
-//! few minutes (see `crate::usage`), or that it couldn't be asked. Off
-//! until turned on in Settings.
+//! How much of each agent's plan is used, above the hosts' load at the foot
+//! of the sidebar: each limit it lists, asked every few minutes (see
+//! `crate::usage`), or that it couldn't be asked; with no plan to measure
+//! against, the tokens used. Off until turned on in Settings.
 
 use super::chrome::{bar_sized, chevron, minimizable_header};
 use super::settings::Prefs;
-use super::sidebar::claude_icon;
+use super::sidebar::{claude_icon, codex_icon};
 use super::{Lemur, sessions};
-use crate::usage::{self, Usage};
+use crate::config::Agent;
+use crate::usage::{self, Tokens, Usage};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Sizable, v_flex};
+use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +23,11 @@ pub(super) const TICK: Duration = Duration::from_secs(30);
 pub(super) struct ClaudeFound(pub(super) bool);
 
 impl Global for ClaudeFound {}
+
+/// The same of Codex: running on a host.
+pub(super) struct CodexFound(pub(super) bool);
+
+impl Global for CodexFound {}
 
 #[derive(Default)]
 pub(super) struct Meter {
@@ -38,9 +44,9 @@ pub(super) struct Meter {
 }
 
 impl Meter {
-    pub(super) fn new(cx: &App) -> Self {
+    pub(super) fn new(agent: Agent, cx: &App) -> Self {
         Meter {
-            on: Prefs::get(cx).claude_usage,
+            on: setting(agent, cx),
             ..Default::default()
         }
     }
@@ -53,7 +59,7 @@ impl Meter {
             (Some(Ok(u)), Some(answered)) => u
                 .limits
                 .iter()
-                .filter_map(|l| l.resets_at.as_deref().and_then(usage::epoch))
+                .filter_map(|l| l.resets_at)
                 .any(|at| answered < at && at <= epoch),
             _ => false,
         };
@@ -65,6 +71,14 @@ impl Meter {
     }
 }
 
+/// Whether Settings has `agent`'s meter on.
+fn setting(agent: Agent, cx: &App) -> bool {
+    match agent {
+        Agent::Claude => Prefs::get(cx).claude_usage,
+        Agent::Codex => Prefs::get(cx).codex_usage,
+    }
+}
+
 /// Seconds since 1970.
 fn epoch_now() -> i64 {
     SystemTime::now()
@@ -72,52 +86,73 @@ fn epoch_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
+
 impl Lemur {
+    fn meter_of(&mut self, agent: Agent) -> &mut Meter {
+        match agent {
+            Agent::Claude => &mut self.meter,
+            Agent::Codex => &mut self.codex_meter,
+        }
+    }
+
     /// Asks, once the hosts are known, when it's time.
     pub(super) fn tick_meter(&mut self, looking: bool, cx: &mut Context<Self>) {
-        if self.meter.on && self.loaded && self.meter.due(looking, Instant::now(), epoch_now()) {
-            self.ask_usage(cx);
+        for agent in AGENTS {
+            let loaded = self.loaded;
+            let meter = self.meter_of(agent);
+            if meter.on && loaded && meter.due(looking, Instant::now(), epoch_now()) {
+                self.ask_usage(agent, cx);
+            }
         }
     }
 
     /// Follows Settings: turned on, it asks at once; off, it's gone.
     pub(super) fn follow_meter_setting(&mut self, cx: &mut Context<Self>) {
-        let on = Prefs::get(cx).claude_usage;
-        if on == self.meter.on {
-            return;
+        for agent in AGENTS {
+            let on = setting(agent, cx);
+            let meter = self.meter_of(agent);
+            if on == meter.on {
+                continue;
+            }
+            *meter = Meter {
+                on,
+                ..Default::default()
+            };
+            if on {
+                self.ask_usage(agent, cx);
+            }
+            cx.notify();
         }
-        self.meter = Meter {
-            on,
-            ..Default::default()
-        };
-        if on {
-            self.ask_usage(cx);
-        }
-        cx.notify();
     }
 
-    /// Tells Settings whether Claude Code is around, when that changes.
-    pub(super) fn note_claude(&self, cx: &mut App) {
+    /// Tells Settings whether the agents are around, when that changes.
+    pub(super) fn note_agents(&self, cx: &mut App) {
         let found =
             !self.cfg.threads.is_empty() || sessions(&self.snap).any(|(_, s)| s.runs_claude());
         if cx.try_global::<ClaudeFound>().map(|f| f.0) != Some(found) {
             cx.set_global(ClaudeFound(found));
         }
+        let found = sessions(&self.snap).any(|(_, s)| s.agent() == Some(Agent::Codex));
+        if cx.try_global::<CodexFound>().map(|f| f.0) != Some(found) {
+            cx.set_global(CodexFound(found));
+        }
     }
 
-    /// Asks Claude Code how much of the plan is used, in the background.
-    pub(super) fn ask_usage(&mut self, cx: &mut Context<Self>) {
-        if self.meter.asking {
+    /// Asks `agent` how much of the plan is used, in the background.
+    pub(super) fn ask_usage(&mut self, agent: Agent, cx: &mut Context<Self>) {
+        let order = self.usage_order(agent);
+        let meter = self.meter_of(agent);
+        if meter.asking {
             return;
         }
-        self.meter.asking = true;
+        meter.asking = true;
         let cfg = self.cfg.clone();
-        let order = self.usage_order();
         self.in_background(
             cx,
-            move || usage::fetch(&cfg, &order),
-            |this, answer, _, cx| {
-                let meter = &mut this.meter;
+            move || usage::fetch(&cfg, agent, &order),
+            move |this, answer, _, cx| {
+                let meter = this.meter_of(agent);
                 meter.asking = false;
                 if !meter.on {
                     return;
@@ -132,8 +167,8 @@ impl Lemur {
         .detach();
     }
 
-    /// The hosts to ask on, the one where Claude ran last first.
-    fn usage_order(&self) -> Vec<String> {
+    /// The hosts to ask on, the one where `agent` ran last first.
+    fn usage_order(&self, agent: Agent) -> Vec<String> {
         let hosts: Vec<(String, Option<u64>)> = self
             .snap
             .hosts
@@ -141,7 +176,7 @@ impl Lemur {
             .filter(|h| h.error.is_none())
             .map(|h| {
                 let last = sessions(&self.snap)
-                    .filter(|(host, s)| *host == h.name && s.runs_claude())
+                    .filter(|(host, s)| *host == h.name && s.agent() == Some(agent))
                     .map(|(_, s)| s.idle_secs)
                     .min();
                 (h.name.clone(), last)
@@ -150,20 +185,44 @@ impl Lemur {
         by_last_claude(hosts)
     }
 
-    /// "Claude" and when its next limit starts over, then a bar for each
-    /// limit, or that Claude couldn't be asked; what each says on hover. A
-    /// click on the bars asks again; on "Claude", it minimizes the meter to
+    /// The agent's name and when its next limit starts over, then a bar for
+    /// each limit, or that it couldn't be asked; what each says on hover. A
+    /// click on the bars asks again; on its name, it minimizes the meter to
     /// that line, the most used limit beside it.
-    pub(super) fn usage_meter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.meter.on {
+    pub(super) fn usage_meter(&self, agent: Agent, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (meter, minimized, name, icon, ids) = match agent {
+            Agent::Claude => (
+                &self.meter,
+                self.cfg.minimized_usage,
+                "Claude",
+                claude_icon(),
+                ("usage", "usage-header", "usage-bars", "usage bars"),
+            ),
+            Agent::Codex => (
+                &self.codex_meter,
+                self.cfg.minimized_codex_usage,
+                "Codex",
+                codex_icon(),
+                (
+                    "codex usage",
+                    "codex-usage-header",
+                    "codex-usage-bars",
+                    "codex usage bars",
+                ),
+            ),
+        };
+        let (id, header_id, bars_id, bars_selector) = ids;
+        if !meter.on {
             return None;
         }
         let now = epoch_now();
-        let shown = describe(self.meter.shown.as_ref(), now);
-        let minimized = self.cfg.minimized_usage;
+        let shown = describe(agent, meter.shown.as_ref(), now);
         let open = !minimized;
-        let failed = matches!(self.meter.shown, Some(Err(_)));
-        let tip = match (&self.meter.shown, open) {
+        let failed = matches!(meter.shown, Some(Err(_)));
+        let tip = match (&meter.shown, open) {
+            (Some(Ok(_)), true) if shown.rows.is_empty() => {
+                format!("{}\nClick to ask now.", shown.tip)
+            }
             (Some(Ok(_)), true) => format!("{}\nClick a bar to ask now.", shown.tip),
             (Some(Err(_)), true) => format!("{} Click to try again.", shown.tip),
             _ => shown.tip,
@@ -185,32 +244,44 @@ impl Lemur {
             .collect();
         let theme = cx.theme();
         let (border, muted) = (theme.sidebar_border, theme.muted_foreground);
+        let totals: Vec<Div> = shown
+            .totals
+            .into_iter()
+            .map(|(label, text)| {
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .child(div().flex_1().text_color(muted).child(label))
+                    .child(text)
+            })
+            .collect();
         let right = if minimized { shown.brief } else { shown.right };
-        let header = minimizable_header("usage-header".into(), minimized, cx)
+        let header = minimizable_header(header_id.into(), minimized, cx)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.toggle_usage_minimized(cx)),
+                cx.listener(move |this, _, _, cx| this.toggle_usage_minimized(agent, cx)),
             )
-            .child(claude_icon().xsmall())
-            .child(div().flex_1().min_w_0().truncate().child("Claude"))
+            .child(icon.xsmall())
+            .child(div().flex_1().min_w_0().truncate().child(name))
             .child(div().text_xs().text_color(muted).child(right))
             .child(chevron(minimized));
-        let body = (open && (failed || !rows.is_empty())).then(|| {
+        let body = (open && (failed || !rows.is_empty() || !totals.is_empty())).then(|| {
             v_flex()
-                .id("usage-bars")
-                .debug_selector(|| "usage bars".into())
+                .id(bars_id)
+                .debug_selector(move || bars_selector.into())
                 .gap_0p5()
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| this.ask_usage(cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.ask_usage(agent, cx)))
                 .when(failed, |this| {
                     this.child(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("Couldn't fetch usage from Claude."),
+                            .child(format!("Couldn't fetch usage from {name}.")),
                     )
                 })
                 .children(rows)
+                .children(totals)
         });
         Some(
             v_flex()
@@ -221,8 +292,8 @@ impl Lemur {
                 .border_color(border)
                 .child(
                     v_flex()
-                        .id("usage")
-                        .debug_selector(|| "usage".into())
+                        .id(id)
+                        .debug_selector(move || id.into())
                         .gap_0p5()
                         .py_1()
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -234,37 +305,47 @@ impl Lemur {
     }
 
     /// Minimizes the meter to its one line, or opens it again.
-    pub(super) fn toggle_usage_minimized(&mut self, cx: &mut Context<Self>) {
-        self.cfg.minimized_usage = !self.cfg.minimized_usage;
+    pub(super) fn toggle_usage_minimized(&mut self, agent: Agent, cx: &mut Context<Self>) {
+        let minimized = match agent {
+            Agent::Claude => &mut self.cfg.minimized_usage,
+            Agent::Codex => &mut self.cfg.minimized_codex_usage,
+        };
+        *minimized = !*minimized;
         self.save_minimized(cx);
     }
 }
 
-/// Hosts by how long ago Claude last did something on them, if it runs
+/// Hosts by how long ago the agent last did something on them, if it runs
 /// there at all, most recent first; the rest in their order after.
 fn by_last_claude(mut hosts: Vec<(String, Option<u64>)>) -> Vec<String> {
     hosts.sort_by_key(|(_, idle)| (idle.is_none(), idle.unwrap_or(0)));
     hosts.into_iter().map(|(name, _)| name).collect()
 }
 
-/// What the meter shows: beside "Claude", open and minimized, a bar for
-/// each limit, and on hover.
+/// What the meter shows: beside the agent's name, open and minimized, a bar
+/// for each limit, a total for what was used with no limits, and on hover.
 struct Shown {
     right: String,
     brief: String,
     rows: Vec<(String, f64)>,
+    totals: Vec<(String, String)>,
     tip: String,
 }
 
 /// The meter for the last answer, if any; `now` in seconds since 1970.
-fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
+fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
+    let (name, source) = match agent {
+        Agent::Claude => ("Claude", "Claude Code's /usage"),
+        Agent::Codex => ("Codex", "Codex's app server"),
+    };
     let u = match shown {
         None => {
             return Shown {
                 right: "asking…".into(),
                 brief: "asking…".into(),
                 rows: vec![],
-                tip: "Asking Claude Code how much of your plan is used…".into(),
+                totals: vec![],
+                tip: format!("Asking {} how much of your plan is used…", agent.name()),
             };
         }
         Some(Err(why)) => {
@@ -272,15 +353,43 @@ fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
                 right: "unavailable".into(),
                 brief: "unavailable".into(),
                 rows: vec![],
-                tip: format!("Couldn't fetch usage from Claude: {why}."),
+                totals: vec![],
+                tip: format!("Couldn't fetch usage from {name}: {why}."),
             };
         }
         Some(Ok(u)) => u,
     };
+    if let Some(first) = u.spent.first() {
+        let line = |label: &str, t: Tokens| {
+            format!(
+                "{label}: {} tokens, {} input (+ {} cached) and {} output",
+                short(t.total()),
+                short(t.fresh()),
+                short(t.cached),
+                short(t.output)
+            )
+        };
+        let mut lines: Vec<String> = u.spent.iter().map(|s| line(s.label, s.tokens)).collect();
+        lines.push(format!(
+            "From {name}'s session logs on {}, every 10 minutes. An API key has no plan limits to show.",
+            u.host
+        ));
+        return Shown {
+            right: "API key".into(),
+            brief: format!("{} {}", first.label, short(first.tokens.total())),
+            rows: vec![],
+            totals: u
+                .spent
+                .iter()
+                .map(|s| (s.label.to_string(), short(s.tokens.total())))
+                .collect(),
+            tip: lines.join("\n"),
+        };
+    }
     let mut lines = vec![];
     let mut soonest: Option<i64> = None;
     for l in &u.limits {
-        let at = l.resets_at.as_deref().and_then(usage::epoch);
+        let at = l.resets_at;
         if let Some(at) = at.filter(|at| *at > now) {
             soonest = Some(soonest.map_or(at, |s| s.min(at)));
         }
@@ -290,12 +399,9 @@ fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
         lines.push(format!("{}: {:.0}% used{resets}", l.label, l.percent));
     }
     if u.limits.is_empty() {
-        lines.push("Claude Code listed no limits for your plan.".into());
+        lines.push(format!("{} listed no limits for your plan.", agent.name()));
     }
-    lines.push(format!(
-        "From Claude Code's /usage on {}, every 10 minutes.",
-        u.host
-    ));
+    lines.push(format!("From {source} on {}, every 10 minutes.", u.host));
     // The most used limit, for the one line.
     let most = u
         .limits
@@ -315,7 +421,21 @@ fn describe(shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
             .iter()
             .map(|l| (l.label.clone(), l.percent))
             .collect(),
+        totals: vec![],
         tip: lines.join("\n"),
+    }
+}
+
+/// A count, roughly: "950", "1.2k", "229k", "4.6M", "21M", "1.3B".
+fn short(n: u64) -> String {
+    let n = n as f64;
+    match n {
+        ..1e3 => format!("{n:.0}"),
+        ..1e4 => format!("{:.1}k", n / 1e3),
+        ..1e6 => format!("{:.0}k", n / 1e3),
+        ..1e7 => format!("{:.1}M", n / 1e6),
+        ..1e9 => format!("{:.0}M", n / 1e6),
+        _ => format!("{:.1}B", n / 1e9),
     }
 }
 
@@ -333,8 +453,9 @@ fn until(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's `test` would stand in for the plain one.
-    use super::{Meter, by_last_claude, describe, until, usage};
-    use crate::usage::{Limit, Usage};
+    use super::{Meter, by_last_claude, describe, short, until, usage};
+    use crate::config::Agent;
+    use crate::usage::{Limit, Spent, Tokens, Usage};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -354,17 +475,18 @@ mod tests {
                 Limit {
                     label: "Session".into(),
                     percent: 42.4,
-                    resets_at: Some("2026-11-01T05:00:00Z".into()),
+                    resets_at: usage::epoch("2026-11-01T05:00:00Z"),
                 },
                 Limit {
                     label: "Week · Fable".into(),
                     percent: 81.0,
-                    resets_at: Some("not a time".into()),
+                    resets_at: None,
                 },
             ],
+            spent: vec![],
             host: "agent".into(),
         };
-        let shown = describe(Some(&Ok(used)), now);
+        let shown = describe(Agent::Claude, Some(&Ok(used.clone())), now);
         assert_eq!(shown.right, "resets in 2h 13m");
         assert_eq!(
             shown.rows,
@@ -382,19 +504,85 @@ mod tests {
 
         let none = Usage {
             limits: vec![],
+            spent: vec![],
             host: "agent".into(),
         };
-        let none = describe(Some(&Ok(none)), now);
+        let none = describe(Agent::Claude, Some(&Ok(none)), now);
         assert_eq!(
             (none.right.as_str(), none.brief.as_str()),
             ("no limits", "no limits")
         );
-        let failed = describe(Some(&Err("Claude Code isn't installed there".into())), now);
+        let failed = describe(
+            Agent::Claude,
+            Some(&Err("Claude Code isn't installed there".into())),
+            now,
+        );
         assert_eq!(failed.right, "unavailable");
         assert_eq!(failed.brief, "unavailable");
         assert!(failed.rows.is_empty());
         assert!(failed.tip.contains("isn't installed"), "{}", failed.tip);
-        assert_eq!(describe(None, now).right, "asking…");
+        assert_eq!(describe(Agent::Claude, None, now).right, "asking…");
+        // Codex's says it's Codex's.
+        let shown = describe(Agent::Codex, Some(&Ok(used)), now);
+        assert!(
+            shown
+                .tip
+                .ends_with("From Codex's app server on agent, every 10 minutes.")
+        );
+        let failed = describe(Agent::Codex, Some(&Err("no plan".into())), now);
+        assert_eq!(failed.tip, "Couldn't fetch usage from Codex: no plan.");
+    }
+
+    /// On an API key: the tokens used, with no bars, as it has no limits.
+    #[test]
+    fn the_meter_shows_what_a_key_used() {
+        let tokens = |input, cached, output| Tokens {
+            input,
+            cached,
+            output,
+        };
+        let used = Usage {
+            limits: vec![],
+            spent: vec![
+                Spent {
+                    label: "24 hours",
+                    tokens: tokens(4_588_020, 4_391_280, 32_215),
+                },
+                Spent {
+                    label: "7 days",
+                    tokens: tokens(5_000_000, 0, 1_000),
+                },
+            ],
+            host: "mac".into(),
+        };
+        let shown = describe(Agent::Codex, Some(&Ok(used)), 0);
+        assert_eq!(shown.right, "API key");
+        assert_eq!(shown.brief, "24 hours 229k");
+        assert!(shown.rows.is_empty());
+        assert_eq!(
+            shown.totals,
+            [
+                ("24 hours".to_string(), "229k".to_string()),
+                ("7 days".to_string(), "5.0M".to_string())
+            ]
+        );
+        assert_eq!(
+            shown.tip,
+            "24 hours: 229k tokens, 197k input (+ 4.4M cached) and 32k output\n\
+             7 days: 5.0M tokens, 5.0M input (+ 0 cached) and 1.0k output\n\
+             From Codex's session logs on mac, every 10 minutes. An API key has no plan limits to show."
+        );
+    }
+
+    #[test]
+    fn counts_read_roughly() {
+        assert_eq!(short(0), "0");
+        assert_eq!(short(950), "950");
+        assert_eq!(short(1_234), "1.2k");
+        assert_eq!(short(229_000), "229k");
+        assert_eq!(short(4_620_235), "4.6M");
+        assert_eq!(short(21_000_000), "21M");
+        assert_eq!(short(1_300_000_000), "1.3B");
     }
 
     #[test]
@@ -436,8 +624,9 @@ mod tests {
                 limits: vec![Limit {
                     label: "Week".into(),
                     percent: 95.0,
-                    resets_at: Some("2026-11-07T10:00:00Z".into()),
+                    resets_at: Some(reset),
                 }],
+                spent: vec![],
                 host: "agent".into(),
             })),
             asked: Some(now),

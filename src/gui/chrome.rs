@@ -8,6 +8,7 @@ use super::terminal::Palette;
 use super::{
     Ask, CloseThread, Key, Lemur, List, NUMBERED_TABS, NewTerminal, icons, rows, sessions,
 };
+use crate::config::Agent;
 use crate::machine::{self, Load};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -322,7 +323,7 @@ impl Lemur {
                                 .action(Box::new(NewTerminal))
                                 .on_click(move |_, _, cx| {
                                     this.update(cx, |this, cx| {
-                                        this.start_now(host.clone(), dir.clone(), true, cx)
+                                        this.start_now(host.clone(), dir.clone(), None, cx)
                                     })
                                     .ok();
                                 }),
@@ -351,11 +352,7 @@ impl Lemur {
     /// Over the terminal: what runs in it, its name, and where.
     pub(super) fn pane_header(&self, cx: &App) -> Option<Div> {
         let s = self.session_of(self.active.as_ref()?)?;
-        let what = if s.runs_claude() {
-            "Claude Code"
-        } else {
-            "Shell"
-        };
+        let what = s.agent().map_or("Shell", Agent::name);
         Some(
             h_flex()
                 .h(HEADER_HEIGHT)
@@ -463,7 +460,7 @@ impl Lemur {
             }
         }
         let needs = sessions(&self.snap)
-            .filter(|(_, s)| s.runs_claude() && s.activity == Activity::NeedsInput)
+            .filter(|(_, s)| s.agent().is_some() && s.activity == Activity::NeedsInput)
             .count();
         bar.when(needs > 0, |bar| {
             bar.child(
@@ -705,6 +702,7 @@ impl Lemur {
             && let Err(e) = crate::config::Config::save_minimized(
                 file,
                 self.cfg.minimized_usage,
+                self.cfg.minimized_codex_usage,
                 &self.cfg.minimized_hosts,
             )
         {

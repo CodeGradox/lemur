@@ -28,6 +28,11 @@ pub fn pencil() -> Icon {
     Icon::empty().data(include_bytes!("icons/pencil.svg"))
 }
 
+/// Codex's threads: code, not a logo of OpenAI's.
+pub fn code_xml() -> Icon {
+    Icon::empty().data(include_bytes!("icons/code-xml.svg"))
+}
+
 /// A Linear issue.
 pub fn ticket() -> Icon {
     Icon::empty().data(include_bytes!("icons/ticket.svg"))

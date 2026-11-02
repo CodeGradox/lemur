@@ -36,7 +36,7 @@ mod terminal_view;
 
 use crate::actions;
 use crate::attach::Active;
-use crate::config::{Config, Host, ThemeChoice, ThreadOrder, leaf};
+use crate::config::{Agent, Config, Host, ThemeChoice, ThreadOrder, leaf};
 use crate::dictate;
 use crate::hc;
 use crate::snapshot::{self, Activity, HostData, Session, Snapshot, Worktree};
@@ -194,14 +194,16 @@ type List = (String, Option<String>);
 
 /// What the name field in the header is asking for.
 enum Ask {
+    /// With `agent` running in it, or with none just a shell.
     NewWorktree {
         base: usize,
+        agent: Option<Agent>,
     },
-    /// Claude, or with `shell` just a shell, in an existing worktree.
+    /// `agent`, or with none just a shell, in an existing worktree.
     NewThread {
         base: usize,
         worktree: String,
-        shell: bool,
+        agent: Option<Agent>,
     },
     Rename {
         host: String,
@@ -286,6 +288,7 @@ struct Lemur {
     loads: HashMap<String, (crate::machine::Load, Option<f32>)>,
     /// How much of Claude's plan is used, at the foot of the sidebar.
     meter: meter::Meter,
+    codex_meter: meter::Meter,
     /// Each worktree's lines added and removed, for the status bar.
     diffs: changes::Changes,
     /// Notification popups that are showing, one per session.
@@ -703,7 +706,8 @@ impl Lemur {
             window: window.window_handle(),
             popups: HashMap::new(),
             loads: HashMap::new(),
-            meter: meter::Meter::new(cx),
+            meter: meter::Meter::new(Agent::Claude, cx),
+            codex_meter: meter::Meter::new(Agent::Codex, cx),
             diffs: changes::Changes::default(),
             changes: 0,
             notes,
@@ -969,7 +973,7 @@ impl Lemur {
         self.snap = snap;
         self.bring_back_needed(cx);
         self.reconnect_terminals(cx);
-        self.note_claude(cx);
+        self.note_agents(cx);
         self.follow_loads();
         // With the hosts known, the meter can ask now, not at its next tick.
         let first = !self.loaded;
@@ -1424,7 +1428,7 @@ impl Lemur {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (label, claude) = match self.session_of(&key) {
+        let (label, agent) = match self.session_of(&key) {
             Some(s) if !s.busy => {
                 // A shell at its prompt closes at once, unless jobs it
                 // started still run or wait (`&`, ⌃Z): they'd end too.
@@ -1441,13 +1445,15 @@ impl Lemur {
                 .detach();
                 return;
             }
-            Some(s) => (s.label.clone(), s.runs_claude()),
-            None => (self.label_of(&key.0, &key.1), false),
+            Some(s) => (s.label.clone(), s.agent()),
+            None => (self.label_of(&key.0, &key.1), None),
         };
-        let description = if claude {
-            "Claude quits, and its terminal ends. Lemur forgets the conversation, as it does for a thread killed."
-        } else {
-            "The terminal ends, and whatever runs in it."
+        let description = match agent {
+            Some(Agent::Claude) => {
+                "Claude quits, and its terminal ends. Lemur forgets the conversation, as it does for a thread killed."
+            }
+            Some(Agent::Codex) => "Codex quits, and its terminal ends.",
+            None => "The terminal ends, and whatever runs in it.",
         };
         self.ask_close(key, label, description, window, cx);
     }
@@ -2193,7 +2199,7 @@ mod tests {
         Ask, Key, Lemur, MIN_NOTES, MIN_SIDEBAR, MIN_TERMINAL, NOTES_WIDTH, NotificationEvent,
         Right, SIDEBAR_WIDTH, meter, move_item, moved_to,
     };
-    use crate::config::{Base, Config, Host, ThreadOrder};
+    use crate::config::{Agent, Base, Config, Host, ThreadOrder};
     use crate::snapshot::{self, Activity, BaseView, HostView, Session, Snapshot, Worktree};
     use crate::test_support::{HcServer, TempDir, fake_dictate, git_in, wait_until};
     use gpui::VisualTestContext;
@@ -2219,6 +2225,7 @@ mod tests {
                 activity: *activity,
                 waiting_for: None,
                 started_claude: false,
+                codex: false,
                 order: None,
                 started: 0,
                 claude: None,
@@ -3143,7 +3150,11 @@ mod tests {
         let ask = |cx: &mut VisualTestContext| {
             cx.update(|window, cx| {
                 app.update(cx, |app, cx| {
-                    app.ask_name(Ask::NewWorktree { base: 0 }, window, cx)
+                    let ask = Ask::NewWorktree {
+                        base: 0,
+                        agent: Some(Agent::Claude),
+                    };
+                    app.ask_name(ask, window, cx)
                 })
             });
             cx.run_until_parked();
@@ -3262,7 +3273,7 @@ mod tests {
                 let ask = Ask::NewThread {
                     base: 0,
                     worktree: path.clone(),
-                    shell: false,
+                    agent: Some(Agent::Claude),
                 };
                 app.ask_name(ask, window, cx)
             })
@@ -3421,30 +3432,36 @@ mod tests {
             app.read_with(cx, |app, cx| {
                 let prompt = app.prompt.as_ref().expect("asking");
                 let Ask::NewThread {
-                    worktree, shell, ..
+                    worktree, agent, ..
                 } = &prompt.what
                 else {
                     panic!("not a new thread");
                 };
                 assert_eq!(worktree, wt);
-                (*shell, prompt.input.read(cx).value().to_string())
+                (*agent, prompt.input.read(cx).value().to_string())
             })
         };
 
         cx.simulate_keystrokes("cmd-j");
         cx.run_until_parked();
-        assert_eq!(asked(cx), (false, "claude".into()));
+        assert_eq!(asked(cx), (Some(Agent::Claude), "claude".into()));
         cx.simulate_keystrokes("down");
-        assert_eq!(asked(cx), (true, "shell".into()));
+        assert_eq!(asked(cx), (Some(Agent::Codex), "codex".into()));
+        cx.simulate_keystrokes("down");
+        assert_eq!(asked(cx), (None, "shell".into()));
         cx.simulate_input("build");
         cx.simulate_keystrokes("up");
-        assert_eq!(asked(cx), (false, "build".into()), "a typed name stays");
+        assert_eq!(
+            asked(cx),
+            (Some(Agent::Codex), "build".into()),
+            "a typed name stays"
+        );
         let shell = cx
             .debug_bounds("kind Shell")
             .expect("the Shell row")
             .center();
         cx.simulate_click(shell, Modifiers::none());
-        assert_eq!(asked(cx), (true, "build".into()));
+        assert_eq!(asked(cx), (None, "build".into()));
         cx.simulate_keystrokes("escape");
         app.read_with(cx, |app, _| assert!(app.prompt.is_none()));
 
@@ -5377,6 +5394,169 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// Codex shows as Codex: started for it, or found reporting as it (as it
+    /// does on its own, to herdr-core) with its status, whatever it was
+    /// started for. A plain terminal isn't an agent, and once what ran there
+    /// is over, it says nothing of what ran.
+    #[gpui::test]
+    fn codex_threads_show_as_codex(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("codex-shown");
+        let report = |state: &str| {
+            format!(r#"printf '\033]7501;state={state}:app=codex\033\\'; exec sleep 600"#)
+        };
+        let started = server.run("/", &["lemur.kind=codex"], &["sleep", "600"]);
+        let by_hand = server.run("/", &[], &["sh", "-c", &report("working")]);
+        let asks = server.run(
+            "/",
+            &["lemur.kind=claude"],
+            &["sh", "-c", &report("blocked")],
+        );
+        let plain = server.run("/", &[], &["sleep", "600"]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let session = |name: &str, cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                super::sessions(&app.snap)
+                    .find(|(_, s)| s.name == name)
+                    .map(|(_, s)| (s.agent(), s.activity))
+            })
+        };
+        let reported = wait_until(Duration::from_secs(10), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            session(&asks, cx) == Some((Some(Agent::Codex), Activity::NeedsInput))
+                && session(&by_hand, cx) == Some((Some(Agent::Codex), Activity::Working))
+        });
+        assert!(reported, "{:?}", session(&asks, cx));
+        assert_eq!(
+            session(&started, cx),
+            Some((Some(Agent::Codex), Activity::Unknown))
+        );
+        assert_eq!(session(&plain, cx), Some((None, Activity::Unknown)));
+
+        let listed = app.read_with(cx, |app, _| {
+            let agents = app.agents();
+            agents
+                .iter()
+                .map(|(_, s)| s.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(listed.contains(&started) && listed.contains(&by_hand) && listed.contains(&asks));
+        assert!(!listed.contains(&plain), "{listed:?}");
+        let noted = app.read_with(cx, |app, _| {
+            super::sessions(&app.snap)
+                .filter(|(_, s)| s.codex)
+                .filter_map(|(_, s)| s.shell_to_note())
+                .count()
+        });
+        assert_eq!(noted, 0, "only Claude's are kept to resume");
+        let_attaches_end(&app, cx);
+    }
+
+    /// Picking an agent the host doesn't have says so where failures show, for
+    /// Codex and for Claude, a thread and a new worktree alike: nothing starts,
+    /// and Lemur goes on, a shell starting as ever. With the agent there, Codex
+    /// starts, labelled for it.
+    #[gpui::test]
+    fn picking_an_agent_the_host_lacks_says_so(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("no-agent-ui");
+        let dir = TempDir::new("no-agent-ui");
+        let repo = dir.join("api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let path = repo.canonicalize().unwrap().to_string_lossy().into_owned();
+        let mut cfg = server.config();
+        cfg.hosts[0].claude = "lemur-has-no-claude".into();
+        cfg.hosts[0].codex = "lemur-has-no-codex".into();
+        cfg.bases.push(Base::new("local", &path));
+        let (app, cx) = rooted(cfg, cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1000.0), px(600.0)));
+        cx.run_until_parked();
+
+        let start = |ask: Ask, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| app.update(cx, |app, cx| app.ask_name(ask, window, cx)));
+            cx.run_until_parked();
+            // As the other prompts' tests do: Enter on the selected label
+            // would replace it here.
+            cx.simulate_input("x");
+            cx.simulate_keystrokes("enter");
+        };
+        let failed = |cx: &mut VisualTestContext| {
+            let said = wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| {
+                    matches!(&app.status, Some((_, super::snackbar::Kind::Error)))
+                })
+            });
+            assert!(said, "{:?}", app.read_with(cx, |app, _| app.status.clone()));
+            app.read_with(cx, |app, _| app.status.clone().unwrap().0)
+        };
+        let thread = |agent: Agent| Ask::NewThread {
+            base: 0,
+            worktree: path.clone(),
+            agent: Some(agent),
+        };
+        for (agent, said) in [
+            (
+                Agent::Codex,
+                "Codex isn't installed on local: its shell can't find `lemur-has-no-codex`",
+            ),
+            (
+                Agent::Claude,
+                "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`",
+            ),
+        ] {
+            start(thread(agent), cx);
+            assert_eq!(failed(cx), said);
+            app.update(cx, |app, _| app.status = None);
+            let worktree = Ask::NewWorktree {
+                base: 0,
+                agent: Some(agent),
+            };
+            start(worktree, cx);
+            assert_eq!(failed(cx), said);
+            app.update(cx, |app, _| app.status = None);
+        }
+        assert!(server.addresses().is_empty(), "no terminal");
+        assert!(!repo.join(".claude/worktrees/x").exists(), "no worktree");
+        assert!(app.read_with(cx, |app, _| app.cfg.threads.is_empty()));
+
+        // Lemur goes on: a shell starts.
+        let shell = Ask::NewThread {
+            base: 0,
+            worktree: path.clone(),
+            agent: None,
+        };
+        start(shell, cx);
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.active.is_some())
+        }));
+
+        // And Codex, with it there.
+        app.update(cx, |app, _| app.cfg.hosts[0].codex = "sleep 600".into());
+        start(thread(Agent::Codex), cx);
+        let started = wait_until(Duration::from_secs(10), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.active
+                    .as_ref()
+                    .and_then(|k| app.session_of(k))
+                    .is_some_and(|s| s.agent() == Some(Agent::Codex))
+            })
+        });
+        assert!(started);
+        assert!(
+            app.read_with(cx, |app, _| app.cfg.threads.is_empty()),
+            "no Claude to keep"
+        );
+        let_attaches_end(&app, cx);
+    }
+
     /// The agents panel lists each Claude thread with what it runs under
     /// it: Claude's subagents as it reports them (OSC 7501 records), and
     /// terminals its agent started (`hc run`, parent and all). A click opens
@@ -6978,7 +7158,7 @@ mod tests {
         app.update(cx, |app, cx| {
             app.cfg.hosts[0].claude = "false".into();
             app.meter.shown = None;
-            app.ask_usage(cx);
+            app.ask_usage(Agent::Claude, cx);
         });
         let failed = shown(cx).expect("asked").unwrap_err();
         assert_eq!(failed, "Claude Code didn't answer (on local)");
@@ -6997,6 +7177,140 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("usage").is_none());
         assert!(app.read_with(cx, |app, _| app.meter.shown.is_none()));
+    }
+
+    /// Codex's usage has a meter of its own: off, it doesn't ask; on, it asks
+    /// Codex and shows what it says, beside Claude's, or why it can't.
+    #[gpui::test]
+    fn the_sidebar_shows_how_much_of_codexs_plan_is_used(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("codex-meter");
+        let dir = TempDir::new("codex-meter");
+        let printed = dir.join("answer.jsonl");
+        let answer = r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1793660000},"secondary":{"usedPercent":61,"windowDurationMins":10080,"resetsAt":1794000000}}}}"#;
+        std::fs::write(&printed, format!("{answer}\n")).unwrap();
+        let ran = dir.join("ran");
+        let fake = dir.join("fake-codex");
+        // Says it ran, prints what Codex answers, and stays until its stdin ends.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ntouch {}\ncat {}\ncat >/dev/null\n",
+                ran.display(),
+                printed.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = server.config();
+        cfg.hosts[0].codex = fake.to_string_lossy().into_owned();
+        cfg.hosts[0].claude = "false".into();
+        let (app, cx) = rooted(cfg, cx);
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.loaded)
+        }));
+        assert!(
+            !cx.update(|_, cx| cx.global::<meter::CodexFound>().0),
+            "none yet"
+        );
+        app.update(cx, |app, cx| app.tick_meter(true, cx));
+        cx.run_until_parked();
+        assert!(!ran.exists(), "off, it doesn't ask");
+        assert!(cx.debug_bounds("codex usage").is_none());
+
+        cx.update(|_, cx| Prefs::update(cx, |p| p.codex_usage = true));
+        let shown = |cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(5), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.codex_meter.shown.is_some())
+            });
+            app.read_with(cx, |app, _| app.codex_meter.shown.clone())
+        };
+        let usage = shown(cx).expect("asked at once").expect("its limits");
+        assert!(ran.exists());
+        let labels: Vec<&str> = usage.limits.iter().map(|l| l.label.as_str()).collect();
+        assert_eq!(labels, ["5 hours", "Week"]);
+        assert!(cx.debug_bounds("codex usage bars").is_some());
+        assert!(cx.debug_bounds("usage").is_none(), "Claude's stays off");
+
+        // With both on, Claude's is above.
+        cx.update(|_, cx| Prefs::update(cx, |p| p.claude_usage = true));
+        cx.run_until_parked();
+        let top = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector).expect(selector).origin.y
+        };
+        assert!(top("usage", cx) < top("codex usage", cx));
+        cx.update(|_, cx| Prefs::update(cx, |p| p.claude_usage = false));
+        cx.run_until_parked();
+
+        let header = cx.debug_bounds("codex-usage-header").unwrap().center();
+        cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("codex usage bars").is_none());
+        assert!(app.read_with(cx, |app, _| app.cfg.minimized_codex_usage));
+        assert!(
+            !app.read_with(cx, |app, _| app.cfg.minimized_usage),
+            "its own"
+        );
+        cx.simulate_mouse_up(header, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        // On an API key it has no plan: the tokens in its logs, without bars.
+        let logs = server.codex_home().join("sessions");
+        std::fs::create_dir_all(&logs).unwrap();
+        let at = crate::usage::rfc3339(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 60,
+        );
+        std::fs::write(
+            logs.join("rollout-1.jsonl"),
+            format!(
+                r#"{{"timestamp":"{at}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":60}},"last_token_usage":{{"input_tokens":50,"cached_input_tokens":20,"output_tokens":10,"total_tokens":60}}}}}}}}"#
+            ) + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &printed,
+            r#"{"error":{"code":-32600,"message":"chatgpt authentication required to read rate limits"},"id":2}"#.to_string() + "\n",
+        )
+        .unwrap();
+        // Open again: it's elsewhere, minimized.
+        let header = cx
+            .debug_bounds("codex-usage-header minimized")
+            .unwrap()
+            .center();
+        cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(header, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.codex_meter.shown = None;
+            app.ask_usage(Agent::Codex, cx);
+        });
+        let used = shown(cx).expect("asked").expect("what it used");
+        assert!(used.limits.is_empty());
+        assert_eq!(used.spent[0].tokens.total(), 40);
+        assert!(cx.debug_bounds("codex usage bars").is_some(), "it says so");
+        assert!(
+            app.read_with(cx, |app, _| app.status.is_none()),
+            "no failure"
+        );
+
+        // A host without it: it says so, and Lemur doesn't fall over.
+        app.update(cx, |app, cx| {
+            app.cfg.hosts[0].codex = "lemur-has-no-codex".into();
+            app.codex_meter.shown = None;
+            app.ask_usage(Agent::Codex, cx);
+        });
+        let failed = shown(cx).expect("asked").unwrap_err();
+        assert_eq!(failed, "Codex isn't installed there (on local)");
+
+        cx.update(|_, cx| Prefs::update(cx, |p| p.codex_usage = false));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("codex usage").is_none());
     }
 
     /// Every host is listed in Other, threads or none, and its + starts a
@@ -7206,7 +7520,7 @@ mod tests {
         assert_eq!(listed(cx), ["review", "build", "main-shell"]);
         cx.simulate_input("bui");
         assert_eq!(listed(cx), ["build"]);
-        cx.simulate_keystrokes("down down");
+        cx.simulate_keystrokes("down down down");
         app.read_with(cx, |app, _| {
             assert_eq!(app.prompt.as_ref().unwrap().go, Some(0))
         });

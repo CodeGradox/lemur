@@ -3,7 +3,7 @@
 //! from herdr-core as they change; worktrees and Claude's conversations
 //! from one script per host.
 
-use crate::config::{ClaudeThread, Config, Host};
+use crate::config::{Agent, ClaudeThread, Config, Host};
 use crate::hc::{self, Terminal};
 use crate::machine::{self, Reading, Server};
 use crate::remote::{Remote, sh_path};
@@ -100,6 +100,8 @@ pub struct Session {
     pub waiting_for: Option<String>,
     /// lemur started it for Claude rather than as a plain shell.
     pub started_claude: bool,
+    /// Started for Codex, or Codex found running in it.
+    pub codex: bool,
     /// Its place in its worktree once threads were dragged into an order.
     pub order: Option<u32>,
     /// When it started, in ms since the epoch: threads never placed follow
@@ -153,9 +155,20 @@ pub struct ClaudeRun {
 }
 
 impl Session {
+    /// The agent it was started for, or found running in it.
+    pub fn agent(&self) -> Option<Agent> {
+        if self.codex {
+            Some(Agent::Codex)
+        } else if self.started_claude || self.activity != Activity::Unknown {
+            Some(Agent::Claude)
+        } else {
+            None
+        }
+    }
+
     /// Started for Claude, or Claude found running in it.
     pub fn runs_claude(&self) -> bool {
-        self.started_claude || self.activity != Activity::Unknown
+        self.agent() == Some(Agent::Claude)
     }
 
     /// Came back from its host restarting as a fresh shell at its prompt
@@ -171,6 +184,10 @@ impl Session {
     /// back from its host restarting once Claude runs in it again. Until
     /// then it's still to resume.
     pub fn shell_to_note(&self) -> Option<u32> {
+        // Only Claude's conversations are kept to resume.
+        if self.codex {
+            return None;
+        }
         let pid = self.pid?;
         let claude_runs = self.activity != Activity::Unknown || self.claude.is_some();
         match self.shell {
@@ -585,6 +602,7 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
                 && let Some(f) = found
             {
                 (s.activity, s.waiting_for) = (f.activity, f.waiting_for.clone());
+                s.codex = false;
             }
             s.claude = found.and_then(|f| f.run.clone()).map(|(_, run)| run);
         }
@@ -651,6 +669,12 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         None => (Activity::Unknown, None),
     };
     let since = t.status_ms.unwrap_or(t.created_ms);
+    // What runs says what it is, whatever the thread was started for.
+    let reported = t
+        .status
+        .as_ref()
+        .filter(|s| !s.app.is_empty() && busy(t))
+        .map(|s| s.app.as_str());
     Session {
         name: t.address.clone(),
         label: label(LABEL).cloned().unwrap_or_else(|| shown_name(t)),
@@ -659,6 +683,10 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         activity,
         waiting_for,
         started_claude: label(KIND).is_some_and(|k| k == "claude"),
+        codex: match reported {
+            Some(app) => app == "codex",
+            None => label(KIND).is_some_and(|k| k == "codex"),
+        },
         order: label(ORDER).and_then(|o| o.parse().ok()),
         started: t.created_ms,
         claude: None,
@@ -836,7 +864,7 @@ fn parse_worktree_line(base: &mut BaseView, line: &str) {
 }
 
 #[derive(Deserialize)]
-struct Agent {
+struct RunningClaude {
     kind: Option<String>,
     pid: Option<u32>,
     status: Option<String>,
@@ -867,7 +895,7 @@ fn claude_activity(
     parents: &HashMap<u32, u32>,
 ) -> Option<HashMap<String, InSession>> {
     // No answer means an older Claude Code, or none.
-    let agents: Vec<Agent> = serde_json::from_str(agents.trim()).ok()?;
+    let agents: Vec<RunningClaude> = serde_json::from_str(agents.trim()).ok()?;
     let mut found: HashMap<String, InSession> = HashMap::new();
     for agent in agents {
         let (Some("interactive"), Some(pid)) = (agent.kind.as_deref(), agent.pid) else {
@@ -1255,6 +1283,12 @@ mod tests {
         );
         let plain = session(&[("lemur.kind", "shell")]);
         assert_eq!(plain.shell_to_note(), None, "only a shell");
+        let codex = Session {
+            activity: Activity::Working,
+            ..session(&[("lemur.kind", "codex")])
+        };
+        assert_eq!(codex.agent(), Some(Agent::Codex));
+        assert_eq!(codex.shell_to_note(), None, "not kept to resume");
         let typed = Session {
             claude: run(),
             ..plain

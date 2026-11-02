@@ -71,6 +71,8 @@ pub struct Terminal {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Status {
+    /// Who says so: `claude-code`, `codex`.
+    pub app: String,
     pub state: String,
     pub msg: String,
     pub title: String,

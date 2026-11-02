@@ -1,11 +1,11 @@
 //! Names asked for in the spotlight: for a new worktree, a new thread or
 //! a rename, and what happens once one is given.
 
-use super::sidebar::claude_icon;
+use super::sidebar::{claude_icon, codex_icon};
 use super::snackbar::Kind;
 use super::{Ask, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
-use crate::config::{ClaudeThread, leaf};
+use crate::config::{Agent, ClaudeThread, leaf};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectState};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, IndexPath, Sizable, h_flex, v_flex};
@@ -17,7 +17,7 @@ actions!(new_thread, [Up, Down]);
 /// Key context of the spotlight for a new thread, or one to go to.
 const NEW_THREAD: &str = "NewThread";
 
-/// ↑↓ pick Claude or Shell for a new thread, or a thread to go to. The
+/// ↑↓ pick what a new thread runs, or a thread to go to. The
 /// name field goes first and passes on the keys it has no use for.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -26,9 +26,16 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// What a new thread can run, as they're listed: an agent, or a shell.
+pub(super) const KINDS: [Option<Agent>; 3] = [Some(Agent::Claude), Some(Agent::Codex), None];
+
 /// What a new thread is called until you name it.
-pub(super) fn default_label(shell: bool) -> &'static str {
-    if shell { "shell" } else { "claude" }
+pub(super) fn default_label(agent: Option<Agent>) -> &'static str {
+    match agent {
+        Some(Agent::Claude) => "claude",
+        Some(Agent::Codex) => "codex",
+        None => "shell",
+    }
 }
 
 /// A new worktree's branch, empty for none, and the branch it starts
@@ -52,12 +59,14 @@ enum Done {
 
 impl Lemur {
     /// Opens the name field, selected so typing replaces it. It asks for a
-    /// label, which several threads can share: it starts as `claude` or
-    /// `shell`, a free random name for a worktree, or the current label.
+    /// label, which several threads can share: it starts as what the thread
+    /// runs, a free random name for a worktree, or the current label.
     pub(super) fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
         let name = match &what {
-            Ask::NewWorktree { base } => actions::random_name(|n| self.worktree_taken(*base, n)),
-            Ask::NewThread { shell, .. } => default_label(*shell).to_string(),
+            Ask::NewWorktree { base, .. } => {
+                actions::random_name(|n| self.worktree_taken(*base, n))
+            }
+            Ask::NewThread { agent, .. } => default_label(*agent).to_string(),
             Ask::Rename { host, session } => self.label_of(host, session),
             Ask::Find => String::new(),
         };
@@ -112,7 +121,7 @@ impl Lemur {
             i.select_all(window, cx);
         });
         let worktree = match &what {
-            Ask::NewWorktree { base } => Some(self.worktree_fields(*base, window, cx)),
+            Ask::NewWorktree { base, .. } => Some(self.worktree_fields(*base, window, cx)),
             _ => None,
         };
         self.prompt = Some(Prompt {
@@ -178,24 +187,27 @@ impl Lemur {
     }
 
     /// The name field, in the spotlight: what it's for, the name, and a
-    /// hint or why the name can't be used. A new thread is Claude or a
-    /// shell, picked above the name.
+    /// hint or why the name can't be used. What a new thread runs is picked
+    /// above the name.
     pub(super) fn prompt_card(&self, prompt: &Prompt, cx: &Context<Self>) -> Div {
         let mut kind = None;
         let mut listed = false;
         let (icon, what, hint) = match &prompt.what {
-            Ask::NewWorktree { base } => (
-                IconName::Folder,
-                format!("New worktree in {}", self.cfg.bases[*base].name()),
-                "⏎ start · esc cancel",
-            ),
+            Ask::NewWorktree { base, agent } => {
+                kind = Some(*agent);
+                (
+                    IconName::Folder,
+                    format!("New worktree in {}", self.cfg.bases[*base].name()),
+                    "↑↓ Claude, Codex or shell · ⏎ start · esc cancel",
+                )
+            }
             Ask::NewThread {
                 base,
                 worktree,
-                shell,
+                agent,
             } => {
-                // While a thread is picked, Claude and Shell aren't.
-                kind = Some(*shell).filter(|_| prompt.go.is_none());
+                // While a thread is picked, what to start isn't.
+                kind = Some(*agent).filter(|_| prompt.go.is_none());
                 listed = true;
                 (
                     IconName::Plus,
@@ -203,7 +215,7 @@ impl Lemur {
                         "New in {}, or go to",
                         self.worktree_name(&self.cfg.bases[*base].host, worktree)
                     ),
-                    "↑↓ Claude, shell or a thread · ⏎ start or go · esc cancel",
+                    "↑↓ Claude, Codex, shell or a thread · ⏎ start or go · esc cancel",
                 )
             }
             Ask::Find => {
@@ -224,10 +236,10 @@ impl Lemur {
             Some((error, _)) => spotlight::footer(error.clone(), true, cx),
             None => spotlight::footer(hint, false, cx),
         };
-        let is_new = matches!(prompt.what, Ask::NewThread { .. });
+        let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
         spotlight::card(cx)
             .child(spotlight::title(icon, what, cx))
-            .when(listed, |card| {
+            .when(listed || is_new, |card| {
                 card.key_context(NEW_THREAD)
                     .on_action(cx.listener(|this, _: &Up, window, cx| this.step(true, window, cx)))
                     .on_action(
@@ -263,25 +275,31 @@ impl Lemur {
             .child(footer)
     }
 
-    /// Picks Claude or, with `shell`, a shell for the new thread asked for.
-    /// The name follows, unless you typed one.
-    pub(super) fn pick_kind(&mut self, shell: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Prompt {
-            what: Ask::NewThread { shell: picked, .. },
-            input,
-            go,
-            ..
-        }) = &mut self.prompt
-        else {
+    /// Picks what the new thread asked for runs: `agent`, or with none a
+    /// shell. A thread's name follows, unless you typed one.
+    pub(super) fn pick_kind(
+        &mut self,
+        agent: Option<Agent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = &mut self.prompt else {
             return;
         };
-        *go = None;
-        if *picked != shell {
+        let (picked, named) = match &mut prompt.what {
+            Ask::NewThread { agent: picked, .. } => (picked, true),
+            // Its name is the worktree's.
+            Ask::NewWorktree { agent: picked, .. } => (picked, false),
+            _ => return,
+        };
+        prompt.go = None;
+        let input = &prompt.input;
+        if *picked != agent {
             let typed = input.read(cx).value() != default_label(*picked);
-            *picked = shell;
-            if !typed {
+            *picked = agent;
+            if named && !typed {
                 input.update(cx, |i, cx| {
-                    i.set_value(default_label(shell), window, cx);
+                    i.set_value(default_label(agent), window, cx);
                     i.select_all(window, cx);
                 });
             }
@@ -291,7 +309,7 @@ impl Lemur {
         cx.notify();
     }
 
-    /// ⌘J: asks for a new Claude thread or shell in the worktree of the one
+    /// ⌘J: asks for a new agent's thread or shell in the worktree of the one
     /// on show.
     pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlaid() {
@@ -316,7 +334,7 @@ impl Lemur {
             let ask = Ask::NewThread {
                 base,
                 worktree,
-                shell: false,
+                agent: Some(Agent::Claude),
             };
             self.ask_name(ask, window, cx);
         }
@@ -362,11 +380,12 @@ impl Lemur {
         self.in_background(
             cx,
             move || match what {
-                Ask::NewWorktree { base } => actions::new_worktree_thread(
+                Ask::NewWorktree { base, agent } => actions::new_worktree_thread(
                     &cfg,
                     base,
                     &name,
                     &name,
+                    agent,
                     branch.as_deref(),
                     from.as_deref(),
                 )
@@ -374,8 +393,8 @@ impl Lemur {
                 Ask::NewThread {
                     base,
                     worktree,
-                    shell,
-                } => actions::new_thread_in(&cfg, base, &worktree, &name, shell)
+                    agent,
+                } => actions::new_thread_in(&cfg, base, &worktree, &name, agent)
                     .map(|started| Done::Started(started, None)),
                 Ask::Find => unreachable!("going to a thread starts nothing"),
                 Ask::Rename { host, session } => {
@@ -478,11 +497,11 @@ impl Lemur {
     }
 }
 
-/// Claude and Shell, to pick from for a new thread; with `shell` the
-/// shell is picked, with none neither.
-fn kinds(shell: Option<bool>, cx: &Context<Lemur>) -> Div {
+/// What a new thread can run, to pick from: `picked` is highlighted, and with
+/// none nothing is.
+fn kinds(picked: Option<Option<Agent>>, cx: &Context<Lemur>) -> Div {
     let theme = cx.theme();
-    let row = |label: &'static str, icon: Icon, is_shell: bool| {
+    let row = |label: &'static str, icon: Icon, kind: Option<Agent>| {
         h_flex()
             .id(label)
             .debug_selector(move || format!("kind {label}"))
@@ -492,20 +511,21 @@ fn kinds(shell: Option<bool>, cx: &Context<Lemur>) -> Div {
             .rounded(theme.radius)
             .text_sm()
             .cursor_pointer()
-            .when(shell == Some(is_shell), |row| {
+            .when(picked == Some(kind), |row| {
                 row.bg(theme.accent).text_color(theme.accent_foreground)
             })
             .child(icon.small())
             .child(label)
-            .on_click(cx.listener(move |this, _, window, cx| this.pick_kind(is_shell, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.pick_kind(kind, window, cx)))
     };
     v_flex()
         .p_1()
         .gap_0p5()
         .border_b_1()
         .border_color(theme.border)
-        .child(row("Claude", claude_icon(), false))
-        .child(row("Shell", Icon::new(IconName::SquareTerminal), true))
+        .child(row("Claude", claude_icon(), Some(Agent::Claude)))
+        .child(row("Codex", codex_icon(), Some(Agent::Codex)))
+        .child(row("Shell", Icon::new(IconName::SquareTerminal), None))
 }
 
 /// A line of the new worktree's fields: what it is, then the field.

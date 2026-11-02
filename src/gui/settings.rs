@@ -4,8 +4,8 @@
 //! once in every window and are saved to the config file.
 
 use super::linear_panel::{self, LinearAccount};
-use super::meter::ClaudeFound;
-use super::sidebar::claude_icon;
+use super::meter::{ClaudeFound, CodexFound};
+use super::sidebar::{claude_icon, codex_icon};
 use super::terminal::{Palette, SLOTS, Slot, set_color};
 use crate::config::{
     Config, FONT_SIZES, Language, SCROLLBACKS, Terminal, ThemeChoice, ThreadOrder,
@@ -39,6 +39,8 @@ pub struct Prefs {
     pub terminal: Terminal,
     /// Whether the sidebar shows how much of Claude's plan is used.
     pub claude_usage: bool,
+    /// Whether it shows how much of Codex's is.
+    pub codex_usage: bool,
     /// The herdr-cores Lemur uses on this Mac, whose versions Settings
     /// shows.
     pub cores: core_update::Cores,
@@ -58,6 +60,7 @@ impl Prefs {
             thread_order: cfg.thread_order,
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
+            codex_usage: cfg.codex_usage,
             cores: core_update::Cores::of(cfg),
             file,
             error: None,
@@ -95,6 +98,7 @@ impl Prefs {
                 prefs.thread_order,
                 &prefs.terminal,
                 prefs.claude_usage,
+                prefs.codex_usage,
             )
             .err()
             .map(|e| format!("{e:#}"))
@@ -156,6 +160,7 @@ struct SettingsView {
     focus: FocusHandle,
     _prefs: Subscription,
     _found: Subscription,
+    _codex_found: Subscription,
     _linear: Subscription,
     /// herdr-core's versions here and on each machine, once asked.
     core: Option<Result<Versions, String>>,
@@ -218,6 +223,7 @@ impl SettingsView {
                 cx.notify();
             }),
             _found: cx.observe_global::<ClaudeFound>(|_, cx| cx.notify()),
+            _codex_found: cx.observe_global::<CodexFound>(|_, cx| cx.notify()),
             _linear: cx.observe_global::<LinearAccount>(|_, cx| cx.notify()),
             core: None,
             updating: false,
@@ -367,6 +373,25 @@ impl Render for SettingsView {
             "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, \
              then turn this on."
         });
+        let codex_found = cx.try_global::<CodexFound>().is_some_and(|f| f.0);
+        let codex_on = Prefs::get(cx).codex_usage;
+        let codex_usage = SettingItem::new(
+            "Show plan usage",
+            SettingField::switch(
+                |cx| Prefs::get(cx).codex_usage,
+                |on, cx| Prefs::update(cx, |p| p.codex_usage = on),
+            ),
+        )
+        .disabled(!codex_found && !codex_on)
+        .description(if codex_found || codex_on {
+            "How much of your ChatGPT plan's Codex use is used, above the hosts' load in the \
+             sidebar. Lemur asks Codex's app server every 10 minutes (30 while Lemur isn't in \
+             front) on the host where Codex ran last; Codex asks, with its own sign-in. Signed \
+             in with an API key there's no plan: it shows the tokens Codex used there, from \
+             Codex's session logs."
+        } else {
+            "Lemur hasn't seen Codex on your hosts yet. Start a Codex thread, then turn this on."
+        });
         let (status, error) = linear_panel::settings_status(cx);
         let (action, act) = linear_panel::settings_action(cx);
         let linear = SettingItem::new(
@@ -428,6 +453,9 @@ impl Render for SettingsView {
             SettingPage::new("Claude")
                 .icon(claude_icon())
                 .group(SettingGroup::new().item(usage)),
+            SettingPage::new("Codex")
+                .icon(codex_icon())
+                .group(SettingGroup::new().item(codex_usage)),
             SettingPage::new("herdr-core")
                 .icon(super::icons::server())
                 .group(self.core_group(cx)),
@@ -706,7 +734,7 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
                 more: Some("A new tab where the thread on show runs."),
             },
             Shortcut {
-                what: "New Claude thread or shell, or go to one",
+                what: "New Claude or Codex thread or shell, or go to one",
                 how: Press::Keys(&["cmd-j"]),
                 more: Some(
                     "Named, in the worktree of the thread on show; type to find another thread.",

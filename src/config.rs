@@ -52,10 +52,15 @@ pub struct Config {
     /// until turned on in Settings.
     #[serde(default)]
     pub claude_usage: bool,
-    /// The sidebar's foot, minimized to one line each: Claude's usage, and
-    /// the hosts' load by host name.
+    /// The same of Codex's.
+    #[serde(default)]
+    pub codex_usage: bool,
+    /// The sidebar's foot, minimized to one line each: Claude's usage, Codex's,
+    /// and the hosts' load by host name.
     #[serde(default)]
     pub minimized_usage: bool,
+    #[serde(default)]
+    pub minimized_codex_usage: bool,
     #[serde(default)]
     pub minimized_hosts: Vec<String>,
     #[serde(default)]
@@ -110,6 +115,23 @@ impl ThreadOrder {
         match self {
             ThreadOrder::Tabs => "tabs",
             ThreadOrder::Recent => "recent",
+        }
+    }
+}
+
+/// A coding agent Lemur starts threads for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    /// What it's called.
+    pub fn name(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude Code",
+            Agent::Codex => "Codex",
         }
     }
 }
@@ -230,6 +252,9 @@ pub struct Host {
     /// Command that starts Claude Code in a new session.
     #[serde(default = "default_claude")]
     pub claude: String,
+    /// Command that starts Codex in a new session.
+    #[serde(default = "default_codex")]
+    pub codex: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -302,6 +327,10 @@ fn default_claude() -> String {
     "claude".into()
 }
 
+fn default_codex() -> String {
+    "codex".into()
+}
+
 fn default_worktree_dir() -> String {
     CLAUDE_WORKTREES.into()
 }
@@ -316,6 +345,15 @@ impl Host {
             hc_session: None,
             tmux_socket: None,
             claude: default_claude(),
+            codex: default_codex(),
+        }
+    }
+
+    /// The command that starts `agent` here.
+    pub fn command(&self, agent: Agent) -> &str {
+        match agent {
+            Agent::Claude => &self.claude,
+            Agent::Codex => &self.codex,
         }
     }
 }
@@ -406,6 +444,7 @@ impl Config {
         thread_order: ThreadOrder,
         terminal: &Terminal,
         claude_usage: bool,
+        codex_usage: bool,
     ) -> Result<()> {
         edit(path, |doc| {
             doc["theme"] = toml_edit::value(theme.as_str());
@@ -423,6 +462,11 @@ impl Config {
                 doc["claude_usage"] = toml_edit::value(true);
             } else {
                 doc.remove("claude_usage");
+            }
+            if codex_usage {
+                doc["codex_usage"] = toml_edit::value(true);
+            } else {
+                doc.remove("codex_usage");
             }
             let table = doc
                 .entry("terminal")
@@ -552,14 +596,24 @@ impl Config {
         })
     }
 
-    /// Keeps which of the sidebar's foot is minimized: Claude's usage, and
-    /// the hosts' load.
-    pub fn save_minimized(path: &Path, usage: bool, hosts: &[String]) -> Result<()> {
+    /// Keeps which of the sidebar's foot is minimized: Claude's usage, Codex's,
+    /// and the hosts' load.
+    pub fn save_minimized(
+        path: &Path,
+        usage: bool,
+        codex_usage: bool,
+        hosts: &[String],
+    ) -> Result<()> {
         edit(path, |doc| {
-            if usage {
-                doc["minimized_usage"] = toml_edit::value(true);
-            } else {
-                doc.remove("minimized_usage");
+            for (key, on) in [
+                ("minimized_usage", usage),
+                ("minimized_codex_usage", codex_usage),
+            ] {
+                if on {
+                    doc[key] = toml_edit::value(true);
+                } else {
+                    doc.remove(key);
+                }
             }
             if hosts.is_empty() {
                 doc.remove("minimized_hosts");
@@ -854,6 +908,7 @@ path = \"~/projects/api\"
             ThreadOrder::Recent,
             &terminal,
             true,
+            true,
         )
         .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
@@ -868,6 +923,7 @@ path = \"~/projects/api\"
         assert_eq!(cfg.dictation_language, Language::Norwegian);
         assert_eq!(cfg.thread_order, ThreadOrder::Recent);
         assert!(cfg.claude_usage);
+        assert!(cfg.codex_usage);
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
 
@@ -884,6 +940,7 @@ path = \"~/projects/api\"
             Language::English,
             ThreadOrder::default(),
             &terminal,
+            false,
             false,
         )
         .unwrap();
@@ -912,13 +969,14 @@ path = \"~/projects/api\"
             "# mine\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n",
         )
         .unwrap();
-        Config::save_minimized(&path, true, &["agent".into()]).unwrap();
+        Config::save_minimized(&path, true, true, &["agent".into()]).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert!(cfg.minimized_usage);
+        assert!(cfg.minimized_codex_usage);
         assert_eq!(cfg.minimized_hosts, ["agent"]);
         assert!(saved.contains("# mine"), "{saved}");
-        Config::save_minimized(&path, false, &[]).unwrap();
+        Config::save_minimized(&path, false, false, &[]).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("minimized"), "{saved}");
         let _ = std::fs::remove_file(path);

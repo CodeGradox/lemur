@@ -1,11 +1,13 @@
 //! Threads that start at once, without a name asked for: a terminal (⌘T)
-//! or Claude, where the thread on show runs or in a worktree, and the menu
+//! or an agent, where the thread on show runs or in a worktree, and the menu
 //! offering them, with their keys, as Herdr's does.
 
-use super::sidebar::claude_icon;
+use super::prompt::default_label;
+use super::sidebar::{claude_icon, codex_icon};
 use super::snackbar::Kind;
 use super::{Ask, Lemur, NewTerminal, NewThreadHere, rows};
 use crate::actions;
+use crate::config::Agent;
 use gpui_kit::component::IconName;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
@@ -28,25 +30,25 @@ impl Lemur {
                 None => return,
             },
         };
-        self.start_now(key.0, dir, true, cx);
+        self.start_now(key.0, dir, None, cx);
     }
 
-    /// Starts a shell, or with `shell` false Claude, in `dir` on `host`,
-    /// labelled `shell` or `claude`, and shows it.
+    /// Starts `agent`, or with none a shell, in `dir` on `host`, labelled
+    /// after what it runs, and shows it.
     pub(super) fn start_now(
         &mut self,
         host: String,
         dir: String,
-        shell: bool,
+        agent: Option<Agent>,
         cx: &mut Context<Self>,
     ) {
-        let label = if shell { "shell" } else { "claude" };
+        let label = default_label(agent);
         self.status = Some((format!("starting {label}…"), Kind::Progress));
         cx.notify();
         let cfg = self.cfg.clone();
         self.in_background(
             cx,
-            move || actions::start_in(&cfg, &host, &dir, label, shell),
+            move || actions::start_in(&cfg, &host, &dir, label, agent),
             |this, started, window, cx| {
                 match started {
                     Ok(started) => {
@@ -64,9 +66,9 @@ impl Lemur {
         .detach();
     }
 
-    /// What can start in `dir` on `host`: a terminal or Claude at once, and
-    /// in a project's worktree (`base`) Claude or a shell named in the
-    /// spotlight. Each shows the key that does it for the thread on show.
+    /// What can start in `dir` on `host`: a terminal or an agent at once, and
+    /// in a project's worktree (`base`) one named in the spotlight. Each shows
+    /// the key that does it for the thread on show.
     pub(super) fn new_menu(
         &self,
         host: &str,
@@ -78,11 +80,11 @@ impl Lemur {
         let (host, dir) = (host.to_string(), dir.to_string());
         Rc::new(
             move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-                let start = |shell: bool| {
+                let start = |agent: Option<Agent>| {
                     let (this, host, dir) = (this.clone(), host.clone(), dir.clone());
                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                         this.update(cx, |this, cx| {
-                            this.start_now(host.clone(), dir.clone(), shell, cx)
+                            this.start_now(host.clone(), dir.clone(), agent, cx)
                         })
                         .ok();
                     }
@@ -92,26 +94,31 @@ impl Lemur {
                         PopupMenuItem::new("New terminal")
                             .icon(IconName::SquareTerminal)
                             .action(Box::new(NewTerminal))
-                            .on_click(start(true)),
+                            .on_click(start(None)),
                     )
                     .item(
                         PopupMenuItem::new("New Claude")
                             .icon(claude_icon())
-                            .on_click(start(false)),
+                            .on_click(start(Some(Agent::Claude))),
+                    )
+                    .item(
+                        PopupMenuItem::new("New Codex")
+                            .icon(codex_icon())
+                            .on_click(start(Some(Agent::Codex))),
                     );
                 let Some(base) = base else {
                     return menu;
                 };
                 let (this, worktree) = (this.clone(), dir.clone());
                 menu.item(
-                    PopupMenuItem::new("Claude or shell, named…")
+                    PopupMenuItem::new("Claude, Codex or shell, named…")
                         .icon(IconName::Plus)
                         .action(Box::new(NewThreadHere))
                         .on_click(move |_, window, cx| {
                             let ask = Ask::NewThread {
                                 base,
                                 worktree: worktree.clone(),
-                                shell: false,
+                                agent: Some(Agent::Claude),
                             };
                             this.update(cx, |this, cx| this.ask_name(ask, window, cx))
                                 .ok();

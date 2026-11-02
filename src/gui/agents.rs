@@ -33,12 +33,12 @@ impl Render for AgentsView {
 }
 
 impl Lemur {
-    /// The Claude threads, and threads running helpers, in the order the
+    /// The agents' threads, and threads running helpers, in the order the
     /// panel lists them: needing you, done while you looked away, working,
     /// then the rest; the latest first in each.
     pub(super) fn agents(&self) -> Vec<(&str, &Session)> {
         let mut agents: Vec<(&str, &Session)> = sessions(&self.snap)
-            .filter(|(_, s)| s.runs_claude() || !s.helpers.is_empty())
+            .filter(|(_, s)| s.agent().is_some() || !s.helpers.is_empty())
             .collect();
         agents.sort_by_key(|(h, s)| {
             let rank = match s.activity {

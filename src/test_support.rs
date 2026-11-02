@@ -41,12 +41,18 @@ impl HcServer {
             ("XDG_CONFIG_HOME".into(), at("config")),
             ("HC_SESSION".into(), self.session.clone()),
             ("CLAUDE_CONFIG_DIR".into(), at("claude")),
+            ("CODEX_HOME".into(), at("codex")),
         ]
     }
 
     /// Where Claude Code's logs are, as scripts this core runs find them.
     pub fn claude_config(&self) -> PathBuf {
         self.dir.join("claude")
+    }
+
+    /// Where Codex's logs are, as scripts this core runs find them.
+    pub fn codex_home(&self) -> PathBuf {
+        self.dir.join("codex")
     }
 
     /// lemur's connection to this core.

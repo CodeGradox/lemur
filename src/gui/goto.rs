@@ -2,6 +2,7 @@
 //! new thread's name, the worktree's first, and ⌘P lists them all. What's
 //! typed narrows them down; ↑↓ picks one and ⏎ opens it.
 
+use super::prompt::KINDS;
 use super::sidebar::thread_icon;
 use super::{Ask, Key, Lemur, Prompt, sessions};
 use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
@@ -28,7 +29,7 @@ impl Lemur {
         let typed = prompt.input.read(cx).value().to_lowercase();
         let query = match &prompt.what {
             // The name it starts with isn't something you searched for.
-            Ask::NewThread { shell, .. } if typed == super::prompt::default_label(*shell) => "",
+            Ask::NewThread { agent, .. } if typed == super::prompt::default_label(*agent) => "",
             _ => typed.trim(),
         };
         let words: Vec<&str> = query.split_whitespace().collect();
@@ -68,14 +69,14 @@ impl Lemur {
         found.into_iter().map(|(_, m)| m).take(SHOWN).collect()
     }
 
-    /// Moves the pick one down (or with `back` up): for a new thread,
-    /// through Claude and Shell, then the threads to go to.
+    /// Moves the pick one down (or with `back` up): for a new thread, through
+    /// what it can run, then the threads to go to.
     pub(super) fn step(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(prompt) = &self.prompt else { return };
-        let count = self.matches(prompt, cx).len();
-        let kinds = match prompt.what {
-            Ask::NewThread { .. } => 2,
-            _ => 0,
+        let (kinds, count) = match prompt.what {
+            Ask::NewWorktree { .. } => (KINDS.len(), 0),
+            Ask::NewThread { .. } => (KINDS.len(), self.matches(prompt, cx).len()),
+            _ => (0, self.matches(prompt, cx).len()),
         };
         let total = kinds + count;
         if total == 0 {
@@ -83,7 +84,9 @@ impl Lemur {
         }
         let now = match (&prompt.what, prompt.go) {
             (_, Some(i)) => kinds + i,
-            (Ask::NewThread { shell, .. }, None) => usize::from(*shell),
+            (Ask::NewThread { agent, .. } | Ask::NewWorktree { agent, .. }, None) => {
+                KINDS.iter().position(|k| k == agent).unwrap_or(0)
+            }
             _ => 0,
         };
         let next = if back {
@@ -95,7 +98,7 @@ impl Lemur {
             if let Some(prompt) = &mut self.prompt {
                 prompt.go = None;
             }
-            self.pick_kind(next == 1, window, cx);
+            self.pick_kind(KINDS[next], window, cx);
         } else if let Some(prompt) = &mut self.prompt {
             prompt.go = Some(next - kinds);
         }

@@ -3,7 +3,7 @@
 
 use super::chrome::{WINDOW_BUTTONS, title_bar};
 use super::{Ask, Key, Lemur, List, ToggleNotes, key, rows, worktree_label};
-use crate::config::{Base, COLORS, ClaudeThread};
+use crate::config::{Agent, Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
@@ -17,6 +17,7 @@ use std::time::Duration;
 /// The sidebar icon for Claude sessions, drawn in Claude's orange.
 const CLAUDE_ICON: &[u8] = include_bytes!("claude.svg");
 const CLAUDE_ORANGE: u32 = 0xd97757;
+const CODEX_BLUE: u32 = 0x4f8fe8;
 
 /// The sidebar's width until its edge is dragged.
 pub(super) const SIDEBAR_WIDTH: Pixels = px(255.0);
@@ -94,6 +95,7 @@ impl Lemur {
                         .icon(IconName::Plus)
                         .on_click(ask_on_click(&this, move || Ask::NewWorktree {
                             base: index,
+                            agent: Some(Agent::Claude),
                         })),
                 )));
             }
@@ -227,10 +229,11 @@ impl Lemur {
         let sidebar = Sidebar::new("sessions")
             .collapsible(SidebarCollapsible::None)
             .w(self.sidebar_width);
-        // At its foot, how much of Claude's plan is used, then each host's load.
+        // At its foot, how much of each agent's plan is used, then each host's load.
         let foot: Vec<AnyElement> = self
-            .usage_meter(cx)
+            .usage_meter(Agent::Claude, cx)
             .into_iter()
+            .chain(self.usage_meter(Agent::Codex, cx))
             .chain(self.machines(cx).map(IntoElement::into_any_element))
             .collect();
         let sidebar = if foot.is_empty() {
@@ -369,8 +372,8 @@ impl Lemur {
             color,
             main: w.main,
             counts: rows::Counts {
-                agents: w.sessions.iter().filter(|s| s.runs_claude()).count(),
-                shells: w.sessions.iter().filter(|s| !s.runs_claude()).count(),
+                agents: w.sessions.iter().filter(|s| s.agent().is_some()).count(),
+                shells: w.sessions.iter().filter(|s| s.agent().is_none()).count(),
                 needs_input: w
                     .sessions
                     .iter()
@@ -735,12 +738,12 @@ fn title_case(name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A thread's icon: Claude's spark, or a terminal.
+/// A thread's icon: its agent's, or a terminal.
 pub(super) fn thread_icon(s: &Session) -> Icon {
-    if s.runs_claude() {
-        claude_icon()
-    } else {
-        Icon::new(IconName::SquareTerminal)
+    match s.agent() {
+        Some(Agent::Claude) => claude_icon(),
+        Some(Agent::Codex) => codex_icon(),
+        None => Icon::new(IconName::SquareTerminal),
     }
 }
 
@@ -749,6 +752,11 @@ pub(super) fn claude_icon() -> Icon {
     Icon::empty()
         .data(CLAUDE_ICON)
         .text_color(rgb(CLAUDE_ORANGE))
+}
+
+/// What marks a thread as Codex's.
+pub(super) fn codex_icon() -> Icon {
+    super::icons::code_xml().text_color(rgb(CODEX_BLUE))
 }
 
 /// A click handler that opens the name field for `ask()`.

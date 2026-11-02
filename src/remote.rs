@@ -47,16 +47,21 @@ impl<'a> Remote<'a> {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// `run`, for a script that's to take at most `time`.
+    pub fn run_within(&self, script: &str, time: Duration) -> Result<String> {
+        let out = self.exec_within(script, time)?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     fn exec(&self, script: &str) -> Result<Output> {
+        self.exec_within(script, SCRIPT_TIME)
+    }
+
+    fn exec_within(&self, script: &str, time: Duration) -> Result<Output> {
         let (core, on) = hc::for_host(self.host)?;
         let script = format!("PATH=\"$HOME/.local/bin:$PATH\"\n{script}");
         let out = core
-            .exec(
-                on.as_deref(),
-                &["sh", "-s"],
-                Some(script.as_bytes()),
-                SCRIPT_TIME,
-            )
+            .exec(on.as_deref(), &["sh", "-s"], Some(script.as_bytes()), time)
             .with_context(|| format!("running a script on {}", self.host.name))?;
         check(&out, &self.host.name)?;
         Ok(out)
