@@ -266,6 +266,8 @@ struct Lemur {
     /// Terminals setting up a host (`hc machine add`), shown in the peek
     /// card until it's put away, and the host each sets up.
     setups: HashMap<Key, Host>,
+    /// Hosts a set-up is starting for: a second click starts no other.
+    setting_up: HashSet<String>,
     /// The tabs' and the peek card's dots, by where and whose.
     dots: std::cell::RefCell<HashMap<(&'static str, Key), Entity<sidebar::DotView>>>,
     /// The tab bar's scroll, and whether it keeps the tab on show in view:
@@ -335,6 +337,7 @@ struct Lemur {
     _sidebar_follows: Subscription,
     _back: Subscription,
     _lost: Subscription,
+    _quitting: Subscription,
 }
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -659,6 +662,7 @@ impl Lemur {
         // thread's terminal does, which a closing dialog hands it back to:
         // it goes to the thread on show.
         let lost = cx.on_focus_lost(window, |this, window, cx| this.focus_terminal(window, cx));
+        let quitting = cx.on_app_quit(|this, cx| this.end_setups(cx));
         let sidebar_width = cfg.sidebar_width.map_or(SIDEBAR_WIDTH, px).max(MIN_SIDEBAR);
         let notes_width = cfg.notes_width.map_or(NOTES_WIDTH, px).max(MIN_NOTES);
         Lemur {
@@ -684,6 +688,7 @@ impl Lemur {
             tab_follows: true,
             diff_preview: None,
             setups: HashMap::new(),
+            setting_up: HashSet::new(),
             ordering: HashMap::new(),
             status: None,
             restore,
@@ -718,6 +723,7 @@ impl Lemur {
             _sidebar_follows: sidebar_follows,
             _back: back,
             _lost: lost,
+            _quitting: quitting,
         }
     }
 
@@ -734,6 +740,9 @@ impl Lemur {
                     .chain(helpers.map(move |x| (h.to_string(), x.id.clone())))
             })
             .collect();
+        // A host's set-up is in no snapshot, but kept as any terminal.
+        let setups = self.setups.keys();
+        let running: HashSet<&Key> = running.iter().chain(setups).collect();
         for (k, view) in &self.terminals {
             if running.contains(k) && view.read(cx).disconnected() {
                 view.update(cx, |v, cx| v.reconnect(cx));
@@ -5418,6 +5427,98 @@ mod tests {
         });
         assert!(ended, "its terminal ended");
         assert!(app.read_with(cx, |app, _| app.setups.is_empty()));
+    }
+
+    /// A double click on Set up starts one terminal, whose stream comes back
+    /// on its own once its program is lost, and which ends as Lemur quits:
+    /// kept, it would stay with nothing to show it.
+    #[gpui::test]
+    fn a_hosts_set_up_starts_once_comes_back_and_ends_with_lemur(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("set-up-once");
+        let cfg = server.far_config("once-box");
+        let host = cfg.hosts[0].clone();
+        let dir = TempDir::new("set-up-once");
+        let started = dir.join("started");
+        let stand_in = |also: &str| {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("echo {also} >> '{}'; exec sleep 600", started.display()),
+            ]
+        };
+        let mut set_up = crate::actions::SET_UP.lock().unwrap();
+        set_up.push(("once-box".into(), stand_in("once")));
+        set_up.push(("twice-box".into(), stand_in("twice")));
+        drop(set_up);
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        app.update(cx, |app, cx| {
+            app.set_up_host(host.clone(), cx);
+            app.set_up_host(host.clone(), cx);
+        });
+        let shown = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.peek.is_some() && app.setting_up.is_empty())
+        });
+        assert!(shown, "its terminal shows");
+        let lines = || std::fs::read_to_string(&started).unwrap_or_default();
+        assert!(wait_until(Duration::from_secs(5), || !lines().is_empty()));
+        assert_eq!(lines(), "once\n", "only one started");
+        app.read_with(cx, |app, _| assert_eq!(app.setups.len(), 1));
+
+        let key = app.read_with(cx, |app, _| app.peek.clone().unwrap());
+        let view = app.read_with(cx, |app, _| app.terminals[&key].clone());
+        let attached = |cx: &mut VisualTestContext| view.read_with(cx, |v, _| v.is_attached());
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            attached(cx)
+        }));
+        let pid = server
+            .core()
+            .terminals()
+            .into_iter()
+            .find(|t| t.address == key.1)
+            .and_then(|t| t.pid)
+            .expect("its program's pid");
+        std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| v.disconnected())
+        }));
+        let back = wait_until(Duration::from_secs(20), || {
+            app.update(cx, |app, cx| app.refresh(cx).detach());
+            cx.run_until_parked();
+            attached(cx)
+        });
+        assert!(back, "attached again on its own");
+
+        // Another host's takes the card, and the first ends.
+        let other = crate::config::Host::new("twice-box", "me@twice");
+        crate::hc::set_test_route("twice-box", &server.session);
+        app.update(cx, |app, cx| app.set_up_host(other, cx));
+        let moved = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                app.peek.as_ref().is_some_and(|k| *k != key) && app.setups.len() == 1
+            })
+        });
+        assert!(moved, "the second shows");
+        let gone = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !server.addresses().contains(&key.1)
+        });
+        assert!(gone, "the first ended");
+
+        let key = app.read_with(cx, |app, _| app.peek.clone().unwrap());
+        app.update(cx, |app, cx| app.end_setups(cx)).detach();
+        let gone = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            !server.addresses().contains(&key.1)
+        });
+        assert!(gone, "it ended with Lemur");
     }
 
     /// A list whose every thread is put away still shows them, under "Put

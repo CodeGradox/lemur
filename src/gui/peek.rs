@@ -146,23 +146,49 @@ impl Lemur {
     /// Herdr does, where you answer what herdr-core asks to add it: to
     /// install herdr-core there or update it, a password, a new host key.
     pub(super) fn set_up_host(&mut self, host: Host, cx: &mut Context<Self>) {
+        // A double click, or one while it starts.
+        if !self.setting_up.insert(host.name.clone()) {
+            return;
+        }
         let asked = host.clone();
         self.in_background(
             cx,
             move || actions::set_up_host(&asked),
-            move |this, started, window, cx| match started {
-                Ok((address, here)) => {
-                    let key = (here.name.clone(), address);
-                    this.setups.insert(key.clone(), host);
-                    let view = this.terminal_for(&key, here, cx);
-                    view.read(cx).focus_handle(cx).focus(window, cx);
-                    this.peek = Some(key);
-                    cx.notify();
+            move |this, started, window, cx| {
+                this.setting_up.remove(&host.name);
+                match started {
+                    Ok((address, here)) => {
+                        // It takes the card; another set-up on it ends.
+                        if this.peek.is_some() {
+                            this.close_peek(window, cx);
+                        }
+                        let key = (here.name.clone(), address);
+                        this.setups.insert(key.clone(), host);
+                        let view = this.terminal_for(&key, here, cx);
+                        if !this.overlaid() {
+                            view.read(cx).focus_handle(cx).focus(window, cx);
+                        }
+                        this.peek = Some(key);
+                        cx.notify();
+                    }
+                    Err(e) => this.fail(e.context(format!("setting up {}", host.name)), cx),
                 }
-                Err(e) => this.fail(e.context(format!("setting up {}", host.name)), cx),
             },
         )
         .detach();
+    }
+
+    /// Lemur is quitting: nothing would show a set-up still asking, and being
+    /// kept it would stay, so it ends.
+    pub(super) fn end_setups(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let setups: Vec<(Key, Host)> = self.setups.drain().collect();
+        cx.background_spawn(async move {
+            for ((_, address), host) in setups {
+                if let Ok(core) = hc::core(hc::machines_session(&host).as_deref()) {
+                    let _ = core.kill(&address);
+                }
+            }
+        })
     }
 
     /// Done with setting up a host, if `key` is the terminal that did:
