@@ -435,10 +435,14 @@ impl Linear {
                 .as_str()
                 .or(answer["error"].as_str())
                 .unwrap_or("no reason given");
-            // Linear turned it down, as a used or revoked refresh token, or
-            // a code already traded. Anything else, as being asked too
-            // often, leaves the sign-in as it is.
-            if answer["error"] == "invalid_grant" {
+            // Linear turned it down, as a used or revoked refresh token, a
+            // code already traded, or Lemur's own OAuth app no longer taken.
+            // Anything else, as being asked too often, leaves the sign-in as
+            // it is.
+            if matches!(
+                answer["error"].as_str(),
+                Some("invalid_grant" | "invalid_client")
+            ) {
                 return Err(anyhow!(Refused).context(format!("Linear refused: {why}")));
             }
             bail!("Linear answered {status}: {why}");
@@ -1254,6 +1258,28 @@ mod tests {
         assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
         assert!(linear.signed_in().unwrap());
         assert!(file.exists(), "what the other kept stays");
+    }
+
+    /// Linear no longer taking Lemur's own OAuth app signs it out: every
+    /// call would fail, with no way to sign in. Being asked too often doesn't.
+    #[test]
+    fn only_what_linear_turns_down_signs_out() {
+        for (error, signed_in) in [
+            ("invalid_client", false),
+            ("invalid_grant", false),
+            ("rate_limited", true),
+        ] {
+            let api = FakeLinear::new(move |r| match r.path.as_str() {
+                "/oauth/token" => (401, json!({ "error": error }).to_string()),
+                _ => (401, json!({ "errors": [{ "message": "no" }] }).to_string()),
+            });
+            let dir = TempDir::new("linear-client");
+            let store = Store::File(dir.join("tokens"));
+            store.save(&tokens("a1", "r1", now() + 10)).unwrap();
+            let linear = Linear::at(&api.url, store);
+            assert!(linear.issue("LAFT-1").is_err(), "{error}");
+            assert_eq!(linear.signed_in().unwrap(), signed_in, "{error}");
+        }
     }
 
     /// Search asks Linear's search, or for the issue when the term is its
