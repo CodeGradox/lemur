@@ -385,9 +385,7 @@ impl Linear {
         }
         // Another Lemur (the app, and one built here) may have refreshed it
         // since: its refresh token is the one Linear still takes.
-        if let Some(stored) = self.store.load()?
-            && stored != tokens
-        {
+        if let Some(stored) = self.stored_since(&tokens) {
             *kept = Some(Some(stored.clone()));
             if !due(&stored) {
                 return Ok(stored.access);
@@ -410,6 +408,14 @@ impl Linear {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// What the store holds, if it's newer than `tokens`. Older, it's what a
+    /// save that failed left there, whose refresh token is retired. Not
+    /// being let read it, what's here can still be refreshed.
+    fn stored_since(&self, tokens: &Tokens) -> Option<Tokens> {
+        let stored = self.store.load().ok().flatten()?;
+        (stored.expires > tokens.expires).then_some(stored)
     }
 
     /// Trades `form` at the token endpoint for tokens.
@@ -1141,6 +1147,79 @@ mod tests {
             .filter(|r| r.path == "/oauth/token")
             .count();
         assert_eq!(refreshed, 1, "r1 isn't used again");
+    }
+
+    fn tokens(access: &str, refresh: &str, expires: u64) -> Tokens {
+        Tokens {
+            access: access.into(),
+            refresh: refresh.into(),
+            expires,
+        }
+    }
+
+    /// Tokens only kept here, as their save failed, stand against what the
+    /// store still holds: its refresh token is retired, and Linear refusing
+    /// it would sign Lemur out.
+    #[test]
+    fn tokens_kept_here_are_newer_than_a_failed_saves() {
+        use std::os::unix::fs::PermissionsExt;
+        let api = FakeLinear::new(|r| match r.path.as_str() {
+            "/oauth/token" if r.body.contains("refresh_token=r2") => (
+                200,
+                json!({ "access_token": "a3", "refresh_token": "r3", "expires_in": 86399 })
+                    .to_string(),
+            ),
+            "/oauth/token" => (400, json!({ "error": "invalid_grant" }).to_string()),
+            _ if r.authorization.as_deref() == Some("Bearer a3") => (
+                200,
+                json!({ "data": { "issue": issue_json("LAFT-1", "One") } }).to_string(),
+            ),
+            _ => (401, json!({ "errors": [{ "message": "no" }] }).to_string()),
+        });
+        let dir = TempDir::new("linear-older");
+        let file = dir.join("tokens");
+        let store = Store::File(file.clone());
+        store.save(&tokens("a1", "r1", now() - 100)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let linear = Linear::at(&api.url, store);
+        let due = tokens("a2", "r2", now() + 10);
+        assert!(
+            linear.keep(&mut linear.kept(), due).is_err(),
+            "the save fails"
+        );
+        // Refreshed with r2, though its own save fails again.
+        assert!(linear.issue("LAFT-1").is_err());
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        assert!(linear.signed_in().unwrap());
+    }
+
+    /// The store not letting itself be read leaves what's here to refresh.
+    #[test]
+    fn a_store_that_cant_be_read_doesnt_stop_a_refresh() {
+        let api = FakeLinear::new(|r| match r.path.as_str() {
+            "/oauth/token" => (
+                200,
+                json!({ "access_token": "a2", "refresh_token": "r2", "expires_in": 86399 })
+                    .to_string(),
+            ),
+            _ => (
+                200,
+                json!({ "data": { "issue": issue_json("LAFT-1", "One") } }).to_string(),
+            ),
+        });
+        let dir = TempDir::new("linear-unread");
+        // A folder: neither read nor written.
+        let linear = Linear::at(&api.url, Store::File(dir.to_path_buf()));
+        let due = tokens("a1", "r1", now() + 10);
+        assert!(linear.keep(&mut linear.kept(), due).is_err());
+        assert!(linear.issue("LAFT-1").is_err(), "the save failed");
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        let refreshed = api
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/oauth/token")
+            .count();
+        assert_eq!(refreshed, 1);
     }
 
     /// Search asks Linear's search, or for the issue when the term is its
