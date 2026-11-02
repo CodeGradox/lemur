@@ -154,15 +154,26 @@ impl Store {
             .unwrap_or_default()
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// Saves it, whole or not at all: it holds what was taken off the list.
+    /// Another Lemur (the app, and one built here) may have saved since: what
+    /// that took off the list stays off, and folders only it knows stay.
+    pub fn save(&mut self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // Whole or not at all: it holds what was taken off the list.
-        let partial = path.with_extension("json.partial");
-        std::fs::write(&partial, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&partial, path)?;
-        Ok(())
+        for (key, theirs) in Store::load(path).0 {
+            match self.0.get_mut(&key) {
+                Some(mine) => {
+                    for url in &theirs.removed {
+                        mine.remove(url);
+                    }
+                }
+                None => {
+                    self.0.insert(key, theirs);
+                }
+            }
+        }
+        crate::config::write_whole(path, &serde_json::to_string_pretty(self)?)
     }
 
     pub fn place(&self, host: &str, path: &str) -> Option<&Place> {
@@ -344,6 +355,42 @@ mod tests {
         assert_eq!(
             logs_folder("/Users/me/laft-web/.worktrees/a_b/web"),
             "-Users-me-laft-web--worktrees-a-b-web"
+        );
+    }
+
+    /// Two Lemurs keep one file: what either took off the list stays off,
+    /// whichever saves last.
+    #[test]
+    fn what_another_lemur_removed_stays_removed() {
+        let dir = TempDir::new("links-two");
+        let file = dir.join("links.json");
+        let mut first = Store::default();
+        let place = first.place_mut("agent", "/srv/api");
+        place.add(vec![link(ONE, "1"), link(TWO, "2")]);
+        first.save(&file).unwrap();
+        let mut second = Store::load(&file);
+
+        first
+            .place_mut("agent", "/srv/api")
+            .remove(&link(ONE, "").url);
+        first
+            .place_mut("agent", "/srv/web")
+            .add(vec![link(TWO, "3")]);
+        first.save(&file).unwrap();
+        second.save(&file).unwrap();
+
+        let kept = Store::load(&file);
+        let api = kept.place("agent", "/srv/api").unwrap();
+        assert_eq!(api.links, [link(TWO, "2")]);
+        assert!(api.removed.contains(&link(ONE, "").url));
+        assert!(
+            kept.place("agent", "/srv/web").is_some(),
+            "its folder stays"
+        );
+        assert_eq!(
+            second.place("agent", "/srv/api").unwrap().links,
+            [link(TWO, "2")],
+            "the one that saved last shows it too"
         );
     }
 
