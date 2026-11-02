@@ -544,6 +544,15 @@ impl Core {
                                 Some(e) => Err(e.clone()),
                                 None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                             });
+                        } else if let Some(channel) =
+                            msg.pointer("/result/channel").and_then(Value::as_u64)
+                        {
+                            // Who asked gave up waiting, as for an attach to
+                            // a slow host: nothing will read this stream.
+                            let channel = channel as u32;
+                            r.early.remove(&channel);
+                            r.detached.insert(channel);
+                            let _ = writer.send(encode(channel, CLOSE, &[]));
                         }
                         continue;
                     }
@@ -1264,6 +1273,29 @@ mod tests {
                 "{name}: pid {pid}"
             );
         }
+    }
+
+    /// An attach answered once who asked has given up leaves no stream
+    /// behind: what its program prints isn't kept for nobody.
+    #[test]
+    fn an_attach_given_up_on_is_let_go_of() {
+        let server = HcServer::new("late-attach");
+        let t = server.run(
+            "/",
+            &[],
+            &["sh", "-c", "while :; do echo x; sleep 0.05; done"],
+        );
+        let core = server.core();
+        let params = json!({"terminal": t, "cols": 80, "rows": 24, "history": 0, "display": {}});
+        assert!(
+            core.call_timeout("terminal.attach", params, Duration::ZERO)
+                .is_err()
+        );
+        core.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        core.flush().unwrap();
+        let routes = core.routes.lock().unwrap();
+        assert!(routes.early.is_empty(), "{:?}", routes.early.keys());
     }
 
     /// A machine removed while Lemur runs is looked for again, not asked
