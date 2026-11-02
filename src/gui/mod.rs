@@ -261,7 +261,7 @@ struct Lemur {
     agent_walk: Vec<Key>,
     /// Lists whose dragged order is being written to herdr-core, a label at
     /// a time, and the order dragged meanwhile, written next. Snapshots
-    /// meanwhile would show it half written: they're dropped.
+    /// meanwhile would show it half written: their host stays as it shows.
     ordering: HashMap<List, Option<Vec<String>>>,
     /// Terminals setting up a host (`hc machine add`), shown in the peek
     /// card until it's put away, and the host each sets up.
@@ -814,9 +814,10 @@ impl Lemur {
                 let snap = snapshot::compose(&cfg, &data);
                 (data, snap)
             },
-            move |this, (data, snap), window, cx| {
-                if this.changes == changes && this.ordering.is_empty() {
+            move |this, (data, mut snap), window, cx| {
+                if this.changes == changes {
                     this.data = data;
+                    this.keep_ordered(&mut snap);
                     this.set_snapshot(snap, window, cx)
                 }
             },
@@ -834,12 +835,31 @@ impl Lemur {
         self.in_background(
             cx,
             move || snapshot::compose(&cfg, &data),
-            move |this, snap, window, cx| {
-                if this.changes == changes && this.ordering.is_empty() {
+            move |this, mut snap, window, cx| {
+                if this.changes == changes {
+                    this.keep_ordered(&mut snap);
                     this.set_snapshot(snap, window, cx)
                 }
             },
         )
+    }
+
+    /// Whether an order dragged on host `name` is being written.
+    fn is_ordering(&self, name: &str) -> bool {
+        self.ordering.keys().any(|(host, _)| host == name)
+    }
+
+    /// Keeps hosts in `snap` as they show while an order dragged there is
+    /// written, a label at a time: they'd show it half written. The others
+    /// go on, whatever their line to this one is like.
+    fn keep_ordered(&self, snap: &mut Snapshot) {
+        for h in &mut snap.hosts {
+            if self.is_ordering(&h.name)
+                && let Some(kept) = self.snap.hosts.iter().find(|k| k.name == h.name)
+            {
+                *h = kept.clone();
+            }
+        }
     }
 
     fn set_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
@@ -6279,6 +6299,46 @@ mod tests {
             assert_eq!(app.active.as_ref(), Some(&shown), "it stays on show");
             assert!(app.terminals.contains_key(&shown), "its view stays");
         });
+    }
+
+    /// While an order dragged on one host is written, which on a poor line
+    /// takes a while, the others' threads go on changing; that host's stay
+    /// as they show, not half written.
+    #[gpui::test]
+    fn an_order_being_written_holds_up_only_its_host(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("order-one");
+        let mut cfg = server.far_config("order-box");
+        let mut here = Host::new("local", "local");
+        here.hc_session = Some(server.session.clone());
+        cfg.hosts.insert(0, here);
+        let (app, cx) = rooted(cfg, cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            app.ordering.insert(("order-box".into(), None), None);
+        });
+        let here = server.run("/", &["lemur.label=here"], &["sleep", "600"]);
+        let far = ["run", "--bg", "--on", "order-box"];
+        server.hc(&[&far[..], &["--", "sleep", "600"]].concat());
+        for refresh in [true, false] {
+            let listed = wait_until(Duration::from_secs(10), || {
+                app.update(cx, |app, cx| {
+                    if refresh {
+                        app.refresh(cx).detach()
+                    } else {
+                        app.recompose(cx).detach()
+                    }
+                });
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.session_of(&key(&here)).is_some())
+            });
+            assert!(listed, "this host's thread lists");
+            app.read_with(cx, |app, _| {
+                let far = app.snap.hosts.iter().find(|h| h.name == "order-box");
+                assert!(far.unwrap().other.is_empty(), "that host's waits");
+            });
+        }
     }
 
     /// A repository at `path`, with one commit.
