@@ -2224,6 +2224,7 @@ mod tests {
             .map(|(name, activity)| Session {
                 name: name.to_string(),
                 label: name.to_string(),
+                own_label: name.to_string(),
                 path: "/tmp".into(),
                 idle_secs: 0,
                 activity: *activity,
@@ -3371,6 +3372,8 @@ mod tests {
                     id: id.clone(),
                     path: "/srv/api".into(),
                 });
+                s.label = "What its program calls it".into();
+                s.own_label = "claude".into();
             }
             cx.update(|window, cx| app.update(cx, |app, cx| app.set_snapshot(snap, window, cx)));
         };
@@ -3386,6 +3389,10 @@ mod tests {
 
         running(&[("a", id(1)), ("b", "not-an-id".into())], cx);
         assert_eq!(kept(cx), [("a".into(), id(1))]);
+        // Kept as what it's labelled: its program's title isn't a name of yours.
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.cfg.threads[0].label.as_deref(), Some("claude"))
+        });
         running(&[("a", id(2))], cx);
         assert_eq!(kept(cx), [("a".into(), id(2))], "after /clear");
         running(&[("c", id(2))], cx);
@@ -5720,6 +5727,73 @@ mod tests {
             &mut |cx| app.read_with(cx, |app, _| app.popups.contains_key(&key(&quiet))),
             cx
         ));
+        let_attaches_end(&app, cx);
+    }
+
+    /// A thread shows what its program calls it until you name it, and a rename
+    /// starts from its own label, not that title, which isn't a name it could keep.
+    #[gpui::test]
+    fn a_thread_shows_its_programs_title_until_named(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("titles");
+        let script = r#"printf '\033]2;\342\234\263 Fix the login\033\\'; exec sleep 600"#;
+        let t = server.run(
+            "/",
+            &["lemur.kind=claude", "lemur.label=claude"],
+            &["sh", "-c", script],
+        );
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let until = |want: &str, cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                app.update(cx, |app, cx| app.refresh(cx).detach());
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.label_of("local", &t) == want)
+            })
+        };
+        assert!(
+            until("Fix the login", cx),
+            "{}",
+            app.read_with(cx, |app, _| app.label_of("local", &t))
+        );
+
+        let rename = Ask::Rename {
+            host: "local".into(),
+            session: t.clone(),
+        };
+        cx.update(|window, cx| app.update(cx, |app, cx| app.ask_name(rename, window, cx)));
+        cx.run_until_parked();
+        let asked = app.read_with(cx, |app, cx| {
+            app.prompt
+                .as_ref()
+                .unwrap()
+                .input
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        assert_eq!(asked, "claude");
+        cx.simulate_input("review");
+        cx.simulate_keystrokes("enter");
+        assert!(until("review", cx));
+        // Yours stays, herdr-core keeping it, over what the program calls it.
+        assert!(wait_until(Duration::from_secs(5), || {
+            let terminals = server.core().terminals();
+            let label = terminals
+                .iter()
+                .find(|x| x.address == t)
+                .unwrap()
+                .labels
+                .get(crate::snapshot::LABEL)
+                .cloned();
+            label.as_deref() == Some("review")
+        }));
+        app.update(cx, |app, cx| app.refresh(cx).detach());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.label_of("local", &t)),
+            "review"
+        );
         let_attaches_end(&app, cx);
     }
 

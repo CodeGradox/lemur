@@ -60,14 +60,18 @@ enum Done {
 impl Lemur {
     /// Opens the name field, selected so typing replaces it. It asks for a
     /// label, which several threads can share: it starts as what the thread
-    /// runs, a free random name for a worktree, or the current label.
+    /// runs, a free random name for a worktree, or the label it has, not what
+    /// its program calls it.
     pub(super) fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
         let name = match &what {
             Ask::NewWorktree { base, .. } => {
                 actions::random_name(|n| self.worktree_taken(*base, n))
             }
             Ask::NewThread { agent, .. } => default_label(*agent).to_string(),
-            Ask::Rename { host, session } => self.label_of(host, session),
+            Ask::Rename { host, session } => sessions(&self.snap)
+                .find(|(h, s)| h == host && s.name == *session)
+                .map(|(_, s)| s.own_label.clone())
+                .unwrap_or_else(|| self.label_of(host, session)),
             Ask::Find => String::new(),
         };
         let placeholder = match &what {
@@ -370,11 +374,13 @@ impl Lemur {
         self.in_background(
             cx,
             move || match what {
+                // The name is the worktree's: its thread shows what its program
+                // calls it.
                 Ask::NewWorktree { base, agent } => actions::new_worktree_thread(
                     &cfg,
                     base,
                     &name,
-                    &name,
+                    default_label(agent),
                     agent,
                     branch.as_deref(),
                     from.as_deref(),
@@ -452,6 +458,7 @@ impl Lemur {
             });
         for s in shown.filter(|s| s.name == session) {
             s.label = name.clone();
+            s.own_label = name.clone();
         }
         cx.notify();
     }

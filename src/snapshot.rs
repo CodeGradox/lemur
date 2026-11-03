@@ -88,8 +88,12 @@ pub struct Worktree {
 pub struct Session {
     /// Its terminal's address in herdr-core (`agent/t7`).
     pub name: String,
-    /// What the sidebar calls it.
+    /// What it's called everywhere it shows: the name you gave it, else what
+    /// its program calls it, else what it was started as.
     pub label: String,
+    /// The label kept on its terminal, whatever its program calls it: what it
+    /// goes back to, is resumed as, and a rename starts from.
+    pub own_label: String,
     /// The worktree it was started for, or its start directory.
     pub path: String,
     /// Since its program last said what it's doing, or since it started.
@@ -217,6 +221,9 @@ pub const HERDR_SPACE: &str = "herdr.space";
 pub const HERDR_TAB: &str = "herdr.tab";
 /// The labels lemur puts on the terminals it starts.
 pub const LABEL: &str = "lemur.label";
+/// The labels a thread starts with until you name it: not names of yours, so
+/// what its program calls it shows instead.
+pub const DEFAULT_LABELS: [&str; 3] = ["claude", "codex", "shell"];
 pub const KIND: &str = "lemur.kind";
 pub const WORKTREE: &str = "lemur.worktree";
 pub const ORDER: &str = "lemur.order";
@@ -681,7 +688,12 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         .map(|s| s.app.as_str());
     Session {
         name: t.address.clone(),
-        label: label(LABEL).cloned().unwrap_or_else(|| shown_name(t)),
+        label: match label(LABEL) {
+            Some(name) if !DEFAULT_LABELS.contains(&name.as_str()) => name.clone(),
+            Some(name) => followed_title(t).unwrap_or_else(|| name.clone()),
+            None => shown_name(t),
+        },
+        own_label: label(LABEL).cloned().unwrap_or_else(|| shown_name(t)),
         path: label(WORKTREE).cloned().unwrap_or_else(|| t.cwd.clone()),
         idle_secs: now_ms.saturating_sub(since) / 1000,
         activity,
@@ -802,13 +814,8 @@ fn busy(t: &Terminal) -> bool {
 /// What a terminal lemur didn't start is called: the title its program
 /// gives it when that says something, else the program.
 fn shown_name(t: &Terminal) -> String {
-    // A shell's title is often where it is (`~/src`) or who (`me@box`).
-    let title = t.title.trim();
-    let telling = !title.starts_with(['~', '/']) && !title.contains('@');
-    // Claude's starts with its spinner.
-    let title = title.trim_start_matches(|c: char| !c.is_alphanumeric());
-    if telling && !title.is_empty() {
-        return title.to_string();
+    if let Some(title) = telling_title(t) {
+        return title;
     }
     let program = t
         .foreground
@@ -817,6 +824,32 @@ fn shown_name(t: &Terminal) -> String {
         .or(t.argv.first().map(|a| crate::config::leaf(a)))
         .filter(|p| !p.is_empty());
     program.unwrap_or("terminal").to_string()
+}
+
+/// The title its program gives it, if it says something.
+fn telling_title(t: &Terminal) -> Option<String> {
+    // A shell's title is often where it is (`~/src`) or who (`me@box`).
+    let title = t.title.trim();
+    let telling = !title.starts_with(['~', '/']) && !title.contains('@');
+    // Claude's starts with its spinner.
+    let title = title.trim_start_matches(|c: char| !c.is_alphanumeric());
+    (telling && !title.is_empty()).then(|| title.to_string())
+}
+
+/// What a thread you haven't named shows in place of what it started as: its
+/// program's title, while it runs, if that says more than the program's name or
+/// the folder it's in. Codex's is the folder until told otherwise.
+fn followed_title(t: &Terminal) -> Option<String> {
+    let title = telling_title(t).filter(|_| busy(t))?;
+    let foreground = t.foreground.as_ref();
+    let dull = ["claude code", "claude", "codex"]
+        .into_iter()
+        .chain(foreground.map(|f| f.name.as_str()))
+        .chain(foreground.map(|f| crate::config::leaf(&f.cwd)))
+        .chain([crate::config::leaf(&t.cwd)])
+        .chain(t.labels.get(WORKTREE).map(|w| crate::config::leaf(w)));
+    let said = title.to_lowercase();
+    (!dull.into_iter().any(|d| d.to_lowercase() == said)).then_some(title)
 }
 
 /// Threads in the order they were dragged into; ones never placed follow,
@@ -1383,6 +1416,58 @@ mod tests {
         assert_eq!(named("~/src/app", "fish"), "fish");
         assert_eq!(named("me@box: ~", "bash"), "bash");
         assert_eq!(named("", ""), "terminal");
+    }
+
+    /// A thread you haven't named shows what its program calls it, while it
+    /// runs, unless that only says what it is or where; a name of yours stays.
+    #[test]
+    fn a_thread_follows_its_programs_title_until_named() {
+        let shown = |own: Option<&str>, title: &str, program: &str| {
+            let labels: Vec<(&str, &str)> = own.iter().map(|o| (LABEL, *o)).collect();
+            let t = Terminal {
+                title: title.into(),
+                foreground: Some(Foreground {
+                    pid: if SHELLS.contains(&program) { 100 } else { 200 },
+                    name: program.into(),
+                    cwd: "/srv/api".into(),
+                }),
+                ..terminal("t1", "/srv/api", 100, &labels)
+            };
+            let s = session(&t, 0);
+            (s.label, s.own_label)
+        };
+        let is = |label: &str, own: &str| (label.to_string(), own.to_string());
+        let claude = Some("claude");
+        assert_eq!(
+            shown(claude, "✳ Fix the login", "claude"),
+            is("Fix the login", "claude")
+        );
+        assert_eq!(
+            shown(claude, "✳ Claude Code", "claude"),
+            is("claude", "claude")
+        );
+        assert_eq!(shown(Some("codex"), "api", "codex"), is("codex", "codex"));
+        assert_eq!(shown(Some("codex"), "⠋ api", "codex"), is("codex", "codex"));
+        assert_eq!(shown(Some("shell"), "~/src", "node"), is("shell", "shell"));
+        assert_eq!(
+            shown(Some("shell"), "npm run dev", "node"),
+            is("npm run dev", "shell")
+        );
+        // Over, what it said is over too.
+        assert_eq!(
+            shown(claude, "✳ Fix the login", "fish"),
+            is("claude", "claude")
+        );
+        // Yours stays.
+        assert_eq!(
+            shown(Some("review"), "✳ Fix the login", "claude"),
+            is("review", "review")
+        );
+        // A terminal Lemur didn't start is named by its title, as ever.
+        assert_eq!(
+            shown(None, "✳ Fix the login", "claude"),
+            is("Fix the login", "Fix the login")
+        );
     }
 
     /// Each session learns its Claude's conversation, the newest one's if

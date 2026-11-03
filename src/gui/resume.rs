@@ -88,7 +88,7 @@ impl Lemur {
                     session: s.name.clone(),
                     path: run.path.clone(),
                     claude_session: run.id.clone(),
-                    label: Some(s.label.clone()),
+                    label: Some(s.own_label.clone()),
                     issue: s.issue.clone(),
                 })
             })
