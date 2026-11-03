@@ -5862,6 +5862,55 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
+    /// The panel says which need you, and which finished while you looked
+    /// away, until you've seen them; nothing moves as that changes.
+    #[gpui::test]
+    fn the_agents_panel_says_which_need_you_or_are_done(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("agents-say");
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        app.update(cx, |app, cx| app.toggle_right(Right::Agents, cx));
+        let check =
+            |statuses: &[(&str, Activity)], says: [Option<&str>; 3], cx: &mut VisualTestContext| {
+                apply(&app, statuses, cx);
+                cx.run_until_parked();
+                let order = app.read_with(cx, |app, _| {
+                    let agents = app.agents();
+                    agents
+                        .iter()
+                        .map(|(_, s)| s.name.clone())
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(order, ["a", "b", "c"], "they stay put");
+                for (i, want) in says.iter().enumerate() {
+                    for word in ["Needs attention", "Done"] {
+                        let selector = Box::leak(format!("agent-{i} says {word}").into_boxed_str());
+                        assert_eq!(
+                            cx.debug_bounds(selector).is_some(),
+                            *want == Some(word),
+                            "{selector}"
+                        );
+                    }
+                }
+            };
+        let (idle, working, asks) = (Activity::Idle, Activity::Working, Activity::NeedsInput);
+        check(
+            &[("a", working), ("b", asks), ("c", idle)],
+            [None, Some("Needs attention"), None],
+            cx,
+        );
+        // a finished while you looked away, and b has been answered.
+        check(
+            &[("a", idle), ("b", working), ("c", idle)],
+            [Some("Done"), None, None],
+            cx,
+        );
+        // Seen, it's just idle.
+        open(&app, "a", cx);
+        check(&[("a", idle), ("b", working), ("c", idle)], [None; 3], cx);
+        let_attaches_end(&app, cx);
+    }
+
     /// Next Agent goes through the agents done while you looked away one by one,
     /// then the rest: opening one doesn't skip the next.
     #[gpui::test]
@@ -6173,10 +6222,11 @@ mod tests {
         let_attaches_end(&app, cx);
     }
 
-    /// The agents panel lists Claude threads, the most urgent first, and
+    /// The agents panel lists the agents' threads in their order, whatever
+    /// they're doing, Next Agent going through them the most urgent first; it
     /// takes turns with the notes on the right.
     #[gpui::test]
-    fn agents_come_most_urgent_first(cx: &mut gpui::TestAppContext) {
+    fn the_agents_panel_keeps_their_order(cx: &mut gpui::TestAppContext) {
         let (app, cx) = rooted(toml::from_str("").unwrap(), cx);
         cx.update(|_, cx| super::bind_keys(cx));
         apply(
@@ -6189,13 +6239,16 @@ mod tests {
             ],
             cx,
         );
-        let listed = app.read_with(cx, |app, _| {
-            app.agents()
+        let names = |agents: Vec<(&str, &snapshot::Session)>| {
+            agents
                 .iter()
                 .map(|(_, s)| s.name.clone())
                 .collect::<Vec<_>>()
-        });
-        assert_eq!(listed, ["asks", "works", "idle"], "a plain shell isn't one");
+        };
+        let listed = app.read_with(cx, |app, _| names(app.agents()));
+        assert_eq!(listed, ["idle", "asks", "works"], "a plain shell isn't one");
+        let walked = app.read_with(cx, |app, _| names(app.agents_by_urgency()));
+        assert_eq!(walked, ["asks", "works", "idle"]);
 
         let open = |cx: &mut VisualTestContext| {
             app.read_with(cx, |app, _| {

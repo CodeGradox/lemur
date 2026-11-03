@@ -1,7 +1,7 @@
 //! The agents panel, on the right as the notes are, shown by its button at
-//! the top right or ⌘⇧A: every Claude thread on every host, the most
-//! urgent first, each with what it runs to help it under it, as Herdr's
-//! agents list. A click opens one.
+//! the top right or ⌘⇧A: every agent's thread on every host, in the sidebar's
+//! order whatever they're doing, each with what it runs to help it under it, as
+//! Herdr's agents list. A click opens one.
 
 use super::sidebar::{claude_icon, status_dot, thread_icon};
 use super::{Key, Lemur, key, sessions, worktree_label};
@@ -33,13 +33,24 @@ impl Render for AgentsView {
 }
 
 impl Lemur {
-    /// The agents' threads, and threads running helpers, in the order the
-    /// panel lists them: needing you, done while you looked away, working,
-    /// then the rest; the latest first in each.
+    /// The agents' threads, and threads running helpers, as the panel lists
+    /// them: in the sidebar's order, projects first, so what they're doing doesn't
+    /// move them.
     pub(super) fn agents(&self) -> Vec<(&str, &Session)> {
         let mut agents: Vec<(&str, &Session)> = sessions(&self.snap)
             .filter(|(_, s)| s.agent().is_some() || !s.helpers.is_empty())
             .collect();
+        agents.sort_by_key(|(h, s)| {
+            self.project_of(h, &s.name)
+                .map_or(usize::MAX, |(base, _)| base)
+        });
+        agents
+    }
+
+    /// The agents as Next Agent goes through them: needing you, done while you
+    /// looked away, working, then the rest; the latest first in each.
+    pub(super) fn agents_by_urgency(&self) -> Vec<(&str, &Session)> {
+        let mut agents = self.agents();
         agents.sort_by_key(|(h, s)| {
             let rank = match s.activity {
                 Activity::NeedsInput => 0,
@@ -52,15 +63,15 @@ impl Lemur {
         agents
     }
 
-    /// Shows the next agent, or the one before, in the agents panel's order,
-    /// as Herdr's ⌘] and ⌘[ do: from the thread on show, or the first.
+    /// Shows the next agent, or the one before, the ones needing you first, as
+    /// Herdr's ⌘] and ⌘[ do: from the thread on show, or the first.
     pub(super) fn next_agent(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlaid() {
             return;
         }
         // Not one put away: showing it would bring it back for good.
         let now: Vec<Key> = self
-            .agents()
+            .agents_by_urgency()
             .into_iter()
             .filter(|(_, s)| !s.away)
             .map(|(h, s)| key(h, s))
@@ -81,7 +92,7 @@ impl Lemur {
         };
         self.agent_walk = agents.clone();
         if agents.is_empty() {
-            self.note("No Claude threads".into(), cx);
+            self.note("No agents' threads".into(), cx);
             return;
         }
         let at = self
@@ -121,7 +132,7 @@ impl Lemur {
                 .p_3()
                 .text_sm()
                 .text_color(muted)
-                .child("No Claude threads. Their subagents show here too while they work.")
+                .child("No agents' threads. Claude's subagents show here too while they work.")
                 .into_any_element()
         } else {
             v_flex()
@@ -138,13 +149,19 @@ impl Lemur {
         v_flex().size_full().child(body)
     }
 
-    /// A Claude thread: its name, where it runs, how long since it last
-    /// said anything, and what it's doing.
+    /// An agent's thread: its name, where it runs, and what it's doing, in words
+    /// too when that's for you to see to.
     fn agent_row(&self, i: usize, host: &str, s: &Session, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let k = key(host, s);
         let shown = self.active.as_ref() == Some(&k);
         let (color, tip) = self.activity(&k, s, cx);
+        let says = match s.activity {
+            Activity::NeedsInput => Some("Needs attention"),
+            Activity::Working => None,
+            _ if self.done.contains(&k) => Some("Done"),
+            _ => None,
+        };
         let mut place = match self.project_of(host, &s.name) {
             Some((base, w)) => format!("{} · {}", self.cfg.bases[base].name(), worktree_label(w)),
             None => host.to_string(),
@@ -212,6 +229,16 @@ impl Lemur {
                         .invisible()
                         .group_hover(group, |style| style.visible())
                         .child(peek),
+                )
+            })
+            .when_some(says, |row, says| {
+                row.child(
+                    div()
+                        .debug_selector(move || format!("agent-{i} says {says}"))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(color)
+                        .child(says),
                 )
             })
             .child(status_dot(&k, color, self.breathes(s.activity), tip))
