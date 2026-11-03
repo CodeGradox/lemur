@@ -140,7 +140,7 @@ Links come from Claude Code's session logs on the host (`~/.claude/projects`), n
 
 **Links:** hold `⌘` over a link in the terminal to underline it, and `⌘`-click to open it in your browser. That's an `http(s)://` URL written out in the text, or a link whose text hides its URL (OSC 8). A URL runs on across rows the terminal wrapped, but not across lines Claude Code broke itself, which a long one in its replies may be.
 
-A file path written out in the terminal, like `src/main.rs:42` or `/etc/hosts`, is a link too: `⌘`-click it to copy the file from the host to a temporary folder on your Mac and preview it with Quick Look, which never runs it. A relative path is from the session's current folder; a `:line` after it is left out.
+A file path written out in the terminal, like `src/main.rs:42` or `/etc/hosts`, is a link too: `⌘`-click it to copy the file from the host to a temporary folder on your Mac and preview it with Quick Look, which never runs it. Right-click it for **Preview** or **Download**, which puts a copy in your Downloads folder, numbered if that name is taken, and never overwrites anything there. On a path, that right click doesn't reach a program using the mouse. A relative path is from the session's current folder; a `:line` after it is left out.
 
 **Scrolling and selection:** the wheel scrolls back through what the terminal showed; opening a thread brings its last 2000 lines from herdr-core. Drag to select, double-click for a word and triple-click for a line, a drag off the terminal too; `⌘C` copies it. A program that asks for the mouse gets the clicks and the wheel instead; hold `⇧` to select anyway. Text a program copies (OSC 52) goes on your Mac clipboard.
 

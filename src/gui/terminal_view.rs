@@ -5,7 +5,7 @@
 use super::keys::{self, Key};
 use super::links::{Link, link_at};
 use super::settings::Prefs;
-use super::snackbar::Kind;
+use super::snackbar::{Kind, NOTE_TIME};
 use super::terminal::{Palette, Screen, Size, hex};
 use crate::actions;
 use crate::config::Host;
@@ -19,6 +19,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
 use futures::StreamExt;
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::ops::Range;
@@ -83,6 +84,8 @@ pub struct TerminalView {
     told_focus: Option<bool>,
     /// Shown in the window's snackbars while this terminal is.
     status: Option<(String, Kind)>,
+    /// What a right click on a file's path offers, where it was clicked.
+    file_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     /// The stream dropped while its program may still run: the line to its
     /// host or to herdr-core went, or herdr-core is restarting a kept
     /// program. Lemur attaches again once the terminal runs (`reconnect`).
@@ -233,6 +236,7 @@ impl TerminalView {
             told_display: None,
             told_focus: None,
             status: None,
+            file_menu: None,
             lost: false,
             tried: None,
             _reader: None,
@@ -769,6 +773,84 @@ impl TerminalView {
         .detach();
     }
 
+    /// Copies a file the session printed the path of from the host into the
+    /// Downloads folder, and says where it went.
+    fn download(&mut self, path: String, cx: &mut Context<Self>) {
+        let (host, session) = (self.host.clone(), self.session.clone());
+        self.set_status(Some((format!("downloading {path}…"), Kind::Progress)), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let file = actions::download(&host, &session, &path)?;
+                    actions::keep_download(&file)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(kept) => {
+                        let name = kept.file_name().unwrap_or_default().to_string_lossy();
+                        this.note(format!("downloaded {name} to Downloads"), cx);
+                    }
+                    Err(e) => {
+                        let failed = format!("download failed: {e:#}");
+                        this.set_status(Some((failed, Kind::Error)), cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows `text` for a while.
+    fn note(&mut self, text: String, cx: &mut Context<Self>) {
+        let shown = Some((text, Kind::Note));
+        self.set_status(shown.clone(), cx);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTE_TIME).await;
+            this.update(cx, |this, cx| {
+                if this.status == shown {
+                    this.set_status(None, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What can be done with the file at `path`, over the terminal at `at`.
+    fn open_file_menu(
+        &mut self,
+        path: String,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let act = |fetch: fn(&mut TerminalView, String, &mut Context<TerminalView>)| {
+                let (this, path) = (this.clone(), path.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    this.update(cx, |view, cx| fetch(view, path.clone(), cx))
+                        .ok();
+                }
+            };
+            menu.item(PopupMenuItem::new("Preview").on_click(act(Self::preview)))
+                .item(PopupMenuItem::new("Download").on_click(act(Self::download)))
+        });
+        menu.focus_handle(cx).focus(window, cx);
+        let dismissed = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, window, cx| {
+            this.file_menu = None;
+            window.focus(&this.focus, cx);
+            cx.notify();
+        });
+        self.file_menu = Some((menu, at, dismissed));
+        cx.notify();
+    }
+
     fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
         let b = self.bounds;
         let col = ((position.x - b.origin.x) / self.cell_size.width).max(0.0) as usize;
@@ -863,6 +945,20 @@ impl TerminalView {
             } else {
                 cx.open_url(&link.url);
             }
+            return;
+        }
+        // A right click on a file's path offers what can be done with it; here
+        // too, the program never sees that click.
+        if event.button == MouseButton::Right
+            && let Some(link) = self.link_at(event.position).filter(|l| l.file)
+        {
+            self.open_file_menu(link.url, event.position, window, cx);
+            // The terminal's own focus doesn't follow the click and take it back.
+            window.prevent_default();
+            return;
+        }
+        // The click that closes that menu only closes it.
+        if self.file_menu.is_some() {
             return;
         }
         // ⇧ selects even in a program that takes the mouse.
@@ -1633,17 +1729,28 @@ impl Render for TerminalView {
                 this.upload(paths.paths().to_vec(), None, cx)
             }))
             .child(grid)
+            .children(self.file_menu.as_ref().map(|(menu, at, _)| {
+                deferred(
+                    anchored()
+                        .position(*at)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Attachment, OUTPUT_EVERY, TerminalInput, TerminalView, block, snapshot};
+    use super::{
+        Attachment, NOTE_TIME, OUTPUT_EVERY, TerminalInput, TerminalView, block, snapshot,
+    };
     use crate::gui::settings::Prefs;
     use crate::gui::terminal::{DARK, Screen, Size};
     use crate::hc::Stream;
-    use crate::test_support::{HcServer, wait_until};
+    use crate::test_support::{HcServer, TempDir, wait_until};
     use alacritty_terminal::grid::Dimensions;
     use gpui_kit::{
         Capslock, InputHandler, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
@@ -1662,7 +1769,20 @@ mod tests {
         String,
         &'a mut gpui::VisualTestContext,
     ) {
-        let t = server.run("/", &[], argv);
+        attach_in(server, "/", argv, cx)
+    }
+
+    fn attach_in<'a>(
+        server: &HcServer,
+        dir: &str,
+        argv: &[&str],
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<TerminalView>,
+        String,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let t = server.run(dir, &[], argv);
         let host = server.config().hosts.remove(0);
         // The core's connection is real threads, so these tests can't be
         // deterministic.
@@ -2064,6 +2184,131 @@ mod tests {
             "it read {:?}",
             read()
         );
+    }
+
+    /// A right click on a file's path offers it to preview or download, even in
+    /// a program that takes the mouse, which never hears of that click, nor of
+    /// the one that closes the menu. Download puts it in the Downloads folder, by
+    /// key or by mouse, and says so for a while.
+    #[gpui::test]
+    fn a_right_click_on_a_path_offers_to_download_it(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("file-menu");
+        let dir = TempDir::new("file-menu");
+        std::fs::create_dir(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/notes.txt"), "what it says\n").unwrap();
+        let downloads =
+            std::env::temp_dir().join(format!("lemur-downloads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&downloads);
+        // Shows two paths and a web link, then, in hex, the one report it reads.
+        let script = r"printf 'docs/notes.txt\ndocs/gone.txt\nhttps://example.com/a\n\033[?1000h'; stty raw -echo; head -c 6 | xxd -p -c 64";
+        let folder = dir.to_string_lossy().into_owned();
+        let (view, t, cx) = attach_in(&server, &folder, &["sh", "-c", script], cx);
+        let reporting = wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| TerminalView::reports_mouse(v.mode()))
+        });
+        assert!(reporting, "the program never asked for mouse reports");
+        let (path, gone, web, blank) = view.read_with(cx, |v, _| {
+            let cell =
+                |x, y| v.bounds.origin + point(v.cell_size.width * x, v.cell_size.height * y);
+            (
+                cell(3.5, 0.5),
+                cell(3.5, 1.5),
+                cell(3.5, 2.5),
+                cell(3.5, 5.5),
+            )
+        });
+        let none = Modifiers::none();
+        let right_click = |at, cx: &mut gpui::VisualTestContext| {
+            cx.simulate_mouse_down(at, MouseButton::Right, none);
+            cx.simulate_mouse_up(at, MouseButton::Right, none);
+            cx.run_until_parked();
+        };
+        let open =
+            |cx: &mut gpui::VisualTestContext| view.read_with(cx, |v, _| v.file_menu.is_some());
+        let kept_as = |file: &str, cx: &mut gpui::VisualTestContext| {
+            let said = format!("downloaded {file} to Downloads");
+            let there = wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                view.read_with(cx, |v, _| v.status().is_some_and(|s| s.0 == said))
+            });
+            let status = view.read_with(cx, |v, _| v.status().cloned());
+            assert!(there, "{status:?}");
+            let kept = std::fs::read_to_string(downloads.join(file)).unwrap();
+            assert_eq!(kept, "what it says\n");
+            assert!(!open(cx), "it closes");
+        };
+
+        right_click(path, cx);
+        assert!(open(cx), "it offers");
+        cx.simulate_keystrokes("down down enter");
+        kept_as("notes.txt", cx);
+
+        // By mouse, on the second item, from the menu's corner at the click.
+        right_click(path, cx);
+        let download = path + point(px(40.0), px(44.0));
+        cx.simulate_mouse_move(download, None, none);
+        cx.simulate_mouse_down(download, MouseButton::Left, none);
+        cx.simulate_mouse_up(download, MouseButton::Left, none);
+        cx.run_until_parked();
+        kept_as("notes 2.txt", cx);
+
+        // A second right click on the path opens it afresh, keys and all; escape
+        // gives them back to the terminal.
+        right_click(path, cx);
+        right_click(path, cx);
+        assert!(open(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!open(cx));
+        let focus = view.read_with(cx, |v, _| v.focus.clone());
+        assert!(cx.update(|window, _| focus.is_focused(window)));
+
+        // A click elsewhere only closes it.
+        right_click(path, cx);
+        assert!(open(cx));
+        cx.simulate_mouse_down(blank, MouseButton::Left, none);
+        cx.simulate_mouse_up(blank, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(!open(cx));
+
+        // What it said goes away, once the time since the last one has passed.
+        cx.executor().advance_clock(NOTE_TIME);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.status().is_none()));
+
+        // A file that isn't there says so, and stays said.
+        right_click(gone, cx);
+        cx.simulate_keystrokes("down down enter");
+        let failed = wait_until(Duration::from_secs(10), || {
+            cx.run_until_parked();
+            view.read_with(cx, |v, _| {
+                v.status()
+                    .is_some_and(|s| s.0.starts_with("download failed:"))
+            })
+        });
+        assert!(
+            failed,
+            "{:?}",
+            view.read_with(cx, |v, _| v.status().cloned())
+        );
+        cx.executor().advance_clock(NOTE_TIME);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.status().is_some()));
+
+        // A web link offers nothing, so the program gets the click: the first it
+        // hears of. ESC [ M, button 3 pressed, column 4, row 3.
+        right_click(web, cx);
+        assert!(!open(cx));
+        let read = || server.hc(&["read", &t]);
+        assert!(
+            wait_until(Duration::from_secs(5), || read().contains("1b5b4d222423")),
+            "it read {:?}",
+            read()
+        );
+        std::fs::remove_dir_all(&downloads).unwrap();
+        let fetched = std::env::temp_dir().join("lemur-files/local");
+        let _ = std::fs::remove_dir_all(fetched.join(dir.strip_prefix("/").unwrap()));
     }
 
     /// A program that asks for the mouse without SGR (1000 alone, as

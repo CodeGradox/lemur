@@ -749,6 +749,59 @@ pub fn rename_session(cfg: &Config, host: &str, session: &str, name: &str) -> Re
     Ok(session.to_string())
 }
 
+/// Where a file downloaded goes. Tests keep off the real one.
+fn downloads_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    return Ok(std::env::temp_dir().join(format!("lemur-downloads-{}", std::process::id())));
+    #[cfg(not(test))]
+    Ok(crate::config::home()?.join("Downloads"))
+}
+
+/// Keeps a copy of `file`, as `download` fetched it, in the Downloads folder;
+/// returns where.
+pub fn keep_download(file: &Path) -> Result<PathBuf> {
+    keep_in(file, &downloads_dir()?)
+}
+
+/// Copies `file` into `dir` under its own name, or as a browser does with a
+/// number if that's taken: nothing there is overwritten. Not its permissions, so
+/// a program stays something you'd have to mean to run.
+fn keep_in(file: &Path, dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let name = file.file_name().context("a file with no name")?;
+    let stem = Path::new(name)
+        .file_stem()
+        .unwrap_or(name)
+        .to_string_lossy();
+    let dot_extension = Path::new(name)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1u32.. {
+        let target = match n {
+            1 => dir.join(name),
+            _ => dir.join(format!("{stem} {n}{dot_extension}")),
+        };
+        // Only if it's not there: what has that name now is someone's.
+        let mut out = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", target.display())),
+        };
+        let copied = std::fs::File::open(file).and_then(|mut f| std::io::copy(&mut f, &mut out));
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&target);
+            return Err(e).with_context(|| format!("writing {}", target.display()));
+        }
+        return Ok(target);
+    }
+    unreachable!("a free name")
+}
+
 /// Copies files into the host's upload dir; returns their remote paths.
 pub fn upload(host: &Host, files: &[PathBuf]) -> Result<Vec<String>> {
     let r = Remote::new(host);
@@ -1818,5 +1871,37 @@ mod tests {
                 .hc(&["read", &started.session])
                 .contains("codex was started")
         }));
+    }
+
+    /// A download never overwrites what's in the folder: it takes the next free
+    /// name, as a browser does, and leaves the rest as they were.
+    #[test]
+    fn a_download_keeps_what_has_its_name() {
+        let dir = TempDir::new("keep-in");
+        let from = dir.join("from");
+        std::fs::create_dir(&from).unwrap();
+        let into = dir.join("into/Downloads");
+        for (name, stem) in [("a.tar.gz", "a.tar"), ("notes", "notes"), (".env", ".env")] {
+            let file = from.join(name);
+            std::fs::write(&file, name).unwrap();
+            let first = keep_in(&file, &into).unwrap();
+            assert_eq!(first, into.join(name));
+            std::fs::write(&first, "yours").unwrap();
+            let second = keep_in(&file, &into).unwrap();
+            let extension = name.strip_prefix(stem).unwrap_or_default();
+            assert_eq!(second, into.join(format!("{stem} 2{extension}")));
+            let third = keep_in(&file, &into).unwrap();
+            assert_eq!(third, into.join(format!("{stem} 3{extension}")));
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "yours");
+            assert_eq!(std::fs::read_to_string(&second).unwrap(), name);
+        }
+        // Not its permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let program = from.join("program");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kept = keep_in(&program, &into).unwrap();
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0, "{mode:o}");
     }
 }
