@@ -164,6 +164,56 @@ pub fn sgr_mouse(
     .into_bytes()
 }
 
+/// How a program asked for its mouse reports.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MouseEncoding {
+    /// 1006.
+    Sgr,
+    /// 1005: cells past 95 as UTF-8.
+    Utf8,
+    /// X10's, the one without either: it can't say which button came up,
+    /// nor cells past 223.
+    Normal,
+}
+
+/// A mouse report as the program asked for it; none where its encoding
+/// can't say it.
+pub fn mouse_report(
+    encoding: MouseEncoding,
+    button: MouseButton,
+    drag: bool,
+    mods: Mods,
+    col: usize,
+    line: usize,
+    pressed: bool,
+) -> Option<Vec<u8>> {
+    if encoding == MouseEncoding::Sgr {
+        return Some(sgr_mouse(button, drag, mods, col, line, pressed));
+    }
+    let wheel = matches!(button, MouseButton::WheelUp | MouseButton::WheelDown);
+    if wheel && !pressed {
+        return None;
+    }
+    // Which button came up isn't said: 3 is "released".
+    let code = if pressed { button as u32 } else { 3 }
+        + 4 * mods.shift as u32
+        + 8 * mods.alt as u32
+        + 16 * mods.ctrl as u32
+        + if drag { 32 } else { 0 };
+    let mut report = b"\x1b[M".to_vec();
+    for n in [code, col as u32 + 1, line as u32 + 1] {
+        let value = 32 + n;
+        match encoding {
+            MouseEncoding::Utf8 => {
+                let c = char::from_u32(value)?;
+                report.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+            _ => report.push(u8::try_from(value).ok()?),
+        }
+    }
+    Some(report)
+}
+
 /// Wraps pasted text in bracketed-paste markers when the program asked for them.
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     // Pasted escape sequences (including a smuggled end marker) would run as

@@ -109,6 +109,11 @@ impl NotesPanel {
     }
 
     /// Shows a worktree's notes; `label` names it in the header.
+    /// Whether the editor has the keyboard.
+    pub fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.editor.focus_handle(cx).is_focused(window)
+    }
+
     pub fn show(
         &mut self,
         host: &str,
@@ -349,7 +354,7 @@ impl Render for NotesPanel {
                 .p_3()
                 .text_sm()
                 .text_color(muted)
-                .child("Open a thread, or a worktree's notes icon, to see its notes.")
+                .child("Open a thread, or Notes in a worktree's + menu, to see its notes.")
                 .into_any_element()
         } else {
             div()

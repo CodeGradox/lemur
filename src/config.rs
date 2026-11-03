@@ -27,6 +27,9 @@ pub const COLORS: [(&str, u32); 10] = [
 /// Terminal font sizes lemur accepts, in points.
 pub const FONT_SIZES: RangeInclusive<f64> = 6.0..=72.0;
 
+/// Lines a terminal can keep to scroll back through.
+pub const SCROLLBACKS: RangeInclusive<u32> = 0..=100_000;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -34,6 +37,9 @@ pub struct Config {
     pub theme: ThemeChoice,
     #[serde(default)]
     pub dictation_language: Language,
+    /// The order ⌃Tab, and ⌃⇧Tab back, go through a worktree's threads in.
+    #[serde(default)]
+    pub thread_order: ThreadOrder,
     /// The sidebar's width in pixels, as last dragged; unset is lemur's own.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
@@ -42,12 +48,27 @@ pub struct Config {
     pub notes_width: Option<f32>,
     #[serde(default)]
     pub terminal: Terminal,
+    /// Whether the sidebar shows how much of Claude's plan is used; off
+    /// until turned on in Settings.
+    #[serde(default)]
+    pub claude_usage: bool,
+    /// The same of Codex's.
+    #[serde(default)]
+    pub codex_usage: bool,
+    /// The sidebar's foot, minimized to one line each: Claude's usage, Codex's,
+    /// and the hosts' load by host name.
+    #[serde(default)]
+    pub minimized_usage: bool,
+    #[serde(default)]
+    pub minimized_codex_usage: bool,
+    #[serde(default)]
+    pub minimized_hosts: Vec<String>,
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub bases: Vec<Base>,
-    /// The threads Claude runs in, so they can be resumed once their tmux
-    /// session is gone, as after the host restarts. lemur keeps them.
+    /// The threads Claude runs in, so they can be resumed once their
+    /// terminal is gone, as after the host restarts. lemur keeps them.
     #[serde(default)]
     pub threads: Vec<ClaudeThread>,
 }
@@ -71,6 +92,46 @@ impl ThemeChoice {
             ThemeChoice::System => "system",
             ThemeChoice::Light => "light",
             ThemeChoice::Dark => "dark",
+        }
+    }
+}
+
+/// The order ⌃Tab, and ⌃⇧Tab back, go through a worktree's threads in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadOrder {
+    /// Along the tabs, from left to right.
+    #[default]
+    Tabs,
+    /// By when they were last opened, the latest first.
+    Recent,
+}
+
+impl ThreadOrder {
+    pub const ALL: [ThreadOrder; 2] = [ThreadOrder::Tabs, ThreadOrder::Recent];
+
+    /// The name the config file uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreadOrder::Tabs => "tabs",
+            ThreadOrder::Recent => "recent",
+        }
+    }
+}
+
+/// A coding agent Lemur starts threads for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    /// What it's called.
+    pub fn name(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude Code",
+            Agent::Codex => "Codex",
         }
     }
 }
@@ -103,6 +164,8 @@ pub struct Terminal {
     pub font_family: String,
     /// In points.
     pub font_size: f64,
+    /// Lines each terminal keeps to scroll back through.
+    pub scrollback: u32,
     /// Colors over lemur's own for a dark app, then a light one.
     pub dark: TerminalColors,
     pub light: TerminalColors,
@@ -113,6 +176,9 @@ impl Default for Terminal {
         Terminal {
             font_family: "Menlo".into(),
             font_size: 13.0,
+            // About as many as herdr-core keeps itself, which come back
+            // when Lemur attaches again.
+            scrollback: 2000,
             dark: TerminalColors::default(),
             light: TerminalColors::default(),
         }
@@ -177,11 +243,18 @@ pub struct Host {
     pub ssh: String,
     #[serde(default = "default_upload_dir")]
     pub upload_dir: String,
-    /// tmux socket name (`tmux -L`); unset uses the default server.
+    /// The herdr-core session (`HC_SESSION`) its terminals run in; unset
+    /// uses herdr-core's default, which Herdr uses too.
+    pub hc_session: Option<String>,
+    /// From before herdr-core ran lemur's terminals: where a thread kept
+    /// from then may still run, so it isn't resumed a second time.
     pub tmux_socket: Option<String>,
     /// Command that starts Claude Code in a new session.
     #[serde(default = "default_claude")]
     pub claude: String,
+    /// Command that starts Codex in a new session.
+    #[serde(default = "default_codex")]
+    pub codex: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,12 +293,30 @@ pub struct Base {
 #[serde(deny_unknown_fields)]
 pub struct ClaudeThread {
     pub host: String,
-    /// Its tmux session.
+    /// Its terminal's address in herdr-core (`agent/t7`); a tmux session's
+    /// name for threads from before.
     pub session: String,
     /// The folder Claude runs in, where it resumes.
     pub path: String,
     /// Claude Code's session ID, as `claude --resume` takes it.
     pub claude_session: String,
+    /// What the sidebar calls it; threads from before had it in `session`.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The Linear issue pinned to it, by its key, pinned again when it's
+    /// resumed.
+    #[serde(default)]
+    pub issue: Option<String>,
+}
+
+impl ClaudeThread {
+    /// What the sidebar calls it.
+    pub fn shown(&self) -> String {
+        match &self.label {
+            Some(label) => label.clone(),
+            None => crate::actions::label(leaf(&self.session)).to_string(),
+        }
+    }
 }
 
 fn default_upload_dir() -> String {
@@ -234,6 +325,10 @@ fn default_upload_dir() -> String {
 
 fn default_claude() -> String {
     "claude".into()
+}
+
+fn default_codex() -> String {
+    "codex".into()
 }
 
 fn default_worktree_dir() -> String {
@@ -247,8 +342,18 @@ impl Host {
             name: name.into(),
             ssh: ssh.into(),
             upload_dir: default_upload_dir(),
+            hc_session: None,
             tmux_socket: None,
             claude: default_claude(),
+            codex: default_codex(),
+        }
+    }
+
+    /// The command that starts `agent` here.
+    pub fn command(&self, agent: Agent) -> &str {
+        match agent {
+            Agent::Claude => &self.claude,
+            Agent::Codex => &self.codex,
         }
     }
 }
@@ -274,11 +379,6 @@ impl Base {
         let name = self.name.as_deref().unwrap_or_else(|| leaf(&self.path));
         // tmux reserves `.` and `:` in target names.
         name.replace(['.', ':'], "-")
-    }
-
-    /// The tmux session for thread `thread` of this base: `<base>/<thread>`.
-    pub fn session_name(&self, thread: &str) -> String {
-        format!("{}/{thread}", self.name())
     }
 }
 
@@ -323,17 +423,28 @@ impl Config {
                 FONT_SIZES.end()
             );
         }
+        if !SCROLLBACKS.contains(&cfg.terminal.scrollback) {
+            bail!(
+                "terminal scrollback {} is outside {}-{}",
+                cfg.terminal.scrollback,
+                SCROLLBACKS.start(),
+                SCROLLBACKS.end()
+            );
+        }
         Ok(cfg)
     }
 
     /// Writes the settings the Settings window changes into the config file
     /// at `path`, leaving everything else in it, comments included, as is.
-    /// The default dictation language is left out of it.
+    /// The default dictation language and thread order are left out of it.
     pub fn save_settings(
         path: &Path,
         theme: ThemeChoice,
         language: Language,
+        thread_order: ThreadOrder,
         terminal: &Terminal,
+        claude_usage: bool,
+        codex_usage: bool,
     ) -> Result<()> {
         edit(path, |doc| {
             doc["theme"] = toml_edit::value(theme.as_str());
@@ -341,6 +452,21 @@ impl Config {
                 doc.remove("dictation_language");
             } else {
                 doc["dictation_language"] = toml_edit::value(language.as_str());
+            }
+            if thread_order == ThreadOrder::default() {
+                doc.remove("thread_order");
+            } else {
+                doc["thread_order"] = toml_edit::value(thread_order.as_str());
+            }
+            if claude_usage {
+                doc["claude_usage"] = toml_edit::value(true);
+            } else {
+                doc.remove("claude_usage");
+            }
+            if codex_usage {
+                doc["codex_usage"] = toml_edit::value(true);
+            } else {
+                doc.remove("codex_usage");
             }
             let table = doc
                 .entry("terminal")
@@ -356,6 +482,14 @@ impl Config {
                 toml_edit::value(size)
             };
             table.insert("font_size", size);
+            if terminal.scrollback == Terminal::default().scrollback {
+                table.remove("scrollback");
+            } else {
+                table.insert(
+                    "scrollback",
+                    toml_edit::value(i64::from(terminal.scrollback)),
+                );
+            }
             for (name, colors) in [("dark", &terminal.dark), ("light", &terminal.light)] {
                 if colors.is_empty() {
                     table.remove(name);
@@ -462,6 +596,35 @@ impl Config {
         })
     }
 
+    /// Keeps which of the sidebar's foot is minimized: Claude's usage, Codex's,
+    /// and the hosts' load.
+    pub fn save_minimized(
+        path: &Path,
+        usage: bool,
+        codex_usage: bool,
+        hosts: &[String],
+    ) -> Result<()> {
+        edit(path, |doc| {
+            for (key, on) in [
+                ("minimized_usage", usage),
+                ("minimized_codex_usage", codex_usage),
+            ] {
+                if on {
+                    doc[key] = toml_edit::value(true);
+                } else {
+                    doc.remove(key);
+                }
+            }
+            if hosts.is_empty() {
+                doc.remove("minimized_hosts");
+            } else {
+                let hosts: toml_edit::Array = hosts.iter().collect();
+                doc["minimized_hosts"] = toml_edit::value(hosts);
+            }
+            Ok(())
+        })
+    }
+
     /// Puts the config file's `[[bases]]` entries in the order of `bases`,
     /// each with its comments. They swap places in the file, so what's
     /// between them, like `[[hosts]]`, stays where it is.
@@ -495,16 +658,19 @@ impl Config {
             if let Some(tables) = tables_mut(doc, "threads")? {
                 tables.retain(|t| !is_thread(t, &thread.host, &thread.session));
             }
-            push_table(
-                doc,
-                "threads",
-                &[
-                    ("host", &thread.host),
-                    ("session", &thread.session),
-                    ("path", &thread.path),
-                    ("claude_session", &thread.claude_session),
-                ],
-            )
+            let mut fields = vec![
+                ("host", thread.host.as_str()),
+                ("session", &thread.session),
+                ("path", &thread.path),
+                ("claude_session", &thread.claude_session),
+            ];
+            if let Some(label) = &thread.label {
+                fields.push(("label", label));
+            }
+            if let Some(issue) = &thread.issue {
+                fields.push(("issue", issue));
+            }
+            push_table(doc, "threads", &fields)
         })
     }
 
@@ -657,6 +823,18 @@ mod tests {
     }
 
     #[test]
+    fn thread_order_defaults_to_tabs() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.thread_order, ThreadOrder::Tabs);
+        for order in ThreadOrder::ALL {
+            let cfg: Config =
+                toml::from_str(&format!("thread_order = \"{}\"", order.as_str())).unwrap();
+            assert_eq!(cfg.thread_order, order);
+        }
+        assert!(toml::from_str::<Config>("thread_order = \"xx\"").is_err());
+    }
+
+    #[test]
     fn dictation_language_defaults_to_english() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.dictation_language, Language::English);
@@ -672,6 +850,9 @@ mod tests {
         let cfg: Config = toml::from_str("[terminal]\nfont_size = 15").unwrap();
         assert_eq!(cfg.terminal.font_size, 15.0);
         assert_eq!(cfg.terminal.font_family, "Menlo");
+        assert_eq!(cfg.terminal.scrollback, 2000);
+        let cfg: Config = toml::from_str("[terminal]\nscrollback = 20000").unwrap();
+        assert_eq!(cfg.terminal.scrollback, 20000);
     }
 
     #[test]
@@ -713,39 +894,91 @@ path = \"~/projects/api\"
         let terminal = Terminal {
             font_family: "JetBrains Mono".into(),
             font_size: 14.0,
+            scrollback: 20000,
             dark: TerminalColors {
                 background: Some("#000000".into()),
                 ..Default::default()
             },
             ..Default::default()
         };
-        Config::save_settings(&path, ThemeChoice::Dark, Language::Norwegian, &terminal).unwrap();
+        Config::save_settings(
+            &path,
+            ThemeChoice::Dark,
+            Language::Norwegian,
+            ThreadOrder::Recent,
+            &terminal,
+            true,
+            true,
+        )
+        .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
             saved.contains("# my hosts") && saved.contains("# the box"),
             "{saved}"
         );
         assert!(saved.contains("font_size = 14\n"), "{saved}");
+        assert!(saved.contains("scrollback = 20000\n"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::Dark);
         assert_eq!(cfg.dictation_language, Language::Norwegian);
+        assert_eq!(cfg.thread_order, ThreadOrder::Recent);
+        assert!(cfg.claude_usage);
+        assert!(cfg.codex_usage);
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
 
-        // Saving again updates the same keys rather than adding new ones.
+        // Saving again updates the same keys rather than adding new ones;
+        // the default scrollback goes without saying.
         let terminal = Terminal {
             font_size: 12.5,
+            scrollback: Terminal::default().scrollback,
             ..terminal
         };
-        Config::save_settings(&path, ThemeChoice::System, Language::English, &terminal).unwrap();
+        Config::save_settings(
+            &path,
+            ThemeChoice::System,
+            Language::English,
+            ThreadOrder::default(),
+            &terminal,
+            false,
+            false,
+        )
+        .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved.matches("font_size").count(), 1, "{saved}");
         assert!(!saved.contains("dictation_language"), "{saved}");
+        assert!(!saved.contains("thread_order"), "{saved}");
+        assert!(!saved.contains("scrollback"), "{saved}");
+        assert!(
+            !saved.contains("claude_usage"),
+            "off is the default: {saved}"
+        );
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!(cfg.theme, ThemeChoice::System);
         assert_eq!(cfg.terminal.font_size, 12.5);
         assert_eq!(cfg.terminal.dark.background.as_deref(), Some("#000000"));
         assert!(saved.contains("[terminal.dark]"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_what_is_minimized_keeps_it_before_the_tables() {
+        let path = std::env::temp_dir().join(format!("lemur-min-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "# mine\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n",
+        )
+        .unwrap();
+        Config::save_minimized(&path, true, true, &["agent".into()]).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert!(cfg.minimized_usage);
+        assert!(cfg.minimized_codex_usage);
+        assert_eq!(cfg.minimized_hosts, ["agent"]);
+        assert!(saved.contains("# mine"), "{saved}");
+        Config::save_minimized(&path, false, false, &[]).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("minimized"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -823,6 +1056,8 @@ collapsed = true
             session: session.into(),
             path: "/srv/api".into(),
             claude_session: id.into(),
+            label: Some("review".into()),
+            issue: (id == "3").then(|| "LAFT-3184".into()),
         };
         let threads = |path: &Path| -> Vec<ClaudeThread> {
             toml::from_str::<Config>(&std::fs::read_to_string(path).unwrap())

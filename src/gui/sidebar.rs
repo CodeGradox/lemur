@@ -1,15 +1,16 @@
 //! The sidebar: each project's worktrees and their threads, as rows to
 //! open, fold, drag into order and right-click.
 
-use super::{Ask, Key, Lemur, List, key, rows, worktree_label};
-use crate::actions;
-use crate::config::{Base, COLORS, ClaudeThread};
+use super::chrome::{WINDOW_BUTTONS, title_bar};
+use super::silence::silence_item;
+use super::{Ask, Key, Lemur, List, ToggleNotes, key, rows, worktree_label};
+use crate::config::{Agent, Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarHeader, SidebarMenuItem};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::sidebar::{Sidebar, SidebarCollapsible, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::*;
 use std::rc::Rc;
 use std::time::Duration;
@@ -17,6 +18,7 @@ use std::time::Duration;
 /// The sidebar icon for Claude sessions, drawn in Claude's orange.
 const CLAUDE_ICON: &[u8] = include_bytes!("claude.svg");
 const CLAUDE_ORANGE: u32 = 0xd97757;
+const CODEX_BLUE: u32 = 0x4f8fe8;
 
 /// The sidebar's width until its edge is dragged.
 pub(super) const SIDEBAR_WIDTH: Pixels = px(255.0);
@@ -41,20 +43,22 @@ impl SidebarView {
 }
 
 impl Render for SidebarView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
         }
         match self.lemur.upgrade() {
-            Some(lemur) => lemur.update(cx, |lemur, cx| lemur.sidebar(cx).into_any_element()),
+            Some(lemur) => {
+                lemur.update(cx, |lemur, cx| lemur.sidebar(window, cx).into_any_element())
+            }
             None => div().into_any_element(),
         }
     }
 }
 
 impl Lemur {
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let mut groups: Vec<rows::Group> = vec![];
         // Projects first, in the config's order whatever their host; then
@@ -92,6 +96,7 @@ impl Lemur {
                         .icon(IconName::Plus)
                         .on_click(ask_on_click(&this, move || Ask::NewWorktree {
                             base: index,
+                            agent: Some(Agent::Claude),
                         })),
                 )));
             }
@@ -102,12 +107,11 @@ impl Lemur {
                         .disable(true),
                 )));
             }
-            let prefix = format!("{}/", base.name());
             let mut hidden = vec![];
             for w in &b.worktrees {
                 // The main checkout and a plain folder are the project itself.
                 let removable = !w.main;
-                let item = self.worktree_item(&h.name, index, w, removable, &prefix, cx);
+                let item = self.worktree_item(&h.name, index, w, removable, cx);
                 if base.hidden_worktrees.contains(&w.path) {
                     hidden.push(item);
                 } else {
@@ -146,26 +150,62 @@ impl Lemur {
                     .menu(self.project_menu(index, cx)),
             );
         }
+        // Then one section for every host, each with its threads outside
+        // every project, to start more there.
+        let mut other = rows::Menu::default();
+        let mut hosts = 0;
         for h in &self.snap.hosts {
             if let Some(e) = &h.error {
-                groups.push(rows::Group::new(
-                    h.name.clone(),
-                    rows::Menu::default().child(rows::Entry::Item(Box::new(
-                        SidebarMenuItem::new(e.clone())
-                            .icon(IconName::TriangleAlert)
-                            .disable(true),
-                    ))),
-                ));
-            } else if !h.other.is_empty() || !h.gone.is_empty() {
-                let threads = self.threads(&h.name, None, &h.other, &h.gone, "", cx);
-                groups.push(
-                    rows::Group::new(
-                        "other",
-                        rows::Menu::default().child(rows::Entry::Threads(threads)),
-                    )
-                    .host(h.name.clone()),
-                );
+                let mut menu = rows::Menu::default().child(rows::Entry::Item(Box::new(
+                    SidebarMenuItem::new(e.clone())
+                        .icon(IconName::TriangleAlert)
+                        .disable(true),
+                )));
+                // herdr-core needs you to add it: in a terminal, as Herdr's.
+                if let Some(host) = self.cfg.host(&h.name).filter(|_| h.needs_you).cloned() {
+                    let this = cx.entity().downgrade();
+                    menu = menu.child(rows::Entry::Item(Box::new(
+                        SidebarMenuItem::new(format!("Set up {}…", h.name))
+                            .icon(IconName::SquareTerminal)
+                            .on_click(move |_, _, cx| {
+                                this.update(cx, |this, cx| this.set_up_host(host.clone(), cx))
+                                    .ok();
+                            }),
+                    )));
+                }
+                groups.push(rows::Group::new(h.name.clone(), menu));
+            } else {
+                let local = self
+                    .cfg
+                    .host(&h.name)
+                    .is_some_and(|c| crate::remote::Remote::new(c).is_local());
+                // In its home, once its script has said where that is.
+                let new = (!h.home.is_empty()).then(|| {
+                    let menu = self.new_menu(&h.name, &h.home, None, cx);
+                    let add = menu.clone();
+                    let suffix: rows::Suffix = Rc::new(move |_, _| {
+                        let add = add.clone();
+                        Button::new("add")
+                            .icon(IconName::Plus)
+                            .ghost()
+                            .xsmall()
+                            .tooltip("New terminal or Claude here")
+                            .dropdown_menu(move |m, window, cx| add(m, window, cx))
+                            .into_any_element()
+                    });
+                    (suffix, menu)
+                });
+                other = other.child(rows::Entry::Host {
+                    label: h.name.clone().into(),
+                    local,
+                    new,
+                    threads: self.threads(&h.name, None, &h.other, &h.gone, cx),
+                });
+                hosts += 1;
             }
+        }
+        if hosts > 0 {
+            groups.push(rows::Group::new("Other", other));
         }
         // Named as in the File menu.
         let add = Button::new("add-folder")
@@ -174,6 +214,12 @@ impl Lemur {
             .xsmall()
             .tooltip("Add project (⌘O)")
             .on_click(cx.listener(|this, _, window, cx| this.open_picker(window, cx)));
+        let find = Button::new("find-thread")
+            .icon(IconName::Search)
+            .ghost()
+            .xsmall()
+            .tooltip("Go to thread (⌘P)")
+            .on_click(cx.listener(|this, _, window, cx| this.find_thread(window, cx)));
         let refresh = Button::new("refresh")
             .icon(IconName::RefreshCw)
             .ghost()
@@ -181,40 +227,94 @@ impl Lemur {
             .tooltip("Refresh")
             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx).detach()));
         // Collapsing hides the cached view whole (see render).
-        Sidebar::new("sessions")
+        let sidebar = Sidebar::new("sessions")
             .collapsible(SidebarCollapsible::None)
-            .w(self.sidebar_width)
+            .w(self.sidebar_width);
+        // At its foot, how much of each agent's plan is used, then each host's load.
+        let foot: Vec<AnyElement> = self
+            .usage_meter(Agent::Claude, cx)
+            .into_iter()
+            .chain(self.usage_meter(Agent::Codex, cx))
+            .chain(self.machines(cx).map(IntoElement::into_any_element))
+            .collect();
+        let sidebar = if foot.is_empty() {
+            sidebar
+        } else {
+            sidebar.footer(v_flex().w_full().children(foot))
+        };
+        // The window's top row, its buttons at the left: over the header's
+        // padding, to the window's top and the sidebar's sides.
+        let buttons = if window.is_fullscreen() {
+            px(12.0)
+        } else {
+            WINDOW_BUTTONS
+        };
+        sidebar
             .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .child(div().font_semibold().child("Lemur"))
-                        .child(h_flex().gap_1().child(add).child(refresh)),
-                ),
+                title_bar("sidebar top bar", window, cx)
+                    .flex_1()
+                    .h_10()
+                    .mt_neg_3()
+                    .mx_neg_3()
+                    .pl(buttons)
+                    .pr_3()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().min_w_0().truncate().font_semibold().child("Lemur"))
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_1()
+                            .child(find)
+                            .child(add)
+                            .child(refresh),
+                    ),
             )
             .children(groups)
     }
 
-    /// A worktree with its sessions; + offers a Claude thread or a shell.
+    /// A worktree with its sessions; + and its right-click menu start a
+    /// terminal or Claude there, and open its notes.
     fn worktree_item(
         &self,
         host: &str,
         base: usize,
         w: &Worktree,
         removable: bool,
-        prefix: &str,
         cx: &mut Context<Self>,
     ) -> rows::Entry {
         let label = worktree_label(w);
         let hidden = self.cfg.bases[base].hidden_worktrees.contains(&w.path);
-        // Color and hiding for every worktree; removing only for linked ones.
+        let start = self.new_menu(host, &w.path, Some(base), cx);
+        let new: rows::MenuBuilder = {
+            let this = cx.entity().downgrade();
+            let (host, worktree, label) = (host.to_string(), w.path.clone(), label.clone());
+            Rc::new(move |menu, window, cx| {
+                let (this, host, worktree, label) =
+                    (this.clone(), host.clone(), worktree.clone(), label.clone());
+                start(menu, window, cx).separator().item(
+                    PopupMenuItem::new("Notes")
+                        .icon(IconName::FileText)
+                        .action(Box::new(ToggleNotes))
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.open_notes(&host, &worktree, &label, window, cx)
+                            })
+                            .ok();
+                        }),
+                )
+            })
+        };
+        // What starts here; then color and hiding for every worktree, and
+        // removing for linked ones.
         let menu: rows::MenuBuilder = {
             let this = cx.entity().downgrade();
             let colors = Rc::new(self.color_menu(base, &w.path, cx));
-            let (worktree, label) = (w.path.clone(), label.clone());
+            let (worktree, label, new) = (w.path.clone(), label.clone(), new.clone());
             Rc::new(
                 move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+                    let menu = new(menu, window, cx).separator();
                     let colors = colors.clone();
                     let menu = menu.submenu("Color", window, cx, move |m, w, cx| colors(m, w, cx));
                     let hide = {
@@ -257,48 +357,30 @@ impl Lemur {
                     .ok();
             })
         };
-        let worktree = w.path.clone();
-        let (host_name, notes_label) = (host.to_string(), label.clone());
         let add = move |_: &mut Window, _: &mut App| {
-            let notes = {
-                let (this, host, worktree, label) = (
-                    this.clone(),
-                    host_name.clone(),
-                    worktree.clone(),
-                    notes_label.clone(),
-                );
-                Button::new("notes")
-                    .icon(IconName::FileText)
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Notes")
-                    .on_click(move |_, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.open_notes(&host, &worktree, &label, window, cx)
-                        })
-                        .ok();
-                    })
-            };
-            let (this, worktree) = (this.clone(), worktree.clone());
-            // The spotlight asks Claude or Shell, as ⌘J does.
-            let add = Button::new("add")
+            let new = new.clone();
+            Button::new("add")
                 .icon(IconName::Plus)
                 .ghost()
                 .xsmall()
-                .tooltip("New Claude thread or shell here")
-                .on_click(ask_on_click(&this, move || Ask::NewThread {
-                    base,
-                    worktree: worktree.clone(),
-                    shell: false,
-                }));
-            h_flex().gap_1().child(notes).child(add)
+                .tooltip("New terminal or Claude here, or notes")
+                .dropdown_menu(move |m, window, cx| new(m, window, cx))
         };
         rows::Entry::Worktree {
             label: label.into(),
             suffix: Rc::new(move |window, cx| add(window, cx).into_any_element()),
             menu,
             color,
-            threads: self.threads(host, Some(&w.path), &w.sessions, &w.gone, prefix, cx),
+            main: w.main,
+            counts: rows::Counts {
+                agents: w.sessions.iter().filter(|s| s.agent().is_some()).count(),
+                shells: w.sessions.iter().filter(|s| s.agent().is_none()).count(),
+                needs_input: w
+                    .sessions
+                    .iter()
+                    .any(|s| s.activity == Activity::NeedsInput),
+            },
+            threads: self.threads(host, Some(&w.path), &w.sessions, &w.gone, cx),
             folded,
             toggle,
         }
@@ -311,55 +393,50 @@ impl Lemur {
         worktree: Option<&str>,
         sessions: &[Session],
         gone: &[ClaudeThread],
-        prefix: &str,
         cx: &mut Context<Self>,
     ) -> rows::Threads {
         let this = cx.entity().downgrade();
         let list: List = (host.to_string(), worktree.map(str::to_string));
+        let key: SharedString = format!("{host}\n{}", worktree.unwrap_or_default()).into();
+        // Those put away come last in a list, so the rest keep their places
+        // for dragging.
+        let (away, shown): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|s| s.away);
+        let toggle_away: rows::Toggle = {
+            let (this, key) = (this.clone(), key.clone());
+            Rc::new(move |_, cx| {
+                this.update(cx, |this, cx| this.toggle_away_list(key.clone(), cx))
+                    .ok();
+            })
+        };
         rows::Threads {
-            key: format!("{host}\n{}", worktree.unwrap_or_default()).into(),
-            rows: sessions
-                .iter()
-                .map(|s| self.session_item(host, s, prefix, cx))
+            away_open: self.away_open.contains(&key),
+            key,
+            rows: shown
+                .into_iter()
+                .map(|s| self.session_item(host, s, cx))
                 .collect(),
-            gone: gone.iter().map(|t| gone_item(t, prefix, cx)).collect(),
+            gone: gone.iter().map(|t| gone_item(t, cx)).collect(),
             reorder: Rc::new(move |from, to, _, cx| {
                 this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
                     .ok();
             }),
+            away: away
+                .into_iter()
+                .map(|s| self.session_item(host, s, cx))
+                .collect(),
+            toggle_away,
         }
     }
 
-    fn session_item(
-        &self,
-        host: &str,
-        s: &Session,
-        prefix: &str,
-        cx: &mut Context<Self>,
-    ) -> rows::Thread {
+    fn session_item(&self, host: &str, s: &Session, cx: &mut Context<Self>) -> rows::Thread {
         let this = cx.entity().downgrade();
         let key = key(host, s);
         let active = self.active.as_ref() == Some(&key);
-        let arming = self.confirm_kill.as_ref() == Some(&key);
-        let label = actions::label(s.name.strip_prefix(prefix).unwrap_or(&s.name)).to_string();
-        let working = s.activity == Activity::Working;
-        let (dot, tip): (Hsla, SharedString) = match s.activity {
-            Activity::NeedsInput => (
-                cx.theme().warning,
-                match &s.waiting_for {
-                    Some(what) => format!("Needs input: {what}").into(),
-                    None => "Needs input".into(),
-                },
-            ),
-            Activity::Working => (cx.theme().success, "Working".into()),
-            _ if self.done.contains(&key) => (cx.theme().info, "Done".into()),
-            Activity::Idle => (cx.theme().muted_foreground.opacity(0.5), "Idle".into()),
-            Activity::Unknown => (
-                cx.theme().muted_foreground.opacity(0.5),
-                "No Claude found".into(),
-            ),
-        };
+        let label = s.label.clone();
+        let breathes = self.breathes(s.activity);
+        let (dot, tip) = self.activity(&key, s, cx);
         let detail = age(s.idle_secs);
+        let issue = s.issue.clone();
         let muted = cx.theme().muted_foreground;
         // Click opens; a double click (its second click) starts a rename.
         let open = {
@@ -377,55 +454,171 @@ impl Lemur {
                 .ok();
             }
         };
+        let away = s.away;
+        let silent = s.silent;
+        // Only an agent has anything to notify of.
+        let silences = s.agent().map(|_| silent);
         let menu = {
             let this = this.clone();
             let key = key.clone();
             move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-                let key = key.clone();
-                menu.item(
-                    PopupMenuItem::new("Rename…").on_click(ask_on_click(&this, move || {
+                let rename = {
+                    let key = key.clone();
+                    ask_on_click(&this, move || {
                         let (host, session) = key.clone();
                         Ask::Rename { host, session }
-                    })),
-                )
+                    })
+                };
+                let peek = {
+                    let (this, key) = (this.clone(), key.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        this.update(cx, |this, cx| this.peek(key.clone(), window, cx))
+                            .ok();
+                    }
+                };
+                let (this, key) = (this.clone(), key.clone());
+                let menu = menu
+                    .item(PopupMenuItem::new("Rename…").on_click(rename))
+                    .item(PopupMenuItem::new("Peek").on_click(peek));
+                let menu = match silences {
+                    Some(silent) => menu.item(silence_item(&this, &key, silent)),
+                    None => menu,
+                };
+                if away {
+                    menu.item(PopupMenuItem::new("Bring back").on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| this.bring_back(&key, cx)).ok();
+                    }))
+                } else {
+                    menu.item(
+                        PopupMenuItem::new("Put away").on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| this.put_away(key.clone(), window, cx))
+                                .ok();
+                        }),
+                    )
+                }
             }
         };
+        // How many it runs to help it, Claude's subagents above all; the
+        // agents panel shows them. A count, so rows don't shift as they come
+        // and go.
+        let helpers = (!s.helpers.is_empty()).then(|| {
+            let mut names: Vec<String> = s.helpers.iter().map(|h| h.label.clone()).collect();
+            names.push("The agents panel (⌘⇧A) shows them.".into());
+            (s.helpers.len(), SharedString::from(names.join("\n")))
+        });
+        let selector = format!("helpers {label}");
+        let separator = format!("separator {label}");
+        let selector_label = label.clone();
         let suffix = move |_: &mut Window, _: &mut App| {
             let this = this.clone();
             let key = key.clone();
-            let status = status_dot(&key, dot, working, tip.clone());
-            let kill = Button::new("kill")
+            let status = status_dot(&key, dot, breathes, tip.clone());
+            let helpers = helpers.clone().map(|(n, names)| {
+                let selector = selector.clone();
+                h_flex()
+                    .id("helpers")
+                    .debug_selector(move || selector)
+                    .gap_0p5()
+                    .items_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .tooltip(move |window, cx| Tooltip::new(names.clone()).build(window, cx))
+                    .child(Icon::new(gpui_kit::assets::IconName::Bot).xsmall())
+                    .child(n.to_string())
+            });
+            let close = Button::new("close")
                 .ghost()
                 .xsmall()
-                .on_click(move |_, _, cx| {
-                    // Otherwise the row opens the session too, which disarms the kill.
+                .icon(IconName::Close)
+                .tooltip("Close thread")
+                .on_click(move |_, window, cx| {
+                    // Otherwise the row opens the session too.
                     cx.stop_propagation();
-                    this.update(cx, |this, cx| this.kill(key.clone(), cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.confirm_close_of(key.clone(), window, cx)
+                    })
+                    .ok();
                 });
-            let kill = if arming {
-                kill.danger().label("Kill?")
-            } else {
-                kill.icon(IconName::Close).tooltip("Kill session")
-            };
-            h_flex()
-                .gap_1()
-                .items_center()
-                .child(div().text_xs().text_color(muted).child(detail.clone()))
-                .child(status)
-                .child(kill)
-        };
-        let icon = if s.runs_claude() {
-            claude_icon()
-        } else {
-            Icon::new(IconName::SquareTerminal)
+            // The Linear issue pinned to it, what helps it, and its age, with
+            // a small dot between them.
+            let said = [
+                issue.clone().map(|issue| {
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(issue)
+                        .into_any_element()
+                }),
+                helpers.map(IntoElement::into_any_element),
+                Some(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(detail.clone())
+                        .into_any_element(),
+                ),
+            ];
+            let mut suffix = h_flex().gap_1().items_center();
+            if silent {
+                let selector = format!("silenced {selector_label}");
+                suffix = suffix.child(
+                    div()
+                        .id("silenced")
+                        .debug_selector(move || selector)
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Makes no notifications").build(window, cx)
+                        })
+                        .child(super::icons::bell_off().xsmall().text_color(muted)),
+                );
+            }
+            for (i, item) in said.into_iter().flatten().enumerate() {
+                if i > 0 {
+                    let separator = separator.clone();
+                    suffix = suffix.child(
+                        div()
+                            .debug_selector(move || format!("{separator} {i}"))
+                            .text_xs()
+                            .text_color(muted)
+                            .child("·"),
+                    );
+                }
+                suffix = suffix.child(item);
+            }
+            suffix.child(status).child(close)
         };
         rows::Thread {
-            icon,
+            icon: thread_icon(s),
             label: label.into(),
             active,
             on_click: Rc::new(open),
             menu: Rc::new(menu),
             suffix: Rc::new(move |window, cx| suffix(window, cx).into_any_element()),
+        }
+    }
+
+    /// Whether a dot for `activity` breathes: while Claude works, and only
+    /// while Lemur is the active window, as each breath redraws the window.
+    pub(super) fn breathes(&self, activity: Activity) -> bool {
+        activity == Activity::Working && self.looking
+    }
+
+    /// A thread's dot: its color, and what it says.
+    pub(super) fn activity(&self, key: &Key, s: &Session, cx: &App) -> (Hsla, SharedString) {
+        match s.activity {
+            Activity::NeedsInput => (
+                cx.theme().warning,
+                match &s.waiting_for {
+                    Some(what) => format!("Needs input: {what}").into(),
+                    None => "Needs input".into(),
+                },
+            ),
+            Activity::Working => (cx.theme().success, "Working".into()),
+            _ if self.done.contains(key) => (cx.theme().info, "Done".into()),
+            Activity::Idle => (cx.theme().muted_foreground.opacity(0.5), "Idle".into()),
+            Activity::Unknown => (
+                cx.theme().muted_foreground.opacity(0.5),
+                "No Claude found".into(),
+            ),
         }
     }
 
@@ -503,9 +696,9 @@ impl Lemur {
 
 /// A thread whose session is gone, dimmed: clicking it or its button
 /// resumes it, and its right-click menu can forget it instead.
-fn gone_item(t: &ClaudeThread, prefix: &str, cx: &mut Context<Lemur>) -> rows::Thread {
+fn gone_item(t: &ClaudeThread, cx: &mut Context<Lemur>) -> rows::Thread {
     let this = cx.entity().downgrade();
-    let label = actions::label(t.session.strip_prefix(prefix).unwrap_or(&t.session)).to_string();
+    let label = t.shown();
     let resume = {
         let (this, t) = (this.clone(), t.clone());
         Rc::new(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -566,11 +759,25 @@ fn title_case(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A thread's icon: its agent's, or a terminal.
+pub(super) fn thread_icon(s: &Session) -> Icon {
+    match s.agent() {
+        Some(Agent::Claude) => claude_icon(),
+        Some(Agent::Codex) => codex_icon(),
+        None => Icon::new(IconName::SquareTerminal),
+    }
+}
+
 /// Claude's spark, in Claude's orange.
 pub(super) fn claude_icon() -> Icon {
     Icon::empty()
         .data(CLAUDE_ICON)
         .text_color(rgb(CLAUDE_ORANGE))
+}
+
+/// What marks a thread as Codex's.
+pub(super) fn codex_icon() -> Icon {
+    super::icons::code_xml().text_color(rgb(CODEX_BLUE))
 }
 
 /// A click handler that opens the name field for `ask()`.
@@ -585,8 +792,72 @@ fn ask_on_click(
     }
 }
 
-/// A session's status dot; it breathes while Claude works.
-fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyElement {
+/// A thread's status dot as a view of its own, for where it's drawn in
+/// the window's own view (the tabs, the peek card): its breaths then
+/// redraw only it, not the window's view, which redraws the sidebar.
+pub(super) struct DotView {
+    key: Key,
+    color: Hsla,
+    breathes: bool,
+    tip: SharedString,
+}
+
+impl DotView {
+    pub(super) fn new(key: Key) -> Self {
+        DotView {
+            key,
+            color: Hsla::default(),
+            breathes: false,
+            tip: SharedString::default(),
+        }
+    }
+
+    pub(super) fn set(
+        &mut self,
+        color: Hsla,
+        breathes: bool,
+        tip: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        if (self.color, self.breathes, &self.tip) != (color, breathes, &tip) {
+            (self.color, self.breathes, self.tip) = (color, breathes, tip);
+            cx.notify();
+        }
+    }
+}
+
+impl Render for DotView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        status_dot(&self.key, self.color, self.breathes, self.tip.clone())
+    }
+}
+
+impl Lemur {
+    /// Thread `key`'s dot in `place` (a tab, the peek card), as a view of
+    /// its own (see `DotView`).
+    pub(super) fn dot_view(
+        &self,
+        place: &'static str,
+        key: &Key,
+        color: Hsla,
+        breathes: bool,
+        tip: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyView {
+        let view = self
+            .dots
+            .borrow_mut()
+            .entry((place, key.clone()))
+            .or_insert_with(|| cx.new(|_| DotView::new(key.clone())))
+            .clone();
+        view.update(cx, |dot, cx| dot.set(color, breathes, tip, cx));
+        view.into()
+    }
+}
+
+/// A session's status dot; it breathes while `breathes` (see
+/// `Lemur::breathes`).
+pub(super) fn status_dot(key: &Key, color: Hsla, breathes: bool, tip: SharedString) -> AnyElement {
     let id = SharedString::from(format!("status-{}-{}", key.0, key.1));
     let dot = div()
         .id(id.clone())
@@ -594,13 +865,15 @@ fn status_dot(key: &Key, color: Hsla, working: bool, tip: SharedString) -> AnyEl
         .rounded_full()
         .bg(color)
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
-    if working {
+    if breathes {
         dot.with_animation(
             id,
-            // Every animation frame redraws the window; 15 fps is smooth enough.
+            // Every animation frame redraws the window, and the sidebar's
+            // list with it: 7.5 a second keep that cheap and still look
+            // smooth enough.
             Animation::new(Duration::from_millis(1600))
                 .repeat()
-                .with_max_fps(15.0)
+                .with_max_fps(7.5)
                 .with_easing(pulsating_between(0.35, 1.0)),
             |dot, delta| dot.opacity(delta),
         )

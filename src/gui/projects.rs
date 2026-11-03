@@ -7,7 +7,8 @@ use super::snackbar::Kind;
 use super::{Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
-use crate::config::{Base, Config, Host, home, leaf};
+use crate::config::{Base, Config, Host, home};
+use crate::snapshot;
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt, v_flex};
@@ -18,7 +19,10 @@ use std::rc::Rc;
 /// A worktree to remove, and the threads to close first.
 #[derive(Clone)]
 pub(super) struct Removal {
-    base: usize,
+    /// Its project, by host and path: projects can be removed or moved while
+    /// this runs, or waits for an answer, so their place isn't kept.
+    host: String,
+    project: String,
     worktree: String,
     label: String,
     pub(super) sessions: Vec<String>,
@@ -28,11 +32,16 @@ pub(super) struct Removal {
 
 impl Lemur {
     pub(super) fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlaid() {
+            return;
+        }
         let hosts = host_choices(&self.cfg);
         let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
         let events = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
-            if let PickerEvent::Add { host, path } = event {
-                this.add_folder(host.clone(), path.clone(), cx);
+            match event {
+                PickerEvent::Add { host, path } => this.add_folder(host.clone(), path.clone(), cx),
+                PickerEvent::SetUp(host) => this.set_up_host(host.clone(), cx),
+                PickerEvent::Dismiss => {}
             }
             this.close_picker(window, cx);
         });
@@ -68,6 +77,7 @@ impl Lemur {
         }
         if new_host {
             self.cfg.hosts.push(host);
+            Prefs::hosts_changed(&self.cfg, cx);
         }
         self.cfg.bases.push(base);
         self.refresh(cx).detach();
@@ -197,8 +207,11 @@ impl Lemur {
         if !move_item(&mut view.worktrees, from, to) {
             return;
         }
-        self.cfg.bases[index].worktree_order =
-            view.worktrees.iter().map(|w| w.path.clone()).collect();
+        let order: Vec<String> = view.worktrees.iter().map(|w| w.path.clone()).collect();
+        for data in &mut self.data {
+            data.sort_worktrees(index, &order);
+        }
+        self.cfg.bases[index].worktree_order = order;
         // A refresh already under way sorts by the old order.
         self.changes += 1;
         self.save_look(index, cx);
@@ -211,11 +224,10 @@ impl Lemur {
         if !move_item(&mut self.cfg.bases, from, to) {
             return;
         }
-        // The snapshot points into the config's bases by index: renumber
-        // its views, and drop snapshots on their way that use the old numbers.
-        for b in self.snap.hosts.iter_mut().flat_map(|h| h.bases.iter_mut()) {
-            b.index = moved_to(b.index, from, to);
-        }
+        // The snapshot, and what a recompose builds the next from, point
+        // into the config's bases by index: renumber their views, and drop
+        // snapshots on their way that use the old numbers.
+        self.renumber_bases(|i| Some(moved_to(i, from, to)));
         self.changes += 1;
         if let Some(file) = Prefs::get(cx).config_file()
             && let Err(e) = Config::save_project_order(file, &self.cfg.bases)
@@ -223,6 +235,17 @@ impl Lemur {
             self.fail(e, cx);
         }
         cx.notify();
+    }
+
+    /// Renumbers the views of the config's bases, in the snapshot and in
+    /// what the last refresh found, as `renumber` says; `None` drops one.
+    fn renumber_bases(&mut self, renumber: impl Fn(usize) -> Option<usize> + Copy) {
+        for h in &mut self.snap.hosts {
+            snapshot::renumber_views(&mut h.bases, renumber);
+        }
+        for data in &mut self.data {
+            data.renumber_bases(renumber);
+        }
     }
 
     /// Keeps how a project shows in the sidebar in the config file: its
@@ -280,17 +303,15 @@ impl Lemur {
             return;
         }
         self.cfg.bases.remove(index);
-        // The snapshot points into the config's bases by index: drop the
-        // project's view, shift the later ones, and drop snapshots on their
-        // way that still use the old numbers.
-        for h in &mut self.snap.hosts {
-            h.bases.retain(|b| b.index != index);
-            for b in &mut h.bases {
-                if b.index > index {
-                    b.index -= 1;
-                }
-            }
-        }
+        // The snapshot, and what a recompose builds the next from, point
+        // into the config's bases by index: drop the project's view, shift
+        // the later ones, and drop snapshots on their way that still use
+        // the old numbers.
+        self.renumber_bases(|i| match i.cmp(&index) {
+            std::cmp::Ordering::Less => Some(i),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(i - 1),
+        });
         self.changes += 1;
         // A name field may be asking about it.
         self.prompt = None;
@@ -300,15 +321,16 @@ impl Lemur {
 
     /// What removing a worktree takes with it: the threads running there.
     pub(super) fn removal(&self, base: usize, worktree: String, label: String) -> Removal {
-        let host = &self.cfg.bases[base].host;
+        let project = &self.cfg.bases[base];
         let sessions = self
             .snap
-            .worktrees(host)
+            .worktrees(&project.host)
             .filter(|w| w.path == worktree)
             .flat_map(|w| w.sessions.iter().map(|s| s.name.clone()))
             .collect();
         Removal {
-            base,
+            host: project.host.clone(),
+            project: project.path.clone(),
             worktree,
             label,
             sessions,
@@ -329,11 +351,12 @@ impl Lemur {
         cx: &mut Context<Self>,
     ) {
         let Removal {
-            base,
+            host,
             worktree,
             label,
             sessions,
             delete,
+            ..
         } = &removal;
         let force = matches!(
             kept,
@@ -342,14 +365,16 @@ impl Lemur {
         // The first time asks whether to delete the folder too.
         let mut ask_delete = None;
         let mut close = sessions.clone();
+        let named = |list: &[String]| -> Vec<String> {
+            list.iter().map(|s| self.label_of(host, s)).collect()
+        };
         let (title, description, ok) = match kept {
             None => {
-                let host = &self.cfg.bases[*base].host;
                 ask_delete = Some(format!("Also delete {worktree} on {host}"));
-                removing(label, sessions)
+                removing(label, &named(sessions))
             }
             Some(actions::Kept::Threads(found)) => {
-                let asked = removing(label, &found);
+                let asked = removing(label, &named(&found));
                 close = found;
                 asked
             }
@@ -425,8 +450,13 @@ impl Lemur {
         self.status = Some((format!("removing {}…", removal.label), Kind::Progress));
         cx.notify();
         let cfg = self.cfg.clone();
+        // Asked while it was still there.
+        let Some(base) = self.project_of_removal(&removal) else {
+            self.status = None;
+            self.note(format!("{}'s project has gone", removal.label), cx);
+            return;
+        };
         let Removal {
-            base,
             worktree,
             sessions,
             delete,
@@ -438,7 +468,11 @@ impl Lemur {
             move |this, removed, window, cx| {
                 this.status = None;
                 match removed {
-                    Ok(()) => this.forget_worktree(removal.base, &removal.worktree, cx),
+                    Ok(()) => {
+                        if let Some(base) = this.project_of_removal(&removal) {
+                            this.forget_worktree(base, &removal.worktree, cx);
+                        }
+                    }
                     // Threads it wasn't to close keep it until you say; git
                     // keeps a locked or changed worktree unless forced.
                     Err(e) => match (force, actions::why_kept(&e)) {
@@ -453,6 +487,14 @@ impl Lemur {
             },
         )
         .detach();
+    }
+
+    /// Where a worktree being removed's project is in the config by now.
+    fn project_of_removal(&self, removal: &Removal) -> Option<usize> {
+        self.cfg
+            .bases
+            .iter()
+            .position(|b| b.host == removal.host && b.path == removal.project)
     }
 
     /// Forgets a removed worktree's color, place in the order, that it was
@@ -491,9 +533,8 @@ impl Lemur {
 }
 
 /// What removing worktree `label` asks: its title, its description and its
-/// button. Threads running in it, `close`, are named; they close first.
-fn removing(label: &str, close: &[String]) -> (String, String, &'static str) {
-    let names: Vec<&str> = close.iter().map(|s| actions::label(leaf(s))).collect();
+/// button. Threads running in it, `names`, are named; they close first.
+fn removing(label: &str, names: &[String]) -> (String, String, &'static str) {
     let title = match names.len() {
         0 => {
             return (

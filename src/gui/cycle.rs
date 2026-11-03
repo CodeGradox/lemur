@@ -1,8 +1,12 @@
-//! ⌃Tab: going through the threads of the worktree on show, the one
-//! opened last first, the way ⌘Tab goes through apps. While ⌃ is held each
-//! Tab goes one further; letting go of it settles on the thread on show.
+//! ⌃Tab: going through the threads of the worktree on show, along the tabs
+//! or, as Settings can say, the one opened last first, the way ⌘Tab goes
+//! through apps. While ⌃ is held each Tab goes one further; letting go of it
+//! settles on the thread on show.
 
+use super::settings::Prefs;
 use super::{Key, Lemur};
+use crate::config::ThreadOrder;
+use crate::snapshot::Session;
 use gpui_kit::*;
 
 /// `threads` by when they were last opened (`recent`, the latest first);
@@ -15,41 +19,52 @@ pub(super) fn by_recent(mut threads: Vec<Key>, recent: &[Key]) -> Vec<Key> {
 impl Lemur {
     /// The threads of the worktree `active` runs in, or of its host's
     /// threads outside every worktree.
-    fn siblings(&self, active: &Key) -> Vec<Key> {
+    pub(super) fn siblings(&self, active: &Key) -> Vec<Key> {
         let (host, session) = active;
+        // Those put away aren't tabs, unless on show.
+        let shown = |s: &&Session| !s.away || s.name == *session;
         let names: Vec<String> = match self
             .snap
             .worktrees(host)
             .find(|w| w.sessions.iter().any(|s| s.name == *session))
         {
-            Some(w) => w.sessions.iter().map(|s| s.name.clone()).collect(),
+            Some(w) => w
+                .sessions
+                .iter()
+                .filter(shown)
+                .map(|s| s.name.clone())
+                .collect(),
             None => self
                 .snap
                 .hosts
                 .iter()
                 .filter(|h| h.name == *host)
-                .flat_map(|h| h.other.iter().map(|s| s.name.clone()))
+                .flat_map(|h| h.other.iter().filter(shown).map(|s| s.name.clone()))
                 .collect(),
         };
         names.into_iter().map(|name| (host.clone(), name)).collect()
     }
 
     /// Shows the next thread of the worktree on show, or with `back` the
-    /// one before, in the order they were last opened.
+    /// one before, in the order Settings says.
     pub(super) fn cycle_threads(
         &mut self,
         back: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.prompt.is_some() || self.picker.is_some() {
+        if self.overlaid() {
             return;
         }
         let Some(active) = self.active.clone() else {
             return;
         };
         if self.cycling.is_none() {
-            let order = by_recent(self.siblings(&active), &self.recent);
+            let threads = self.siblings(&active);
+            let order = match Prefs::get(cx).thread_order {
+                ThreadOrder::Tabs => threads,
+                ThreadOrder::Recent => by_recent(threads, &self.recent),
+            };
             if order.len() < 2 {
                 return;
             }

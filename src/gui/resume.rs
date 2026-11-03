@@ -1,12 +1,12 @@
 //! Threads Claude runs in, kept with their Claude session ID so they can be
-//! resumed once their tmux session is gone, as after the host restarted.
+//! resumed once their terminal is gone, as after the host restarted.
 //! Each starts with an ID of lemur's, and refreshes keep it current.
 
 use super::settings::Prefs;
 use super::snackbar::Kind;
 use super::{Lemur, sessions};
 use crate::actions;
-use crate::config::{ClaudeThread, Config, leaf};
+use crate::config::{ClaudeThread, Config};
 use gpui_kit::*;
 
 impl Lemur {
@@ -53,6 +53,29 @@ impl Lemur {
         cx.notify();
     }
 
+    /// Notes the shell each Claude thread runs in, so that one whose host
+    /// restarted, back at its address as a fresh shell, is known to be.
+    pub(super) fn note_shells(&mut self, cx: &mut Context<Self>) {
+        let notes: Vec<(String, String, u32)> = sessions(&self.snap)
+            .filter_map(|(host, s)| Some((host.to_string(), s.name.clone(), s.shell_to_note()?)))
+            .collect();
+        if notes.is_empty() {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        self.in_background(
+            cx,
+            move || {
+                for (host, session, pid) in notes {
+                    // Noted at the next snapshot if it can't be now.
+                    let _ = actions::note_shell(&cfg, &host, &session, pid);
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .detach();
+    }
+
     /// Keeps each running Claude's session ID as `claude agents` reports
     /// it: a thread lemur didn't start gets one, and one whose Claude
     /// started over (`/clear`) gets the new one.
@@ -65,6 +88,8 @@ impl Lemur {
                     session: s.name.clone(),
                     path: run.path.clone(),
                     claude_session: run.id.clone(),
+                    label: Some(s.own_label.clone()),
+                    issue: s.issue.clone(),
                 })
             })
             .collect();
@@ -90,9 +115,15 @@ impl Lemur {
     /// Starts gone threads' sessions again, each resuming its Claude
     /// conversation; one alone opens.
     pub(super) fn resume(&mut self, threads: Vec<ClaudeThread>, cx: &mut Context<Self>) {
+        // Not one being resumed, as with a double click, or ▶ then Resume
+        // all: two Claudes would work on one conversation.
+        let threads: Vec<ClaudeThread> = threads
+            .into_iter()
+            .filter(|t| self.resuming.insert((t.host.clone(), t.session.clone())))
+            .collect();
         let what = match threads.as_slice() {
             [] => return,
-            [one] => actions::label(leaf(&one.session)).to_string(),
+            [one] => one.shown(),
             many => format!("{} threads", many.len()),
         };
         self.status = Some((format!("resuming {what}…"), Kind::Progress));
@@ -113,22 +144,27 @@ impl Lemur {
                 this.status = None;
                 let mut resumed = vec![];
                 for (thread, result) in results {
+                    this.resuming
+                        .remove(&(thread.host.clone(), thread.session.clone()));
                     match result {
-                        Ok(()) => resumed.push(thread),
-                        Err(e) => this.fail(
-                            e.context(format!(
-                                "resuming {}",
-                                actions::label(leaf(&thread.session))
-                            )),
-                            cx,
-                        ),
+                        // It goes on in a terminal of its own.
+                        Ok(session) => {
+                            this.forget_threads(
+                                &thread.host,
+                                std::slice::from_ref(&thread.session),
+                                cx,
+                            );
+                            let again = ClaudeThread { session, ..thread };
+                            this.keep_thread(again.clone(), cx);
+                            resumed.push(again);
+                        }
+                        Err(e) => this.fail(e.context(format!("resuming {}", thread.shown())), cx),
                     }
                 }
-                this.snap.retain_gone(|t| !resumed.contains(t));
                 // Refreshes that started before it was back are stale.
                 this.changes += 1;
                 if let [one] = resumed.as_slice() {
-                    this.open(one.host.clone(), one.session.clone(), window, cx);
+                    this.open_fresh(one.host.clone(), one.session.clone(), window, cx);
                 }
                 this.refresh(cx).detach();
                 cx.notify();

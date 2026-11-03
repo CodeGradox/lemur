@@ -1,10 +1,19 @@
-//! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font and
-//! colors, and the language dictation listens for. Changes apply at once in
-//! every window and are saved to the config file.
+//! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font,
+//! scrollback and colors, the language dictation listens for, whether to
+//! show Claude's plan usage, and Lemur's Linear sign-in. Changes apply at
+//! once in every window and are saved to the config file.
 
+use super::linear_panel::{self, LinearAccount};
+use super::meter::{ClaudeFound, CodexFound};
+use super::sidebar::{claude_icon, codex_icon};
 use super::terminal::{Palette, SLOTS, Slot, set_color};
-use crate::config::{Config, FONT_SIZES, Language, Terminal, ThemeChoice};
+use crate::config::{
+    Config, FONT_SIZES, Language, SCROLLBACKS, Terminal, ThemeChoice, ThreadOrder,
+};
+use crate::core_update::{self, Versions};
 use alacritty_terminal::vte::ansi::Rgb;
+use gpui_kit::component::Disableable;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::setting::{
@@ -26,7 +35,15 @@ pub const CONTEXT: &str = "Settings";
 pub struct Prefs {
     pub theme: ThemeChoice,
     pub dictation_language: Language,
+    pub thread_order: ThreadOrder,
     pub terminal: Terminal,
+    /// Whether the sidebar shows how much of Claude's plan is used.
+    pub claude_usage: bool,
+    /// Whether it shows how much of Codex's is.
+    pub codex_usage: bool,
+    /// The herdr-cores Lemur uses on this Mac, whose versions Settings
+    /// shows.
+    pub cores: core_update::Cores,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
     /// Why the last change couldn't be saved.
@@ -40,9 +57,20 @@ impl Prefs {
         Prefs {
             theme: cfg.theme,
             dictation_language: cfg.dictation_language,
+            thread_order: cfg.thread_order,
             terminal: cfg.terminal.clone(),
+            claude_usage: cfg.claude_usage,
+            codex_usage: cfg.codex_usage,
+            cores: core_update::Cores::of(cfg),
             file,
             error: None,
+        }
+    }
+
+    /// A host was added: Settings asks and updates the cores it takes.
+    pub fn hosts_changed(cfg: &Config, cx: &mut App) {
+        if cx.has_global::<Prefs>() {
+            cx.global_mut::<Prefs>().cores = core_update::Cores::of(cfg);
         }
     }
 
@@ -63,9 +91,17 @@ impl Prefs {
         let theme = prefs.theme;
         change(&mut prefs);
         prefs.error = prefs.file.as_deref().and_then(|path| {
-            Config::save_settings(path, prefs.theme, prefs.dictation_language, &prefs.terminal)
-                .err()
-                .map(|e| format!("{e:#}"))
+            Config::save_settings(
+                path,
+                prefs.theme,
+                prefs.dictation_language,
+                prefs.thread_order,
+                &prefs.terminal,
+                prefs.claude_usage,
+                prefs.codex_usage,
+            )
+            .err()
+            .map(|e| format!("{e:#}"))
         });
         cx.set_global(prefs);
         if Prefs::get(cx).theme != theme {
@@ -123,6 +159,14 @@ struct SettingsView {
     pickers: Vec<Picker>,
     focus: FocusHandle,
     _prefs: Subscription,
+    _found: Subscription,
+    _codex_found: Subscription,
+    _linear: Subscription,
+    /// herdr-core's versions here and on each machine, once asked.
+    core: Option<Result<Versions, String>>,
+    /// Updating it, and then what that did, or why it didn't.
+    updating: bool,
+    core_note: Option<(String, bool)>,
     _pickers: Vec<Subscription>,
 }
 
@@ -166,6 +210,10 @@ impl SettingsView {
                 });
             }
         }
+        // Tests don't ask the release site.
+        if !cfg!(test) {
+            cx.defer_in(window, |this: &mut Self, _, cx| this.check_core(cx));
+        }
         SettingsView {
             fonts,
             pickers,
@@ -174,6 +222,12 @@ impl SettingsView {
                 this.sync_pickers(window, cx);
                 cx.notify();
             }),
+            _found: cx.observe_global::<ClaudeFound>(|_, cx| cx.notify()),
+            _codex_found: cx.observe_global::<CodexFound>(|_, cx| cx.notify()),
+            _linear: cx.observe_global::<LinearAccount>(|_, cx| cx.notify()),
+            core: None,
+            updating: false,
+            core_note: None,
             _pickers: subscriptions,
         }
     }
@@ -220,6 +274,33 @@ impl SettingsView {
     }
 }
 
+/// `item` with its help text under it, across the page. Given as the item's
+/// description it would sit beside what the item sets, as large as it needs, and
+/// leave that too little room. Searching finds both by what either says.
+fn described(item: SettingItem, help: impl Into<SharedString>) -> [SettingItem; 2] {
+    let help: SharedString = help.into();
+    let title = match &item {
+        SettingItem::Item { title, .. } => title.clone(),
+        SettingItem::Element { .. } => SharedString::default(),
+    };
+    let (shown, selector) = (help.clone(), format!("help {title}"));
+    [
+        item.keywords([help.clone()]),
+        SettingItem::render(move |_, _, cx| {
+            let selector = selector.clone();
+            div()
+                .debug_selector(move || selector)
+                // Close under its item, past most of the gap between a
+                // group's items.
+                .mt(px(-12.0))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(shown.clone())
+        })
+        .keywords([title, help]),
+    ]
+}
+
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let themes = ThemeChoice::ALL
@@ -256,6 +337,19 @@ impl Render for SettingsView {
             |size, cx| Prefs::update(cx, |p| p.terminal.font_size = size),
         )
         .default_value(defaults.font_size);
+        let scrollback = SettingField::number_input(
+            NumberFieldOptions {
+                min: f64::from(*SCROLLBACKS.start()),
+                max: f64::from(*SCROLLBACKS.end()),
+                step: 1000.0,
+            },
+            |cx| f64::from(Prefs::get(cx).terminal.scrollback),
+            |lines, cx| {
+                let lines = (lines.round() as u32).min(*SCROLLBACKS.end());
+                Prefs::update(cx, |p| p.terminal.scrollback = lines)
+            },
+        )
+        .default_value(f64::from(defaults.scrollback));
         let languages = Language::ALL
             .map(|l| (l.as_str().into(), language_label(l).into()))
             .to_vec();
@@ -271,51 +365,163 @@ impl Render for SettingsView {
             },
         )
         .default_value(Language::default().as_str());
-        let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
-            SettingPage::new("Appearance").icon(IconName::Sun).group(
-                SettingGroup::new().item(
-                    SettingItem::new("Theme", theme)
-                        .description("System follows macOS's light or dark mode."),
-                ),
+        let thread_orders = ThreadOrder::ALL
+            .map(|o| (o.as_str().into(), thread_order_label(o).into()))
+            .to_vec();
+        let thread_order = SettingField::dropdown(
+            thread_orders,
+            |cx| Prefs::get(cx).thread_order.as_str().into(),
+            |value: SharedString, cx| {
+                let order = ThreadOrder::ALL
+                    .into_iter()
+                    .find(|o| o.as_str() == value.as_ref())
+                    .unwrap_or_default();
+                Prefs::update(cx, |p| p.thread_order = order);
+            },
+        )
+        .default_value(ThreadOrder::default().as_str());
+        // Offered once Lemur has seen Claude Code; turned on, it can be
+        // turned off whatever happens.
+        let found = cx.try_global::<ClaudeFound>().is_some_and(|f| f.0);
+        let usage_on = Prefs::get(cx).claude_usage;
+        let usage = SettingItem::new(
+            "Show plan usage",
+            SettingField::switch(
+                |cx| Prefs::get(cx).claude_usage,
+                |on, cx| Prefs::update(cx, |p| p.claude_usage = on),
             ),
+        )
+        .disabled(!found && !usage_on);
+        let usage = described(
+            usage,
+            if found || usage_on {
+                "How much of your Claude plan is used, above the hosts' load in the sidebar. \
+             Lemur runs Claude Code's /usage every 10 minutes (30 while Lemur isn't in front) \
+             on the host where Claude ran last; Claude Code asks, with its own sign-in."
+            } else {
+                "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, \
+             then turn this on."
+            },
+        );
+        let codex_found = cx.try_global::<CodexFound>().is_some_and(|f| f.0);
+        let codex_on = Prefs::get(cx).codex_usage;
+        let codex_usage = SettingItem::new(
+            "Show plan usage",
+            SettingField::switch(
+                |cx| Prefs::get(cx).codex_usage,
+                |on, cx| Prefs::update(cx, |p| p.codex_usage = on),
+            ),
+        )
+        .disabled(!codex_found && !codex_on);
+        let codex_usage = described(
+            codex_usage,
+            if codex_found || codex_on {
+                "How much of your ChatGPT plan's Codex use is used, above the hosts' load in the \
+             sidebar. Lemur asks Codex's app server every 10 minutes (30 while Lemur isn't in \
+             front) on the host where Codex ran last; Codex asks, with its own sign-in. Signed \
+             in with an API key there's no plan: it shows the tokens Codex used there, from \
+             Codex's session logs."
+            } else {
+                "Lemur hasn't seen Codex on your hosts yet. Start a Codex thread, then turn this on."
+            },
+        );
+        let (status, error) = linear_panel::settings_status(cx);
+        let (action, act) = linear_panel::settings_action(cx);
+        let account = SettingItem::new(
+            "Account",
+            SettingField::render(move |_, _, _| {
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().text_sm().child(status.clone()))
+                    .child(
+                        Button::new("linear-account")
+                            .small()
+                            .label(action)
+                            .on_click(move |_, _, cx| act(cx)),
+                    )
+            }),
+        );
+        let linear = described(
+            account,
+            error.unwrap_or_else(|| {
+                "Lemur signs in with its own Linear app, and only reads: it searches issues and \
+             shows the one pinned to a thread. The sign-in is kept in your Keychain, where \
+             only Lemur can read it."
+                    .into()
+            }),
+        );
+        let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
+            SettingPage::new("Appearance")
+                .icon(IconName::Sun)
+                .group(SettingGroup::new().items(described(
+                    SettingItem::new("Theme", theme),
+                    "System follows macOS's light or dark mode.",
+                ))),
             SettingPage::new("Terminal")
                 .icon(IconName::SquareTerminal)
                 .group(
                     SettingGroup::new()
-                        .item(
-                            SettingItem::new("Font", font)
-                                .description("Monospaced fonts installed on this Mac."),
-                        )
-                        .item(SettingItem::new("Font size", font_size).description("In points.")),
+                        .items(described(
+                            SettingItem::new("Font", font),
+                            "Monospaced fonts installed on this Mac.",
+                        ))
+                        .items(described(
+                            SettingItem::new("Font size", font_size),
+                            "In points.",
+                        ))
+                        .items(described(
+                            SettingItem::new("Scrollback", scrollback),
+                            "Lines each terminal keeps to scroll back through. A thousand \
+                             lines of a terminal 130 columns wide take about 3 MB. herdr-core \
+                             keeps about 2,600 of its own, which come back when Lemur \
+                             attaches again. More apply at once; fewer when a terminal \
+                             attaches again, as when Lemur starts.",
+                        )),
                 ),
             SettingPage::new("Terminal colors")
                 .icon(IconName::Palette)
                 .groups([self.color_group(true), self.color_group(false)]),
             SettingPage::new("Dictation")
                 .icon(gpui_kit::assets::IconName::Mic)
-                .group(
-                    SettingGroup::new()
-                        .item(SettingItem::new("Language", language).description(
-                            "What ⌘D listens for. The dictation bar switches it too.",
-                        )),
-                ),
+                .group(SettingGroup::new().items(described(
+                    SettingItem::new("Language", language),
+                    "What ⌘D listens for. The dictation bar switches it too.",
+                ))),
+            SettingPage::new("Claude")
+                .icon(claude_icon())
+                .group(SettingGroup::new().items(usage)),
+            SettingPage::new("Codex")
+                .icon(codex_icon())
+                .group(SettingGroup::new().items(codex_usage)),
+            SettingPage::new("herdr-core")
+                .icon(super::icons::server())
+                .group(self.core_group(cx)),
             SettingPage::new("Shortcuts")
-                // Not among gpui-component's own icons; the full set has it.
-                .icon(gpui_kit::assets::IconName::Keyboard)
+                .icon(super::icons::keyboard())
+                .group(SettingGroup::new().items(described(
+                    SettingItem::new("Thread order", thread_order),
+                    "The order ⌃Tab goes through the worktree's threads in, and ⌃⇧Tab \
+                     back, and which one shows when you close one. By last opened starts \
+                     with the thread opened before this one, as ⌘Tab does with apps.",
+                )))
                 .groups(SHORTCUTS.iter().map(|(title, shortcuts)| {
                     SettingGroup::new()
                         .title(*title)
-                        .items(shortcuts.iter().map(|s| {
+                        .items(shortcuts.iter().flat_map(|s| {
                             let item = SettingItem::new(
                                 s.what,
                                 SettingField::render(|_, _, _| s.how.render()),
                             );
                             match s.more {
-                                Some(more) => item.description(more),
-                                None => item,
+                                Some(more) => described(item, more).to_vec(),
+                                None => vec![item],
                             }
                         }))
                 })),
+            SettingPage::new("Linear")
+                .icon(super::icons::ticket())
+                .group(SettingGroup::new().items(linear)),
         ]);
         let error = Prefs::get(cx).error.clone();
         let danger = cx.theme().danger;
@@ -337,6 +543,158 @@ impl Render for SettingsView {
                         .child(format!("Couldn't save: {error}")),
                 )
             })
+    }
+}
+
+impl SettingsView {
+    /// Asks which herdr-core runs here and on each machine, and the latest.
+    fn check_core(&mut self, cx: &mut Context<Self>) {
+        self.core = None;
+        cx.notify();
+        let cores = Prefs::get(cx).cores.clone();
+        cx.spawn(async move |this, cx| {
+            let versions = cx
+                .background_spawn(async move { core_update::check(&cores) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.core = Some(versions.map_err(|e| format!("{e:#}")));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Brings what's behind up to the latest: here first, then the machines.
+    fn update_core(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(versions)) = &self.core else {
+            return;
+        };
+        let outdated = versions.outdated();
+        if outdated.is_empty() || self.updating {
+            return;
+        }
+        self.updating = true;
+        self.core_note = None;
+        cx.notify();
+        let cores = Prefs::get(cx).cores.clone();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_spawn(async move { core_update::update(&outdated, &cores) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.updating = false;
+                this.core_note = Some(match done {
+                    Ok(note) => (note, false),
+                    Err(e) => (format!("{e:#}"), true),
+                });
+                this.check_core(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Each herdr-core's version, the latest, and Update.
+    fn core_group(&self, cx: &mut Context<Self>) -> SettingGroup {
+        let text =
+            |s: String| SettingField::render(move |_, _, _| div().text_sm().child(s.clone()));
+        let group = SettingGroup::new().description(
+            "herdr-core runs Lemur's terminals, here and on each host. An update keeps them running.",
+        );
+        let versions = match &self.core {
+            None => return group.item(SettingItem::new("Versions", text("Asking…".into()))),
+            Some(Err(e)) => {
+                return group.item(SettingItem::new(
+                    "Versions",
+                    text(format!("Couldn't ask: {e}")),
+                ));
+            }
+            Some(Ok(v)) => v.clone(),
+        };
+        let latest = versions.latest.clone();
+        let shown = |v: &Option<String>| match (v, &latest) {
+            (None, _) => "unknown".to_string(),
+            (Some(v), Some(l)) if core_update::newer(l, v) => format!("{v} · {l} is out"),
+            (Some(v), Some(_)) => format!("{v} · up to date"),
+            (Some(v), None) => v.clone(),
+        };
+        let mut here = shown(&versions.here);
+        if let Some(by) = &versions.managed {
+            here += &format!(" · {by} updates it");
+        }
+        let mut group = group.item(SettingItem::new("This Mac", text(here)));
+        for (name, v) in &versions.machines {
+            group = group.item(SettingItem::new(name.clone(), text(shown(v))));
+        }
+        let outdated = versions.outdated();
+        let what = update_summary(&versions);
+        let this = cx.entity().downgrade();
+        let updating = self.updating;
+        let can = !outdated.is_empty() && !updating;
+        let buttons = SettingField::render(move |_, _, _| {
+            let (update, check) = (this.clone(), this.clone());
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("update-core")
+                        .small()
+                        .primary()
+                        .label(if updating { "Updating…" } else { "Update" })
+                        .disabled(!can)
+                        .on_click(move |_, _, cx| {
+                            update.update(cx, |v, cx| v.update_core(cx)).ok();
+                        }),
+                )
+                .child(
+                    Button::new("check-core")
+                        .small()
+                        .label("Check again")
+                        .disabled(updating)
+                        .on_click(move |_, _, cx| {
+                            check.update(cx, |v, cx| v.check_core(cx)).ok();
+                        }),
+                )
+        });
+        let mut group = group.items(described(SettingItem::new("Update", buttons), what));
+        if let Some((note, failed)) = self.core_note.clone() {
+            let color = if failed {
+                cx.theme().danger
+            } else {
+                cx.theme().muted_foreground
+            };
+            group = group.item(SettingItem::new(
+                "",
+                SettingField::render(move |_, _, _| {
+                    div().text_sm().text_color(color).child(note.clone())
+                }),
+            ));
+        }
+        group
+    }
+}
+
+/// What Update does, or why there's nothing for it to do.
+fn update_summary(versions: &Versions) -> String {
+    let outdated = versions.outdated();
+    let Some(latest) = &versions.latest else {
+        return "Couldn't ask for the latest release.".to_string();
+    };
+    if !outdated.is_empty() {
+        return format!("Updates {}.", versions.describe(&outdated));
+    }
+    // Behind, but this Mac's isn't Lemur's to update, and the hosts get
+    // what this Mac has.
+    match &versions.managed {
+        Some(by)
+            if versions
+                .here
+                .as_deref()
+                .is_some_and(|v| core_update::newer(latest, v)) =>
+        {
+            format!("{by} updates this Mac's herdr-core; then Lemur can update the hosts.")
+        }
+        _ => "Everything is up to date.".to_string(),
     }
 }
 
@@ -384,8 +742,18 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
     (
         "Window",
         &[
+            Shortcut {
+                what: "Command palette",
+                how: Press::Keys(&["cmd-shift-p"]),
+                more: Some("Every command by name, with its key."),
+            },
             keys("Toggle the sidebar", &["cmd-b"]),
-            keys("Toggle the notes", &["cmd-r"]),
+            Shortcut {
+                what: "Toggle the right panel",
+                how: Press::Keys(&["cmd-r"]),
+                more: Some("The panel that showed last: the notes at first."),
+            },
+            keys("Toggle the agents", &["cmd-shift-a"]),
             keys("Add a project", &["cmd-o"]),
             keys("Settings", &["cmd-,"]),
             keys("Close Settings", &["cmd-w"]),
@@ -398,18 +766,36 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         "Threads",
         &[
             Shortcut {
-                what: "New Claude thread or shell",
+                what: "New terminal",
+                how: Press::Keys(&["cmd-t"]),
+                more: Some("A new tab where the thread on show runs."),
+            },
+            Shortcut {
+                what: "New Claude or Codex thread or shell, or go to one",
                 how: Press::Keys(&["cmd-j"]),
-                more: Some("In the worktree of the thread on show."),
+                more: Some("Named, where the thread on show runs; type to find another thread."),
+            },
+            keys("Go to a thread", &["cmd-p"]),
+            Shortcut {
+                what: "Close the thread on show",
+                how: Press::Keys(&["cmd-w"]),
+                more: Some("Asking first while something runs in it."),
             },
             Shortcut {
                 what: "Next thread in the worktree",
                 how: Press::Keys(&["ctrl-tab"]),
-                more: Some(
-                    "The one opened before it; hold ⌃ and press Tab again to go further back.",
-                ),
+                more: Some("In the order set above; hold ⌃ and press Tab again to go further."),
             },
             keys("Previous thread in the worktree", &["ctrl-shift-tab"]),
+            keys(
+                "Move the tab left or right",
+                &["cmd-shift-left", "cmd-shift-right"],
+            ),
+            Shortcut {
+                what: "Go to a tab",
+                how: Press::Keys(&["cmd-1", "cmd-9"]),
+                more: Some("⌘1 shows the first tab, ⌘2 the second, and so on up to the ninth."),
+            },
         ],
     ),
     (
@@ -530,6 +916,13 @@ pub fn language_label(language: Language) -> &'static str {
     }
 }
 
+fn thread_order_label(order: ThreadOrder) -> &'static str {
+    match order {
+        ThreadOrder::Tabs => "Along the tabs",
+        ThreadOrder::Recent => "By last opened",
+    }
+}
+
 fn theme_label(theme: ThemeChoice) -> &'static str {
     match theme {
         ThemeChoice::System => "System",
@@ -558,11 +951,61 @@ fn monospace_fonts(cx: &App) -> Vec<SharedString> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla};
+    use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla, update_summary};
     use crate::config::ThemeChoice;
+    use crate::core_update::Versions;
     use crate::gui::terminal::{DARK, Palette, Slot, set_color};
     use gpui_kit::component::ActiveTheme;
     use gpui_kit::{Keystroke, hsla};
+    use gpui_kit::{px, size};
+
+    /// With nothing Lemur can update, Update says why, though this Mac's
+    /// herdr-core is behind: a package manager updates it.
+    #[test]
+    fn update_says_why_theres_nothing_to_do() {
+        let behind = Versions {
+            here: Some("0.1.15".into()),
+            managed: Some("homebrew".into()),
+            machines: vec![("agent".into(), Some("0.1.15".into()))],
+            latest: Some("0.1.16".into()),
+        };
+        assert_eq!(
+            update_summary(&behind),
+            "homebrew updates this Mac's herdr-core; then Lemur can update the hosts."
+        );
+        let current = Versions {
+            here: Some("0.1.16".into()),
+            machines: vec![("agent".into(), Some("0.1.16".into()))],
+            ..behind.clone()
+        };
+        assert_eq!(update_summary(&current), "Everything is up to date.");
+        let ours = Versions {
+            managed: None,
+            ..behind
+        };
+        assert_eq!(
+            update_summary(&ours),
+            "Updates this Mac 0.1.15, agent 0.1.15."
+        );
+    }
+
+    /// Help text goes under its item, across the page, so it leaves what the
+    /// item sets the room it needs, however narrow the window.
+    #[gpui::test]
+    fn help_text_goes_under_its_item(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(SettingsView::new);
+        cx.simulate_resize(size(px(760.0), px(514.0)));
+        cx.run_until_parked();
+        let help = cx.debug_bounds("help Theme").expect("Theme's help text");
+        // The page is what's left of the window beside Settings' own list.
+        let page = px(760.0 - 200.0);
+        assert!(
+            help.size.width > page * 0.8,
+            "{:?} of {page:?}",
+            help.size.width
+        );
+    }
 
     /// A color picked in Settings becomes that slot's color and is kept;
     /// a reset puts lemur's own back, in the picker too.

@@ -150,7 +150,7 @@ pub fn folder_to_add(host: &Host, path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, git_in};
+    use crate::test_support::{HcServer, TempDir, git_in};
 
     #[test]
     fn aliases_come_from_the_config_and_its_includes() {
@@ -188,7 +188,9 @@ mod tests {
         }
         std::fs::write(dir.join("file.txt"), "").unwrap();
         git_in(&dir.join("api"), &["init", "-q"]);
-        let local = Host::new("local", "local");
+        // This Mac, through the test's own herdr-core, not the one in use.
+        let server = HcServer::new("browse");
+        let local: Host = server.config().hosts.remove(0);
         let base = dir.to_string_lossy().into_owned();
 
         let folders = list_folders(&local, &base).unwrap();

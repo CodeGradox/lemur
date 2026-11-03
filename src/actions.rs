@@ -1,10 +1,16 @@
 use crate::attach::Active;
-use crate::config::{ClaudeThread, Config, Host};
-use crate::remote::{Remote, quote, sh_path, target};
+use crate::config::{Agent, ClaudeThread, Config, Host};
+use crate::hc::{self, Stream};
+use crate::remote::{Remote, quote, sh_path};
+use crate::snapshot::{
+    AWAY, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
+};
 use anyhow::{Context, Result, bail};
+use futures::channel::mpsc::TryRecvError;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty()
@@ -88,19 +94,13 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Separates a thread's label from the random words that keep its tmux name
-/// unique, so several threads can share a label: `claude--calm-heron`.
+/// Separates a thread's label from the random words that kept its tmux
+/// name unique, in threads kept from before herdr-core: `claude--calm-heron`.
 const LABEL_END: &str = "--";
 
-/// A thread name for `label` that `taken` doesn't know yet:
-/// `claude` becomes `claude--calm-heron`.
-pub fn unique_thread(label: &str, taken: impl Fn(&str) -> bool) -> String {
-    let words = random_name(|w| taken(&format!("{label}{LABEL_END}{w}")));
-    format!("{label}{LABEL_END}{words}")
-}
-
-/// What lemur shows for a session or thread: the name without its unique
-/// words. `api/claude--calm-heron` shows as `api/claude`.
+/// What lemur shows for a thread kept from before herdr-core: its tmux
+/// name without the unique words. `api/claude--calm-heron` shows as
+/// `api/claude`.
 pub fn label(name: &str) -> &str {
     match name.rsplit_once(LABEL_END) {
         Some((label, words)) if !words.contains('/') => label,
@@ -170,47 +170,52 @@ fn parse_branches(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// A thread just started: its host and session, and for Claude, what
+/// A thread just started: its host and terminal, and for Claude, what
 /// resumes it.
 #[derive(Debug)]
 pub struct Started {
     pub host: String,
+    /// Its terminal's address.
     pub session: String,
     pub claude: Option<ClaudeThread>,
 }
 
-/// Starts Claude in a new worktree `name` of `base`, in a session for
-/// thread `thread`. The worktree checks out a new `branch`, or with none
-/// its start, detached. It starts from `from`, or the default branch; a
+/// Starts Claude in a new worktree `name` of `base`, in a thread labelled
+/// `label`. The worktree checks out a new `branch`, or with none its
+/// start, detached. It starts from `from`, or the default branch; a
 /// remote's branch is fetched first. Returns the thread, and a note if
 /// that fetch failed and the worktree starts where it was last fetched.
 pub fn new_worktree_thread(
     cfg: &Config,
     base: usize,
     name: &str,
-    thread: &str,
+    label: &str,
+    agent: Option<Agent>,
     branch: Option<&str>,
     from: Option<&str>,
 ) -> Result<(Started, Option<String>)> {
     validate_name(name)?;
+    validate_name(label)?;
     if let Some(branch) = branch {
         validate_branch(branch)?;
     }
     let b = &cfg.bases[base];
+    let host = cfg.host_or_err(&b.host)?;
+    if let Some(agent) = agent {
+        installed(host, agent)?;
+    }
     let (from, fetched) = fetch_start(cfg, base, from)?;
     let checkout = match branch {
         Some(branch) => format!("--no-track -b {}", quote(branch)),
         None => "--detach".to_string(),
     };
-    let id = random_uuid();
-    let started = start_session(cfg, base, thread, Some(&id), |host, tmux, session| {
-        let (repo, wt, s) = (sh_path(&b.path), sh_path(&b.worktree_dir), quote(session));
-        format!(
-            "cd {repo}\nmkdir -p {wt}\ngit worktree add -q {checkout} {wt}/{name} {}\ndir=\"$(cd {wt}/{name} && pwd -P)\"\n{tmux} new-session -d -s {s} -c \"$dir\"\n{}",
-            quote(&from),
-            launch(tmux, session, &format!("{} --session-id {id}", host.claude)),
-        )
-    })?;
+    let (repo, wt) = (sh_path(&b.path), sh_path(&b.worktree_dir));
+    let out = Remote::new(host).run(&format!(
+        "set -e\ncd {repo}\nmkdir -p {wt}\ngit worktree add -q {checkout} {wt}/{name} {}\ncd {wt}/{name}\npwd -P\n",
+        quote(&from),
+    ))?;
+    let dir = out.lines().last().unwrap_or_default();
+    let started = start_on(host, dir, label, agent)?;
     let note = (!fetched)
         .then(|| format!("couldn't fetch {from}; the worktree starts where it was last fetched"));
     Ok((started, note))
@@ -242,142 +247,321 @@ printf '%s\n%s\n' "$from" "$fetched"
     Ok((from, lines.next() == Some("yes")))
 }
 
-/// Starts Claude, or with `shell` just a shell, in an existing worktree, in
-/// a session for thread `thread`.
+/// Starts `agent`, or with none just a shell, in an existing worktree, in a
+/// thread labelled `label`.
 pub fn new_thread_in(
     cfg: &Config,
     base: usize,
     worktree: &str,
-    thread: &str,
-    shell: bool,
+    label: &str,
+    agent: Option<Agent>,
 ) -> Result<Started> {
-    let id = (!shell).then(random_uuid);
-    start_session(cfg, base, thread, id.as_deref(), |host, tmux, session| {
-        let start = match &id {
-            None => tag(tmux, session, "shell"),
-            Some(id) => launch(tmux, session, &format!("{} --session-id {id}", host.claude)),
-        };
-        format!(
-            "dir={}\n{tmux} new-session -d -s {} -c \"$dir\"\n{start}",
-            quote(worktree),
-            quote(session)
-        )
+    start_in(cfg, &cfg.bases[base].host, worktree, label, agent)
+}
+
+/// Starts a thread labelled `label` in `dir` on `host`, a project's worktree
+/// or any folder: `agent`, or with none just a shell.
+pub fn start_in(
+    cfg: &Config,
+    host: &str,
+    dir: &str,
+    label: &str,
+    agent: Option<Agent>,
+) -> Result<Started> {
+    let host = cfg.host_or_err(host)?;
+    if let Some(agent) = agent {
+        installed(host, agent)?;
+    }
+    start_on(host, dir, label, agent)
+}
+
+fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>) -> Result<Started> {
+    if agent == Some(Agent::Claude) {
+        return start_claude(host, dir, label);
+    }
+    let (kind, command) = match agent {
+        Some(agent) => ("codex", Some(host.command(agent))),
+        None => ("shell", None),
+    };
+    Ok(Started {
+        host: host.name.clone(),
+        session: start_thread(host, dir, label, kind, command, None)?,
+        claude: None,
     })
 }
 
-/// Creates the session for thread `thread` of `base`. `body` gets the host,
-/// the tmux command and the session name, and must run `new-session` in
-/// `$dir`. With `claude`, the Claude session ID it starts with, the thread
-/// comes back with what resumes it.
-fn start_session(
-    cfg: &Config,
-    base: usize,
-    thread: &str,
-    claude: Option<&str>,
-    body: impl FnOnce(&Host, &str, &str) -> String,
-) -> Result<Started> {
-    validate_name(thread)?;
-    let b = &cfg.bases[base];
-    let host = cfg.host_or_err(&b.host)?;
-    let r = Remote::new(host);
-    let tmux = r.tmux();
-    let session = b.session_name(thread);
-    let out = r.run(&format!(
-        "set -e\n{}\n{}\nprintf '%s\\n' \"$dir\"\n",
-        refuse_existing(&tmux, &session),
-        body(host, &tmux, &session)
-    ))?;
-    let dir = out.lines().last().unwrap_or_default().to_string();
+/// How long a host's shell gets to say what it can start: it may read a lot
+/// on starting.
+const INSTALLED_TIME: Duration = Duration::from_secs(10);
+
+/// Stops here if `host` can't start `agent`, with nothing left behind: no
+/// terminal whose shell says "command not found", no worktree. Not knowing
+/// isn't missing: a host that doesn't answer, or whose shell Lemur can't ask,
+/// goes on to fail or work as it would.
+fn installed(host: &Host, agent: Agent) -> Result<()> {
+    let Some(program) = program_of(host.command(agent)) else {
+        return Ok(());
+    };
+    let answer = Remote::new(host).run_within(&find_program(program), INSTALLED_TIME);
+    if answer.is_ok_and(|out| out.contains("lemur-no") && !out.contains("lemur-yes")) {
+        bail!(
+            "{} isn't installed on {}: its shell can't find `{program}`",
+            agent.name(),
+            host.name
+        );
+    }
+    Ok(())
+}
+
+/// The program a host's command for an agent starts, past any `NAME=value`;
+/// None if it's more than a plain word can say.
+fn program_of(command: &str) -> Option<&str> {
+    command
+        .split_whitespace()
+        .find(|word| !word.contains('='))
+        .filter(|word| {
+            word.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_./+-~".contains(&b))
+        })
+}
+
+/// Prints `lemur-yes` or `lemur-no` for whether `program`, a plain word, can
+/// start. A thread types it into an interactive shell, so one of those has the
+/// last word: it may set up PATH where `sh` wouldn't look, or have a function
+/// of that name.
+fn find_program(program: &str) -> String {
+    format!(
+        "command -v {program} >/dev/null 2>&1 && {{ echo lemur-yes; exit 0; }}\n\
+         case \"${{SHELL##*/}}\" in\n\
+         sh|dash|bash|zsh|ksh|fish) \"$SHELL\" -lic 'type {program} >/dev/null 2>&1 && echo lemur-yes || echo lemur-no' </dev/null 2>/dev/null ;;\n\
+         esac\n\
+         exit 0\n"
+    )
+}
+
+/// Starts Claude in a thread labelled `label`, in `dir` on `host`, with a
+/// session ID of lemur's, and returns the thread with what resumes it.
+fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
+    let id = random_uuid();
+    let command = format!("{} --session-id {id}", host.claude);
+    let address = start_thread(host, dir, label, "claude", Some(&command), None)?;
     Ok(Started {
         host: host.name.clone(),
-        session: session.clone(),
-        claude: claude.map(|id| ClaudeThread {
+        session: address.clone(),
+        claude: Some(ClaudeThread {
             host: host.name.clone(),
-            session,
-            path: dir,
-            claude_session: id.to_string(),
+            session: address,
+            path: dir.to_string(),
+            claude_session: id,
+            label: Some(label.to_string()),
+            issue: None,
         }),
     })
 }
 
-/// Starts a thread's session again, once it's gone, as after its host
-/// restarted, and resumes its Claude conversation in it.
-pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<()> {
+/// Starts a thread labelled `label` in `dir` on `host`: the host's shell,
+/// and with `command`, what starts its agent typed into it, so the shell has
+/// set up PATH first. The terminal's labels file it under `dir`, say what it
+/// was started for (`kind`), and pin `issue` to it. Returns its address.
+fn start_thread(
+    host: &Host,
+    dir: &str,
+    label: &str,
+    kind: &str,
+    command: Option<&str>,
+    issue: Option<&str>,
+) -> Result<String> {
+    validate_name(label)?;
+    let (core, on) = hc::for_host(host)?;
+    let mut labels = BTreeMap::from([
+        (LABEL.to_string(), label.to_string()),
+        (KIND.to_string(), kind.to_string()),
+        (WORKTREE.to_string(), dir.to_string()),
+    ]);
+    if let Some(issue) = issue {
+        labels.insert(ISSUE.to_string(), issue.to_string());
+    }
+    let terminals = core.terminals();
+    let on_host = terminals.iter().filter(|t| hc::on_host(t, on.as_deref()));
+    labels.insert(HERDR_SPACE.to_string(), herdr_space(on_host, dir));
+    labels.insert(HERDR_TAB.to_string(), new_herdr_id("tb"));
+    let address = core.run(on.as_deref(), dir, &[], &labels)?;
+    if let Some(command) = command {
+        core.type_line(&address, command)?;
+    }
+    Ok(address)
+}
+
+/// The Herdr space for a thread started in `dir`: that of a terminal running
+/// there, so it joins them as a tab, else one made from the folder, which Herdr
+/// makes on seeing it, and threads started there later share.
+fn herdr_space<'a>(terminals: impl Iterator<Item = &'a hc::Terminal>, dir: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let inside = format!("{dir}/");
+    let there = |t: &&hc::Terminal| t.cwd == dir || t.cwd.starts_with(&inside);
+    let known = terminals
+        .filter(there)
+        .find_map(|t| t.labels.get(HERDR_SPACE).filter(|s| !s.is_empty()));
+    if let Some(space) = known {
+        return space.clone();
+    }
+    let part = |salt: u8| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (salt, dir).hash(&mut hash);
+        hash.finish()
+    };
+    format!("sp{:016x}{:016x}", part(0), part(1))
+}
+
+/// A new id for Herdr, as it makes them: `prefix`, then 32 hex digits.
+fn new_herdr_id(prefix: &str) -> String {
+    format!("{prefix}{}", random_uuid().replace('-', ""))
+}
+
+/// Resumes a thread's Claude conversation once its Claude is gone: in its
+/// terminal when that came back from its host restarting as a fresh shell,
+/// else in a new one, as when that's gone too. Returns the terminal's
+/// address.
+pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
     if !is_uuid(&thread.claude_session) {
         bail!("{} isn't a Claude session ID", thread.claude_session);
     }
     let host = cfg.host_or_err(&thread.host)?;
-    let r = Remote::new(host);
-    let tmux = r.tmux();
-    let session = &thread.session;
-    let resume = format!("{} --resume {}", host.claude, thread.claude_session);
-    r.run(&format!(
-        "set -e\n{}\ndir={}\nif [ ! -d \"$dir\" ]; then echo {} >&2; exit 1; fi\n{tmux} new-session -d -s {} -c \"$dir\"\n{}\n",
-        refuse_existing(&tmux, session),
+    installed(host, Agent::Claude)?;
+    let (core, _) = hc::for_host(host)?;
+    // Back from its host restarting as a fresh shell, it resumes there.
+    let back = match core
+        .terminals()
+        .iter()
+        .find(|t| t.address == thread.session)
+    {
+        Some(t) if crate::snapshot::came_back(t) => t.pid,
+        Some(_) => bail!("{} still runs", thread.shown()),
+        None => None,
+    };
+    // A thread from before herdr-core, Lemur 1.8 and older, may still run
+    // in tmux: resumed, two Claudes would work on one conversation.
+    let in_tmux = if is_address(&thread.session) {
+        String::new()
+    } else {
+        let tmux = match &host.tmux_socket {
+            Some(socket) => format!("tmux -L {}", quote(socket)),
+            None => "tmux".into(),
+        };
+        format!(
+            "if command -v tmux >/dev/null 2>&1 && {tmux} has-session -t {} 2>/dev/null; then echo {} >&2; exit 1; fi\n",
+            quote(&format!("={}", thread.session)),
+            quote(&format!(
+                "{} still runs in tmux, as {}: end it there first",
+                thread.shown(),
+                thread.session
+            )),
+        )
+    };
+    Remote::new(host).run(&format!(
+        "if [ ! -d {} ]; then echo {} >&2; exit 1; fi\n{in_tmux}",
         quote(&thread.path),
         quote(&format!("{} is gone", thread.path)),
-        quote(session),
-        launch(&tmux, session, &resume),
     ))?;
-    Ok(())
-}
-
-fn refuse_existing(tmux: &str, session: &str) -> String {
-    format!(
-        "if {tmux} has-session -t {} 2>/dev/null; then echo {} >&2; exit 1; fi",
-        target(session),
-        quote(&format!("session {session} already exists"))
+    // Threads from before kept their label in their tmux name.
+    let label = Some(thread.shown())
+        .filter(|l| validate_name(l).is_ok())
+        .unwrap_or_else(|| "claude".into());
+    let resume = format!("{} --resume {}", host.claude, thread.claude_session);
+    if back.is_some() {
+        // Where it ran: Claude would go on in whatever folder the shell is,
+        // and the shell notes itself once Claude runs, so that a resume that
+        // fails still offers another.
+        let there = format!("cd {} && {resume}", quote(&thread.path));
+        core.type_line(&thread.session, &there)?;
+        wait_for_program(&core, &thread.session);
+        return Ok(thread.session.clone());
+    }
+    start_thread(
+        host,
+        &thread.path,
+        &label,
+        "claude",
+        Some(&resume),
+        thread.issue.as_deref(),
     )
 }
 
-/// Tags the session as Claude's and types the Claude command into its shell,
-/// so a login shell has set up PATH first.
-///
-/// Inside tmux, Claude Code draws in 256 colors, which turn its colors pale,
-/// unless `CLAUDE_CODE_TMUX_TRUECOLOR` says tmux passes 24-bit color on, and
-/// `COLORTERM` says there is 24-bit color at all (tmux sets it only from
-/// 3.6). tmux brings it down to 256 for a terminal that can't show it.
-fn launch(tmux: &str, session: &str, command: &str) -> String {
-    let t = target(session);
-    format!(
-        "{}\n{tmux} send-keys -t {t}: -l {}\n{tmux} send-keys -t {t}: Enter",
-        tag(tmux, session, "claude"),
-        quote(&format!(
-            "COLORTERM=truecolor CLAUDE_CODE_TMUX_TRUECOLOR=1 {command}"
-        ))
-    )
+/// Waits a moment for what was typed into the shell of terminal `address`
+/// to run, so what's asked next finds the thread running.
+fn wait_for_program(core: &hc::Core, address: &str) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        let terminals = core.terminals();
+        let t = terminals.iter().find(|t| t.address == address);
+        if t.is_none_or(|t| !crate::snapshot::came_back(t)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
-/// Records the session's worktree (`$dir`), so the sidebar files it there,
-/// and what it was started for (`claude` or `shell`), for its icon.
-fn tag(tmux: &str, session: &str, kind: &str) -> String {
-    let t = target(session);
-    format!(
-        "{tmux} set-option -t {t}: @lemur_worktree \"$dir\"\n{tmux} set-option -t {t}: @lemur_kind {kind}"
-    )
+/// Notes the shell `pid` a Claude thread runs in, to tell when its host
+/// restarted.
+pub fn note_shell(cfg: &Config, host: &str, session: &str, pid: u32) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(SHELL, &pid.to_string())])
 }
 
-/// Records the order threads were dragged into: `@lemur_order` 0, 1, 2, …
+/// How many processes the shell `pid` on `host` started that still run or
+/// wait: jobs sent off with `&`, or stopped with ⌃Z. Closing its terminal
+/// ends them.
+pub fn shell_jobs(cfg: &Config, host: &str, pid: Option<u32>) -> Result<usize> {
+    let pid = pid.context("its shell has no pid")?;
+    let out = Remote::new(cfg.host_or_err(host)?).run(&format!(
+        "ps -A -o ppid= | awk -v p={pid} '$1 == p {{ n++ }} END {{ print n + 0 }}'\n"
+    ))?;
+    out.trim().parse().context("counting its shell's jobs")
+}
+
+/// Whether `session` is a herdr-core address (`t7`, `agent/t7`), not a tmux
+/// session's name from before.
+fn is_address(session: &str) -> bool {
+    hc::is_terminal_id(session.rsplit('/').next().unwrap_or(session))
+}
+
+/// Records the order threads were dragged into: `lemur.order` 0, 1, 2, …
+/// Puts a thread away, or with `away` false brings it back.
+pub fn set_away(cfg: &Config, host: &str, session: &str, away: bool) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(AWAY, if away { "1" } else { "" })])
+}
+
+/// Silences a thread's notifications, or lets them come again.
+pub fn set_silent(cfg: &Config, host: &str, session: &str, silent: bool) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(SILENT, if silent { "1" } else { "" })])
+}
+
+/// Pins the Linear issue `issue` (its key) to a thread, or with `None`
+/// unpins the one pinned.
+pub fn set_issue(cfg: &Config, host: &str, session: &str, issue: Option<&str>) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(ISSUE, issue.unwrap_or_default())])
+}
+
 pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
-    let r = Remote::new(cfg.host_or_err(host)?);
-    let tmux = r.tmux();
-    let script: String = sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("{tmux} set-option -t {}: @lemur_order {i}\n", target(s)))
-        .collect();
-    r.run(&format!("set -e\n{script}"))?;
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    for (i, s) in sessions.iter().enumerate() {
+        core.label(s, &[(ORDER, &i.to_string())])?;
+    }
     Ok(())
 }
 
 /// Takes a linked worktree of `base` out of git; its branch stays, and its
 /// folder stays as plain files unless `delete`. The threads running in it
-/// close first: those started or filed there, and those with a pane in it.
-/// Nothing closes or changes until all that would keep it is ruled out: a
-/// thread that isn't one of `sessions` (the error names them all, see
-/// `why_kept`), and as git refuses, a lock, and when deleting, uncommitted
-/// changes. `force` unlocks it and throws the changes away. Whatever is
-/// left of a deleted folder goes too: git can't delete read-only folders.
+/// close first: those started or filed there, and those whose program is
+/// there now. Nothing closes or changes until all that would keep it is
+/// ruled out: a thread that isn't one of `sessions` (the error names them
+/// all, see `why_kept`), and as git refuses, a lock, and when deleting,
+/// uncommitted changes. `force` unlocks it and throws the changes away.
+/// Whatever is left of a deleted folder goes too: git can't delete
+/// read-only folders.
 pub fn remove_worktree(
     cfg: &Config,
     base: usize,
@@ -387,28 +571,27 @@ pub fn remove_worktree(
     delete: bool,
 ) -> Result<()> {
     let b = &cfg.bases[base];
-    let r = Remote::new(cfg.host_or_err(&b.host)?);
-    let tmux = r.tmux();
-    let unasked = if sessions.is_empty() {
-        "true".to_string()
-    } else {
-        let names: String = sessions
-            .iter()
-            .map(|s| format!(" -e {}", quote(s)))
-            .collect();
-        format!("printf '%s\\n' \"$found\" | grep -vxqF{names}")
+    let host = cfg.host_or_err(&b.host)?;
+    let r = Remote::new(host);
+    let (core, on) = hc::for_host(host)?;
+    let inside = |p: &str| {
+        p.strip_prefix(worktree)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     };
-    let threads = format!(
-        r#"found=$({{ {tmux} list-sessions -F {}; {tmux} list-panes -a -F {}; }} 2>/dev/null | awk -F '[|]::[|]' -v wt="$wt" '{{ for (i = 2; i <= NF; i++) if ($i == wt || index($i, wt "/") == 1) {{ if (!seen[$1]++) print $1; next }} }}')
-if [ -n "$found" ] && {unasked}; then
-    printf '%s\n%s\n' {} "$found" >&2
-    exit 1
-fi
-"#,
-        quote(IN_SESSION),
-        quote(IN_PANE),
-        quote(STILL_RUNNING),
-    );
+    let found: Vec<String> = core
+        .terminals()
+        .into_iter()
+        .filter(|t| hc::on_host(t, on.as_deref()))
+        .filter(|t| {
+            let filed = t.labels.get(WORKTREE).is_some_and(|w| inside(w));
+            filed || inside(&t.cwd) || inside(t.folder())
+        })
+        .map(|t| t.address)
+        .collect();
+    if found.iter().any(|f| !sessions.contains(f)) {
+        bail!("{}: {STILL_RUNNING}\n{}\n", host.name, found.join("\n"));
+    }
+    let start = format!("set -e\ncd {}\nwt={}\n", sh_path(&b.path), quote(worktree));
     let unlock = if force {
         "git worktree unlock \"$wt\" 2>/dev/null || true\n"
     } else {
@@ -433,12 +616,10 @@ fi
     } else {
         ""
     };
-    let close = format!(
-        r#"if [ -n "$found" ]; then
-    printf '%s\n' "$found" | while IFS= read -r s; do {tmux} kill-session -t "=$s"; done
-fi
-"#
-    );
+    r.run(&format!("{start}{unlock}{locked}{changes}"))?;
+    for address in &found {
+        core.kill(address)?;
+    }
     let remove = if delete {
         let remove = if force { "remove --force" } else { "remove" };
         format!(
@@ -459,19 +640,10 @@ fi
         // Without its .git file, git prunes it and leaves the rest.
         "rm -f \"$wt/.git\"\ngit worktree prune\n".to_string()
     };
-    r.run(&format!(
-        "set -e\ncd {}\nwt={}\n{threads}{unlock}{locked}{changes}{close}{remove}",
-        sh_path(&b.path),
-        quote(worktree)
-    ))?;
+    r.run(&format!("{start}{remove}"))?;
     Ok(())
 }
 
-/// Where a session is: where it started, and the worktree lemur filed it
-/// under, by its tags from before the renames too.
-const IN_SESSION: &str = "#{session_name}|::|#{session_path}|::|#{@lemur_worktree}|::|#{@lemen_worktree}|::|#{@muxbox_worktree}";
-/// Where a pane's shell or program is now.
-const IN_PANE: &str = "#{session_name}|::|#{pane_current_path}";
 /// Starts the refusal that names the threads running in a worktree.
 const STILL_RUNNING: &str = "threads still run in the worktree:";
 
@@ -479,7 +651,8 @@ const STILL_RUNNING: &str = "threads still run in the worktree:";
 /// threads, or `force`.
 #[derive(Debug, PartialEq)]
 pub enum Kept {
-    /// Threads run in it that weren't to be closed: all of them, by name.
+    /// Threads run in it that weren't to be closed: all of them, by
+    /// address.
     Threads(Vec<String>),
     Changes,
     /// Locked, with git's reason; Claude Code locks the worktree its
@@ -507,43 +680,126 @@ pub fn why_kept(e: &anyhow::Error) -> Option<Kept> {
     }
 }
 
-pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {
-    let r = Remote::new(cfg.host_or_err(host)?);
-    r.run(&format!("{} kill-session -t {}", r.tmux(), target(session)))?;
-    Ok(())
-}
+/// What this Mac is called where it shows a terminal of its own, as one
+/// that sets up a host.
+pub const HERE: &str = "this Mac";
 
-/// The session name for a thread relabeled `name`. The `base/` prefix and
-/// the unique words stay: `api/claude--calm-heron` becomes
-/// `api/review--calm-heron`.
-pub fn renamed(session: &str, name: &str) -> String {
-    let (prefix, thread) = match session.rsplit_once('/') {
-        Some((prefix, thread)) => (format!("{prefix}/"), thread),
-        None => (String::new(), session),
+/// Starts `hc machine add` for `host` in a terminal on this Mac, in the
+/// core that reaches the other hosts, where you answer what herdr-core
+/// asks to add it: to install herdr-core there or update it, a password, a
+/// new host key, as Herdr does. Returns the terminal's address, and this
+/// Mac as the host to show it from.
+pub fn set_up_host(host: &Host) -> Result<(String, Host)> {
+    let session = hc::machines_session(host);
+    let here = Host {
+        hc_session: session.clone(),
+        ..Host::new(HERE, "local")
     };
-    match thread.rsplit_once(LABEL_END) {
-        Some((_, words)) => format!("{prefix}{name}{LABEL_END}{words}"),
-        None => format!("{prefix}{name}"),
-    }
+    let (core, _) = hc::for_host(&here)?;
+    let labels = BTreeMap::from([(LABEL.to_string(), format!("set up {}", host.name))]);
+    let home = crate::config::home()?.to_string_lossy().into_owned();
+    let added = core.known_machine(host);
+    let argv = set_up_argv(host, session.as_deref(), added.as_deref());
+    let address = core.run(None, &home, &argv, &labels)?;
+    Ok((address, here))
 }
 
-/// Renames a thread (its tmux session); returns the new session name.
-/// Claude keeps running and attached clients stay attached.
+/// `hc machine add` for `host`, to the core of `session` here, or with
+/// `added`, the machine's name once it has one, `hc machine login`: it would
+/// refuse to add it again.
+fn set_up_argv(host: &Host, session: Option<&str>, added: Option<&str>) -> Vec<String> {
+    #[cfg(test)]
+    if let Some((_, argv)) = SET_UP.lock().unwrap().iter().find(|(h, _)| *h == host.name) {
+        return argv.clone();
+    }
+    let mut argv = vec![];
+    if let Some(session) = session {
+        argv.extend(["env".to_string(), format!("HC_SESSION={session}")]);
+    }
+    argv.push(hc::binary().to_string_lossy().into_owned());
+    if let Some(name) = added {
+        argv.extend(["machine", "login", name].map(String::from));
+        return argv;
+    }
+    argv.extend(["machine", "add", &host.ssh, "--name"].map(String::from));
+    argv.push(hc::machine_name(&host.name));
+    if let Some(theirs) = &host.hc_session {
+        argv.extend(["--session".to_string(), theirs.clone()]);
+    }
+    argv
+}
+
+/// What tests run in place of `hc machine add`, which would dial a host,
+/// by the host's name: tests run at once.
+#[cfg(test)]
+pub static SET_UP: std::sync::Mutex<Vec<(String, Vec<String>)>> = std::sync::Mutex::new(vec![]);
+
+/// Ends a thread's terminal.
+pub fn kill_session(cfg: &Config, host: &str, session: &str) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.kill(session)
+}
+
+/// Relabels a thread; returns its terminal's address, which stays.
+/// Claude keeps running and attached terminals stay attached.
 pub fn rename_session(cfg: &Config, host: &str, session: &str, name: &str) -> Result<String> {
     validate_name(name)?;
-    let r = Remote::new(cfg.host_or_err(host)?);
-    let tmux = r.tmux();
-    let new = renamed(session, name);
-    if new == session {
-        return Ok(new);
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(LABEL, name)])?;
+    Ok(session.to_string())
+}
+
+/// Where a file downloaded goes. Tests keep off the real one.
+fn downloads_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    return Ok(std::env::temp_dir().join(format!("lemur-downloads-{}", std::process::id())));
+    #[cfg(not(test))]
+    Ok(crate::config::home()?.join("Downloads"))
+}
+
+/// Keeps a copy of `file`, as `download` fetched it, in the Downloads folder;
+/// returns where.
+pub fn keep_download(file: &Path) -> Result<PathBuf> {
+    keep_in(file, &downloads_dir()?)
+}
+
+/// Copies `file` into `dir` under its own name, or as a browser does with a
+/// number if that's taken: nothing there is overwritten. Not its permissions, so
+/// a program stays something you'd have to mean to run.
+fn keep_in(file: &Path, dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let name = file.file_name().context("a file with no name")?;
+    let stem = Path::new(name)
+        .file_stem()
+        .unwrap_or(name)
+        .to_string_lossy();
+    let dot_extension = Path::new(name)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1u32.. {
+        let target = match n {
+            1 => dir.join(name),
+            _ => dir.join(format!("{stem} {n}{dot_extension}")),
+        };
+        // Only if it's not there: what has that name now is someone's.
+        let mut out = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", target.display())),
+        };
+        let copied = std::fs::File::open(file).and_then(|mut f| std::io::copy(&mut f, &mut out));
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&target);
+            return Err(e).with_context(|| format!("writing {}", target.display()));
+        }
+        return Ok(target);
     }
-    r.run(&format!(
-        "set -e\n{}\n{tmux} rename-session -t {} {}\n",
-        refuse_existing(&tmux, &new),
-        target(session),
-        quote(&new),
-    ))?;
-    Ok(new)
+    unreachable!("a free name")
 }
 
 /// Copies files into the host's upload dir; returns their remote paths.
@@ -580,17 +836,26 @@ pub fn upload(host: &Host, files: &[PathBuf]) -> Result<Vec<String>> {
         .collect()
 }
 
+/// The terminal at `session`, if it runs.
+fn terminal(host: &Host, session: &str) -> Result<hc::Terminal> {
+    let (core, _) = hc::for_host(host)?;
+    core.terminals()
+        .into_iter()
+        .find(|t| t.address == session)
+        .with_context(|| format!("{session} isn't running"))
+}
+
 /// Copies a file a session printed the path of from the host, into a
 /// temporary folder that mirrors the host's, and returns where it went. A
 /// relative path is from the session's current folder, as Claude prints
 /// them.
 pub fn download(host: &Host, session: &str, path: &str) -> Result<PathBuf> {
     let r = Remote::new(host);
+    let folder = terminal(host, session)?.folder().to_string();
     let remote = r.run(&format!(
-        "set -e\np={}\ncase $p in /*) ;; *) p=\"$({} display-message -p -t {}: '#{{pane_current_path}}')/$p\" ;; esac\n[ -f \"$p\" ] || {{ echo \"no file at $p\" >&2; exit 1; }}\ncd \"$(dirname \"$p\")\"\nprintf '%s/%s\\n' \"$(pwd -P)\" \"$(basename \"$p\")\"\n",
+        "set -e\np={}\ncase $p in /*) ;; *) p={}/\"$p\" ;; esac\n[ -f \"$p\" ] || {{ echo \"no file at $p\" >&2; exit 1; }}\ncd \"$(dirname \"$p\")\"\nprintf '%s/%s\\n' \"$(pwd -P)\" \"$(basename \"$p\")\"\n",
         sh_path(path),
-        r.tmux(),
-        target(session)
+        quote(&folder),
     ))?;
     let remote = remote.trim_end_matches('\n');
     // Only the folders' names: `..` can't climb out.
@@ -631,8 +896,50 @@ pub fn paste_line(paths: &[String]) -> String {
     format!("{} ", paths.join(" "))
 }
 
-/// Uploads files and pastes their remote paths into a session's prompt,
-/// as a bracketed paste when the app asked for one (like a real drop).
+/// Pastes `text` into a session, as a bracketed paste when its program
+/// asked for one, as a drop in lemur does. It attaches at the terminal's
+/// own size, so nothing on its screen moves.
+pub fn paste(host: &Host, session: &str, text: &str) -> Result<()> {
+    let t = terminal(host, session)?;
+    let (core, _) = hc::for_host(host)?;
+    // Its screen's modes are all it needs, not its history.
+    let mut attached = core.attach(
+        session,
+        t.cols.max(1),
+        t.rows.max(1),
+        0,
+        serde_json::json!({}),
+    )?;
+    // The first paint sets the program's modes, bracketed paste among
+    // them; it's over once the stream goes quiet.
+    let mut painted = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut quiet_since = Instant::now();
+    while Instant::now() < deadline {
+        match attached.stream.try_recv() {
+            Ok(Stream::Data(bytes)) => {
+                core.credit(attached.channel, bytes.len());
+                painted.extend(bytes);
+                quiet_since = Instant::now();
+            }
+            Ok(_) | Err(TryRecvError::Closed) => bail!("{session} ended"),
+            Err(TryRecvError::Empty)
+                if !painted.is_empty() && quiet_since.elapsed() > Duration::from_millis(100) =>
+            {
+                break;
+            }
+            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let painted = String::from_utf8_lossy(&painted);
+    let bracketed = painted.rfind("\x1b[?2004h") > painted.rfind("\x1b[?2004l");
+    core.input(attached.channel, &crate::gui::keys::paste(text, bracketed));
+    core.detach(attached.channel);
+    // `lemur paste` and `lemur upload` exit right after.
+    core.flush()
+}
+
+/// Uploads files and pastes their remote paths into a session's prompt.
 pub fn upload_and_type(
     cfg: &Config,
     host: &str,
@@ -641,13 +948,7 @@ pub fn upload_and_type(
 ) -> Result<Vec<String>> {
     let h = cfg.host_or_err(host)?;
     let paths = upload(h, files)?;
-    let r = Remote::new(h);
-    let tmux = r.tmux();
-    r.run(&format!(
-        "set -e\n{tmux} set-buffer -b lemur {}\n{tmux} paste-buffer -p -d -b lemur -t {}:\n",
-        quote(&paste_line(&paths)),
-        target(session)
-    ))?;
+    paste(h, session, &paste_line(&paths))?;
     Ok(paths)
 }
 
@@ -679,7 +980,7 @@ pub fn resolve_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, TmuxServer, git_in, wait_until};
+    use crate::test_support::{HcServer, TempDir, git_in, wait_until};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::Duration;
@@ -688,42 +989,49 @@ mod tests {
     /// absolute one says; a folder or a missing file doesn't.
     #[test]
     fn downloading_a_printed_path_fetches_the_file() {
-        let server = TmuxServer::new("dl");
+        let server = HcServer::new("dl");
         let dir = TempDir::new("dl");
         let work = dir.join("work");
         std::fs::create_dir_all(work.join("src")).unwrap();
         std::fs::write(work.join("src/a.rs"), "fn a() {}\n").unwrap();
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "t",
-            "-c",
-            &work.to_string_lossy(),
-        ]);
+        let t = server.run(&work.to_string_lossy(), &[], &["sleep", "600"]);
         let cfg = server.config();
         let host = cfg.host("local").unwrap();
+        assert!(wait_until(Duration::from_secs(5), || server
+            .addresses()
+            .contains(&t)));
 
-        let got = download(host, "t", "src/a.rs").unwrap();
+        let got = download(host, &t, "src/a.rs").unwrap();
         assert_eq!(std::fs::read_to_string(&got).unwrap(), "fn a() {}\n");
         assert!(got.ends_with("work/src/a.rs"), "{}", got.display());
         let absolute = work.join("src/a.rs");
         assert_eq!(
-            download(host, "t", &absolute.to_string_lossy()).unwrap(),
+            download(host, &t, &absolute.to_string_lossy()).unwrap(),
             got
         );
-        let folder = download(host, "t", "src").unwrap_err();
+        let folder = download(host, &t, "src").unwrap_err();
         assert!(format!("{folder:#}").contains("no file at"), "{folder:#}");
-        assert!(download(host, "t", "missing.rs").is_err());
+        assert!(download(host, &t, "missing.rs").is_err());
         std::fs::remove_file(got).unwrap();
     }
 
+    /// Waits for the core to list `address`.
+    fn listed_by(server: &HcServer, address: &str) {
+        assert!(
+            wait_until(Duration::from_secs(5), || server
+                .addresses()
+                .iter()
+                .any(|a| a == address)),
+            "{address} never showed up"
+        );
+    }
+
     /// Removing a worktree closes its threads and then deletes it. A thread
-    /// it wasn't asked to close, even one that only has a pane in it, keeps
+    /// it wasn't asked to close, even one whose program only went there, keeps
     /// it and everything in it; so do changes or a lock, until forced.
     #[test]
     fn removing_a_worktree_closes_its_threads() {
-        let server = TmuxServer::new("rm-wt");
+        let server = HcServer::new("rm-wt");
         let dir = TempDir::new("rm-wt");
         let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -733,74 +1041,54 @@ mod tests {
         git(&["worktree", "add", "-q", "-b", "a", "wt/a"]);
         git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
         let (a, b) = (repo.join("wt/a"), repo.join("wt/b"));
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "repo/a1",
-            "-c",
-            &a.to_string_lossy(),
-        ]);
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "repo/b1",
-            "-c",
-            &b.to_string_lossy(),
-        ]);
+        let a1 = server.run(&a.to_string_lossy(), &[], &["sleep", "600"]);
+        let b1 = server.run(&b.to_string_lossy(), &[], &["sleep", "600"]);
+        listed_by(&server, &a1);
+        listed_by(&server, &b1);
         let mut cfg = server.config();
         cfg.bases
             .push(crate::config::Base::new("local", &repo.to_string_lossy()));
-        let alive = |s: &str| {
-            server
-                .tmux(&["list-sessions", "-F", "#{session_name}"])
-                .lines()
-                .any(|l| l == s)
-        };
+        let alive = |s: &str| server.addresses().iter().any(|a| a == s);
 
         let a_path = a.to_string_lossy().into_owned();
         let err = remove_worktree(&cfg, 0, &a_path, &[], false, true).unwrap_err();
         assert_eq!(
             why_kept(&err),
-            Some(Kept::Threads(vec!["repo/a1".into()])),
+            Some(Kept::Threads(vec![a1.clone()])),
             "{err:#}"
         );
-        assert!(a.exists() && alive("repo/a1"));
-        remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], false, true).unwrap();
+        assert!(a.exists() && alive(&a1));
+        remove_worktree(&cfg, 0, &a_path, std::slice::from_ref(&a1), false, true).unwrap();
         assert!(!a.exists());
-        assert!(!alive("repo/a1"));
+        assert!(wait_until(Duration::from_secs(5), || !alive(&a1)));
 
-        // Started in the main checkout, its shell has moved into b.
+        // Started in the main checkout, its program has moved into b.
         let visit = format!("cd {} && exec sleep 600", quote(&b.to_string_lossy()));
-        server.tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "visitor",
-            "-c",
-            &repo.to_string_lossy(),
-            &visit,
-        ]);
+        let visitor = server.run(&repo.to_string_lossy(), &[], &["sh", "-c", &visit]);
         let b_path = b.to_string_lossy().into_owned();
         let moved = wait_until(Duration::from_secs(5), || {
-            server.tmux(&["display", "-p", "-t", "=visitor:", "#{pane_current_path}"]) == b_path
+            server
+                .core()
+                .terminals()
+                .iter()
+                .any(|t| t.address == visitor && t.folder() == b_path)
         });
-        assert!(moved, "the visitor's pane never got to {b_path}");
-        let err = remove_worktree(&cfg, 0, &b_path, &["repo/b1".into()], false, true).unwrap_err();
+        assert!(moved, "the visitor never got to {b_path}");
+        let err =
+            remove_worktree(&cfg, 0, &b_path, std::slice::from_ref(&b1), false, true).unwrap_err();
         assert_eq!(
             why_kept(&err),
-            Some(Kept::Threads(vec!["repo/b1".into(), "visitor".into()])),
+            Some(Kept::Threads(vec![b1.clone(), visitor.clone()])),
             "{err:#}"
         );
-        assert!(b.exists() && alive("repo/b1") && alive("visitor"));
+        assert!(b.exists() && alive(&b1) && alive(&visitor));
 
         // What git would refuse is asked about before any thread closes.
         std::fs::write(b.join("draft.txt"), "unsaved").unwrap();
-        let both = ["repo/b1".to_string(), "visitor".to_string()];
+        let both = [b1.clone(), visitor.clone()];
         let err = remove_worktree(&cfg, 0, &b_path, &both, false, true).unwrap_err();
         assert_eq!(why_kept(&err), Some(Kept::Changes), "{err:#}");
-        assert!(b.exists() && alive("repo/b1") && alive("visitor"));
+        assert!(b.exists() && alive(&b1) && alive(&visitor));
         // Locked, as Claude Code locks its worktree: force unlocks it too.
         git(&[
             "worktree",
@@ -815,10 +1103,10 @@ mod tests {
             Some(Kept::Locked("claude session draft (pid 1)".into())),
             "{err:#}"
         );
-        assert!(b.exists() && alive("repo/b1") && alive("visitor"));
+        assert!(b.exists() && alive(&b1) && alive(&visitor));
         remove_worktree(&cfg, 0, &b_path, &both, true, true).unwrap();
         assert!(!b.exists());
-        assert!(!alive("repo/b1") && !alive("visitor"));
+        assert!(wait_until(Duration::from_secs(5), || !alive(&b1) && !alive(&visitor)));
     }
 
     /// The worktrees git lists, by path.
@@ -846,7 +1134,7 @@ mod tests {
     /// even when git can't delete all of it.
     #[test]
     fn removing_a_worktree_keeps_its_folder_unless_deleted() {
-        let server = TmuxServer::new("keep-wt");
+        let server = HcServer::new("keep-wt");
         let dir = TempDir::new("keep-wt");
         let repo = dir.join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -857,33 +1145,30 @@ mod tests {
         git(&["worktree", "add", "-q", "-b", "b", "wt/b"]);
         let (a, b) = (repo.join("wt/a"), repo.join("wt/b"));
         let (a_path, b_path) = (a.to_string_lossy(), b.to_string_lossy());
-        server.tmux(&["new-session", "-d", "-s", "repo/a1", "-c", &a_path]);
-        // Keeps the tmux server up once repo/a1 is closed.
-        server.tmux(&["new-session", "-d", "-s", "other"]);
+        let a1 = server.run(&a_path, &[], &["sleep", "600"]);
+        let other = server.run("/", &[], &["sleep", "600"]);
+        listed_by(&server, &a1);
+        listed_by(&server, &other);
         let mut cfg = server.config();
         cfg.bases
             .push(crate::config::Base::new("local", &repo.to_string_lossy()));
 
         std::fs::write(a.join("draft.txt"), "unsaved").unwrap();
         git(&["worktree", "lock", "wt/a"]);
-        let err = remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], false, false).unwrap_err();
+        let mine = std::slice::from_ref(&a1);
+        let err = remove_worktree(&cfg, 0, &a_path, mine, false, false).unwrap_err();
         assert_eq!(why_kept(&err), Some(Kept::Locked(String::new())), "{err:#}");
         assert!(listed(&repo).contains(&a_path.to_string()));
-        let sessions = server.tmux(&["list-sessions", "-F", "#{session_name}"]);
-        assert!(sessions.lines().any(|l| l == "repo/a1"), "{sessions}");
-        remove_worktree(&cfg, 0, &a_path, &["repo/a1".into()], true, false).unwrap();
+        assert!(server.addresses().contains(&a1));
+        remove_worktree(&cfg, 0, &a_path, mine, true, false).unwrap();
         assert!(!listed(&repo).contains(&a_path.to_string()));
         assert_eq!(
             std::fs::read_to_string(a.join("draft.txt")).unwrap(),
             "unsaved"
         );
         assert!(!a.join(".git").exists());
-        assert_eq!(
-            server
-                .tmux(&["list-sessions", "-F", "#{session_name}"])
-                .trim(),
-            "other"
-        );
+        assert!(wait_until(Duration::from_secs(5), || server.addresses()
+            == [other.clone()]));
         assert_eq!(git_out(&repo, &["branch", "--list", "a"]), "a");
 
         // A read-only folder, as Go's module cache makes, stops git halfway.
@@ -899,7 +1184,7 @@ mod tests {
 
     /// A repo cloned from `origin`, which then gets a commit the clone
     /// hasn't fetched. Both are on `main`; the config's one base is the clone.
-    fn cloned(tag: &str, server: &TmuxServer) -> (TempDir, Config) {
+    fn cloned(tag: &str, server: &HcServer) -> (TempDir, Config) {
         let dir = TempDir::new(tag);
         let origin = dir.join("origin");
         std::fs::create_dir(&origin).unwrap();
@@ -908,7 +1193,7 @@ mod tests {
         git_in(&dir, &["clone", "-q", "origin", "repo"]);
         git_in(&origin, &["commit", "-q", "--allow-empty", "-m", "two"]);
         let mut cfg = server.config();
-        // Typed into the new sessions; nothing to start.
+        // Typed into the new threads; nothing to start.
         cfg.hosts[0].claude = "true".into();
         cfg.bases.push(crate::config::Base::new(
             "local",
@@ -919,7 +1204,7 @@ mod tests {
 
     #[test]
     fn branches_start_with_the_default_one() {
-        let server = TmuxServer::new("branches");
+        let server = HcServer::new("branches");
         let (dir, cfg) = cloned("branches", &server);
         git_in(&dir.join("repo"), &["branch", "local-only"]);
         assert_eq!(
@@ -937,23 +1222,34 @@ mod tests {
     /// fetched, or what it was told. A fetch that fails leaves a note.
     #[test]
     fn a_new_worktree_starts_from_the_fetched_default_branch() {
-        let server = TmuxServer::new("new-wt");
+        let server = HcServer::new("new-wt");
         let (dir, cfg) = cloned("new-wt", &server);
         let repo = dir.join("repo");
         let worktree = |name: &str| repo.join(".claude/worktrees").join(name);
         let subject = |name: &str| git_out(&worktree(name), &["log", "-1", "--format=%s"]);
 
-        let (started, note) =
-            new_worktree_thread(&cfg, 0, "feat", "feat--a", Some("feature/x"), None).unwrap();
+        let (started, note) = new_worktree_thread(
+            &cfg,
+            0,
+            "feat",
+            "review",
+            Some(Agent::Claude),
+            Some("feature/x"),
+            None,
+        )
+        .unwrap();
         assert_eq!(note, None);
-        assert!(started.session.ends_with("feat--a"), "{}", started.session);
         // Claude resumes in the worktree it starts in.
         let claude = started.claude.expect("a Claude thread");
         assert_eq!(claude.session, started.session);
-        assert_eq!(
-            claude.path,
-            worktree("feat").canonicalize().unwrap().to_string_lossy()
-        );
+        assert_eq!(claude.label.as_deref(), Some("review"));
+        let feat = worktree("feat").canonicalize().unwrap();
+        assert_eq!(claude.path, feat.to_string_lossy());
+        let t = server.core().terminals();
+        let t = t.iter().find(|t| t.address == started.session).unwrap();
+        assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("review"));
+        assert_eq!(t.labels.get(KIND).map(String::as_str), Some("claude"));
+        assert_eq!(t.cwd, feat.to_string_lossy());
         assert_eq!(
             git_out(&worktree("feat"), &["branch", "--show-current"]),
             "feature/x"
@@ -966,7 +1262,7 @@ mod tests {
             .unwrap();
         assert!(!upstream.status.success(), "feature/x tracks {upstream:?}");
 
-        new_worktree_thread(&cfg, 0, "loose", "loose--a", None, None).unwrap();
+        new_worktree_thread(&cfg, 0, "loose", "claude", Some(Agent::Claude), None, None).unwrap();
         assert_eq!(
             git_out(&worktree("loose"), &["branch", "--show-current"]),
             ""
@@ -974,92 +1270,438 @@ mod tests {
         assert_eq!(subject("loose"), "two");
 
         // The local main is still at what was cloned.
-        new_worktree_thread(&cfg, 0, "old", "old--a", None, Some("main")).unwrap();
+        new_worktree_thread(
+            &cfg,
+            0,
+            "old",
+            "claude",
+            Some(Agent::Claude),
+            None,
+            Some("main"),
+        )
+        .unwrap();
         assert_eq!(subject("old"), "one");
 
         git_in(&repo, &["remote", "set-url", "origin", "/nonexistent/repo"]);
-        let (_, note) = new_worktree_thread(&cfg, 0, "offline", "offline--a", None, None).unwrap();
+        let (_, note) = new_worktree_thread(
+            &cfg,
+            0,
+            "offline",
+            "claude",
+            Some(Agent::Claude),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(note.is_some_and(|n| n.contains("origin/main")));
         assert_eq!(subject("offline"), "two");
 
-        assert!(new_worktree_thread(&cfg, 0, "bad", "bad--a", Some("a b"), None).is_err());
+        assert!(
+            new_worktree_thread(
+                &cfg,
+                0,
+                "bad",
+                "claude",
+                Some(Agent::Claude),
+                Some("a b"),
+                None
+            )
+            .is_err()
+        );
     }
 
     /// A Claude thread starts with a session ID of lemur's, and comes back
-    /// with what resumes it; once its session is gone, resuming starts it
+    /// with what resumes it; once its terminal is gone, resuming starts one
     /// again in its folder, with that conversation.
     #[test]
     fn claude_threads_start_with_an_id_and_resume_with_it() {
-        let server = TmuxServer::new("resume");
+        let server = HcServer::new("resume");
         let (dir, mut cfg) = cloned("resume", &server);
         // Prints what Claude would get.
-        cfg.hosts[0].claude =
-            r#"sh -c 'echo "claude truecolor=$CLAUDE_CODE_TMUX_TRUECOLOR $*"' claude"#.into();
+        cfg.hosts[0].claude = r#"sh -c 'echo "claude color=$COLORTERM $*"' claude"#.into();
         let typed = |session: &str, text: &str| {
-            wait_until(Duration::from_secs(5), || {
-                server
-                    .tmux(&["capture-pane", "-p", "-t", &format!("={session}:")])
-                    .contains(text)
+            wait_until(Duration::from_secs(10), || {
+                server.hc(&["read", session]).contains(text)
             })
         };
         let repo = dir.join("repo").canonicalize().unwrap();
         let path = repo.to_string_lossy().into_owned();
-        let started = new_thread_in(&cfg, 0, &path, "claude--a", false).unwrap();
+        let started = new_thread_in(&cfg, 0, &path, "claude", Some(Agent::Claude)).unwrap();
         let claude = started.claude.expect("a Claude thread");
         assert!(is_uuid(&claude.claude_session), "{}", claude.claude_session);
         assert_eq!(
             (claude.host.as_str(), claude.path.as_str()),
             ("local", path.as_str())
         );
-        let first = format!("claude truecolor=1 --session-id {}", claude.claude_session);
-        assert!(typed(&started.session, &first), "{first} never ran");
-        assert!(
-            new_thread_in(&cfg, 0, &path, "shell--a", true)
-                .unwrap()
-                .claude
-                .is_none()
+        let first = format!(
+            "claude color=truecolor --session-id {}",
+            claude.claude_session
         );
+        assert!(typed(&started.session, &first), "{first} never ran");
+        let shell = new_thread_in(&cfg, 0, &path, "shell", None).unwrap();
+        assert!(shell.claude.is_none());
 
-        // Its session is there: resuming would start a second.
+        // Its terminal is there: resuming would start a second.
+        listed_by(&server, &started.session);
         assert!(resume_thread(&cfg, &claude).is_err());
-        server.tmux(&["kill-session", "-t", &format!("={}", started.session)]);
-        resume_thread(&cfg, &claude).unwrap();
-        let again = format!("claude truecolor=1 --resume {}", claude.claude_session);
-        assert!(typed(&started.session, &again), "{again} never ran");
-        let at = |option: &str| {
-            server.tmux(&[
-                "display",
-                "-p",
-                "-t",
-                &format!("={}:", started.session),
-                option,
-            ])
+        kill_session(&cfg, "local", &started.session).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&started.session)));
+        // Resumed with the Linear issue pinned to it.
+        let pinned = ClaudeThread {
+            issue: Some("LAFT-3184".into()),
+            ..claude.clone()
         };
-        assert_eq!(at("#{pane_current_path}"), path);
-        assert_eq!(at("#{@lemur_kind}"), "claude");
+        let again = resume_thread(&cfg, &pinned).unwrap();
+        assert_ne!(again, started.session, "a new terminal");
+        let resumed = format!("claude color=truecolor --resume {}", claude.claude_session);
+        assert!(typed(&again, &resumed), "{resumed} never ran");
+        let t = server.core().terminals();
+        let t = t.iter().find(|t| t.address == again).unwrap();
+        assert_eq!(t.cwd, path);
+        assert_eq!(t.labels.get(KIND).map(String::as_str), Some("claude"));
+        assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("claude"));
+        assert_eq!(t.labels.get(ISSUE).map(String::as_str), Some("LAFT-3184"));
 
         // Nothing starts where its folder was, or with an ID that isn't one.
+        let before = server.addresses().len();
         let gone = ClaudeThread {
-            session: "repo/gone--a".into(),
+            session: "t999".into(),
             path: dir.join("deleted").to_string_lossy().into_owned(),
             ..claude.clone()
         };
         let err = resume_thread(&cfg, &gone).unwrap_err();
         assert!(format!("{err:#}").contains("is gone"), "{err:#}");
+        // Typed into a shell, it would run: here only a mark, should the
+        // check ever fail.
+        let ran = dir.join("ran");
         let odd = ClaudeThread {
-            session: "repo/odd--a".into(),
-            claude_session: "x; rm -rf ~".into(),
+            session: "t998".into(),
+            claude_session: format!("x; touch {}", ran.display()),
             ..claude
         };
         assert!(resume_thread(&cfg, &odd).is_err());
-        let alive = |s: &str| {
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!ran.exists(), "it ran");
+        assert_eq!(server.addresses().len(), before);
+    }
+
+    /// After its host restarts, herdr-core gives a Claude thread's terminal
+    /// a fresh shell at the same address: it counts as gone, and resumes
+    /// there, not in a second terminal.
+    #[test]
+    fn a_thread_back_from_a_restart_resumes_in_its_terminal() {
+        let server = HcServer::new("resume-back");
+        let (dir, mut cfg) = cloned("resume-back", &server);
+        cfg.hosts[0].claude = r#"sh -c 'echo "claude $* in $PWD"; exec sleep 600' claude"#.into();
+        let path = dir.join("repo").canonicalize().unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let started = new_thread_in(&cfg, 0, &path, "claude", Some(Agent::Claude)).unwrap();
+        let thread = started.claude.expect("a Claude thread");
+        cfg.threads.push(thread.clone());
+        let t = thread.session.clone();
+        listed_by(&server, &t);
+        let pid = || {
             server
-                .tmux(&["list-sessions", "-F", "#{session_name}"])
-                .lines()
-                .any(|l| l == s)
+                .core()
+                .terminals()
+                .into_iter()
+                .find(|x| x.address == t)
+                .and_then(|x| x.pid)
         };
-        assert!(alive(&started.session));
-        assert!(!alive("repo/gone--a") && !alive("repo/odd--a"));
+        let before = pid().expect("its shell");
+        note_shell(&cfg, "local", &t, before).unwrap();
+        // Filed as a thread, or as one to resume.
+        let filed = |cfg: &Config| {
+            let snap = crate::snapshot::fetch(cfg);
+            let worktrees = snap.hosts[0].bases[0].worktrees.clone();
+            let live = worktrees
+                .iter()
+                .any(|w| w.sessions.iter().any(|s| s.name == t));
+            let gone = worktrees
+                .iter()
+                .any(|w| w.gone.iter().any(|g| g.session == t));
+            (live, gone)
+        };
+        assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (true, false)));
+        assert!(resume_thread(&cfg, &thread).is_err(), "it still runs");
+
+        // The host restarts: herdr-core stops, and starts again.
+        server.hc(&["server", "stop"]);
+        let back = wait_until(Duration::from_secs(15), || {
+            pid().is_some_and(|now| now != before)
+        });
+        assert!(back, "a fresh shell at {t}");
+        assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (false, true)));
+        // However far its shell went, it resumes where it ran.
+        server.hc(&["send", &t, "cd /"]);
+        let count = server.addresses().len();
+        assert_eq!(resume_thread(&cfg, &thread).unwrap(), t, "in its terminal");
+        let resumed = format!("claude --resume {} in {path}", thread.claude_session);
+        assert!(
+            wait_until(Duration::from_secs(10), || server
+                .hc(&["read", &t])
+                .contains(&resumed)),
+            "{}",
+            server.hc(&["read", &t])
+        );
+        assert_eq!(server.addresses().len(), count, "no second terminal");
+        assert!(wait_until(Duration::from_secs(5), || filed(&cfg) == (true, false)));
+    }
+
+    /// A thread started shows in Herdr too: a tab of its own, in the space of
+    /// what runs in its folder, else in one for that folder, on this machine
+    /// or another, by that machine's ids.
+    #[test]
+    fn threads_are_filed_for_herdr() {
+        let server = HcServer::new("herdr-labels");
+        let dir = TempDir::new("herdr-labels");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (a, b) = (
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        );
+        let cfg = server.config();
+        // Once the core's stream has told of it, which the next start reads.
+        let labels = |address: &str| {
+            let told = wait_until(Duration::from_secs(5), || {
+                let terminals = server.core().terminals();
+                terminals.iter().any(|t| t.address == address)
+            });
+            assert!(told, "{address} never showed up");
+            let terminals = server.core().terminals();
+            let t = terminals.iter().find(|t| t.address == address).unwrap();
+            let get = |k: &str| t.labels.get(k).cloned().unwrap_or_default();
+            (get(HERDR_SPACE), get(HERDR_TAB))
+        };
+        let start = |dir: &str| start_in(&cfg, "local", dir, "shell", None).unwrap().session;
+
+        let one = start(&a);
+        let (space, tab) = labels(&one);
+        assert!(space.starts_with("sp") && space.len() == 34, "{space}");
+        assert!(tab.starts_with("tb") && tab.len() == 34, "{tab}");
+        let two = start(&a);
+        let (same, other) = labels(&two);
+        assert_eq!(same, space, "one space for the folder");
+        assert_ne!(other, tab, "each its own tab");
+
+        // Herdr's own in another folder: its space is the one joined.
+        let args = [
+            "--label",
+            "herdr.space=spherdrs",
+            "--label",
+            "herdr.tab=tbherdrs",
+        ];
+        let theirs = server.hc(&[
+            &["run", "--bg", "--json", "--keep", "--cwd", b.as_str()][..],
+            &args[..],
+            &["--", "sleep", "600"],
+        ]
+        .concat());
+        let theirs: serde_json::Value = serde_json::from_str(&theirs).unwrap();
+        labels(theirs["address"].as_str().unwrap());
+        let three = start(&b);
+        assert_eq!(labels(&three).0, "spherdrs");
+
+        // Another machine's space isn't this one's, in a folder of that name.
+        let far = server.far_config("herdr-box");
+        let there = start_in(&far, "herdr-box", &b, "shell", None)
+            .unwrap()
+            .session;
+        let (space, _) = labels(&there);
+        assert!(space.starts_with("sp") && space != "spherdrs", "{space}");
+    }
+
+    /// Setting up a host runs `hc machine add` for it, under the name
+    /// herdr-core takes, with the session on it the config names, to this
+    /// Mac's core for the hosts.
+    #[test]
+    fn setting_up_a_host_adds_it_as_herdr_does() {
+        let mut host = Host::new("Agent", "me@agent.example");
+        let argv = set_up_argv(&host, None, None);
+        assert_eq!(
+            &argv[1..],
+            ["machine", "add", "me@agent.example", "--name", "agent"]
+        );
+        assert!(argv[0].ends_with("herdr-core"), "{argv:?}");
+        let argv = set_up_argv(&host, None, Some("agent"));
+        assert_eq!(&argv[1..], ["machine", "login", "agent"], "added before");
+        host.hc_session = Some("lemur".into());
+        let argv = set_up_argv(&host, Some("test"), None);
+        assert_eq!(&argv[..2], ["env", "HC_SESSION=test"]);
+        assert_eq!(&argv[argv.len() - 2..], ["--session", "lemur"]);
+    }
+
+    /// A thread from before herdr-core still running in tmux isn't resumed
+    /// a second time; once its tmux session is gone, it is.
+    #[test]
+    fn a_thread_still_in_tmux_isnt_resumed_twice() {
+        struct Tmux(String);
+        impl Drop for Tmux {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["-L", &self.0, "kill-server"])
+                    .output();
+            }
+        }
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("no tmux here: skipped");
+            return;
+        }
+        let server = HcServer::new("resume-tmux");
+        let dir = TempDir::new("resume-tmux");
+        let mut cfg = server.config();
+        let socket = Tmux(format!("lemur-test-{}", std::process::id()));
+        cfg.hosts[0].tmux_socket = Some(socket.0.clone());
+        cfg.hosts[0].claude = "true".into();
+        let name = "api/claude--calm-heron";
+        let started = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &socket.0,
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "sleep 600",
+            ])
+            .output()
+            .unwrap();
+        assert!(started.status.success(), "{started:?}");
+        let thread = ClaudeThread {
+            host: "local".into(),
+            session: name.into(),
+            path: dir.to_string_lossy().into_owned(),
+            claude_session: random_uuid(),
+            label: None,
+            issue: None,
+        };
+        let before = server.addresses().len();
+        let err = resume_thread(&cfg, &thread).unwrap_err();
+        assert!(format!("{err:#}").contains("still runs in tmux"), "{err:#}");
+        assert_eq!(server.addresses().len(), before, "nothing started");
+
+        drop(socket);
+        assert!(resume_thread(&cfg, &thread).is_ok());
+        assert!(is_address("t7") && is_address("agent/t12"));
+        assert!(
+            is_address("t1b") && is_address("agent/t2p"),
+            "its own digits"
+        );
+        assert!(!is_address(name) && !is_address("agent/t") && !is_address("tx"));
+    }
+
+    /// A paste goes to the program bracketed when it asked for that, and
+    /// as is otherwise.
+    #[test]
+    fn pastes_reach_the_program() {
+        let server = HcServer::new("paste");
+        let cfg = server.config();
+        let host = cfg.host("local").unwrap();
+        // Shows, in hex, the bytes it reads.
+        let reads = |bracketed: bool, count: usize| {
+            let ask = if bracketed {
+                r"printf '\033[?2004h'; "
+            } else {
+                ""
+            };
+            let script = format!("{ask}stty raw -echo; head -c {count} | xxd -p");
+            let t = server.run("/", &[], &["sh", "-c", &script]);
+            listed_by(&server, &t);
+            paste(host, &t, "a.png ").unwrap();
+            t
+        };
+        let shows = |t: &str, hex: &str| {
+            wait_until(Duration::from_secs(5), || {
+                server.hc(&["read", t]).contains(hex)
+            })
+        };
+        let bracketed = reads(true, 18);
+        let plain = reads(false, 6);
+        assert!(
+            shows(&bracketed, "1b5b3230307e612e706e67201b5b3230317e"),
+            "{}",
+            server.hc(&["read", &bracketed])
+        );
+        assert!(
+            shows(&plain, "612e706e6720"),
+            "{}",
+            server.hc(&["read", &plain])
+        );
+    }
+
+    /// A host herdr-core reaches as another machine: commands, files,
+    /// pastes and threads go there through it, and only its own terminals
+    /// file under it.
+    #[test]
+    fn hosts_are_reached_through_the_core() {
+        let server = HcServer::new("far");
+        let dir = TempDir::new("far");
+        let path = dir.to_string_lossy().into_owned();
+        let mut cfg = server.far_config("box");
+        cfg.hosts[0].upload_dir = format!("{path}/uploads");
+        cfg.bases.push(crate::config::Base::new("box", &path));
+        let host = cfg.host("box").unwrap().clone();
+        assert_eq!(Remote::new(&host).run("echo $((1 + 2))").unwrap(), "3\n");
+
+        let up = dir.join("up.txt");
+        std::fs::write(&up, "hello").unwrap();
+        let sent = upload(&host, &[up]).unwrap();
+        assert!(sent[0].starts_with(&format!("{path}/uploads/")), "{sent:?}");
+        assert_eq!(std::fs::read_to_string(&sent[0]).unwrap(), "hello");
+        // Bigger than herdr-core takes in one write, or one frame: in parts.
+        let big: Vec<u8> = (0..13_000_000u32).map(|i| (i % 251) as u8).collect();
+        let up = dir.join("big.bin");
+        std::fs::write(&up, &big).unwrap();
+        let sent = upload(&host, &[up]).unwrap();
+        assert!(std::fs::read(&sent[0]).unwrap() == big, "the same bytes");
+        let left = std::fs::read_dir(dir.join("uploads")).unwrap().count();
+        assert_eq!(left, 2, "no parts left behind");
+
+        let started = new_thread_in(&cfg, 0, &path, "build", None).unwrap();
+        assert!(started.session.starts_with("box/"), "{}", started.session);
+        let here = server.run("/", &[], &["sleep", "600"]);
+        let mut shown = vec![];
+        let filed = wait_until(Duration::from_secs(10), || {
+            let snap = crate::snapshot::fetch(&cfg);
+            let w = snap.hosts[0].bases[0].worktrees.first();
+            shown = w
+                .map(|w| {
+                    w.sessions
+                        .iter()
+                        .map(|s| (s.name.clone(), s.label.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            !shown.is_empty()
+        });
+        assert!(filed, "{:?}", crate::snapshot::fetch(&cfg).hosts[0]);
+        assert_eq!(shown, [(started.session.clone(), "build".to_string())]);
+        assert!(
+            !shown.iter().any(|(s, _)| *s == here),
+            "this Mac's terminal"
+        );
+
+        std::fs::write(dir.join("x.txt"), "there").unwrap();
+        let got = download(&host, &started.session, "x.txt").unwrap();
+        assert_eq!(std::fs::read_to_string(&got).unwrap(), "there");
+        std::fs::remove_file(got).unwrap();
+
+        paste(&host, &started.session, "far-paste").unwrap();
+        assert!(wait_until(Duration::from_secs(5), || server
+            .hc(&["read", &started.session])
+            .contains("far-paste")));
+        kill_session(&cfg, "box", &started.session).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || !server
+            .addresses()
+            .contains(&started.session)));
     }
 
     #[test]
@@ -1121,23 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn renaming_keeps_the_base_prefix_and_unique_words() {
-        assert_eq!(renamed("api/calm-heron", "auth-ui"), "api/auth-ui");
-        assert_eq!(
-            renamed("api/claude--calm-heron", "review"),
-            "api/review--calm-heron"
-        );
-        assert_eq!(renamed("scratch", "notes"), "notes");
-    }
-
-    #[test]
     fn labels_hide_the_unique_words() {
-        let thread = unique_thread("claude", |_| false);
-        assert!(
-            thread.starts_with("claude--") && validate_name(&thread).is_ok(),
-            "{thread}"
-        );
-        assert_eq!(label(&thread), "claude");
         assert_eq!(label("api/claude--calm-heron"), "api/claude");
         assert_eq!(label("api/calm-heron"), "api/calm-heron");
         // Only the last part counts: `--` in a base name isn't a label end.
@@ -1154,5 +1780,128 @@ mod tests {
         let names: std::collections::HashSet<String> =
             (0..50).map(|_| random_name(|_| false)).collect();
         assert!(names.len() > 25, "names barely vary: {names:?}");
+    }
+
+    #[test]
+    fn the_program_of_a_hosts_command_is_found_in_it() {
+        assert_eq!(program_of("codex"), Some("codex"));
+        assert_eq!(program_of("  codex --full-auto"), Some("codex"));
+        assert_eq!(
+            program_of("FOO=1 BAR=2 ~/bin/claude -x"),
+            Some("~/bin/claude")
+        );
+        assert_eq!(program_of("$(which codex)"), None);
+        assert_eq!(program_of("\"my codex\""), None);
+        assert_eq!(program_of("FOO=1"), None);
+        assert_eq!(program_of(""), None);
+    }
+
+    /// A host without an agent says so, and nothing's left behind: no
+    /// terminal saying "command not found", no worktree. A shell starts all
+    /// the same.
+    #[test]
+    fn an_agent_not_installed_starts_nothing() {
+        let server = HcServer::new("no-agent");
+        let dir = TempDir::new("no-agent");
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let path = repo.canonicalize().unwrap().to_string_lossy().into_owned();
+        let mut cfg = server.config();
+        cfg.bases.push(crate::config::Base::new("local", &path));
+        cfg.hosts[0].claude = "lemur-has-no-claude".into();
+        cfg.hosts[0].codex = "lemur-has-no-codex --flag".into();
+
+        let cases = [
+            (Agent::Claude, "Claude Code", "lemur-has-no-claude"),
+            (Agent::Codex, "Codex", "lemur-has-no-codex"),
+        ];
+        for (agent, name, program) in cases {
+            let said = format!("{name} isn't installed on local: its shell can't find `{program}`");
+            let e = new_thread_in(&cfg, 0, &path, "x", Some(agent))
+                .err()
+                .unwrap();
+            assert_eq!(format!("{e:#}"), said);
+            let e = new_worktree_thread(&cfg, 0, "x", "x", Some(agent), None, None)
+                .err()
+                .unwrap();
+            assert_eq!(format!("{e:#}"), said);
+            let e = start_in(&cfg, "local", &path, "x", Some(agent))
+                .err()
+                .unwrap();
+            assert_eq!(format!("{e:#}"), said);
+        }
+        assert!(server.addresses().is_empty(), "no terminal");
+        assert!(!repo.join(".claude/worktrees/x").exists(), "no worktree");
+
+        let thread = ClaudeThread {
+            host: "local".into(),
+            session: "t99".into(),
+            path: path.clone(),
+            claude_session: random_uuid(),
+            label: None,
+            issue: None,
+        };
+        let e = resume_thread(&cfg, &thread).err().unwrap();
+        assert!(format!("{e:#}").contains("isn't installed"), "{e:#}");
+        assert!(server.addresses().is_empty(), "no terminal to resume in");
+
+        let shell = new_thread_in(&cfg, 0, &path, "sh", None).unwrap();
+        assert_eq!(server.addresses(), [shell.session]);
+    }
+
+    /// Codex starts as the host says, typed into the thread's shell; there's
+    /// no conversation of Claude's to keep.
+    #[test]
+    fn codex_starts_in_a_thread_of_its_own() {
+        let server = HcServer::new("codex-start");
+        let dir = TempDir::new("codex-start");
+        let path = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        let mut cfg = server.config();
+        cfg.hosts[0].codex = r#"sh -c 'echo "codex was started $*"' codex"#.into();
+        let started = start_in(&cfg, "local", &path, "codex", Some(Agent::Codex)).unwrap();
+        assert!(started.claude.is_none());
+        let t = server.core().terminals();
+        let t = t.iter().find(|t| t.address == started.session).unwrap();
+        assert_eq!(t.labels.get(KIND).map(String::as_str), Some("codex"));
+        assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("codex"));
+        assert!(wait_until(Duration::from_secs(10), || {
+            server
+                .hc(&["read", &started.session])
+                .contains("codex was started")
+        }));
+    }
+
+    /// A download never overwrites what's in the folder: it takes the next free
+    /// name, as a browser does, and leaves the rest as they were.
+    #[test]
+    fn a_download_keeps_what_has_its_name() {
+        let dir = TempDir::new("keep-in");
+        let from = dir.join("from");
+        std::fs::create_dir(&from).unwrap();
+        let into = dir.join("into/Downloads");
+        for (name, stem) in [("a.tar.gz", "a.tar"), ("notes", "notes"), (".env", ".env")] {
+            let file = from.join(name);
+            std::fs::write(&file, name).unwrap();
+            let first = keep_in(&file, &into).unwrap();
+            assert_eq!(first, into.join(name));
+            std::fs::write(&first, "yours").unwrap();
+            let second = keep_in(&file, &into).unwrap();
+            let extension = name.strip_prefix(stem).unwrap_or_default();
+            assert_eq!(second, into.join(format!("{stem} 2{extension}")));
+            let third = keep_in(&file, &into).unwrap();
+            assert_eq!(third, into.join(format!("{stem} 3{extension}")));
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "yours");
+            assert_eq!(std::fs::read_to_string(&second).unwrap(), name);
+        }
+        // Not its permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let program = from.join("program");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kept = keep_in(&program, &into).unwrap();
+        let mode = std::fs::metadata(&kept).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0, "{mode:o}");
     }
 }

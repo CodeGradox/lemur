@@ -41,6 +41,20 @@ pub struct Threads {
     /// Threads whose session is gone, dimmed under the rest.
     pub gone: Vec<Thread>,
     pub reorder: Reorder,
+    /// Threads put away, under "Put away", which `toggle_away` opens and
+    /// folds: dimmed there, and not dragged.
+    pub away: Vec<Thread>,
+    pub away_open: bool,
+    pub toggle_away: Toggle,
+}
+
+/// How many agents and shells run in a worktree, and whether one of them
+/// needs you.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Counts {
+    pub agents: usize,
+    pub shells: usize,
+    pub needs_input: bool,
 }
 
 #[derive(Clone)]
@@ -53,15 +67,28 @@ pub enum Entry {
         suffix: Suffix,
         /// Its right-click menu.
         menu: MenuBuilder,
-        /// Its folder icon's color.
+        /// Its icon's color.
         color: Option<Hsla>,
+        /// The project's own checkout, with a folder for its icon; a linked
+        /// worktree has a branch.
+        main: bool,
+        /// What runs in it, shown while it's folded.
+        counts: Counts,
         threads: Threads,
         /// Its threads are folded away; clicking it calls `toggle`.
         folded: bool,
         toggle: Toggle,
     },
-    /// Threads with no worktree row above them.
-    Threads(Threads),
+    /// A host's threads outside every project, under a row naming it.
+    Host {
+        label: SharedString,
+        /// This Mac, with a screen for its icon; another host has a server.
+        local: bool,
+        /// What starts a thread there: its buttons, and its right-click
+        /// menu.
+        new: Option<(Suffix, MenuBuilder)>,
+        threads: Threads,
+    },
     /// A project's hidden worktrees, under a Hidden row of their own, shown
     /// while it's `open`; clicking it calls `toggle`.
     Hidden {
@@ -125,12 +152,16 @@ impl SidebarItem for Menu {
                         suffix,
                         menu,
                         color,
+                        main,
+                        counts,
                         threads,
                         folded,
                         toggle,
                     } => {
                         let look = WorktreeLook {
                             color,
+                            main,
+                            counts,
                             folded,
                             toggle,
                             drag: order
@@ -140,7 +171,12 @@ impl SidebarItem for Menu {
                         worktrees += 1;
                         worktree(id, label, suffix, menu, threads, look, window, cx)
                     }
-                    Entry::Threads(threads) => thread_list(threads, window, cx),
+                    Entry::Host {
+                        label,
+                        local,
+                        new,
+                        threads,
+                    } => host(id, label, local, new, threads, window, cx),
                     Entry::Hidden {
                         entries,
                         open,
@@ -348,6 +384,8 @@ struct ThreadRow;
 struct WorktreeRow;
 #[derive(Clone)]
 struct ProjectRow;
+#[derive(Clone)]
+struct TabRow;
 
 impl<Kind: 'static> Render for Dragged<Kind> {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -373,6 +411,7 @@ fn row(
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let name = label.clone();
     let (hover, active_bg, accent_text) = (
         theme.sidebar_accent.opacity(0.8),
         theme.tokens.sidebar_accent,
@@ -401,7 +440,14 @@ fn row(
                 .gap_x_2()
                 .justify_between()
                 .overflow_x_hidden()
-                .child(h_flex().flex_1().overflow_x_hidden().child(label))
+                .child(
+                    div()
+                        .debug_selector(move || format!("label {name}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(label),
+                )
                 .child(suffix),
         )
 }
@@ -411,6 +457,8 @@ fn row(
 /// key, its place and what moves it.
 struct WorktreeLook {
     color: Option<Hsla>,
+    main: bool,
+    counts: Counts,
     folded: bool,
     toggle: Toggle,
     drag: Option<(SharedString, usize, Reorder)>,
@@ -428,21 +476,48 @@ fn worktree(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let has_threads = !threads.rows.is_empty() || !threads.gone.is_empty();
+    let has_threads =
+        !threads.rows.is_empty() || !threads.gone.is_empty() || !threads.away.is_empty();
     let is_open = has_threads && !look.folded;
     let toggle = look.toggle;
     let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
         cx.stop_propagation();
         toggle(window, cx);
     };
-    let icon = Icon::new(IconName::Folder).when_some(look.color, |i, c| i.text_color(c));
-    // Its buttons do what they say without folding it.
+    let icon = match look.main {
+        true => Icon::new(IconName::Folder),
+        false => super::icons::git_branch(),
+    };
+    let icon = icon.when_some(look.color, |i, c| i.text_color(c));
+    // Its buttons do what they say without folding it. They show while
+    // the pointer is on it; the rest of the time a folded worktree says
+    // what runs in it there instead.
+    let hovered = SharedString::from(format!("{id}-row"));
     let buttons = format!("buttons {label}");
-    let suffix = h_flex()
-        .id("suffix")
-        .debug_selector(move || buttons)
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(suffix(window, cx));
+    // Both in one cell, as wide as the wider, so the label ends before either.
+    let suffix = div()
+        .grid()
+        .grid_cols_max_content(1)
+        .child(
+            h_flex()
+                .id("suffix")
+                .debug_selector(move || buttons)
+                .col_start(1)
+                .row_start(1)
+                .justify_end()
+                .invisible()
+                .group_hover(hovered.clone(), |style| style.visible())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(suffix(window, cx)),
+        )
+        .when(look.folded && has_threads, |this| {
+            this.child(
+                counts(look.counts, &label, cx)
+                    .col_start(1)
+                    .row_start(1)
+                    .group_hover(hovered.clone(), |style| style.invisible()),
+            )
+        });
     let header = row(
         "worktree",
         icon,
@@ -473,6 +548,7 @@ fn worktree(
         None => header,
     };
     let header = header
+        .group(hovered)
         .context_menu(move |m, window, cx| menu(m, window, cx))
         .into_any_element();
     let border = cx.theme().sidebar_border;
@@ -499,9 +575,165 @@ fn worktree(
         .into_any_element()
 }
 
+/// What runs in a folded worktree: its agents' and shells' counts, each
+/// with its icon, and a dot when one needs you.
+fn counts(c: Counts, label: &SharedString, cx: &App) -> Div {
+    let theme = cx.theme();
+    let selector = format!("counts {label}");
+    let count = |icon: Icon, n: usize| {
+        h_flex()
+            .gap_0p5()
+            .items_center()
+            .child(icon.xsmall())
+            .child(n.to_string())
+    };
+    h_flex()
+        .debug_selector(move || selector)
+        .gap_1p5()
+        .items_center()
+        .justify_end()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .when(c.agents > 0, |this| {
+            this.child(count(super::sidebar::claude_icon(), c.agents))
+        })
+        .when(c.shells > 0, |this| {
+            this.child(count(Icon::new(IconName::SquareTerminal), c.shells))
+        })
+        .when(c.needs_input, |this| {
+            this.child(div().size_1p5().rounded_full().bg(theme.warning))
+        })
+}
+
+/// A host's row in Other, and its threads under it.
+fn host(
+    id: SharedString,
+    label: SharedString,
+    local: bool,
+    new: Option<(Suffix, MenuBuilder)>,
+    threads: Threads,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let has_threads =
+        !threads.rows.is_empty() || !threads.gone.is_empty() || !threads.away.is_empty();
+    let icon = match local {
+        true => super::icons::monitor(),
+        false => super::icons::server(),
+    };
+    let selector = format!("host {label}");
+    // Its buttons show while the pointer is on it, as a worktree's do.
+    let hovered = SharedString::from(format!("{id}-row"));
+    let buttons = format!("buttons {label}");
+    let suffix = match &new {
+        Some((suffix, _)) => h_flex()
+            .id("suffix")
+            .debug_selector(move || buttons)
+            .invisible()
+            .group_hover(hovered.clone(), |style| style.visible())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(suffix(window, cx))
+            .into_any_element(),
+        None => Empty.into_any_element(),
+    };
+    let header = row("host", icon, label, false, suffix, cx)
+        .debug_selector(move || selector)
+        .group(hovered);
+    let header = match new {
+        Some((_, menu)) => header
+            .context_menu(move |m, window, cx| menu(m, window, cx))
+            .into_any_element(),
+        None => header.into_any_element(),
+    };
+    let border = cx.theme().sidebar_border;
+    div()
+        .id(id)
+        .w_full()
+        .child(header)
+        .when(has_threads, |this| {
+            this.child(
+                div()
+                    .border_l_1()
+                    .border_color(border)
+                    .ml_3p5()
+                    .pl_2p5()
+                    .py_0p5()
+                    .child(thread_list(threads, window, cx)),
+            )
+        })
+        .into_any_element()
+}
+
 /// The Hidden row at the bottom of a project, with how many it holds, and
 /// while `is_open` the hidden worktrees under it; clicking it calls
 /// `toggle`.
+/// "Put away" and how many, a click on which shows them under it, dimmed,
+/// or folds them; nothing without any.
+fn away_rows(
+    away: Vec<Thread>,
+    is_open: bool,
+    toggle: Toggle,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<AnyElement> {
+    if away.is_empty() {
+        return vec![];
+    }
+    let fold = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        toggle(window, cx);
+    };
+    let count = div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(away.len().to_string());
+    let header = row(
+        "away",
+        Icon::new(IconName::EyeOff),
+        "Put away".into(),
+        false,
+        count.into_any_element(),
+        cx,
+    )
+    .debug_selector(|| "away".into())
+    .cursor_pointer()
+    .text_color(cx.theme().muted_foreground)
+    .on_click(fold.clone())
+    .child(
+        Button::new("caret")
+            .xsmall()
+            .ghost()
+            .icon(
+                Icon::new(IconName::ChevronRight)
+                    .size_4()
+                    .when(is_open, |this| this.rotate(percentage(90. / 360.))),
+            )
+            .on_click(fold),
+    );
+    let mut rows = vec![header.into_any_element()];
+    if is_open {
+        rows.extend(away.into_iter().enumerate().map(|(ix, t)| {
+            let (on_click, menu) = (t.on_click, t.menu);
+            let id = format!("away-{ix}");
+            let suffix = (t.suffix)(window, cx);
+            row(
+                SharedString::from(id.clone()),
+                t.icon,
+                t.label,
+                t.active,
+                suffix,
+                cx,
+            )
+            .debug_selector(move || id)
+            .opacity(0.6)
+            .on_click(move |event, window, cx| on_click(event, window, cx))
+            .context_menu(move |m, window, cx| menu(m, window, cx))
+            .into_any_element()
+        }));
+    }
+    rows
+}
+
 fn hidden(
     id: SharedString,
     entries: Vec<Entry>,
@@ -626,13 +858,55 @@ fn drop_target<Kind: 'static>(
         })
 }
 
+/// Makes `tab` draggable along the tab bar `key`, where it's at `index`:
+/// dropped on another tab, it takes that one's place. The line on the side
+/// it will land is on a slot around the tab, whose own border is its look.
+pub fn draggable_tab(
+    tab: Stateful<Div>,
+    key: SharedString,
+    index: usize,
+    label: SharedString,
+    reorder: Reorder,
+    cx: &App,
+) -> Stateful<Div> {
+    let line = cx.theme().drag_border;
+    let tab = drag_handle::<TabRow>(tab, key.clone(), index, label);
+    div()
+        .id(SharedString::from(format!("tab-slot-{index}")))
+        .flex_shrink_0()
+        .child(tab)
+        .can_drop(move |value, _, _| {
+            value
+                .downcast_ref::<Dragged<TabRow>>()
+                .is_some_and(|d| d.list == key)
+        })
+        .drag_over::<Dragged<TabRow>>(move |style, dragged, _, _| {
+            if dragged.index > index {
+                style.border_l_2().border_color(line)
+            } else if dragged.index < index {
+                style.border_r_2().border_color(line)
+            } else {
+                style
+            }
+        })
+        .on_drop(move |dragged: &Dragged<TabRow>, window, cx| {
+            if dragged.index != index {
+                reorder(dragged.index, index, window, cx);
+            }
+        })
+}
+
 fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElement {
     let Threads {
         key,
         rows,
         gone,
         reorder,
+        away,
+        away_open,
+        toggle_away,
     } = threads;
+    let away = away_rows(away, away_open, toggle_away, window, cx);
     let gone: Vec<_> = gone
         .into_iter()
         .enumerate()
@@ -671,6 +945,7 @@ fn thread_list(threads: Threads, window: &mut Window, cx: &mut App) -> AnyElemen
             draggable::<ThreadRow>(row, key.clone(), ix, t.label, reorder.clone(), cx)
                 .context_menu(move |m, window, cx| menu(m, window, cx))
         }))
+        .children(away)
         .children(gone)
         .into_any_element()
 }

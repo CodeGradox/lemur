@@ -1,34 +1,41 @@
 //! Names asked for in the spotlight: for a new worktree, a new thread or
 //! a rename, and what happens once one is given.
 
-use super::sidebar::claude_icon;
+use super::sidebar::{claude_icon, codex_icon};
 use super::snackbar::Kind;
 use super::{Ask, Lemur, Prompt, sessions, spotlight, worktree_label};
 use crate::actions;
-use crate::config::{ClaudeThread, leaf};
+use crate::config::{Agent, ClaudeThread, leaf};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectState};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, IndexPath, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-actions!(new_thread, [OtherKind]);
+actions!(new_thread, [Up, Down]);
 
-/// Key context of the spotlight for a new thread.
+/// Key context of the spotlight for a new thread, or one to go to.
 const NEW_THREAD: &str = "NewThread";
 
-/// ↑↓ pick Claude or Shell for a new thread. The name field goes first
-/// and passes on the keys it has no use for.
+/// ↑↓ pick what a new thread runs, or a thread to go to. The
+/// name field goes first and passes on the keys it has no use for.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("up", OtherKind, Some(NEW_THREAD)),
-        KeyBinding::new("down", OtherKind, Some(NEW_THREAD)),
+        KeyBinding::new("up", Up, Some(NEW_THREAD)),
+        KeyBinding::new("down", Down, Some(NEW_THREAD)),
     ]);
 }
 
+/// What a new thread can run, as they're listed: an agent, or a shell.
+pub(super) const KINDS: [Option<Agent>; 3] = [Some(Agent::Claude), Some(Agent::Codex), None];
+
 /// What a new thread is called until you name it.
-fn default_label(shell: bool) -> &'static str {
-    if shell { "shell" } else { "claude" }
+pub(super) fn default_label(agent: Option<Agent>) -> &'static str {
+    match agent {
+        Some(Agent::Claude) => "claude",
+        Some(Agent::Codex) => "codex",
+        None => "shell",
+    }
 }
 
 /// A new worktree's branch, empty for none, and the branch it starts
@@ -45,32 +52,59 @@ enum Done {
     Started(actions::Started, Option<String>),
     Renamed {
         host: String,
-        old: String,
-        new: String,
+        session: String,
+        name: String,
     },
 }
 
 impl Lemur {
     /// Opens the name field, selected so typing replaces it. It asks for a
-    /// label, which several threads can share: it starts as `claude` or
-    /// `shell`, a free random name for a worktree, or the current label.
+    /// label, which several threads can share: it starts as what the thread
+    /// runs, a free random name for a worktree, or the label it has, not what
+    /// its program calls it.
     pub(super) fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
         let name = match &what {
-            Ask::NewWorktree { base } => actions::random_name(|n| self.worktree_taken(*base, n)),
-            Ask::NewThread { shell, .. } => default_label(*shell).to_string(),
-            Ask::Rename { session, .. } => actions::label(leaf(session)).to_string(),
+            Ask::NewWorktree { base, .. } => {
+                actions::random_name(|n| self.worktree_taken(*base, n))
+            }
+            Ask::NewThread { agent, .. } => default_label(*agent).to_string(),
+            Ask::Rename { host, session } => sessions(&self.snap)
+                .find(|(h, s)| h == host && s.name == *session)
+                .map(|(_, s)| s.own_label.clone())
+                .unwrap_or_else(|| self.label_of(host, session)),
+            Ask::Find => String::new(),
+        };
+        let placeholder = match &what {
+            Ask::Find => "Go to a thread…",
+            _ => "name",
         };
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("name")
+                .placeholder(placeholder)
                 .default_value(name)
         });
         let events =
             cx.subscribe_in(
                 &input,
                 window,
-                |this, _, event: &InputEvent, _, cx| match event {
-                    InputEvent::PressEnter { .. } => this.submit(cx),
+                |this, _, event: &InputEvent, window, cx| match event {
+                    // A thread picked to go to opens; otherwise the name
+                    // starts or renames.
+                    InputEvent::PressEnter { .. } => match this.prompt.as_ref() {
+                        Some(Prompt {
+                            what: Ask::Find,
+                            go,
+                            ..
+                        }) => {
+                            let go = *go;
+                            this.go_to(go, window, cx);
+                        }
+                        Some(Prompt { go: Some(i), .. }) => {
+                            let i = *i;
+                            this.go_to(Some(i), window, cx);
+                        }
+                        _ => this.submit(cx),
+                    },
                     // Enter also reports a change; only new text answers the error.
                     InputEvent::Change => {
                         if let Some(prompt) = &mut this.prompt {
@@ -78,6 +112,8 @@ impl Lemur {
                             if prompt.error.as_ref().is_some_and(|(_, name)| *name != text) {
                                 prompt.error = None;
                             }
+                            // What's listed changed, so the pick starts over.
+                            prompt.go = None;
                         }
                         cx.notify();
                     }
@@ -89,7 +125,7 @@ impl Lemur {
             i.select_all(window, cx);
         });
         let worktree = match &what {
-            Ask::NewWorktree { base } => Some(self.worktree_fields(*base, window, cx)),
+            Ask::NewWorktree { base, .. } => Some(self.worktree_fields(*base, window, cx)),
             _ => None,
         };
         self.prompt = Some(Prompt {
@@ -97,6 +133,7 @@ impl Lemur {
             input,
             worktree,
             error: None,
+            go: None,
             _events: events,
         });
         cx.notify();
@@ -154,34 +191,43 @@ impl Lemur {
     }
 
     /// The name field, in the spotlight: what it's for, the name, and a
-    /// hint or why the name can't be used. A new thread is Claude or a
-    /// shell, picked above the name.
+    /// hint or why the name can't be used. What a new thread runs is picked
+    /// above the name.
     pub(super) fn prompt_card(&self, prompt: &Prompt, cx: &Context<Self>) -> Div {
         let mut kind = None;
+        let mut listed = false;
         let (icon, what, hint) = match &prompt.what {
-            Ask::NewWorktree { base } => (
-                IconName::Folder,
-                format!("New worktree in {}", self.cfg.bases[*base].name()),
-                "⏎ start · esc cancel",
-            ),
-            Ask::NewThread {
-                base,
-                worktree,
-                shell,
-            } => {
-                kind = Some(*shell);
+            Ask::NewWorktree { base, agent } => {
+                kind = Some(*agent);
                 (
-                    IconName::Plus,
-                    format!(
-                        "New in {}",
-                        self.worktree_name(&self.cfg.bases[*base].host, worktree)
-                    ),
-                    "↑↓ Claude or shell · ⏎ start · esc cancel",
+                    IconName::Folder,
+                    format!("New worktree in {}", self.cfg.bases[*base].name()),
+                    "↑↓ Claude, Codex or shell · ⏎ start · esc cancel",
                 )
             }
-            Ask::Rename { session, .. } => (
+            Ask::NewThread {
+                host, dir, agent, ..
+            } => {
+                // While a thread is picked, what to start isn't.
+                kind = Some(*agent).filter(|_| prompt.go.is_none());
+                listed = true;
+                (
+                    IconName::Plus,
+                    format!("New in {}, or go to", self.worktree_name(host, dir)),
+                    "↑↓ Claude, Codex, shell or a thread · ⏎ start or go · esc cancel",
+                )
+            }
+            Ask::Find => {
+                listed = true;
+                (
+                    IconName::Search,
+                    "Go to a thread".to_string(),
+                    "↑↓ pick · ⏎ go · esc cancel",
+                )
+            }
+            Ask::Rename { host, session } => (
                 IconName::CaseSensitive,
-                format!("Rename {}", actions::label(leaf(session))),
+                format!("Rename {}", self.label_of(host, session)),
                 "⏎ rename · esc cancel",
             ),
         };
@@ -189,20 +235,25 @@ impl Lemur {
             Some((error, _)) => spotlight::footer(error.clone(), true, cx),
             None => spotlight::footer(hint, false, cx),
         };
+        let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
         spotlight::card(cx)
             .child(spotlight::title(icon, what, cx))
-            .when_some(kind, |card, shell| {
+            .when(listed || is_new, |card| {
                 card.key_context(NEW_THREAD)
-                    .on_action(cx.listener(move |this, _: &OtherKind, window, cx| {
-                        this.pick_kind(!shell, window, cx)
-                    }))
-                    .child(kinds(shell, cx))
+                    .on_action(cx.listener(|this, _: &Up, window, cx| this.step(true, window, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &Down, window, cx| this.step(false, window, cx)),
+                    )
             })
+            .when(is_new, |card| card.child(kinds(kind, cx)))
             .child(
                 div()
                     .p_1()
                     .child(Input::new(&prompt.input).appearance(false)),
             )
+            // A rename or a new worktree's name isn't a thread to go to:
+            // a click on one would drop what's typed.
+            .when(listed, |card| card.children(self.match_rows(prompt, cx)))
             .when_some(prompt.worktree.as_ref(), |card, fields| {
                 card.child(
                     v_flex()
@@ -223,23 +274,31 @@ impl Lemur {
             .child(footer)
     }
 
-    /// Picks Claude or, with `shell`, a shell for the new thread asked for.
-    /// The name follows, unless you typed one.
-    fn pick_kind(&mut self, shell: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Prompt {
-            what: Ask::NewThread { shell: picked, .. },
-            input,
-            ..
-        }) = &mut self.prompt
-        else {
+    /// Picks what the new thread asked for runs: `agent`, or with none a
+    /// shell. A thread's name follows, unless you typed one.
+    pub(super) fn pick_kind(
+        &mut self,
+        agent: Option<Agent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = &mut self.prompt else {
             return;
         };
-        if *picked != shell {
+        let (picked, named) = match &mut prompt.what {
+            Ask::NewThread { agent: picked, .. } => (picked, true),
+            // Its name is the worktree's.
+            Ask::NewWorktree { agent: picked, .. } => (picked, false),
+            _ => return,
+        };
+        prompt.go = None;
+        let input = &prompt.input;
+        if *picked != agent {
             let typed = input.read(cx).value() != default_label(*picked);
-            *picked = shell;
-            if !typed {
+            *picked = agent;
+            if named && !typed {
                 input.update(cx, |i, cx| {
-                    i.set_value(default_label(shell), window, cx);
+                    i.set_value(default_label(agent), window, cx);
                     i.select_all(window, cx);
                 });
             }
@@ -249,34 +308,30 @@ impl Lemur {
         cx.notify();
     }
 
-    /// ⌘J: asks for a new Claude thread or shell in the worktree of the one
-    /// on show.
+    /// ⌘J: asks for a new agent's thread or shell where the one on show runs:
+    /// its worktree, or its folder outside every worktree.
     pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.prompt.is_some() || self.picker.is_some() {
+        if self.overlaid() {
             return;
         }
-        let Some((host, session)) = self.active.clone() else {
+        let Some(key) = self.active.clone() else {
             return;
         };
-        let Some((worktree, _)) = self.worktree_of(&host, &session) else {
-            return;
+        let (dir, base) = match self.project_of(&key.0, &key.1) {
+            Some((base, worktree)) => (worktree.path.clone(), Some(base)),
+            None => match self.session_of(&key) {
+                Some(s) => (s.path.clone(), None),
+                // Not listed yet: there's no telling where it runs.
+                None => return self.ask_name(Ask::Find, window, cx),
+            },
         };
-        let base = self
-            .snap
-            .hosts
-            .iter()
-            .filter(|h| h.name == host)
-            .flat_map(|h| h.bases.iter())
-            .find(|b| b.worktrees.iter().any(|w| w.path == worktree))
-            .map(|b| b.index);
-        if let Some(base) = base {
-            let ask = Ask::NewThread {
-                base,
-                worktree,
-                shell: false,
-            };
-            self.ask_name(ask, window, cx);
-        }
+        let ask = Ask::NewThread {
+            host: key.0,
+            base,
+            dir,
+            agent: Some(Agent::Claude),
+        };
+        self.ask_name(ask, window, cx);
     }
 
     pub(super) fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -308,18 +363,10 @@ impl Lemur {
         let Some(Prompt { what, .. }) = self.prompt.take() else {
             return;
         };
-        let thread = match &what {
-            Ask::NewWorktree { base } | Ask::NewThread { base, .. } => {
-                self.unique_thread(*base, &name)
-            }
-            Ask::Rename { .. } => String::new(),
-        };
         let cfg = self.cfg.clone();
         let doing = match &what {
-            Ask::Rename { host, session } => {
-                self.renaming = Some((host.clone(), session.clone()));
-                "renaming"
-            }
+            Ask::Rename { .. } => "renaming",
+            Ask::Find => return,
             _ => "starting",
         };
         self.status = Some((format!("{doing} {name}…"), Kind::Progress));
@@ -327,42 +374,49 @@ impl Lemur {
         self.in_background(
             cx,
             move || match what {
-                Ask::NewWorktree { base } => actions::new_worktree_thread(
+                // The name is the worktree's: its thread shows what its program
+                // calls it.
+                Ask::NewWorktree { base, agent } => actions::new_worktree_thread(
                     &cfg,
                     base,
                     &name,
-                    &thread,
+                    default_label(agent),
+                    agent,
                     branch.as_deref(),
                     from.as_deref(),
                 )
                 .map(|(started, note)| Done::Started(started, note)),
                 Ask::NewThread {
-                    base,
-                    worktree,
-                    shell,
-                } => actions::new_thread_in(&cfg, base, &worktree, &thread, shell)
+                    host, dir, agent, ..
+                } => actions::start_in(&cfg, &host, &dir, &name, agent)
                     .map(|started| Done::Started(started, None)),
+                Ask::Find => unreachable!("going to a thread starts nothing"),
                 Ask::Rename { host, session } => {
-                    actions::rename_session(&cfg, &host, &session, &name).map(|new| Done::Renamed {
-                        host,
-                        old: session,
-                        new,
+                    actions::rename_session(&cfg, &host, &session, &name).map(|session| {
+                        Done::Renamed {
+                            host,
+                            session,
+                            name,
+                        }
                     })
                 }
             },
             |this, done, window, cx| {
-                this.renaming = None;
                 match done {
                     Ok(Done::Started(started, note)) => {
                         this.status = note.map(|note| (note, Kind::Warning));
                         if let Some(claude) = started.claude {
                             this.keep_thread(claude, cx);
                         }
-                        this.open(started.host, started.session, window, cx);
+                        this.open_fresh(started.host, started.session, window, cx);
                     }
-                    Ok(Done::Renamed { host, old, new }) => {
+                    Ok(Done::Renamed {
+                        host,
+                        session,
+                        name,
+                    }) => {
                         this.status = None;
-                        this.follow_rename(host, old, new, cx);
+                        this.follow_rename(host, session, name, cx);
                     }
                     Err(e) => this.fail(e, cx),
                 }
@@ -372,37 +426,49 @@ impl Lemur {
         .detach();
     }
 
-    /// Moves the open terminal, the selection and the thread kept to
-    /// resume to a renamed session.
-    fn follow_rename(&mut self, host: String, old: String, new: String, cx: &mut Context<Self>) {
+    /// Shows a thread's new label at once, and keeps it with the thread
+    /// kept to resume.
+    fn follow_rename(
+        &mut self,
+        host: String,
+        session: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
         let kept = self
             .cfg
             .threads
             .iter()
-            .find(|t| t.host == host && t.session == old)
+            .find(|t| t.host == host && t.session == session)
             .cloned();
         if let Some(thread) = kept {
-            self.forget_threads(&host, std::slice::from_ref(&old), cx);
-            let session = new.clone();
-            self.keep_thread(ClaudeThread { session, ..thread }, cx);
+            let label = Some(name.clone());
+            self.keep_thread(ClaudeThread { label, ..thread }, cx);
         }
-        let old_key = (host.clone(), old);
-        let new_key = (host.clone(), new.clone());
-        if let Some(view) = self.terminals.remove(&old_key) {
-            // Reconnects attach by name, so the view must learn the new one.
-            view.update(cx, |v, _| v.session = new.clone());
-            self.terminals.insert(new_key.clone(), view);
-        }
-        for key in &mut self.recent {
-            if *key == old_key {
-                *key = new_key.clone();
-            }
-        }
-        if self.active.as_ref() == Some(&old_key) {
-            self.active = Some(new_key);
-            self.remember(host, new);
+        let shown = self
+            .snap
+            .hosts
+            .iter_mut()
+            .filter(|h| h.name == host)
+            .flat_map(|h| {
+                let in_bases = h.bases.iter_mut().flat_map(|b| b.worktrees.iter_mut());
+                in_bases
+                    .flat_map(|w| w.sessions.iter_mut())
+                    .chain(h.other.iter_mut())
+            });
+        for s in shown.filter(|s| s.name == session) {
+            s.label = name.clone();
+            s.own_label = name.clone();
         }
         cx.notify();
+    }
+
+    /// What the sidebar calls a thread.
+    pub(super) fn label_of(&self, host: &str, session: &str) -> String {
+        sessions(&self.snap)
+            .find(|(h, s)| *h == host && s.name == session)
+            .map(|(_, s)| s.label.clone())
+            .unwrap_or_else(|| actions::label(leaf(session)).to_string())
     }
 
     /// A worktree's name as the sidebar shows it.
@@ -424,22 +490,13 @@ impl Lemur {
             .flat_map(|v| v.worktrees.iter())
             .any(|w| leaf(&w.path) == name)
     }
-
-    /// A thread name for `label` in `base` that no session uses yet.
-    fn unique_thread(&self, base: usize, label: &str) -> String {
-        let b = &self.cfg.bases[base];
-        actions::unique_thread(label, |thread| {
-            let session = b.session_name(thread);
-            sessions(&self.snap).any(|(h, s)| h == b.host && s.name == session)
-        })
-    }
 }
 
-/// Claude and Shell, to pick from for a new thread; with `shell` the
-/// shell is picked.
-fn kinds(shell: bool, cx: &Context<Lemur>) -> Div {
+/// What a new thread can run, to pick from: `picked` is highlighted, and with
+/// none nothing is.
+fn kinds(picked: Option<Option<Agent>>, cx: &Context<Lemur>) -> Div {
     let theme = cx.theme();
-    let row = |label: &'static str, icon: Icon, is_shell: bool| {
+    let row = |label: &'static str, icon: Icon, kind: Option<Agent>| {
         h_flex()
             .id(label)
             .debug_selector(move || format!("kind {label}"))
@@ -449,20 +506,21 @@ fn kinds(shell: bool, cx: &Context<Lemur>) -> Div {
             .rounded(theme.radius)
             .text_sm()
             .cursor_pointer()
-            .when(shell == is_shell, |row| {
+            .when(picked == Some(kind), |row| {
                 row.bg(theme.accent).text_color(theme.accent_foreground)
             })
             .child(icon.small())
             .child(label)
-            .on_click(cx.listener(move |this, _, window, cx| this.pick_kind(is_shell, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.pick_kind(kind, window, cx)))
     };
     v_flex()
         .p_1()
         .gap_0p5()
         .border_b_1()
         .border_color(theme.border)
-        .child(row("Claude", claude_icon(), false))
-        .child(row("Shell", Icon::new(IconName::SquareTerminal), true))
+        .child(row("Claude", claude_icon(), Some(Agent::Claude)))
+        .child(row("Codex", codex_icon(), Some(Agent::Codex)))
+        .child(row("Shell", Icon::new(IconName::SquareTerminal), None))
 }
 
 /// A line of the new worktree's fields: what it is, then the field.

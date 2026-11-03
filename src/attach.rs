@@ -1,34 +1,25 @@
 //! Attaching to a session, and remembering which one lemur showed last.
 
 use crate::config::{Host, home, read_toml};
-use crate::remote::{Remote, target};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// argv for a terminal attached to `session` on `host`.
-pub fn attach_argv(host: &Host, session: &str) -> Vec<String> {
-    let r = Remote::new(host);
-    r.interactive(&format!(
-        "unset TMUX; exec {} attach -t {}",
-        r.tmux(),
-        target(session)
-    ))
-}
-
-/// Attaches this terminal to a session until you detach.
+/// Attaches this terminal to a session until you detach (ctrl+\), with
+/// herdr-core's own `attach`.
 pub fn attach_here(host: &Host, session: &str) -> Result<()> {
-    let argv = attach_argv(host, session);
     let _ = Active {
         host: host.name.clone(),
         session: session.to_string(),
     }
     .save();
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .context("starting attach")?;
+    let mut command = Command::new(crate::hc::binary());
+    command.arg("attach").arg(session);
+    if let Some(s) = host.hc_session.as_deref().filter(|_| host.ssh == "local") {
+        command.env("HC_SESSION", s);
+    }
+    let status = command.status().context("starting herdr-core attach")?;
     if !status.success() {
         bail!("attach to {session} exited with {status}");
     }

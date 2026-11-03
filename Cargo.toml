@@ -7,16 +7,20 @@ edition = "2024"
 alacritty_terminal = "0.26.0"
 anyhow = "1.0.104"
 arboard = "3.7.0"
+base64 = "0.22.1"
 clap = { version = "4.6.7", features = ["derive"] }
 futures = "0.3"
 gpui-kit = "0.8.0"
 # The editor's link type, for ⌘-clicking URLs in notes; gpui-kit's own version.
 lsp-types = "0.97.0"
 png = "0.18.1"
+# The Keychain, so only Lemur can read its Linear sign-in.
+security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.8"
 toml_edit = "0.25.17"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 gpui = { version = "=0.3.9", package = "gpui-pre", features = ["test-support"] }

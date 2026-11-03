@@ -237,9 +237,7 @@ fn trimmed(url: &[char]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::terminal::{Pty, Size};
-    use crate::test_support::wait_until;
-    use std::time::Duration;
+    use crate::gui::terminal::{Screen, Size};
 
     /// The URL in `text` at the first character of `at`.
     fn url(text: &str, at: &str) -> Option<String> {
@@ -311,18 +309,25 @@ mod tests {
         assert_eq!(path("Edit a.rs. Then", ". Then"), None);
     }
 
-    /// A shell printing `script` in a 30-column terminal, once `shown` shows.
-    fn printed(script: &str, shown: &str) -> Pty {
-        let argv: Vec<String> = ["sh", "-c", script].iter().map(|s| s.to_string()).collect();
-        let size = Size {
-            cols: 30,
-            lines: 6,
-            cell_width: 8,
-            cell_height: 16,
-        };
-        let pty = Pty::spawn(&argv, size).unwrap().0;
-        let text = |pty: &Pty| {
-            let term = pty.term.lock();
+    /// What a shell printing `script` shows in a 30-column terminal; it
+    /// must show `shown`.
+    fn printed(script: &str, shown: &str) -> Screen {
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .output()
+            .expect("running sh");
+        let mut screen = Screen::new(
+            Size {
+                cols: 30,
+                lines: 6,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            100,
+        );
+        screen.advance(&out.stdout);
+        let text = {
+            let term = screen.term.lock();
             let grid = term.grid();
             (0..grid.screen_lines())
                 .map(|line| {
@@ -332,21 +337,17 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        assert!(
-            wait_until(Duration::from_secs(5), || text(&pty).contains(shown)),
-            "{:?}",
-            text(&pty)
-        );
-        pty
+        assert!(text.contains(shown), "{text:?}");
+        screen
     }
 
     #[test]
     fn a_url_runs_on_across_wrapped_rows() {
-        let pty = printed(
-            "printf 'go https://example.com/a/long/path/here now'; sleep 5",
+        let screen = printed(
+            "printf 'go https://example.com/a/long/path/here now'",
             "now",
         );
-        let term = pty.term.lock();
+        let term = screen.term.lock();
         let link = link_at(&term, 2, 1).expect("on the wrapped row");
         assert_eq!(link.url, "https://example.com/a/long/path/here");
         assert_eq!(link.spans, [(0, 3, 30), (1, 0, 9)]);
@@ -355,11 +356,11 @@ mod tests {
 
     #[test]
     fn an_osc_8_link_goes_to_its_uri() {
-        let pty = printed(
-            r"printf 'read \033]8;;https://lemur.dev/docs\033\\the docs\033]8;;\033\\ now'; sleep 5",
+        let screen = printed(
+            r"printf 'read \033]8;;https://lemur.dev/docs\033\\the docs\033]8;;\033\\ now'",
             "now",
         );
-        let term = pty.term.lock();
+        let term = screen.term.lock();
         let link = link_at(&term, 7, 0).expect("on the text");
         assert_eq!(link.url, "https://lemur.dev/docs");
         assert_eq!(link.spans, [(0, 5, 13)]);
@@ -368,8 +369,8 @@ mod tests {
 
     #[test]
     fn a_path_written_out_links_to_its_file() {
-        let pty = printed("printf 'edit src/gui/links.rs:42 now'; sleep 5", "now");
-        let term = pty.term.lock();
+        let screen = printed("printf 'edit src/gui/links.rs:42 now'", "now");
+        let term = screen.term.lock();
         let link = link_at(&term, 8, 0).expect("on the path");
         assert_eq!(link.url, "src/gui/links.rs");
         assert!(link.file);
@@ -381,11 +382,11 @@ mod tests {
     /// Text can hide any URI; only a web link's opens.
     #[test]
     fn an_osc_8_link_elsewhere_doesnt_open() {
-        let pty = printed(
-            r"printf '\033]8;;file:///etc/passwd\033\\safe\033]8;;\033\\ \033]8;;HTTPS://x.dev\033\\web\033]8;;\033\\ end'; sleep 5",
+        let screen = printed(
+            r"printf '\033]8;;file:///etc/passwd\033\\safe\033]8;;\033\\ \033]8;;HTTPS://x.dev\033\\web\033]8;;\033\\ end'",
             "end",
         );
-        let term = pty.term.lock();
+        let term = screen.term.lock();
         assert_eq!(link_at(&term, 1, 0), None);
         let web = link_at(&term, 6, 0).expect("on the web link");
         assert_eq!(web.url, "HTTPS://x.dev");
