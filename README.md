@@ -4,6 +4,8 @@ A macOS app for Claude Code and Codex sessions that live on a remote host: a sid
 
 [![Lemur in use: Claude threads by project and worktree, answering one that waits, ⌘J for a new shell, ⌃Tab between threads, a pasted screenshot, and notes](docs/demo.avif)](docs/demo.avif)
 
+[Download the tutorial](https://github.com/CodeGradox/lemur/releases/download/v2.0.0/lemur-tutorial.mp4) (MP4, 3:48, 26 MB, with sound): installing, projects, threads, agents, the panels and dictation.
+
 ## Install
 
 Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag Lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 11 or newer (dictation, macOS 26).
