@@ -86,6 +86,8 @@ actions!(
         ShowAll,
         NextThread,
         PreviousThread,
+        MoveTabLeft,
+        MoveTabRight,
         NewThreadHere,
         NewTerminal,
         GoToThread,
@@ -119,6 +121,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", CommandPalette, None),
         KeyBinding::new("ctrl-tab", NextThread, None),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, None),
+        // Text fields take these first, to select to the line's ends.
+        KeyBinding::new("cmd-shift-left", MoveTabLeft, None),
+        KeyBinding::new("cmd-shift-right", MoveTabRight, None),
         // A new tab, as in a terminal app; ⌘W closes the one on show.
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-j", NewThreadHere, None),
@@ -405,6 +410,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
                     MenuItem::separator(),
                     MenuItem::action("Next Thread in Worktree", NextThread),
                     MenuItem::action("Previous Thread in Worktree", PreviousThread),
+                    MenuItem::action("Move Tab Left", MoveTabLeft),
+                    MenuItem::action("Move Tab Right", MoveTabRight),
                     MenuItem::action("Next Agent", NextAgent),
                     MenuItem::action("Previous Agent", PreviousAgent),
                 ]),
@@ -1363,6 +1370,43 @@ impl Lemur {
         }
     }
 
+    /// ⌘⇧← or, with `back` false, ⌘⇧→: moves the tab on show one place along
+    /// the tabs, as dragging it there does; at the end it stays.
+    fn move_tab(&mut self, back: bool, cx: &mut Context<Self>) {
+        if self.overlaid() {
+            return;
+        }
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        let tabs = self.siblings(&active);
+        let Some(at) = tabs.iter().position(|k| *k == active) else {
+            return;
+        };
+        let next = if back {
+            at.checked_sub(1)
+        } else {
+            Some(at + 1).filter(|to| *to < tabs.len())
+        };
+        let Some(next) = next else {
+            return;
+        };
+        let list: List = (
+            active.0.clone(),
+            self.project_of(&active.0, &active.1)
+                .map(|(_, w)| w.path.clone()),
+        );
+        // In the list, with what's put away among it.
+        let place =
+            |this: &mut Self, name: &str| this.list_mut(&list)?.iter().position(|s| s.name == name);
+        let (Some(from), Some(to)) = (place(self, &active.1), place(self, &tabs[next].1)) else {
+            return;
+        };
+        // It may have been scrolled away from.
+        self.tab_follows = true;
+        self.reorder(list, from, to, cx);
+    }
+
     /// Writes the order dragged into `list` to herdr-core, a label a
     /// thread, then the one dragged meanwhile, if any.
     fn write_order(&mut self, list: List, names: Vec<String>, cx: &mut Context<Self>) {
@@ -1955,6 +1999,8 @@ impl Render for Lemur {
             .on_action(
                 cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &MoveTabLeft, _, cx| this.move_tab(true, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabRight, _, cx| this.move_tab(false, cx)))
             .on_action(cx.listener(|this, _: &PutAway, window, cx| {
                 if let Some(k) = this.active.clone() {
                     this.put_away(k, window, cx);
@@ -2404,6 +2450,62 @@ mod tests {
             .map(|s| s.name.clone())
             .collect();
         assert_eq!(kept, [b.as_str(), &c, &a]);
+        let_attaches_end(&app, cx);
+    }
+
+    /// ⌘⇧← and ⌘⇧→ move the tab on show along the tabs, stopping at the ends;
+    /// it stays on show, and herdr-core keeps the order.
+    #[gpui::test]
+    fn keys_move_the_tab_on_show(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("move-tab");
+        let [a, b, c] = ["a", "b", "c"]
+            .map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+        let (app, cx) = rooted(server.config(), cx);
+        cx.update(|_, cx| super::bind_keys(cx));
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        open(&app, &b, cx);
+        cx.run_until_parked();
+        let tabs = |cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                let other = &app.snap.hosts[0].other;
+                other.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tabs(cx), [a.as_str(), &b, &c]);
+
+        cx.simulate_keystrokes("cmd-shift-right");
+        assert_eq!(tabs(cx), [a.as_str(), &c, &b]);
+        cx.simulate_keystrokes("cmd-shift-right");
+        assert_eq!(tabs(cx), [a.as_str(), &c, &b], "it's the last");
+        cx.simulate_keystrokes("cmd-shift-left");
+        cx.simulate_keystrokes("cmd-shift-left");
+        assert_eq!(tabs(cx), [b.as_str(), &a, &c]);
+        cx.simulate_keystrokes("cmd-shift-left");
+        assert_eq!(tabs(cx), [b.as_str(), &a, &c], "it's the first");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active.clone()),
+            Some(key(&b)),
+            "it stays on show"
+        );
+
+        // Past one put away, which isn't a tab.
+        app.update(cx, |app, cx| {
+            app.snap.hosts[0].other[2].away = true;
+            app.move_tab(false, cx);
+            app.move_tab(false, cx);
+        });
+        assert_eq!(tabs(cx), [a.as_str(), &b, &c], "only the tabs' end");
+
+        cx.run_until_parked();
+        assert!(wait_until(Duration::from_secs(5), || {
+            cx.run_until_parked();
+            let kept: Vec<String> = snapshot::fetch(&server.config()).hosts[0]
+                .other
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            kept == [a.as_str(), &b, &c]
+        }));
         let_attaches_end(&app, cx);
     }
 

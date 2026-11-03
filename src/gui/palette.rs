@@ -3,10 +3,10 @@
 
 use super::prompt::{Down, Up};
 use super::{
-    AddProject, CloseThread, Dictate, GoToThread, Lemur, NewTerminal, NewThreadHere, NextAgent,
-    NextThread, OpenSettings, PreviousAgent, PreviousThread, PutAway, Quit, Refresh, ToggleAgents,
-    ToggleChanges, ToggleLinear, ToggleLinks, ToggleNotes, ToggleRightPanel, ToggleSidebar,
-    UpdateCore, spotlight,
+    AddProject, CloseThread, Dictate, GoToThread, Lemur, MoveTabLeft, MoveTabRight, NewTerminal,
+    NewThreadHere, NextAgent, NextThread, OpenSettings, PreviousAgent, PreviousThread, PutAway,
+    Quit, Refresh, ToggleAgents, ToggleChanges, ToggleLinear, ToggleLinks, ToggleNotes,
+    ToggleRightPanel, ToggleSidebar, UpdateCore, spotlight,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -46,6 +46,8 @@ fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Previous Agent", Box::new(PreviousAgent)),
         ("Next Thread in Worktree", Box::new(NextThread)),
         ("Previous Thread in Worktree", Box::new(PreviousThread)),
+        ("Move Tab Left", Box::new(MoveTabLeft)),
+        ("Move Tab Right", Box::new(MoveTabRight)),
         ("Toggle Sidebar", Box::new(ToggleSidebar)),
         ("Toggle Right Panel", Box::new(ToggleRightPanel)),
         ("Toggle Notes", Box::new(ToggleNotes)),
