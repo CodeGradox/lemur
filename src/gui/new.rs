@@ -66,9 +66,9 @@ impl Lemur {
         .detach();
     }
 
-    /// What can start in `dir` on `host`: a terminal or an agent at once, and
-    /// in a project's worktree (`base`) one named in the spotlight. Each shows
-    /// the key that does it for the thread on show.
+    /// What can start in `dir` on `host`, a worktree of project `base` or any
+    /// folder: a terminal or an agent at once, or one named in the spotlight. Each
+    /// shows the key that does it for the thread on show.
     pub(super) fn new_menu(
         &self,
         host: &str,
@@ -106,9 +106,6 @@ impl Lemur {
                             .icon(codex_icon())
                             .on_click(start(Some(Agent::Codex))),
                     );
-                let Some(base) = base else {
-                    return menu;
-                };
                 let (this, host, worktree) = (this.clone(), host.clone(), dir.clone());
                 menu.item(
                     PopupMenuItem::new("Claude, Codex or shell, named…")
@@ -117,7 +114,7 @@ impl Lemur {
                         .on_click(move |_, window, cx| {
                             let ask = Ask::NewThread {
                                 host: host.clone(),
-                                base: Some(base),
+                                base,
                                 dir: worktree.clone(),
                                 agent: Some(Agent::Claude),
                             };

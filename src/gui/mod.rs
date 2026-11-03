@@ -7470,6 +7470,22 @@ mod tests {
         cx.simulate_mouse_move(add, None, Modifiers::none());
         cx.simulate_click(add, Modifiers::none());
         cx.run_until_parked();
+        // Its last item names one in the spotlight, there too.
+        cx.simulate_keystrokes("down down down down enter");
+        cx.run_until_parked();
+        let asked = app.read_with(cx, |app, _| match app.prompt.as_ref().map(|p| &p.what) {
+            Some(Ask::NewThread {
+                host, base, dir, ..
+            }) => Some((host.clone(), *base, dir.clone())),
+            _ => None,
+        });
+        assert_eq!(asked, Some(("local".to_string(), None, home.clone())));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        cx.simulate_mouse_move(add, None, Modifiers::none());
+        cx.simulate_click(add, Modifiers::none());
+        cx.run_until_parked();
         cx.simulate_keystrokes("down enter");
         let mut started = None;
         assert!(wait_until(Duration::from_secs(5), || {
