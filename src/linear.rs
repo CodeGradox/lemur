@@ -8,7 +8,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
 use security_framework::os::macos::keychain::SecKeychain;
+use security_framework::os::macos::keychain_item::SecKeychainItem;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -16,7 +18,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +30,10 @@ pub const PORT: u16 = 38417;
 const CALLBACK: &str = "/linear/callback";
 const AUTHORIZE: &str = "https://linear.app/oauth/authorize";
 const API: &str = "https://api.linear.app";
+/// For how many seconds a sign-in just read from the store isn't read again to
+/// refresh it. At launch it's read, then at once found due, and each read of the
+/// Keychain may ask you.
+const JUST_READ: u64 = 10;
 /// How long a sign-in waits for you in the browser.
 pub const SIGN_IN_TIME: Duration = Duration::from_secs(5 * 60);
 /// The Keychain item that keeps the sign-in.
@@ -83,6 +89,8 @@ pub struct Linear {
     /// build macOS doesn't know yet asks you once. Held for a refresh, as
     /// each hands out a new refresh token and retires the one it used.
     kept: Arc<Mutex<Option<Option<Tokens>>>>,
+    /// When the store was first read, in seconds since 1970.
+    read_at: Arc<AtomicU64>,
 }
 
 /// Where the sign-in is kept.
@@ -190,6 +198,7 @@ impl Linear {
             #[cfg(test)]
             store: Store::Nowhere,
             kept: Default::default(),
+            read_at: Default::default(),
         }
     }
 
@@ -200,6 +209,7 @@ impl Linear {
             api: api.into(),
             store,
             kept: Default::default(),
+            read_at: Default::default(),
         }
     }
 
@@ -228,6 +238,7 @@ impl Linear {
     fn load(&self, kept: &mut Option<Option<Tokens>>) -> Result<Option<Tokens>> {
         if kept.is_none() {
             *kept = Some(self.store.load()?);
+            self.read_at.store(now(), Ordering::Relaxed);
         }
         Ok(kept.clone().flatten())
     }
@@ -384,8 +395,10 @@ impl Linear {
             return Ok(tokens.access);
         }
         // Another Lemur (the app, and one built here) may have refreshed it
-        // since: its refresh token is the one Linear still takes.
-        if let Some(stored) = self.stored_since(&tokens) {
+        // since: its refresh token is the one Linear still takes. Read a moment
+        // ago, it's what's there; Linear refusing it is still seen to below.
+        let read_since = now().saturating_sub(self.read_at.load(Ordering::Relaxed)) >= JUST_READ;
+        if read_since && let Some(stored) = self.stored_since(&tokens) {
             *kept = Some(Some(stored.clone()));
             if !due(&stored) {
                 return Ok(stored.access);
@@ -590,9 +603,14 @@ impl Store {
     fn save(&self, tokens: &Tokens) -> Result<()> {
         let json = serde_json::to_vec(tokens)?;
         match self {
-            Store::Keychain(path) => keychain(path)?
-                .set_generic_password(SERVICE, ACCOUNT, &json)
-                .map_err(|e| anyhow!("couldn't keep Lemur's Linear sign-in in the Keychain: {e}")),
+            Store::Keychain(path) => {
+                let keychain = keychain(path)?;
+                match sign_in_item(&keychain)? {
+                    Some(mut item) => item.set_password(&json),
+                    None => keychain.add_generic_password(SERVICE, ACCOUNT, &json),
+                }
+                .map_err(|e| anyhow!("couldn't keep Lemur's Linear sign-in in the Keychain: {e}"))
+            }
             #[cfg(test)]
             Store::Nowhere => Ok(()),
             #[cfg(test)]
@@ -604,20 +622,11 @@ impl Store {
         match self {
             Store::Keychain(path) => {
                 let keychain = keychain(path)?;
-                let gone = |keychain: &SecKeychain| match keychain
-                    .find_generic_password(SERVICE, ACCOUNT)
-                {
-                    Ok((_, item)) => Ok(Some(item)),
-                    Err(e) if e.code() == NOT_FOUND => Ok(None),
-                    Err(e) => Err(anyhow!(
-                        "couldn't remove Lemur's Linear sign-in from the Keychain: {e}"
-                    )),
-                };
-                if let Some(item) = gone(&keychain)? {
+                if let Some(item) = sign_in_item(&keychain)? {
                     item.delete();
                 }
                 // Deleting doesn't say whether it did.
-                match gone(&keychain)? {
+                match sign_in_item(&keychain)? {
                     None => Ok(()),
                     Some(_) => bail!("couldn't remove Lemur's Linear sign-in from the Keychain"),
                 }
@@ -630,6 +639,26 @@ impl Store {
                 _ => Ok(()),
             },
         }
+    }
+}
+
+/// The sign-in's item, found without reading what it keeps: that's what makes
+/// macOS ask you, and neither changing nor removing it needs that.
+fn sign_in_item(keychain: &SecKeychain) -> Result<Option<SecKeychainItem>> {
+    let found = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(SERVICE)
+        .account(ACCOUNT)
+        .keychains(std::slice::from_ref(keychain))
+        .load_refs(true)
+        .search();
+    match found {
+        Ok(results) => Ok(results.into_iter().find_map(|result| match result {
+            SearchResult::Ref(Reference::KeychainItem(item)) => Some(item),
+            _ => None,
+        })),
+        Err(e) if e.code() == NOT_FOUND => Ok(None),
+        Err(e) => bail!("couldn't find Lemur's Linear sign-in in the Keychain: {e}"),
     }
 }
 
@@ -1202,6 +1231,52 @@ mod tests {
         assert!(linear.issue("LAFT-1").is_err());
         assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
         assert!(linear.signed_in().unwrap());
+    }
+
+    /// Read a moment ago, as at launch, the sign-in isn't read again to refresh
+    /// it: each read of the Keychain may ask you. Any later, it is, as another
+    /// Lemur may have refreshed it.
+    #[test]
+    fn a_sign_in_just_read_isnt_read_again_to_refresh() {
+        let api = FakeLinear::new(|r| match r.path.as_str() {
+            "/oauth/token" => (
+                200,
+                json!({ "access_token": "a2", "refresh_token": "r2", "expires_in": 86399 })
+                    .to_string(),
+            ),
+            _ => (
+                200,
+                json!({ "data": { "issue": issue_json("LAFT-1", "One") } }).to_string(),
+            ),
+        });
+        let dir = TempDir::new("linear-read");
+        let store = Store::File(dir.join("tokens"));
+        let due = tokens("a1", "r1", now() + 10);
+        // Only reading again would find this.
+        let others = tokens("a9", "r9", now() + 86399);
+
+        store.save(&due).unwrap();
+        let linear = Linear::at(&api.url, store.clone());
+        assert!(linear.signed_in().unwrap());
+        store.save(&others).unwrap();
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        let sent = api.requests();
+        assert!(
+            sent[0].body.contains("refresh_token=r1"),
+            "{:?}",
+            sent[0].body
+        );
+        assert_eq!(sent[1].authorization.as_deref(), Some("Bearer a2"));
+
+        store.save(&due).unwrap();
+        let linear = Linear::at(&api.url, store.clone());
+        assert!(linear.signed_in().unwrap());
+        linear.read_at.store(now() - JUST_READ, Ordering::Relaxed);
+        store.save(&others).unwrap();
+        assert_eq!(linear.issue("LAFT-1").unwrap().title, "One");
+        let sent = api.requests();
+        assert_eq!(sent.len(), 3, "no refresh: the other's is good");
+        assert_eq!(sent[2].authorization.as_deref(), Some("Bearer a9"));
     }
 
     /// The store not letting itself be read leaves what's here to refresh.
