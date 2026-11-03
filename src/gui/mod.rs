@@ -5200,6 +5200,7 @@ mod tests {
         });
         let kept = app.read_with(cx, |app, _| app.cfg.threads[0].issue.clone());
         assert_eq!(kept.as_deref(), Some("LAFT-12"));
+        let_attaches_end(&app, cx);
     }
 
     /// A program that asks for focus reports hears it lost focus when
@@ -6021,6 +6022,7 @@ mod tests {
             visited.push(app.read_with(cx, |app, _| app.active.clone().unwrap().1));
         }
         assert_eq!(visited, ["a", "b", "c"]);
+        let_attaches_end(&app, cx);
     }
 
     /// A host herdr-core needs you to add is set up in a terminal over the
