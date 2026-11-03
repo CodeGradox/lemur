@@ -29,6 +29,7 @@ mod resume;
 mod rows;
 mod settings;
 mod sidebar;
+mod silence;
 mod snackbar;
 mod spotlight;
 mod terminal;
@@ -945,7 +946,8 @@ impl Lemur {
                 // It ranks among the done now: Next Agent starts over.
                 self.agent_walk.clear();
             }
-            if finished || (s.activity == Activity::NeedsInput && was != Activity::NeedsInput) {
+            let asks = s.activity == Activity::NeedsInput && was != Activity::NeedsInput;
+            if (finished || asks) && !s.silent {
                 news.push((k.clone(), s.activity, s.waiting_for.clone()));
             }
         }
@@ -2237,6 +2239,7 @@ mod tests {
                 shell: None,
                 helpers: vec![],
                 away: false,
+                silent: false,
                 issue: None,
             })
             .collect();
@@ -5637,6 +5640,83 @@ mod tests {
             app.read_with(cx, |app, _| app.cfg.threads.is_empty()),
             "no Claude to keep"
         );
+        let_attaches_end(&app, cx);
+    }
+
+    /// A silenced thread makes no notifications, and a popup it made goes; what
+    /// it's doing shows as ever. herdr-core keeps that, and it can notify again.
+    #[gpui::test]
+    fn a_silenced_thread_makes_no_notifications(cx: &mut gpui::TestAppContext) {
+        let server = HcServer::new("silence");
+        // Needs you when told to, then works, then needs you again. A program
+        // of its own, as a shell in front would mean what it said is over.
+        let script = r#"BEGIN { s[1] = "blocked"; s[2] = "working"; s[3] = "blocked" }
+            { printf "\033]7501;state=%s:app=claude-code\033\\", s[NR]; fflush() }"#;
+        let quiet = server.run(
+            "/",
+            &["lemur.kind=claude", "lemur.silent=1"],
+            &["awk", script],
+        );
+        let loud = server.run("/", &["lemur.kind=claude"], &["awk", script]);
+        let (app, cx) = rooted(server.config(), cx);
+        cx.simulate_resize(size(px(1200.0), px(700.0)));
+        let session = |name: &str, cx: &mut VisualTestContext| {
+            app.read_with(cx, |app, _| {
+                super::sessions(&app.snap)
+                    .find(|(_, s)| s.name == name)
+                    .map(|(_, s)| (s.activity, s.silent))
+            })
+        };
+        let until = |want: &mut dyn FnMut(&mut VisualTestContext) -> bool,
+                     cx: &mut VisualTestContext| {
+            wait_until(Duration::from_secs(10), || {
+                app.update(cx, |app, cx| app.refresh(cx).detach());
+                cx.run_until_parked();
+                want(cx)
+            })
+        };
+        let labelled = |t: &str| {
+            let terminals = server.core().terminals();
+            let t = terminals.iter().find(|x| x.address == t).unwrap();
+            t.labels.contains_key(crate::snapshot::SILENT)
+        };
+        assert!(until(
+            &mut |cx| session(&loud, cx).is_some() && session(&quiet, cx).is_some(),
+            cx
+        ));
+        server.hc(&["send", "--force", &quiet, "go"]);
+        server.hc(&["send", "--force", &loud, "go"]);
+        assert!(until(
+            &mut |cx| {
+                session(&quiet, cx) == Some((Activity::NeedsInput, true))
+                    && session(&loud, cx) == Some((Activity::NeedsInput, false))
+            },
+            cx
+        ));
+        app.read_with(cx, |app, _| {
+            assert!(app.popups.contains_key(&key(&loud)));
+            assert!(!app.popups.contains_key(&key(&quiet)), "silenced");
+        });
+
+        // Silenced, its popup goes at once, and herdr-core keeps it.
+        app.update(cx, |app, cx| app.set_silent(key(&loud), true, cx));
+        app.read_with(cx, |app, _| assert!(!app.popups.contains_key(&key(&loud))));
+        assert!(until(&mut |_| labelled(&loud), cx));
+        assert_eq!(session(&loud, cx), Some((Activity::NeedsInput, true)));
+
+        // Allowed again, what it does next makes one.
+        app.update(cx, |app, cx| app.set_silent(key(&quiet), false, cx));
+        assert!(until(&mut |_| !labelled(&quiet), cx));
+        server.hc(&["send", "--force", &quiet, "go"]);
+        assert!(until(
+            &mut |cx| session(&quiet, cx) == Some((Activity::Working, false)),
+            cx
+        ));
+        server.hc(&["send", "--force", &quiet, "go"]);
+        assert!(until(
+            &mut |cx| app.read_with(cx, |app, _| app.popups.contains_key(&key(&quiet))),
+            cx
+        ));
         let_attaches_end(&app, cx);
     }
 

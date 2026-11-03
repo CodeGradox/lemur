@@ -4,6 +4,7 @@
 
 use super::settings::Prefs;
 use super::sidebar::thread_icon;
+use super::silence::silence_item;
 use super::terminal::Palette;
 use super::{
     Ask, CloseThread, Key, Lemur, List, NUMBERED_TABS, NewTerminal, icons, rows, sessions,
@@ -292,6 +293,10 @@ impl Lemur {
         let this = cx.entity().downgrade();
         let key = key.clone();
         let dir = self.place_of(&key).map(|(dir, _)| dir);
+        // Only an agent has anything to notify of.
+        let silences = self
+            .session_of(&key)
+            .and_then(|s| s.agent().map(|_| s.silent));
         Rc::new(
             move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
                 let rename = {
@@ -338,8 +343,12 @@ impl Lemur {
                             .ok();
                     }
                 };
-                menu.separator()
-                    .item(PopupMenuItem::new("Put away").on_click(away))
+                let menu = menu.separator();
+                let menu = match silences {
+                    Some(silent) => menu.item(silence_item(&this, &key, silent)),
+                    None => menu,
+                };
+                menu.item(PopupMenuItem::new("Put away").on_click(away))
                     .item(
                         PopupMenuItem::new("Close")
                             .action(Box::new(CloseThread))

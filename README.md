@@ -158,6 +158,8 @@ Each session's dot comes from the agent itself: Claude Code and Codex (recent ve
 
 When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. It names the project and worktree under the session's name. **Show** brings Lemur forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too, and so does coming back to Lemur while it's the session on show. A popup never keeps the keyboard: if `⌘Tab` back to Lemur hands it to one, it goes on to the main window.
 
+To stop a thread's notifications, right-click it or its tab → **Silence notifications**, or use the bell on hover in the agents panel; **Allow notifications** lets them come again. It makes no more popups, and one it already made goes. Its dot and **Needs attention** go on saying what it does, and a crossed-out bell marks it, in the sidebar and the panel. herdr-core keeps it as a label on the terminal (`lemur.silent`), so it stays silent across restarts and from any Mac; a thread resumed in a new terminal starts over.
+
 What Claude reports arrives at once. The refresh, for worktrees, servers and hosts' load, runs every 3 seconds while Lemur is in front, and every 15 seconds while it's in the background; `claude agents`, and the servers listening (`lsof` on a Mac), run with it at most every 30 seconds, as they cost each host a moment of CPU.
 
 ## Trademarks

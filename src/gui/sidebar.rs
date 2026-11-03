@@ -2,6 +2,7 @@
 //! open, fold, drag into order and right-click.
 
 use super::chrome::{WINDOW_BUTTONS, title_bar};
+use super::silence::silence_item;
 use super::{Ask, Key, Lemur, List, ToggleNotes, key, rows, worktree_label};
 use crate::config::{Agent, Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
@@ -454,6 +455,9 @@ impl Lemur {
             }
         };
         let away = s.away;
+        let silent = s.silent;
+        // Only an agent has anything to notify of.
+        let silences = s.agent().map(|_| silent);
         let menu = {
             let this = this.clone();
             let key = key.clone();
@@ -476,6 +480,10 @@ impl Lemur {
                 let menu = menu
                     .item(PopupMenuItem::new("Rename…").on_click(rename))
                     .item(PopupMenuItem::new("Peek").on_click(peek));
+                let menu = match silences {
+                    Some(silent) => menu.item(silence_item(&this, &key, silent)),
+                    None => menu,
+                };
                 if away {
                     menu.item(PopupMenuItem::new("Bring back").on_click(move |_, _, cx| {
                         this.update(cx, |this, cx| this.bring_back(&key, cx)).ok();
@@ -500,6 +508,7 @@ impl Lemur {
         });
         let selector = format!("helpers {label}");
         let separator = format!("separator {label}");
+        let selector_label = label.clone();
         let suffix = move |_: &mut Window, _: &mut App| {
             let this = this.clone();
             let key = key.clone();
@@ -550,6 +559,18 @@ impl Lemur {
                 ),
             ];
             let mut suffix = h_flex().gap_1().items_center();
+            if silent {
+                let selector = format!("silenced {selector_label}");
+                suffix = suffix.child(
+                    div()
+                        .id("silenced")
+                        .debug_selector(move || selector)
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Makes no notifications").build(window, cx)
+                        })
+                        .child(super::icons::bell_off().xsmall().text_color(muted)),
+                );
+            }
             for (i, item) in said.into_iter().flatten().enumerate() {
                 if i > 0 {
                     let separator = separator.clone();

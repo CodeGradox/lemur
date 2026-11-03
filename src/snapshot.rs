@@ -126,6 +126,8 @@ pub struct Session {
     /// Put away: listed after the rest, and out of the sidebar's lists and
     /// the tabs.
     pub away: bool,
+    /// Silenced: it makes no notifications; its dot says what it does as ever.
+    pub silent: bool,
     /// The Linear issue pinned to it, by its key.
     pub issue: Option<String>,
 }
@@ -221,6 +223,8 @@ pub const ORDER: &str = "lemur.order";
 /// Set on a thread put away: out of the sidebar's lists and the tabs while
 /// it runs, until it needs you or is opened.
 pub const AWAY: &str = "lemur.away";
+/// Set on a thread silenced: it makes no notifications, whatever it does.
+pub const SILENT: &str = "lemur.silent";
 /// The Linear issue pinned to a thread, by its key (`LAFT-3184`).
 pub const ISSUE: &str = "lemur.issue";
 /// The pid of the shell a Claude thread's Claude runs in, as lemur last
@@ -696,6 +700,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         shell: label(SHELL).and_then(|p| p.parse().ok()),
         helpers: vec![],
         away: label(AWAY).is_some(),
+        silent: label(SILENT).is_some(),
         issue: label(ISSUE).cloned(),
     }
 }

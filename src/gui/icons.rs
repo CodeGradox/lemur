@@ -33,6 +33,16 @@ pub fn code_xml() -> Icon {
     Icon::empty().data(include_bytes!("icons/code-xml.svg"))
 }
 
+/// A thread's notifications, to silence.
+pub fn bell() -> Icon {
+    Icon::empty().data(include_bytes!("icons/bell.svg"))
+}
+
+/// A thread silenced.
+pub fn bell_off() -> Icon {
+    Icon::empty().data(include_bytes!("icons/bell-off.svg"))
+}
+
 /// A Linear issue.
 pub fn ticket() -> Icon {
     Icon::empty().data(include_bytes!("icons/ticket.svg"))

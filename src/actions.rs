@@ -2,7 +2,9 @@ use crate::attach::Active;
 use crate::config::{Agent, ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
-use crate::snapshot::{AWAY, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, WORKTREE};
+use crate::snapshot::{
+    AWAY, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
+};
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
 use std::collections::BTreeMap;
@@ -528,6 +530,12 @@ fn is_address(session: &str) -> bool {
 pub fn set_away(cfg: &Config, host: &str, session: &str, away: bool) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
     core.label(session, &[(AWAY, if away { "1" } else { "" })])
+}
+
+/// Silences a thread's notifications, or lets them come again.
+pub fn set_silent(cfg: &Config, host: &str, session: &str, silent: bool) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(SILENT, if silent { "1" } else { "" })])
 }
 
 /// Pins the Linear issue `issue` (its key) to a thread, or with `None`

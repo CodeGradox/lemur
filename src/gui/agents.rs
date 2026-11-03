@@ -4,6 +4,7 @@
 //! Herdr's agents list. A click opens one.
 
 use super::sidebar::{claude_icon, status_dot, thread_icon};
+use super::silence::silence_label;
 use super::{Key, Lemur, key, sessions, worktree_label};
 use crate::snapshot::{Activity, Helper, Session};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -188,6 +189,33 @@ impl Lemur {
                 }))
         };
         let group = SharedString::from(format!("agent-row-{i}"));
+        // On hover, and always once silenced: that's worth seeing.
+        let silence = s.agent().map(|_| {
+            let (k, silent) = (k.clone(), s.silent);
+            let icon = if silent {
+                super::icons::bell_off()
+            } else {
+                super::icons::bell()
+            };
+            let selector = format!("silence {i}");
+            div()
+                .debug_selector(move || selector)
+                .when(!silent, |this| {
+                    this.invisible()
+                        .group_hover(group.clone(), |style| style.visible())
+                })
+                .child(
+                    Button::new(SharedString::from(format!("silence-{i}")))
+                        .icon(icon)
+                        .ghost()
+                        .xsmall()
+                        .tooltip(silence_label(silent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_silent(k.clone(), !silent, cx);
+                        })),
+                )
+        });
         h_flex()
             .id(SharedString::from(format!("agent-{i}")))
             .debug_selector(move || format!("agent-{i}"))
@@ -231,6 +259,7 @@ impl Lemur {
                         .child(peek),
                 )
             })
+            .children(silence)
             .when_some(says, |row, says| {
                 row.child(
                     div()
