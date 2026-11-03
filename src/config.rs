@@ -394,7 +394,12 @@ impl Config {
     }
 
     pub fn load() -> Result<Config> {
-        let cfg: Config = read_toml(&Self::path()?)?;
+        Self::load_from(&Self::path()?)
+    }
+
+    fn load_from(path: &Path) -> Result<Config> {
+        let cfg: Config = toml::from_str(&config_text(path)?)
+            .with_context(|| format!("parsing {}", path.display()))?;
         for b in &cfg.bases {
             if cfg.host(&b.host).is_none() {
                 bail!("base {} refers to unknown host {}", b.path, b.host);
@@ -714,15 +719,28 @@ impl Config {
     }
 }
 
+/// What the config file at `path` says. A first run has no file yet, which
+/// says nothing, as an empty one does; a link to a file that's gone is an error.
+fn config_text(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() => {
+            Ok(String::new())
+        }
+        read => read.with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// Changes the config file at `path` in place: what `change` doesn't touch,
-/// comments included, stays as it is.
+/// comments included, stays as it is. The first change makes the file.
 fn edit(path: &Path, change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Result<()> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = config_text(path)?;
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
     change(&mut doc)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     write_whole(path, &doc.to_string())
 }
 
@@ -1195,5 +1213,36 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((cfg.hosts.len(), cfg.bases.len()), (1, 1));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A first run has no config, and starts with nothing in it. Starting
+    /// writes nothing; the first thing saved makes the file and its folder.
+    #[test]
+    fn no_config_file_is_an_empty_one_until_something_is_saved() {
+        let dir = std::env::temp_dir().join(format!("lemur-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("lemur/config.toml");
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.hosts.is_empty() && cfg.bases.is_empty());
+        assert!(!dir.exists());
+
+        let app = Host::new("app", "app");
+        Config::save_folder(&path, Some(&app), &Base::new("app", "/srv/site")).unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!((cfg.hosts.len(), cfg.bases.len()), (1, 1));
+
+        // A link to a file that's gone isn't a first run: nothing replaces it.
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(dir.join("gone.toml"), &link).unwrap();
+        assert!(Config::load_from(&link).is_err());
+        assert!(Config::save_folder(&link, None, &Base::new("app", "/srv/site")).is_err());
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+
+        // Nor is a file that can't be read as a config.
+        std::fs::write(&path, "not toml").unwrap();
+        assert!(Config::load_from(&path).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -10,7 +10,7 @@ A macOS app for Claude Code and Codex sessions that live on a remote host: a sid
 
 Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag Lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 11 or newer (dictation, macOS 26).
 
-Lemur was called lemen up to 1.0.0. Coming from lemen, move `~/.config/lemen` to `~/.config/lemur` (Lemur won't start without its config) and `~/.lemen` to `~/.lemur` (your notes). `lemen.app` can go once Lemur runs.
+Lemur was called lemen up to 1.0.0. Coming from lemen, move `~/.config/lemen` to `~/.config/lemur` (without it, Lemur starts with no hosts or projects) and `~/.lemen` to `~/.lemur` (your notes). `lemen.app` can go once Lemur runs.
 
 Lemur runs its terminals in herdr-core (`hc`), here and on each host, where it needs `git` too. Install herdr-core on this Mac and on each host:
 
@@ -31,7 +31,7 @@ Building needs Xcode 26 or newer (GPUI compiles Metal shaders, and dictation's h
 
 ## Config
 
-`~/.config/lemur/config.toml` (or `$LEMUR_CONFIG`):
+`~/.config/lemur/config.toml` (or `$LEMUR_CONFIG`). Lemur starts without one, and makes it the first time it saves something, like a project you add. It looks like this:
 
 ```toml
 # theme = "system"                # or "light" / "dark"; must come before the tables
