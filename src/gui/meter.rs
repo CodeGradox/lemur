@@ -251,8 +251,9 @@ impl Lemur {
                 h_flex()
                     .gap_2()
                     .text_xs()
-                    .child(div().flex_1().text_color(muted).child(label))
-                    .child(text)
+                    .child(div().flex_shrink_0().text_color(muted).child(label))
+                    // Narrow, its end goes first: the hover says it all.
+                    .child(div().flex_1().min_w_0().truncate().text_right().child(text))
             })
             .collect();
         let right = if minimized { shown.brief } else { shown.right };
@@ -381,7 +382,7 @@ fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Sh
             totals: u
                 .spent
                 .iter()
-                .map(|s| (s.label.to_string(), short(s.tokens.total())))
+                .map(|s| (s.label.to_string(), used(s.tokens)))
                 .collect(),
             tip: lines.join("\n"),
         };
@@ -423,6 +424,15 @@ fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Sh
             .collect(),
         totals: vec![],
         tip: lines.join("\n"),
+    }
+}
+
+/// What a row says of tokens used: those worked through anew, and those from
+/// the cache, which are usually billed too, and so aren't left to the hover.
+fn used(t: Tokens) -> String {
+    match t.cached {
+        0 => short(t.total()),
+        cached => format!("{} + {} cached", short(t.total()), short(cached)),
     }
 }
 
@@ -562,7 +572,7 @@ mod tests {
         assert_eq!(
             shown.totals,
             [
-                ("24 hours".to_string(), "229k".to_string()),
+                ("24 hours".to_string(), "229k + 4.4M cached".to_string()),
                 ("7 days".to_string(), "5.0M".to_string())
             ]
         );
