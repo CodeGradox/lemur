@@ -4771,6 +4771,8 @@ mod tests {
             card.size.width > px(1100.0) && card.size.height > px(700.0),
             "{card:?}"
         );
+        // Below the window's buttons, which end 28 points down.
+        assert!(card.top() >= px(28.0), "{card:?}");
         wheel("changes-diff-preview", cx);
         let scrolled = app.read_with(cx, |app, _| {
             let preview = app.diff_preview.as_ref().unwrap();

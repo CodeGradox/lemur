@@ -115,6 +115,8 @@ impl Lemur {
                     .ok();
             })
             .p_4()
+            // Under the row with the window's buttons, which show over anything.
+            .pt_10()
             .into_any_element(),
         )
     }
