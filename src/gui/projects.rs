@@ -1,7 +1,6 @@
 //! Projects and their worktrees: adding, folding, coloring, ordering,
 //! hiding and removing them.
 
-use super::snackbar::Kind;
 use super::{Dialog, Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
@@ -53,7 +52,6 @@ impl Lemur {
         }
         if new_host {
             self.cfg.hosts.push(host);
-            self.prefs.cores = crate::core_update::Cores::of(&self.cfg);
         }
         self.cfg.bases.push(base);
         self.refresh();
@@ -373,14 +371,13 @@ impl Lemur {
         &mut self,
         removal: Removal,
         force: bool) {
-        self.status = Some((format!("removing {}…", removal.label), Kind::Progress));
         let cfg = self.cfg.clone();
         // Asked while it was still there.
         let Some(base) = self.project_of_removal(&removal) else {
-            self.status = None;
             self.note(format!("{}'s project has gone", removal.label));
             return;
         };
+        let said = self.busy(format!("removing {}…", removal.label));
         let Removal {
             worktree,
             sessions,
@@ -390,7 +387,7 @@ impl Lemur {
         self.in_background(
             move || actions::remove_worktree(&cfg, base, &worktree, &sessions, force, delete),
             move |this, removed| {
-                this.status = None;
+                this.done(&said);
                 match removed {
                     Ok(()) => {
                         if let Some(base) = this.project_of_removal(&removal) {

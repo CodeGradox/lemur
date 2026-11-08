@@ -20,7 +20,7 @@ impl Drop for Lemur {
 
 /// `card` over the window, which a click outside closes with `close`; `place` lays it out
 /// in the window. Only the card itself keeps its clicks.
-pub fn over_window<S: 'static>(
+fn over_window<S: 'static>(
     key: &str,
     card: El,
     place: impl FnOnce(El) -> El,
@@ -32,11 +32,6 @@ pub fn over_window<S: 'static>(
         .fill(k.c.scrim)
         .on_press(close)
         .child(place(card.on_press(|_: &mut S| {})))
-}
-
-/// In the middle of the window.
-pub fn centred(card: El) -> El {
-    col().w_full().h_full().center().child(card)
 }
 
 impl Lemur {

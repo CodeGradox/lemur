@@ -2,6 +2,7 @@
 //! in the toolbar, the terminal in its frame with its header, the status bar under it, and
 //! what shows over the window (the spotlight, a dialog, a peek, snackbars).
 
+use super::card;
 use super::prompt::{Ask, agent_icon, new_menu, new_picked};
 use super::silence::silence_label;
 use super::snackbar;
@@ -11,7 +12,7 @@ use crate::machine;
 use crate::snapshot::Activity;
 use rune::{Cx, El, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
 use rune_kit::shell::{SidebarToggle, SplitView, TabItem, TabItemStatus, TabOrientation, TabOverflow, TabReorder, TabStrip, Toolbar};
-use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, Kit};
 
 /// How many tabs have a key (⌘1 to ⌘9).
 const NUMBERED_TABS: usize = 9;
@@ -110,11 +111,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
     let place = s.place_of(&active);
     let plus = place.map(|(dir, base)| {
         let (host, dir) = (host.clone(), dir);
-        IconButton::new(&icons::PLUS)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label("New terminal or Claude here")
-            .help("New terminal or Claude here")
+        icons::button(&icons::PLUS, "New terminal or Claude here")
             .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
                 let (host, dir) = (host.clone(), dir.clone());
                 tx.popup_menu(new_menu(), "new-tab", move |s: &mut Lemur, picked, _| {
@@ -159,7 +156,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
 /// The panels' buttons, at the toolbar's end: each shows its panel, or hides it.
 fn panel_buttons(s: &Lemur, k: &Kit) -> Vec<El> {
     let panel = |which: Right, glyph: &'static rune::Icon, name: &'static str, tip: &'static str| {
-        let on = s.right == Some(which);
+        let on = s.right() == Some(which);
         Button::new(name)
             .variant(if on { ButtonVariant::Outline } else { ButtonVariant::Ghost })
             .control_size(ControlSize::Small)
@@ -271,7 +268,7 @@ fn status_bar(s: &Lemur, k: &Kit) -> El {
     if let Some((host, _)) = &s.active
         && let Some(h) = s.cfg.host(host)
     {
-        bar = bar.child(if h.ssh == "local" { item(&icons::MONITOR, "This Mac".into()) } else { item(&icons::SERVER, h.name.clone()) });
+        bar = bar.child(item(super::picker::host_icon(h), super::picker::host_label(h)));
     }
     if let Some((host, w)) = s.active_worktree() {
         let branch = match (&w.branch, &w.head) {
@@ -345,7 +342,7 @@ fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec
 }
 
 /// A question over the window, as an alert.
-fn dialog(d: &super::Dialog, k: &Kit) -> El {
+fn dialog(d: &super::Dialog, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     let mut body = col().gap(10.0).child(text(d.title.clone()).font(k.ty.body_medium).color(c.text_base).wrap()).child(
         text(d.description.clone()).font(k.ty.ui).color(c.text_muted).wrap(),
@@ -384,18 +381,8 @@ fn dialog(d: &super::Dialog, k: &Kit) -> El {
     } else {
         row().gap(8.0).justify_end().child(cancel).child(ok)
     };
-    let card = col()
-        .key("dialog")
-        .w(420.0)
-        .padding(20.0)
-        .gap(16.0)
-        .radius(k.radius.lg)
-        .fill(c.surface_raised)
-        .border(1.0, c.border_base)
-        .shadow(12.0, 40.0, c.scrim)
-        .child(body)
-        .child(buttons);
-    peek::over_window("dialog", card, peek::centred, |s: &mut Lemur| s.dialog = None, k)
+    let card = card::surface("dialog", 420.0, k).child(col().padding(20.0).gap(16.0).child(body).child(buttons));
+    card::over_window("dialog", card, |s: &mut Lemur| s.dialog = None, k, layer);
 }
 
 /// The whole window.
@@ -424,11 +411,10 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
         root = root.child(over);
     }
     if let Some(p) = &s.prompt {
-        let place = |card: El| peek::centred(col().pt(80.0).child(card));
-        root = root.child(peek::over_window("spotlight", prompt::card(s, p, k), place, |s: &mut Lemur| s.close_prompt(), k));
+        card::over_window("spotlight", prompt::card(s, p, k), |s: &mut Lemur| s.close_prompt(), k, layer);
     }
     if let Some(d) = &s.dialog {
-        root = root.child(dialog(d, k));
+        dialog(d, k, layer);
     }
     root
 }

@@ -103,7 +103,7 @@ fn picking_a_host_then_a_folder_adds_its_repo() {
     // web has no git, and is added as it is; the picker closes and hands the keyboard back.
     press(&mut rt, K::Enter, Mods::default());
     assert!(wait_for(&mut rt, 10.0, |s| s.panels.picker.is_none()), "closed once added");
-    assert!(!rt.state.typing);
+    assert!(rt.state.keyboard_on_terminal());
     assert_eq!(bases(&rt.state), [("local".to_string(), format!("{base}/web"))]);
 
     // A folder inside a repository adds the repository.
@@ -164,11 +164,11 @@ fn an_added_folder_joins_the_sidebar_once() {
     let local = HostChoice { host: cfg.hosts[0].clone(), configured: true };
     let mut rt = window(cfg);
     press(&mut rt, K::Command('o'), cmd());
-    assert!(rt.state.panels.picker.is_some() && rt.state.typing);
+    assert!(rt.state.panels.picker.is_some() && !rt.state.keyboard_on_terminal());
     frames(&mut rt, 4);
     press(&mut rt, K::Escape, Mods::default());
     assert!(rt.state.panels.picker.is_none());
-    assert!(!rt.state.typing, "the keyboard's back");
+    assert!(rt.state.keyboard_on_terminal(), "the keyboard's back");
 
     for _ in 0..2 {
         rt.update(|s, _| s.add_folder(local.clone(), "/srv/api".into()));

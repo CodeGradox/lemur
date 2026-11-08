@@ -251,14 +251,12 @@ impl TermView {
         let mut open = true;
         // Its program ended: the thread goes from the sidebar, and this with it.
         let mut over = false;
+        let mut read = 0;
         for item in batch {
             match item {
                 Stream::Data(bytes) => {
                     grid.write(&bytes);
-                    if let Attachment::Attached(core, channel) = &self.attachment {
-                        core.credit(*channel, bytes.len());
-                    }
-                    self.last_output = Some(Instant::now());
+                    read += bytes.len();
                 }
                 Stream::Closed(why) => {
                     open = false;
@@ -266,6 +264,13 @@ impl TermView {
                 }
                 Stream::Lost => open = false,
             }
+        }
+        // Once for the batch: streaming fast, a batch holds hundreds of chunks.
+        if read > 0 {
+            if let Attachment::Attached(core, channel) = &self.attachment {
+                core.credit(*channel, read);
+            }
+            self.last_output = Some(Instant::now());
         }
         let replies = grid.take_replies();
         if !replies.is_empty() {
@@ -533,7 +538,7 @@ impl Lemur {
 
     /// The keyboard is the terminal's: nothing else (a field, a spotlight) has it.
     pub(super) fn keyboard_on_terminal(&self) -> bool {
-        self.prompt.is_none() && self.dialog.is_none() && !self.panels_overlaid() && !self.typing && !self.editing()
+        self.prompt.is_none() && self.dialog.is_none() && !self.panels_overlaid() && !self.editing()
     }
 
     /// A text field of the window's has the keyboard. Rune keeps each field's `focused`, so

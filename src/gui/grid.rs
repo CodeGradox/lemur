@@ -17,7 +17,6 @@ use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::error::Error;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Pointer positions go to Ghostty in hundredths of a point, which it takes as pixels: whole
@@ -140,9 +139,9 @@ pub struct Grid {
     epoch: Instant,
     /// What the terminal answers its program with (cursor position, device attributes),
     /// for the view to send on.
-    replies: Arc<Mutex<Vec<u8>>>,
+    replies: Rc<RefCell<Vec<u8>>>,
     /// The size it tells a program that asks.
-    told: Arc<Mutex<Size>>,
+    told: Rc<Cell<Size>>,
     /// Output came since the rows were last brought up to date, or they wait for a hold
     /// to end.
     pub stale: bool,
@@ -170,17 +169,14 @@ impl Grid {
             .set_scrollback_max_lines(scrollback_limit(scrollback))?
             .set_terminfo_name("xterm-256color")?;
         t.resize(size.cols, size.lines, u32::from(size.cell_width), u32::from(size.cell_height))?;
-        let replies = Arc::new(Mutex::new(Vec::new()));
+        // The terminal and its callbacks stay on the window's thread, as Ghostty's must.
+        let replies = Rc::new(RefCell::new(Vec::new()));
         let back = replies.clone();
-        t.on_pty_write(move |_, data| {
-            if let Ok(mut r) = back.lock() {
-                r.extend_from_slice(data);
-            }
-        })?;
-        let told = Arc::new(Mutex::new(size));
+        t.on_pty_write(move |_, data| back.borrow_mut().extend_from_slice(data))?;
+        let told = Rc::new(Cell::new(size));
         let asked = told.clone();
         t.on_size(move |_| {
-            let s = *asked.lock().ok()?;
+            let s = asked.get();
             Some(SizeReportSize {
                 rows: s.lines,
                 columns: s.cols,
@@ -268,11 +264,11 @@ impl Grid {
 
     /// What the terminal answered its program with since last asked.
     pub fn take_replies(&self) -> Vec<u8> {
-        self.replies.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default()
+        std::mem::take(&mut *self.replies.borrow_mut())
     }
 
     pub fn size(&self) -> Size {
-        self.told.lock().map(|s| *s).unwrap_or(Size { cols: 80, lines: 24, cell_width: 16, cell_height: 32 })
+        self.told.get()
     }
 
     /// Takes `size`; true when it changed.
@@ -281,9 +277,7 @@ impl Grid {
             return Ok(false);
         }
         self.terminal.resize(size.cols, size.lines, u32::from(size.cell_width), u32::from(size.cell_height))?;
-        if let Ok(mut t) = self.told.lock() {
-            *t = size;
-        }
+        self.told.set(size);
         self.stale = true;
         Ok(true)
     }

@@ -9,6 +9,7 @@ mod actions;
 mod agents;
 mod away;
 mod bg;
+mod card;
 mod changes;
 mod changes_panel;
 mod chrome;
@@ -44,7 +45,6 @@ mod tests;
 
 use crate::attach::Active;
 use crate::config::{Config, Host, Language, Terminal, ThemeChoice, ThreadOrder};
-use crate::core_update;
 use crate::snapshot::{Activity, HostData, Session, Snapshot, Worktree};
 use bg::Bg;
 use rune::{AppSpec, Chrome, Cx, El, KeyEvent, Tx, Waker, el};
@@ -92,7 +92,6 @@ pub struct Prefs {
     pub terminal: Terminal,
     pub claude_usage: bool,
     pub codex_usage: bool,
-    pub cores: core_update::Cores,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
 }
@@ -106,7 +105,6 @@ impl Prefs {
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
             codex_usage: cfg.codex_usage,
-            cores: core_update::Cores::of(cfg),
             file,
         }
     }
@@ -176,10 +174,10 @@ pub struct Lemur {
     /// Counts changes a snapshot fetched across one would undo (the thread order, a removed
     /// project); such a snapshot is dropped.
     changes: u64,
-    pub right: Option<Right>,
+    /// The panel on the right, shown last; `right()` says whether it's out.
     right_last: Right,
     /// The lists whose "Put away" is open, by their key.
-    pub away_open: HashSet<String>,
+    pub away_open: HashSet<List>,
     /// A thread peeked at, over the one on show.
     pub peek: Option<Key>,
     /// A question over the window.
@@ -191,11 +189,11 @@ pub struct Lemur {
     pub metrics: Metrics,
     /// The terminal's area in the window, which its grid fits.
     term_area: (f32, f32),
-    /// A field has the keyboard, so keys don't go to the terminal.
-    pub typing: bool,
     /// The tab bar's drag, and the sidebar's.
     pub tab_drag: TabDragState,
-    pub row_drag: Option<sidebar::RowDrag>,
+    pub row_drag: rune_kit::shell::Reorder,
+    /// The list `row_drag` is for: the one under the pointer as a drag starts.
+    pub row_drag_list: List,
     /// A worktree or project being dragged by its row or header, by key, and how far; and
     /// where each of those is laid out (`y`, height), to drop it by.
     pub moving: Option<(String, f32)>,
@@ -316,7 +314,6 @@ impl Lemur {
             restore,
             loads: HashMap::new(),
             changes: 0,
-            right: None,
             right_last: Right::Notes,
             away_open: HashSet::new(),
             peek: None,
@@ -325,9 +322,9 @@ impl Lemur {
             dark: true,
             metrics,
             term_area: (900.0, 600.0),
-            typing: false,
             tab_drag: TabDragState::new(),
-            row_drag: None,
+            row_drag: rune_kit::shell::Reorder::new().gap(1.0),
+            row_drag_list: (String::new(), None),
             moving: None,
             places: HashMap::new(),
             saved_widths: (sidebar_width, notes_width),
@@ -375,6 +372,20 @@ impl Lemur {
                 s.status = None;
             }
         });
+    }
+
+    /// Says `text` while something runs; returns what it said, for `done` to take away.
+    pub fn busy(&mut self, text: String) -> Option<(String, Kind)> {
+        self.status = Some((text, Kind::Progress));
+        self.status.clone()
+    }
+
+    /// What `said` was for is over: it goes, unless something else was said since, so one
+    /// job ending doesn't take away another's.
+    pub fn done(&mut self, said: &Option<(String, Kind)>) {
+        if self.status == *said {
+            self.status = None;
+        }
     }
 
     /// Runs `work` off the main thread, then `then` with its result.

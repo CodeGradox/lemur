@@ -19,7 +19,7 @@ fn no_config() -> Config {
 /// The window with Settings open on page `page` (its key, as `PAGES` has it).
 fn settings_on(cfg: Config, page: &str) -> Runtime<Lemur> {
     let mut rt = window(cfg);
-    rt.update(|s, tx| s.open_settings(tx));
+    rt.update(|s, _| s.open_settings());
     click(&mut rt, &format!("settings-page-{page}"));
     rt
 }
@@ -75,7 +75,7 @@ fn settings_open_once_over_the_window() {
 fn help_text_goes_under_its_item() {
     let mut rt = window(no_config());
     rt.set_viewport((760.0, 514.0), 2.0);
-    rt.update(|s, tx| s.open_settings(tx));
+    rt.update(|s, _| s.open_settings());
     frames(&mut rt, 20);
     let (help, _) = rt.presented("help-theme").expect("Theme's help text");
     let (content, _) = rt.presented("settings-content").expect("the page");
@@ -131,7 +131,7 @@ fn changes_are_kept_in_the_config() {
     let cfg = no_config();
     let mut rt = window(cfg.clone());
     rt.state.prefs = Prefs::new(&cfg, Some(file.clone()));
-    rt.update(|s, tx| s.open_settings(tx));
+    rt.update(|s, _| s.open_settings());
     click(&mut rt, "settings-page-terminal");
     click(&mut rt, "settings-font-size-more");
     assert_eq!(rt.state.prefs.terminal.font_size, 14.0);
@@ -148,7 +148,7 @@ fn changes_are_kept_in_the_config() {
 #[test]
 fn a_font_size_typed_applies_once_its_valid() {
     let mut rt = settings_on(no_config(), "terminal");
-    rt.update(|s, _| s.panels.settings.font_size = super::field("13"));
+    rt.update(|s, _| s.panels.settings.font_size = super::super::prompt::field("13"));
     frames(&mut rt, 2);
     type_text(&mut rt, "1");
     assert_eq!(rt.state.prefs.terminal.font_size, 13.0, "1 point is too small");
@@ -162,7 +162,7 @@ fn a_font_size_typed_applies_once_its_valid() {
 fn usage_turned_on_can_be_turned_off() {
     let mut rt = window(no_config());
     rt.state.prefs.claude_usage = true;
-    rt.update(|s, tx| s.open_settings(tx));
+    rt.update(|s, _| s.open_settings());
     click(&mut rt, "settings-page-claude");
     click(&mut rt, "settings-claude-usage");
     assert!(!rt.state.prefs.claude_usage);
@@ -217,9 +217,10 @@ fn settings_ask_a_host_once_its_added() {
     let server = HcServer::new("rprefs");
     let far = server.far_config("prefs-box").hosts.remove(0);
     let mut rt = window(server.config());
-    assert!(!rt.state.prefs.cores.machines);
+    let machines = |s: &Lemur| crate::core_update::Cores::of(&s.cfg).machines;
+    assert!(!machines(&rt.state));
     rt.update(|s, _| s.add_folder(HostChoice { host: far, configured: false }, "/".into()));
-    assert!(rt.state.prefs.cores.machines);
+    assert!(machines(&rt.state));
 }
 
 #[cfg(target_os = "macos")]

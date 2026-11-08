@@ -2,11 +2,12 @@
 //! (lemur's own, an SSH alias, or this Mac), then type or pick a path while
 //! the folders on that host are suggested.
 
+use super::card;
 use super::projects::{HostChoice, host_choices};
-use super::{Lemur, icons, peek};
+use super::{Lemur, icons};
 use crate::browse::{self, Folder};
 use crate::config::Host;
-use rune::{El, Icon, Key as K, ScrollSpec, TextEdit, Tx, col, icon, row, text};
+use rune::{El, Icon, Key as K, ScrollSpec, TextEdit, Tx, col, icon};
 use rune_kit::{Kit, TextInput};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -142,12 +143,10 @@ impl Lemur {
     /// The picker, offering `hosts`.
     pub(super) fn show_picker(&mut self, hosts: Vec<HostChoice>) {
         self.panels.picker = Some(Picker::new(hosts));
-        self.typing = true;
     }
 
     pub(super) fn close_picker(&mut self) {
         self.panels.picker = None;
-        self.typing = false;
     }
 
     /// What's typed changed: the pick starts over, an error about it goes, and the folder it's
@@ -252,8 +251,7 @@ impl Lemur {
     /// ↑ or ↓: selects the row above or below, round at the ends, and keeps it in view.
     fn picker_step(&mut self, up: bool, tx: &mut Tx) {
         let Some(p) = &mut self.panels.picker else { return };
-        let len = p.rows().len().max(1);
-        p.selected = if up { (p.selected + len - 1) % len } else { (p.selected + 1) % len };
+        p.selected = card::step(p.selected, p.rows().len(), up);
         tx.scroll_into_view(format!("picker-row-{}", p.selected));
     }
 
@@ -289,38 +287,24 @@ fn folder_path(text: &str) -> String {
     }
 }
 
-fn host_icon(host: &Host) -> &'static Icon {
+/// How a host shows: this Mac's monitor, another's server.
+pub(super) fn host_icon(host: &Host) -> &'static Icon {
     if host.ssh == "local" { &icons::MONITOR } else { &icons::SERVER }
 }
 
-fn host_label(host: &Host) -> String {
+/// What a host is called where it shows: this Mac as such, another by its name.
+pub(super) fn host_label(host: &Host) -> String {
     if host.ssh == "local" { "This Mac".into() } else { host.name.clone() }
 }
 
 /// The picker over the window, as the spotlight is: the host picked, the field, the rows, and
 /// what it's doing or why it can't.
-pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
-    let p = s.panels.picker.as_ref()?;
+pub fn overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
+    let Some(p) = s.panels.picker.as_ref() else { return };
     let c = &k.c;
-    let mut card = col()
-        .key("picker")
-        .w(560.0)
-        .radius(k.radius.lg)
-        .fill(c.surface_raised)
-        .border(1.0, c.border_base)
-        .shadow(12.0, 40.0, c.scrim)
-        .clip_rounded(k.radius.lg);
+    let mut card = card::surface("picker", card::WIDTH, k);
     if let Some(choice) = p.host() {
-        card = card.child(
-            row()
-                .key("picker-host")
-                .px(12.0)
-                .h(34.0)
-                .gap(8.0)
-                .center_y()
-                .child(icon(host_icon(&choice.host), 14.0).color(c.icon_muted))
-                .child(text(host_label(&choice.host)).font(k.ty.ui_medium).color(c.text_base).truncate()),
-        );
+        card = card.child(card::title("picker-host", host_icon(&choice.host), host_label(&choice.host), k));
     }
     let input = TextInput::new(&p.input)
         .placeholder(if p.host().is_some() { "Path" } else { "Search hosts" })
@@ -342,15 +326,11 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
                 s.picker_complete();
                 true
             }
-            K::Escape => {
-                s.close_picker();
-                true
-            }
             _ => false,
         })
         .build(k)
         .key("picker-input");
-    card = card.child(row().px(8.0).py(6.0).border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak).child(input));
+    card = card.child(card::field(input)).child(card::divider(k));
     let rows = p.rows();
     let selected = p.selected.min(rows.len().saturating_sub(1));
     let mut list = col().key("picker-rows").w_full().max_h(320.0).padding(4.0).gap(2.0).scroll(ScrollSpec { stick_bottom: false });
@@ -368,39 +348,16 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
             Row::Folder(f) => (&icons::FOLDER, f.name, f.repo.then(|| "git".into())),
         };
         let picked = i == selected;
-        let ink = if picked { c.text_contrast } else { c.text_base };
-        let mut item = row()
-            .key(format!("picker-row-{i}"))
-            .px(8.0)
-            .h(28.0)
-            .gap(8.0)
-            .center_y()
-            .radius(k.radius.sm)
-            .cursor(rune::Cursor::Pointer)
-            .child(icon(glyph, 14.0).color(if picked { c.text_contrast } else { c.icon_muted }))
-            .child(text(label).font(k.ty.ui).color(ink).truncate().grow(1.0));
-        if let Some(d) = detail {
-            item = item.child(text(d).font(k.ty.small).color(if picked { c.text_contrast } else { c.text_faint }));
-        }
-        let item = if picked { item.fill(c.bg_accent) } else { k.interactive(item) };
+        let lead = icon(glyph, 14.0).color(if picked { c.text_contrast } else { c.icon_muted });
+        let item = card::pick_row(format!("picker-row-{i}"), Some(lead), label, detail, None, picked, k);
         list = list.child(item.on_press(move |s: &mut Lemur| s.picker_pick(i)));
     }
     card = card.child(list);
     let line = p.error.clone().map(|e| (e, true)).or_else(|| p.note().map(|n| (n, false)));
     if let Some((line, error)) = line {
-        card = card.child(
-            row()
-                .key("picker-footer")
-                .px(12.0)
-                .py(6.0)
-                .min_h(28.0)
-                .center_y()
-                .fill(c.layer_01)
-                .child(text(line).font(k.ty.small).color(if error { c.danger.fg } else { c.text_faint }).wrap()),
-        );
+        card = card.child(card::footer("picker-footer", line, error, k));
     }
-    let place = |card: El| peek::centred(col().pt(80.0).child(card));
-    Some(peek::over_window("picker", card, place, |s: &mut Lemur| s.close_picker(), k))
+    card::over_window("picker", card, |s: &mut Lemur| s.close_picker(), k, layer);
 }
 
 #[cfg(test)]

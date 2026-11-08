@@ -9,7 +9,7 @@ use crate::config::{Config, Language};
 use crate::dictate::{Heard, Recording};
 use futures::StreamExt;
 use rune::{El, Key as K, TextEdit, col, el, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, TextArea};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, TextArea};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -252,11 +252,7 @@ pub fn bar(s: &Lemur, k: &Kit) -> Option<El> {
                 .key("dictation-language"),
         )
         .child(
-            IconButton::new(if listening { &icons::CIRCLE_STOP } else { &icons::MIC })
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(if listening { "Stop listening (⌘D)" } else { "Listen for more (⌘D)" })
-                .help(if listening { "Stop listening (⌘D)" } else { "Listen for more (⌘D)" })
+            icons::button(if listening { &icons::CIRCLE_STOP } else { &icons::MIC }, if listening { "Stop listening (⌘D)" } else { "Listen for more (⌘D)" })
                 .on_press(|s: &mut Lemur| s.record())
                 .build(k)
                 .key("dictation-record"),
@@ -271,11 +267,7 @@ pub fn bar(s: &Lemur, k: &Kit) -> Option<El> {
                 .key("dictation-paste"),
         )
         .child(
-            IconButton::new(&icons::X)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label("Throw it away (Esc)")
-                .help("Throw it away (Esc)")
+            icons::button(&icons::X, "Throw it away (Esc)")
                 .on_press(|s: &mut Lemur| s.close_dictation())
                 .build(k)
                 .key("dictation-dismiss"),

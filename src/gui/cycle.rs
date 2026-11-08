@@ -54,8 +54,7 @@ impl Lemur {
             self.cycling = Some((order, at));
         }
         let Some((order, at)) = &mut self.cycling else { return };
-        let len = order.len();
-        *at = if back { (*at + len - 1) % len } else { (*at + 1) % len };
+        *at = super::card::step(*at, order.len(), back);
         let (host, session) = order[*at].clone();
         self.open(host, session);
         // From the menu, or a window that doesn't say ⌃ is still held: settled.

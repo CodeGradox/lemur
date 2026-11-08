@@ -8,8 +8,8 @@ use super::terminal::PAD;
 use super::{Key, Lemur};
 use crate::actions;
 use libghostty_vt::mouse::{Action as MouseAction, Button};
-use rune::{Drag, Ime, Phase, PointerEvent, PopupItem, PopupMenu, Tx, WheelEvent};
-use std::path::PathBuf;
+use rune::{Drag, FileDialogOptions, Ime, Phase, PointerEvent, PopupItem, PopupMenu, Tx, WheelEvent};
+use std::path::{Path, PathBuf};
 
 impl Lemur {
     /// The terminal at the front: one peeked at, else the one on show.
@@ -43,8 +43,7 @@ impl Lemur {
         let mods = tx.mods();
         if d.phase == Phase::Down {
             // A click on the terminal gives it the keyboard back.
-            if self.typing && self.prompt.is_none() && self.dialog.is_none() {
-                self.typing = false;
+            if self.editing() {
                 tx.blur();
             }
             if self.terminals.get(&key).is_some_and(|v| v.exited()) {
@@ -109,10 +108,14 @@ impl Lemur {
         let Some(key) = self.front() else { return };
         let (x, y) = (e.x - PAD, e.y - PAD);
         if let Some(link) = self.link_under(x, y).filter(|l| l.file) {
-            let menu = PopupMenu::new().item(PopupItem::new("preview", "Preview")).item(PopupItem::new("download", "Download"));
-            tx.popup_menu(menu, e.window(), move |s: &mut Lemur, picked, _| match picked {
+            let menu = PopupMenu::new()
+                .item(PopupItem::new("preview", "Preview"))
+                .item(PopupItem::new("zed", "Open in Zed"))
+                .item(PopupItem::new("download", "Download"));
+            tx.popup_menu(menu, e.window(), move |s: &mut Lemur, picked, tx| match picked {
                 Some("preview") => s.preview(key, link.url),
-                Some("download") => s.download(key, link.url),
+                Some("zed") => s.open_in_zed(key, link.url, link.place),
+                Some("download") => s.download(key, link.url, tx),
                 _ => {}
             });
             return;
@@ -260,22 +263,60 @@ impl Lemur {
         );
     }
 
+    /// Opens a file the session printed the path of in Zed, at the line it gave.
+    fn open_in_zed(&mut self, key: Key, path: String, place: String) {
+        let Some(view) = self.terminals.get_mut(&key) else { return };
+        let (host, session) = (view.host.clone(), view.session.clone());
+        view.status = Some((format!("opening {path} in Zed…"), Kind::Progress));
+        self.in_background(
+            move || actions::open_in_zed(&host, &session, &path, &place),
+            move |s, result| {
+                if let Some(view) = s.terminals.get_mut(&key) {
+                    view.status = result.err().map(|e| (format!("couldn't open it in Zed: {e:#}"), Kind::Error));
+                }
+            },
+        );
+    }
+
     /// Copies a file the session printed the path of from the host into Downloads, and
     /// says where it went.
-    fn download(&mut self, key: Key, path: String) {
+    fn download(&mut self, key: Key, path: String, tx: &mut Tx) {
+        let options = FileDialogOptions {
+            title: "Download".into(),
+            directory: actions::downloads_dir().ok(),
+            file_name: Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        tx.save_file(options, move |s: &mut Lemur, answer, _| match answer {
+            Ok(Some(to)) => s.fetch(key, path, Some(to)),
+            Ok(None) => {}
+            // No Save dialog to ask with: into Downloads, as before.
+            Err(_) => s.fetch(key, path, None),
+        });
+    }
+
+    /// Copies a file the session printed the path of from the host to `to`, or with none
+    /// into Downloads under its own name, numbered if that's taken; says where it went.
+    fn fetch(&mut self, key: Key, path: String, to: Option<PathBuf>) {
         let Some(view) = self.terminals.get_mut(&key) else { return };
         let (host, session) = (view.host.clone(), view.session.clone());
         view.status = Some((format!("downloading {path}…"), Kind::Progress));
         self.in_background(
-            move || actions::keep_download(&actions::download(&host, &session, &path)?),
+            move || {
+                let file = actions::download(&host, &session, &path)?;
+                match to {
+                    Some(to) => actions::keep_download_at(&file, &to).map(|()| to),
+                    None => actions::keep_download(&file),
+                }
+            },
             move |s, result| {
                 if let Some(view) = s.terminals.get_mut(&key) {
                     view.status = None;
                 }
                 match result {
                     Ok(kept) => {
-                        let name = kept.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                        s.note(format!("downloaded {name} to Downloads"));
+                        let name = |p: Option<&Path>| p.and_then(Path::file_name).unwrap_or_default().to_string_lossy().into_owned();
+                        s.note(format!("downloaded {} to {}", name(Some(&kept)), name(kept.parent())));
                     }
                     Err(e) => s.fail(e.context("download failed")),
                 }

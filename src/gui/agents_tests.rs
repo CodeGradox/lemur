@@ -95,7 +95,7 @@ fn the_agents_panel_shows_what_threads_run() {
 
     rt.key(KeyEvent { key: K::Command('a'), mods: Mods { shift: true, ..cmd() } });
     rt.frame(1.0 / 60.0);
-    assert_eq!(rt.state.right, Some(Right::Agents), "⌘⇧A");
+    assert_eq!(rt.state.right(), Some(Right::Agents), "⌘⇧A");
     click(&mut rt, "agent-0-0");
     assert_eq!(rt.state.active, Some(key(&a)), "a subagent shows its thread");
     click(&mut rt, "agent-0-1");

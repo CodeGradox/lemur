@@ -7,6 +7,8 @@ pub struct Link {
     pub url: String,
     /// `url` is a path on the session's host, as programs print them, rather than a web link.
     pub file: bool,
+    /// After a file's path, the `:line` or `:line:column` it was printed with, if any.
+    pub place: String,
     /// Where it's drawn: its row, first column and the column after its last.
     pub row: u16,
     pub start: u16,
@@ -18,15 +20,15 @@ pub struct Link {
 pub fn link_at(cells: &[(char, u16)], row: u16, col: u16) -> Option<Link> {
     let here = cells.iter().rposition(|(_, c)| *c <= col)?;
     let text: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
-    let (start, stop, url, file) = match url_at(&text, here) {
-        Some((start, stop)) => (start, stop, text[start..stop].iter().collect(), false),
+    let (start, stop, url, file, place) = match url_at(&text, here) {
+        Some((start, stop)) => (start, stop, text[start..stop].iter().collect(), false, String::new()),
         None => {
             let (start, end, stop) = path_at(&text, here)?;
-            (start, stop, text[start..end].iter().collect(), true)
+            (start, stop, text[start..end].iter().collect(), true, text[end..stop].iter().collect())
         }
     };
     let end = cells.get(stop).map_or(cells.last()?.1 + 1, |(_, c)| *c);
-    Some(Link { url, file, row, start: cells[start].1, end })
+    Some(Link { url, file, place, row, start: cells[start].1, end })
 }
 
 /// The link `uri` a program put on column `col` of row `row` (OSC 8), over the columns
@@ -38,7 +40,7 @@ pub fn hyperlinked(uri: String, row: u16, col: u16, cols: u16, same: impl Fn(u16
     }
     let start = (0..col).rev().take_while(|c| same(*c)).last().unwrap_or(col);
     let end = (col..cols).take_while(|c| same(*c)).last()? + 1;
-    Some(Link { url: uri, file: false, row, start, end })
+    Some(Link { url: uri, file: false, place: String::new(), row, start, end })
 }
 
 const SCHEMES: [&str; 2] = ["https://", "http://"];
@@ -258,7 +260,7 @@ mod tests {
         assert_eq!((link.url.as_str(), link.file, link.start, link.end), ("https://example.com/a", false, 4, 25));
         let cells: Vec<(char, u16)> = "Read(src/main.rs:12)".chars().zip(0..).collect();
         let link = link_at(&cells, 0, 8).unwrap();
-        assert_eq!((link.url.as_str(), link.file), ("src/main.rs", true));
+        assert_eq!((link.url.as_str(), link.file, link.place.as_str()), ("src/main.rs", true, ":12"));
         assert!(link_at(&cells, 0, 1).is_none());
     }
 }

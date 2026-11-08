@@ -7,12 +7,12 @@
 //! repositories inside the worktree, as worktrees kept in a project's
 //! folder, are neither listed nor committed.
 
-use super::{Lemur, Right, icons, peek, worktree_label};
+use super::{Lemur, Right, icons, worktree_label};
 use crate::config::Host;
 use crate::remote::{Remote, quote, sh_path};
 use rune::{Cursor, El, ScrollSpec, TextEdit, col, row, text};
 use rune_kit::diff::{self, DiffState, DiffView, FileDiff};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Kit, TextInput};
 use std::collections::{HashMap, HashSet};
 
 /// The most diff lines shown of one file.
@@ -37,7 +37,7 @@ pub(super) struct Change {
 #[derive(Default)]
 pub struct ChangesPanel {
     /// The host and worktree shown, and what it's called.
-    place: Option<(Host, String, String)>,
+    place: Option<super::panels::Place>,
     files: Vec<Change>,
     /// Why there are none to show, as outside a repository.
     error: Option<String>,
@@ -73,13 +73,12 @@ impl ChangesPanel {
     /// Whether it shows worktree `on`, by its host and path; with None,
     /// nothing.
     pub(super) fn is_on(&self, on: Option<(&str, &str)>) -> bool {
-        let place = self.place.as_ref();
-        place.map(|(h, p, _)| (h.name.as_str(), p.as_str())) == on
+        super::panels::place_is(self.place.as_ref(), on)
     }
 
     /// Whether worktree `path` on host `name` shows.
     fn shows(&self, (name, path): &(String, String)) -> bool {
-        self.place.as_ref().is_some_and(|(h, p, _)| h.name == *name && p == path)
+        self.is_on(Some((name, path)))
     }
 
     /// No file's diff shows, here or over the window.
@@ -150,7 +149,7 @@ impl Lemur {
     /// The panel goes by the thread on show (see `Lemur::follow_shown`): with none it says
     /// so, rather than showing, and committing in, the worktree of the one that was.
     pub(super) fn changes_follow_shown(&mut self) {
-        if self.right != Some(Right::Changes) {
+        if self.right() != Some(Right::Changes) {
             return;
         }
         let on = self.active.is_none();
@@ -188,7 +187,7 @@ impl Lemur {
     /// while the panel is hidden and the field isn't there to have it.
     pub(super) fn committing(&self) -> bool {
         let p = &self.panels.changes;
-        self.right == Some(Right::Changes) && p.place.is_some() && p.message.focused
+        self.right() == Some(Right::Changes) && p.place.is_some() && p.message.focused
     }
 
     /// Shows worktree `path` on `host`, called `label`, and asks it again.
@@ -398,20 +397,8 @@ fn file_row(i: usize, f: &Change, shown: bool, k: &Kit) -> El {
 pub fn view(s: &Lemur, k: &Kit) -> El {
     let c = &k.c;
     let p = &s.panels.changes;
-    let title = match &p.place {
-        Some((_, _, label)) => format!("Changes · {label}"),
-        None => "Changes".to_string(),
-    };
-    let mut header = row()
-        .key("changes-header")
-        .h(40.0)
-        .px(12.0)
-        .gap(8.0)
-        .center_y()
-        .child(text(title).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0));
-    if !p.files.is_empty() {
-        header = header.child(text(p.files.len().to_string()).font(k.ty.small).color(c.text_muted));
-    }
+    let label = p.place.as_ref().map(|(_, _, label)| label.as_str());
+    let header = super::panels::header("changes-header", None, "Changes", label, p.files.len(), k);
     let empty = match (&p.place, &p.error) {
         (None, _) => Some("Open a thread in a worktree to see its changes.".to_string()),
         (_, Some(e)) => Some(e.clone()),
@@ -441,11 +428,7 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
                     .key("changes-diff")
                     // In a row of its own: the header keys what it's given.
                     .header_actions(move |_: &Lemur, _| {
-                        let button = IconButton::new(&icons::MAXIMIZE)
-                            .variant(IconButtonVariant::GhostMuted)
-                            .control_size(ControlSize::Small)
-                            .label("Show it over the window")
-                            .help("Show it over the window")
+                        let button = icons::button(&icons::MAXIMIZE, "Show it over the window")
                             .on_press(|s: &mut Lemur| s.open_diff_preview())
                             .build(&kc)
                             .key("changes-preview");
@@ -515,20 +498,16 @@ fn commit_box(p: &ChangesPanel, k: &Kit) -> El {
 
 /// The diff shown over the window, nearly as wide and tall: ×, ⌘W, Esc or a click outside
 /// closes it.
-pub fn diff_overlay(s: &Lemur, k: &Kit) -> Option<El> {
+pub fn diff_overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     if !s.panels.changes.over_shown {
-        return None;
+        return;
     }
     let kc = k.clone();
     let diff = DiffView::new(|s: &Lemur| &s.panels.changes.over, |s: &mut Lemur| &mut s.panels.changes.over)
         .key("changes-diff-preview")
         .header_actions(move |_: &Lemur, _| {
-            let button = IconButton::new(&icons::X)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label("Close")
-                .help("Close")
+            let button = icons::button(&icons::X, "Close")
                 .on_press(|s: &mut Lemur| {
                     s.close_diff_preview();
                 })
@@ -547,16 +526,15 @@ pub fn diff_overlay(s: &Lemur, k: &Kit) -> Option<El> {
         .shadow(12.0, 40.0, c.scrim)
         .clip_rounded(k.radius.lg)
         .child(diff);
-    Some(peek::over_window(
+    super::card::over_window(
         "diff-preview",
         card,
-        // Pinned: it places itself.
-        |card| card,
         |s: &mut Lemur| {
             s.close_diff_preview();
         },
         k,
-    ))
+        layer,
+    );
 }
 
 /// `file`'s diff as `git diff` printed it, or a new file's text with every line added;

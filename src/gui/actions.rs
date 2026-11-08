@@ -93,7 +93,7 @@ impl Action {
 /// Runs `action` on the app.
 pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
     match action {
-        Action::Settings => s.open_settings(tx),
+        Action::Settings => s.open_settings(),
         Action::AddProject => s.open_picker(),
         Action::NewTerminal => s.new_terminal_here(),
         Action::NewThreadHere => s.new_thread_here(),

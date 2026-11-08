@@ -31,32 +31,18 @@ pub enum Page {
     Linear,
 }
 
-/// Each page with its key and its name.
-const PAGES: [(Page, &str, &str); 9] = [
-    (Page::Appearance, "appearance", "Appearance"),
-    (Page::Terminal, "terminal", "Terminal"),
-    (Page::Colors, "colors", "Terminal colors"),
-    (Page::Dictation, "dictation", "Dictation"),
-    (Page::Claude, "claude", "Claude"),
-    (Page::Codex, "codex", "Codex"),
-    (Page::Core, "core", "herdr-core"),
-    (Page::Shortcuts, "shortcuts", "Shortcuts"),
-    (Page::Linear, "linear", "Linear"),
+/// Each page with its key, its name and its icon.
+static PAGES: [(Page, &str, &str, &Icon); 9] = [
+    (Page::Appearance, "appearance", "Appearance", &icons::SUN),
+    (Page::Terminal, "terminal", "Terminal", &icons::SQUARE_TERMINAL),
+    (Page::Colors, "colors", "Terminal colors", &icons::PALETTE),
+    (Page::Dictation, "dictation", "Dictation", &icons::MIC),
+    (Page::Claude, "claude", "Claude", &icons::CLAUDE),
+    (Page::Codex, "codex", "Codex", &icons::CODE_XML),
+    (Page::Core, "core", "herdr-core", &icons::SERVER),
+    (Page::Shortcuts, "shortcuts", "Shortcuts", &icons::KEYBOARD),
+    (Page::Linear, "linear", "Linear", &icons::TICKET),
 ];
-
-fn page_icon(page: Page) -> &'static Icon {
-    match page {
-        Page::Appearance => &icons::SUN,
-        Page::Terminal => &icons::SQUARE_TERMINAL,
-        Page::Colors => &icons::PALETTE,
-        Page::Dictation => &icons::MIC,
-        Page::Claude => &icons::CLAUDE,
-        Page::Codex => &icons::CODE_XML,
-        Page::Core => &icons::SERVER,
-        Page::Shortcuts => &icons::KEYBOARD,
-        Page::Linear => &icons::TICKET,
-    }
-}
 
 #[derive(Default)]
 pub struct Settings {
@@ -86,18 +72,10 @@ fn number(size: f64) -> String {
     if size.fract() == 0.0 { format!("{size:.0}") } else { size.to_string() }
 }
 
-/// A field showing `text`, all of it selected so typing replaces it, with the keyboard.
-fn field(text: &str) -> TextEdit {
-    let mut e = TextEdit::new(text);
-    e.anchor = 0;
-    e.focused = true;
-    e
-}
-
 impl Lemur {
     /// ⌘,: opens Settings over the window. Like the spotlight, it waits under what's over
     /// the window already.
-    pub(super) fn open_settings(&mut self, _tx: &mut Tx) {
+    pub(super) fn open_settings(&mut self) {
         if self.panels.settings.open || self.overlaid() {
             return;
         }
@@ -236,7 +214,7 @@ impl Lemur {
     /// Types the color of `slot`, for a dark Lemur or a light one.
     fn edit_color(&mut self, dark: bool, slot: Slot) {
         let now = Palette::themed(dark, &self.prefs.terminal).get(slot);
-        self.panels.settings.color = Some((dark, slot, field(&hex(now))));
+        self.panels.settings.color = Some((dark, slot, super::prompt::field(&hex(now))));
     }
 
     fn color_typed(&mut self) {
@@ -252,7 +230,7 @@ impl Lemur {
     /// Asks which herdr-core runs here and on each machine, and the latest.
     fn check_core(&mut self) {
         self.panels.settings.core = None;
-        let cores = self.prefs.cores.clone();
+        let cores = core_update::Cores::of(&self.cfg);
         self.in_background(
             move || core_update::check(&cores),
             |s, versions| s.panels.settings.core = Some(versions.map_err(|e| format!("{e:#}"))),
@@ -270,7 +248,7 @@ impl Lemur {
         }
         st.updating = true;
         st.core_note = None;
-        let cores = self.prefs.cores.clone();
+        let cores = core_update::Cores::of(&self.cfg);
         self.in_background(
             move || core_update::update(&outdated, &cores),
             |s, done| {
@@ -295,7 +273,7 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
     }
     let c = &k.c;
     let mut nav = col().key("settings-nav").w(200.0).h_full().padding(8.0).gap(2.0);
-    for (page, id, name) in PAGES {
+    for &(page, id, name, glyph) in &PAGES {
         let on = st.page == page;
         let r = row()
             .key(format!("settings-page-{id}"))
@@ -305,7 +283,7 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
             .center_y()
             .radius(k.radius.sm)
             .cursor(rune::Cursor::Pointer)
-            .child(icon(page_icon(page), 14.0).color(if on { c.icon_base } else { c.icon_muted }))
+            .child(icon(glyph, 14.0).color(if on { c.icon_base } else { c.icon_muted }))
             .child(text(name).font(if on { k.ty.ui_medium } else { k.ty.ui }).color(c.text_base));
         let r = if on { r.fill(c.layer_02) } else { k.interactive(r) };
         nav = nav.child(r.on_press(move |s: &mut Lemur| {
@@ -313,7 +291,7 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
             s.panels.settings.color = None;
         }));
     }
-    let name = PAGES.iter().find(|(p, ..)| *p == st.page).map_or("", |(_, _, name)| name);
+    let name = PAGES.iter().find(|(p, ..)| *p == st.page).map_or("", |(_, _, name, _)| name);
     let groups = match st.page {
         Page::Appearance => appearance(s, k),
         Page::Terminal => terminal(s, k),
@@ -576,11 +554,7 @@ fn color_group(s: &Lemur, dark: bool, k: &Kit) -> El {
             let mut control = row().gap(8.0).center_y();
             if color != defaults.get(slot) {
                 control = control.child(
-                    IconButton::new(&icons::ROTATE_CCW)
-                        .variant(IconButtonVariant::GhostMuted)
-                        .control_size(ControlSize::Small)
-                        .label(format!("Put lemur's own back: {}", hex(defaults.get(slot))))
-                        .help(format!("Put lemur's own back: {}", hex(defaults.get(slot))))
+                    icons::button(&icons::ROTATE_CCW, format!("Put lemur's own back: {}", hex(defaults.get(slot))))
                         .on_press(move |s: &mut Lemur| {
                             s.panels.settings.color = None;
                             s.set_terminal_color(dark, slot, None);

@@ -1,9 +1,10 @@
 //! The command palette (⌘⇧P), as Herdr's: every command by name, with its
 //! key. What's typed narrows them down; ↑↓ picks one and ⏎ runs it.
 
+use super::card;
 use super::actions::{self, ACTIONS, Action};
-use super::{Lemur, icons, peek};
-use rune::{Chord, El, Key as K, KeyPlatform, TextEdit, Tx, col, icon, row, text};
+use super::{Lemur, icons};
+use rune::{Chord, El, Key as K, KeyPlatform, TextEdit, Tx, col, row, text};
 use rune_kit::{Keybind, KeybindVariant, Kit, TextInput};
 
 /// How many commands it lists at most.
@@ -72,12 +73,10 @@ impl Lemur {
         let mut input = TextEdit::new("");
         input.focused = true;
         self.panels.commands = Some(Commands { input, picked: 0 });
-        self.typing = true;
     }
 
     pub(super) fn close_palette(&mut self) {
         self.panels.commands = None;
-        self.typing = false;
     }
 
     fn palette_matches(&self) -> Vec<(&'static str, Command)> {
@@ -89,9 +88,7 @@ impl Lemur {
     fn step_palette(&mut self, back: bool) {
         let count = self.palette_matches().len().min(SHOWN);
         let Some(palette) = &mut self.panels.commands else { return };
-        if count > 0 {
-            palette.picked = if back { (palette.picked + count - 1) % count } else { (palette.picked + 1) % count };
-        }
+        palette.picked = card::step(palette.picked, count, back);
     }
 
     /// Runs the command picked, as its key or menu item would, once the palette is gone and
@@ -109,8 +106,8 @@ impl Lemur {
 }
 
 /// The palette over the window, while it's open.
-pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
-    let palette = s.panels.commands.as_ref()?;
+pub fn overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
+    let Some(palette) = s.panels.commands.as_ref() else { return };
     let c = &k.c;
     let input = TextInput::new(&palette.input)
         .placeholder("Run a command…")
@@ -132,10 +129,6 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
                 s.step_palette(false);
                 true
             }
-            K::Escape => {
-                s.close_palette();
-                true
-            }
             _ => false,
         })
         .build(k)
@@ -154,20 +147,8 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
     }
     for (i, (name, command)) in matches.into_iter().take(SHOWN).enumerate() {
         let picked = palette.picked == i;
-        let mut r = row()
-            .key(format!("command-{i}"))
-            .px(8.0)
-            .h(28.0)
-            .gap(8.0)
-            .center_y()
-            .radius(k.radius.sm)
-            .cursor(rune::Cursor::Pointer)
-            .child(text(name).font(k.ty.ui).color(c.text_base).grow(1.0).truncate());
-        if let Some(caps) = keycaps(command) {
-            r = r.child(Keybind::new(&caps).variant(if picked { KeybindVariant::Neutral } else { KeybindVariant::Ghost }).build(k));
-        }
-        // A tint of the accent, so the keys on it still read.
-        let r = if picked { r.fill(c.bg_accent.alpha(0.25)) } else { k.interactive(r) };
+        let caps = keycaps(command).map(|caps| Keybind::new(&caps).variant(if picked { KeybindVariant::Neutral } else { KeybindVariant::Ghost }).build(k));
+        let r = card::pick_row(format!("command-{i}"), None, name.to_string(), None, caps, picked, k);
         rows = rows.child(r.on_press_tx(move |s: &mut Lemur, tx: &mut Tx| {
             if let Some(p) = &mut s.panels.commands {
                 p.picked = i;
@@ -175,37 +156,13 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
             s.run_picked(tx);
         }));
     }
-    let card = col()
-        .key("palette")
-        .w(560.0)
-        .radius(k.radius.lg)
-        .fill(c.surface_raised)
-        .border(1.0, c.border_base)
-        .shadow(12.0, 40.0, c.scrim)
-        .clip_rounded(k.radius.lg)
-        .child(
-            row()
-                .px(12.0)
-                .h(34.0)
-                .gap(8.0)
-                .center_y()
-                .child(icon(&icons::SEARCH, 14.0).color(c.icon_muted))
-                .child(text("Commands").font(k.ty.ui_medium).color(c.text_base)),
-        )
-        .child(row().px(8.0).py(6.0).child(input))
-        .child(rune::el().w_full().h(1.0).fill(c.border_weak))
+    let card = card::surface("palette", card::WIDTH, k)
+        .child(card::title("palette-title", &icons::SEARCH, "Commands".into(), k))
+        .child(card::field(input))
+        .child(card::divider(k))
         .child(rows)
-        .child(
-            row()
-                .key("palette-footer")
-                .px(12.0)
-                .h(28.0)
-                .center_y()
-                .fill(c.layer_01)
-                .child(text("↑↓ pick · ⏎ run · esc cancel").font(k.ty.small).color(c.text_faint)),
-        );
-    let place = |card: El| peek::centred(col().pt(80.0).child(card));
-    Some(peek::over_window("palette", card, place, |s: &mut Lemur| s.close_palette(), k))
+        .child(card::footer("palette-footer", "↑↓ pick · ⏎ run · esc cancel".into(), false, k));
+    card::over_window("palette", card, |s: &mut Lemur| s.close_palette(), k, layer);
 }
 
 #[cfg(test)]
@@ -272,16 +229,16 @@ pub(super) mod tests {
     fn the_palette_runs_commands_by_name() {
         let mut rt = window(toml::from_str("").unwrap());
         let shift_cmd = Mods { shift: true, ..cmd() };
-        let open = |rt: &Runtime<Lemur>| (rt.state.panels.commands.is_some(), rt.state.right);
+        let open = |rt: &Runtime<Lemur>| (rt.state.panels.commands.is_some(), rt.state.right());
         press(&mut rt, K::Command('p'), shift_cmd);
         assert_eq!(open(&rt), (true, None));
-        assert!(rt.state.typing, "its field has the keyboard");
+        assert!(!rt.state.keyboard_on_terminal(), "its field has the keyboard");
         rt.frame(1.0 / 60.0);
         assert!(rt.find("command-0").is_some());
         type_text(&mut rt, "toggle agents");
         press(&mut rt, K::Enter, Mods::default());
         assert_eq!(open(&rt), (false, Some(Right::Agents)), "Toggle Agents ran");
-        assert!(!rt.state.typing, "the keyboard's back");
+        assert!(rt.state.keyboard_on_terminal(), "the keyboard's back");
 
         press(&mut rt, K::Command('p'), shift_cmd);
         rt.frame(1.0 / 60.0);

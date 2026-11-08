@@ -66,3 +66,14 @@ lucide! {
     TRIANGLE_ALERT, "triangle-alert", r#"<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>"#;
     X, "x", r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#;
 }
+
+/// A small icon button, as the app's panels and bars have them: `label` says what it does,
+/// read out and shown under the pointer.
+pub fn button(glyph: &'static rune::Icon, label: impl Into<String>) -> rune_kit::IconButton {
+    let label = label.into();
+    rune_kit::IconButton::new(glyph)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .control_size(rune_kit::ControlSize::Small)
+        .label(label.clone())
+        .help(label)
+}

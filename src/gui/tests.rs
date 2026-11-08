@@ -386,15 +386,15 @@ fn the_panels_take_turns_on_the_right() {
     let server = HcServer::new("rright");
     let mut rt = window(server.config());
     rt.update(|s, tx| actions::run(s, Action::ToggleChanges, tx));
-    assert_eq!(rt.state.right, Some(Right::Changes));
+    assert_eq!(rt.state.right(), Some(Right::Changes));
     assert!(rt.state.inspector.is_open());
     rt.update(|s, tx| actions::run(s, Action::ToggleAgents, tx));
-    assert_eq!(rt.state.right, Some(Right::Agents));
+    assert_eq!(rt.state.right(), Some(Right::Agents));
     press(&mut rt, K::Command('r'), cmd());
-    assert_eq!(rt.state.right, None);
+    assert_eq!(rt.state.right(), None);
     assert!(!rt.state.inspector.is_open());
     press(&mut rt, K::Command('r'), cmd());
-    assert_eq!(rt.state.right, Some(Right::Agents), "the last one comes back");
+    assert_eq!(rt.state.right(), Some(Right::Agents), "the last one comes back");
 }
 
 /// ⌘B folds the sidebar away, and back.
@@ -539,7 +539,7 @@ fn dragging_a_row_reorders_its_list() {
     drag(&mut rt, "row-local-a", 2.0 * (b - a));
     let shown: Vec<String> = rt.state.snap.hosts[0].other.iter().map(|t| t.name.clone()).collect();
     assert_eq!(shown, ["b", "c", "a"]);
-    assert!(rt.state.row_drag.is_none(), "the drag is over");
+    assert!(rt.state.row_drag.dragging().is_none(), "the drag is over");
     // A press that doesn't move is a click.
     click(&mut rt, "row-local-c");
     assert_eq!(rt.state.active, Some(key("c")));
@@ -645,10 +645,10 @@ fn a_click_on_a_button_leaves_the_keyboard_with_the_terminal() {
     open(&mut rt, &t);
     assert!(wait_for(&mut rt, 10.0, |s| s.terminals.get(&key(&t)).is_some_and(|v| v.painted)), "painted");
     click(&mut rt, "toggle-links");
-    assert_eq!(rt.state.right, Some(Right::Links));
+    assert_eq!(rt.state.right(), Some(Right::Links));
     type_text(&mut rt, "echo a b");
     press(&mut rt, K::Enter, Mods::default());
-    assert_eq!(rt.state.right, Some(Right::Links), "Space didn't press it");
+    assert_eq!(rt.state.right(), Some(Right::Links), "Space didn't press it");
     let k = key(&t);
     assert!(
         wait_for(&mut rt, 10.0, |s| super::terminal::lines(s, &k).iter().any(|l| l == "a b")),
@@ -718,7 +718,63 @@ fn notes_opened_from_a_menu_come_back_with_cmd_r() {
     rt.update(|s, _| s.toggle_right(Right::Links));
     rt.update(|s, _| s.open_notes("local", "/", "root"));
     press(&mut rt, K::Command('r'), cmd());
-    assert_eq!(rt.state.right, None);
+    assert_eq!(rt.state.right(), None);
     press(&mut rt, K::Command('r'), cmd());
-    assert_eq!(rt.state.right, Some(Right::Notes));
+    assert_eq!(rt.state.right(), Some(Right::Notes));
+}
+
+/// How long frames take while a terminal streams output beside a long sidebar, and at
+/// rest: `cargo test --release bench_frames -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_frames() {
+    let server = HcServer::new("rbench");
+    for _ in 0..30 {
+        server.run("/", &[], &["sleep", "600"]);
+    }
+    let t = server.run("/", &[], &["sh", "-c", "sleep 2; seq 1 2000000; sleep 600"]);
+    let mut rt = loaded(&server);
+    open(&mut rt, &t);
+    let stats = |name: &str, mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
+        eprintln!("{name}: {} frames, p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms", v.len(), at(0.5), at(0.95), at(1.0));
+    };
+    let mut streaming = vec![];
+    let mut resting = vec![];
+    let start = std::time::Instant::now();
+    let mut last = String::new();
+    let mut quiet_since = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        let f = std::time::Instant::now();
+        rt.frame(1.0 / 60.0);
+        let took = f.elapsed();
+        let shown = screen(&rt, &key(&t)).into_iter().rev().find(|l| !l.is_empty()).unwrap_or_default();
+        if shown != last {
+            last = shown;
+            quiet_since = std::time::Instant::now();
+            streaming.push(took.as_secs_f64() * 1000.0);
+        } else if quiet_since.elapsed() > Duration::from_secs(1) {
+            resting.push(took.as_secs_f64() * 1000.0);
+            if resting.len() >= 120 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(16).saturating_sub(took));
+    }
+    eprintln!("last line: {last}");
+    stats("streaming", streaming);
+    stats("at rest", resting);
+}
+
+/// Dragging the right panel's edge in folds it away: no panel shows, and ⌘R brings it back.
+#[test]
+fn a_right_panel_folded_by_its_edge_is_hidden() {
+    let server = HcServer::new("rfold");
+    let mut rt = window(server.config());
+    rt.update(|s, _| s.toggle_right(Right::Links));
+    rt.update(|s, _| s.inspector.set_open(false));
+    assert_eq!(rt.state.right(), None);
+    press(&mut rt, K::Command('r'), cmd());
+    assert_eq!(rt.state.right(), Some(Right::Links));
 }

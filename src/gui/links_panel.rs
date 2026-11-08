@@ -11,7 +11,7 @@ use crate::gh::{self, Problem, PullRequest, State};
 use crate::links::{self, Artifact, Place, Store};
 use rune::{El, Key as K, ScrollSpec, TextEdit, Tx, col, icon, row, text};
 use rune_kit::shell::SidebarRow;
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, TextInput};
+use rune_kit::{Kit, TextInput};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,7 +24,7 @@ pub struct LinksPanel {
     file: Option<PathBuf>,
     store: Store,
     /// The host and folder shown, and what it's called.
-    place: Option<(Host, String, String)>,
+    place: Option<super::panels::Place>,
     /// The host and folder being read.
     loading: Option<(String, String)>,
     /// Why the logs couldn't be read.
@@ -72,12 +72,11 @@ impl LinksPanel {
     /// Whether it shows folder `on`, by its host and path; with None,
     /// nothing.
     pub(super) fn is_on(&self, on: Option<(&str, &str)>) -> bool {
-        let place = self.place.as_ref();
-        place.map(|(h, p, _)| (h.name.as_str(), p.as_str())) == on
+        super::panels::place_is(self.place.as_ref(), on)
     }
 
     fn shows(&self, host: &str, path: &str) -> bool {
-        self.place.as_ref().is_some_and(|(h, p, _)| h.name == host && p == path)
+        self.is_on(Some((host, path)))
     }
 
     fn save(&mut self) {
@@ -143,7 +142,7 @@ impl Lemur {
 
     /// The panel goes by the thread on show (see `Lemur::follow_shown`).
     pub(super) fn links_follow_shown(&mut self) {
-        if self.right != Some(Right::Links) {
+        if self.right() != Some(Right::Links) {
             return;
         }
         let on = self.active.is_none();
@@ -265,18 +264,13 @@ impl Lemur {
         let p = &mut self.panels.links;
         let name = p.links().iter().find(|l| l.url == url).map(|a| p.name_of(a).to_string()).unwrap_or_default();
         // All of it selected, so typing replaces it.
-        let mut input = TextEdit::new(name);
-        input.anchor = 0;
-        input.focused = true;
-        p.renaming = Some(Renaming { url, input });
-        self.typing = true;
+        p.renaming = Some(Renaming { url, input: super::prompt::field(&name) });
     }
 
     /// Done with the name asked for; with `keep`, it's kept.
     fn finish_renaming(&mut self, keep: bool) {
         let p = &mut self.panels.links;
         let Some(renaming) = p.renaming.take() else { return };
-        self.typing = false;
         if keep && let Some((host, path, _)) = &p.place {
             p.store.place_mut(&host.name, path).rename(&renaming.url, &renaming.input.text, now());
             p.save();
@@ -285,38 +279,23 @@ impl Lemur {
 
     /// The panel goes elsewhere: a name being given is let go.
     fn drop_renaming(&mut self) {
-        if self.panels.links.renaming.take().is_some() {
-            self.typing = false;
-        }
+        self.panels.links.renaming = None;
+    }
+
+    /// The name being given has the keyboard.
+    pub(super) fn links_editing(&self) -> bool {
+        self.right() == Some(Right::Links) && self.panels.links.renaming.as_ref().is_some_and(|r| r.input.focused)
     }
 
     /// Before each frame: the name being given lost the keyboard, to a click elsewhere or
     /// the panel hidden. What's typed is kept, as with Enter. True if that changed anything.
     pub(super) fn links_keyboard(&mut self) -> bool {
-        let Some(r) = &self.panels.links.renaming else { return false };
-        if self.right == Some(Right::Links) && r.input.focused {
+        if self.panels.links.renaming.is_none() || self.links_editing() {
             return false;
         }
         self.finish_renaming(true);
         true
     }
-}
-
-/// The panel's title, and how many it lists.
-fn header(title: String, count: usize, k: &Kit) -> El {
-    let c = &k.c;
-    let mut h = row()
-        .key("links-head")
-        .w_full()
-        .h(40.0)
-        .px(12.0)
-        .gap(8.0)
-        .center_y()
-        .child(text(title).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0).shrink());
-    if count > 0 {
-        h = h.child(text(count.to_string()).key("links-count").font(k.ty.small).color(c.text_muted));
-    }
-    h
 }
 
 /// A section's name, over its rows.
@@ -326,11 +305,7 @@ fn section(name: &'static str, k: &Kit) -> El {
 
 /// A small button on a row, shown under the pointer.
 fn row_button(glyph: &'static rune::Icon, tip: &str, key: String, k: &Kit, press: impl Fn(&mut Lemur) + 'static) -> El {
-    IconButton::new(glyph)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tip)
-        .help(tip)
+    icons::button(glyph, tip)
         .on_press(press)
         .build(k)
         .key(key)
@@ -428,10 +403,6 @@ fn artifact_row(p: &LinksPanel, i: usize, artifact: &Artifact, k: &Kit) -> El {
 pub fn view(s: &Lemur, k: &Kit) -> El {
     let p = &s.panels.links;
     let c = &k.c;
-    let title = match &p.place {
-        Some((_, _, label)) => format!("Links · {label}"),
-        None => "Links".to_string(),
-    };
     let (links, prs) = (p.links(), p.prs());
     let count = links.len() + prs.len();
     let empty = match (&p.place, &p.error) {
@@ -464,7 +435,7 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
     if let Some(e) = empty {
         list = list.child(text(e).key("links-empty").font(k.ty.ui).color(c.text_muted).wrap().padding(4.0));
     }
-    col().key("links-panel").w_full().h_full().min_h(0.0).child(header(title, count, k)).child(list)
+    col().key("links-panel").w_full().h_full().min_h(0.0).child(super::panels::header("links-head", None, "Links", p.place.as_ref().map(|(_, _, l)| l.as_str()), count, k)).child(list)
 }
 
 #[cfg(test)]

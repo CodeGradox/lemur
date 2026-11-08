@@ -123,7 +123,7 @@ fn the_notes_give_the_keyboard_back() {
     show(&mut rt, "/srv/a");
     let typing = |rt: &mut Runtime<Lemur>| {
         frames(rt, 2);
-        (rt.state.typing, rt.state.keyboard_on_terminal())
+        (rt.state.notes_editing(), rt.state.keyboard_on_terminal())
     };
     assert_eq!(typing(&mut rt), (false, true));
 
@@ -139,10 +139,10 @@ fn the_notes_give_the_keyboard_back() {
 
     click(&mut rt, "notes-editor");
     press(&mut rt, K::Command('r'), cmd());
-    assert_eq!(rt.state.right, None);
+    assert_eq!(rt.state.right(), None);
     assert_eq!(typing(&mut rt), (false, true), "folded away");
     press(&mut rt, K::Command('r'), cmd());
-    assert_eq!(rt.state.right, Some(Right::Notes));
+    assert_eq!(rt.state.right(), Some(Right::Notes));
     assert_eq!(typing(&mut rt), (false, true), "and back, without it");
 
     click(&mut rt, "notes-editor");
@@ -508,7 +508,7 @@ fn snapshot(worktrees: &[(&str, &str, &[&str])]) -> Snapshot {
 
 /// The worktree whose notes show, and whether the panel does.
 fn shown(rt: &Runtime<Lemur>) -> (Option<String>, bool) {
-    (rt.state.panels.notes.worktree().map(str::to_string), rt.state.right == Some(Right::Notes))
+    (rt.state.panels.notes.worktree().map(str::to_string), rt.state.right() == Some(Right::Notes))
 }
 
 fn api_window(server: &HcServer) -> Runtime<Lemur> {

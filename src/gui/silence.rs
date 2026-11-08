@@ -19,36 +19,12 @@ impl Lemur {
     /// notify again. Shown at once, until the next refresh says what herdr-core
     /// keeps.
     pub(super) fn set_silent(&mut self, k: Key, silent: bool) {
-        let shown = self
-            .snap
-            .hosts
-            .iter_mut()
-            .filter(|h| h.name == k.0)
-            .flat_map(|h| {
-                let in_bases = h.bases.iter_mut().flat_map(|b| b.worktrees.iter_mut());
-                in_bases
-                    .flat_map(|w| w.sessions.iter_mut())
-                    .chain(h.other.iter_mut())
-            });
-        for s in shown.filter(|s| s.name == k.1) {
+        if let Some(s) = self.session_mut(&k) {
             s.silent = silent;
         }
         if silent {
             self.close_popup(&k);
         }
-        self.changes += 1;
-                let cfg = self.cfg.clone();
-        self.in_background(
-            move || actions::set_silent(&cfg, &k.0, &k.1, silent),
-            |this, saved| {
-                // Refreshes that started before herdr-core had it are stale.
-                this.changes += 1;
-                if let Err(e) = saved {
-                    this.fail(e);
-                }
-                this.refresh();
-            },
-        )
-        ;
+        self.write_core(move |cfg| actions::set_silent(cfg, &k.0, &k.1, silent));
     }
 }

@@ -1,7 +1,6 @@
 //! What the window knows of herdr-core: refreshes, the watch on its changes, the thread on
 //! show, and opening, closing and ordering threads.
 
-use super::snackbar::Kind;
 use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, key, move_item, sessions, watched, worktree_label};
 use crate::actions;
 use crate::attach::Active;
@@ -264,9 +263,6 @@ impl Lemur {
 
     /// Shows a thread, as a click on it does.
     pub fn open(&mut self, host: String, session: String) {
-        if self.peek.as_ref().is_some_and(|k| k.0 == host && k.1 == session) {
-            self.peek = None;
-        }
         self.show_thread(host, session);
     }
 
@@ -310,13 +306,14 @@ impl Lemur {
             return true;
         }
         if self.prompt.take().is_some() {
-            self.typing = false;
             return true;
         }
         if self.close_panel_overlay() {
             return true;
         }
-        if self.peek.take().is_some() {
+        if self.peek.is_some() {
+            // As its ×: a host's set-up ends with it, and the host is asked again.
+            self.close_peek();
             return true;
         }
         false
@@ -467,6 +464,23 @@ impl Lemur {
         }
     }
 
+    /// Writes a change made here to herdr-core with `write`. Refreshes that started before
+    /// herdr-core had it are stale; the one after shows what herdr-core keeps.
+    pub(super) fn write_core(&mut self, write: impl FnOnce(&crate::config::Config) -> anyhow::Result<()> + Send + 'static) {
+        self.changes += 1;
+        let cfg = self.cfg.clone();
+        self.in_background(
+            move || write(&cfg),
+            |s, saved| {
+                s.changes += 1;
+                if let Err(e) = saved {
+                    s.fail(e);
+                }
+                s.refresh();
+            },
+        );
+    }
+
     pub fn session_mut(&mut self, (host, name): &Key) -> Option<&mut Session> {
         let h = self.snap.hosts.iter_mut().find(|h| &h.name == host)?;
         h.bases
@@ -481,7 +495,7 @@ impl Lemur {
     pub fn confirm_close(&mut self) {
         // The peek is in front, not the thread on show under it.
         if self.peek.is_some() && self.prompt.is_none() && self.dialog.is_none() && !self.panels_overlaid() {
-            self.peek = None;
+            self.close_peek();
             return;
         }
         if self.close_panel_overlay() {
@@ -558,24 +572,25 @@ impl Lemur {
     /// The notes, Linear, the changes and the agents take turns on the right: showing one
     /// hides the other, and showing the one that shows hides it.
     pub fn toggle_right(&mut self, which: Right) {
-        if self.right == Some(which) {
-            self.right = None;
+        if self.right() == Some(which) {
+            self.inspector.set_open(false);
         } else {
-            self.right = Some(which);
             self.right_last = which;
+            self.inspector.set_open(true);
             self.panel_shown(which);
         }
-        self.inspector.set_open(self.right.is_some());
+    }
+
+    /// The panel on the right, while it's out: dragging its edge in folds it away too.
+    pub fn right(&self) -> Option<Right> {
+        self.inspector.is_open().then_some(self.right_last)
     }
 
     /// ⌘R: hides the right panel, or brings back the one shown last; the notes the first
     /// time.
     pub fn toggle_right_panel(&mut self) {
-        match self.right {
-            Some(_) => {
-                self.right = None;
-                self.inspector.set_open(false);
-            }
+        match self.right() {
+            Some(_) => self.inspector.set_open(false),
             None => self.toggle_right(self.right_last),
         }
     }
@@ -606,7 +621,7 @@ impl Lemur {
     /// Updates herdr-core here, then on each machine behind, as Herdr does; terminals keep
     /// running.
     pub fn update_core(&mut self) {
-        self.status = Some(("Updating herdr-core…".into(), Kind::Progress));
+        self.busy("Updating herdr-core…".into());
         let cores = crate::core_update::Cores::of(&self.cfg);
         self.in_background(
             move || {

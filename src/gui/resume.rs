@@ -2,7 +2,6 @@
 //! resumed once their terminal is gone, as after the host restarted.
 //! Each starts with an ID of lemur's, and refreshes keep it current.
 
-use super::snackbar::Kind;
 use super::{Lemur, sessions};
 use crate::actions;
 use crate::config::{ClaudeThread, Config};
@@ -121,8 +120,8 @@ impl Lemur {
             [one] => one.shown(),
             many => format!("{} threads", many.len()),
         };
-        self.status = Some((format!("resuming {what}…"), Kind::Progress));
-                let cfg = self.cfg.clone();
+        let said = self.busy(format!("resuming {what}…"));
+        let cfg = self.cfg.clone();
         self.in_background(
             move || {
                 threads
@@ -133,8 +132,8 @@ impl Lemur {
                     })
                     .collect::<Vec<_>>()
             },
-            |this, results| {
-                this.status = None;
+            move |this, results| {
+                this.done(&said);
                 let mut resumed = vec![];
                 for (thread, result) in results {
                     this.resuming

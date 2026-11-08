@@ -44,11 +44,11 @@ impl Panels {
 impl Lemur {
     /// Every refresh tick (`REFRESH`).
     pub(super) fn panels_tick(&mut self) {
-        if self.right == Some(Right::Changes) && self.ticks % 3 == 0 {
+        if self.right() == Some(Right::Changes) && self.ticks % 3 == 0 {
             self.refresh_changes();
         }
         // It asks again once `links_panel::EVERY` has passed.
-        if self.right == Some(Right::Links) {
+        if self.right() == Some(Right::Links) {
             self.show_links();
         }
         self.tick_meter();
@@ -69,7 +69,11 @@ impl Lemur {
 
     /// A text field of the panels' has the keyboard.
     pub(super) fn panels_editing(&self) -> bool {
-        self.committing() || self.panels.dictation.as_ref().is_some_and(|d| d.input.focused)
+        self.notes_editing()
+            || self.committing()
+            || self.links_editing()
+            || self.linear_editing()
+            || self.panels.dictation.as_ref().is_some_and(|d| d.input.focused)
     }
 
     /// Escape or ⌘W: closes what of the panels' is over the window, front first.
@@ -104,10 +108,10 @@ impl Lemur {
 
     /// A thread came on show: the panels go where it runs.
     pub(super) fn thread_shown(&mut self) {
-        if self.right == Some(Right::Changes) {
+        if self.right() == Some(Right::Changes) {
             self.show_changes();
         }
-        if self.right == Some(Right::Links) {
+        if self.right() == Some(Right::Links) {
             self.show_links();
         }
         self.follow_linear();
@@ -141,7 +145,7 @@ impl Lemur {
 
 /// The panel on the right.
 pub fn right(s: &Lemur, k: &Kit) -> El {
-    match s.right {
+    match s.right() {
         Some(Right::Notes) | None => notes::view(s, k),
         Some(Right::Linear) => linear_panel::view(s, k),
         Some(Right::Changes) => changes_panel::view(s, k),
@@ -151,9 +155,11 @@ pub fn right(s: &Lemur, k: &Kit) -> El {
 }
 
 /// What shows over the window besides the spotlight, a dialog and a peek: front last.
-pub fn overlays(s: &Lemur, k: &Kit, tx_layer: &mut Vec<El>) -> Vec<El> {
-    let _ = tx_layer;
-    [changes_panel::diff_overlay(s, k), settings::overlay(s, k), picker::overlay(s, k), commands::overlay(s, k)].into_iter().flatten().collect()
+pub fn overlays(s: &Lemur, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
+    changes_panel::diff_overlay(s, k, layer);
+    picker::overlay(s, k, layer);
+    commands::overlay(s, k, layer);
+    settings::overlay(s, k).into_iter().collect()
 }
 
 /// Under the terminal, over the status bar: the dictation bar while dictating.
@@ -164,4 +170,31 @@ pub fn under_terminal(s: &Lemur, k: &Kit) -> Option<El> {
 /// At the sidebar's foot, over the hosts' load: how much of each agent's plan is used.
 pub fn sidebar_foot(s: &Lemur, k: &Kit) -> Vec<El> {
     meter::meters(s, k)
+}
+
+/// A host, a folder there, and what it's called: where the Changes and Links panels are.
+pub type Place = (crate::config::Host, String, String);
+
+/// Whether `place` is folder `on`, by its host and path; with None, no place.
+pub fn place_is(place: Option<&Place>, on: Option<(&str, &str)>) -> bool {
+    place.map(|(h, p, _)| (h.name.as_str(), p.as_str())) == on
+}
+
+/// The top of a panel on the right: `name`, and what it shows; how many it lists, if any.
+pub fn header(key: &str, glyph: Option<&'static rune::Icon>, name: &str, label: Option<&str>, count: usize, k: &Kit) -> El {
+    let c = &k.c;
+    let title = label.map_or_else(|| name.to_string(), |l| format!("{name} · {l}"));
+    let mut h = rune::row()
+        .key(key)
+        .w_full()
+        .h(40.0)
+        .px(12.0)
+        .gap(8.0)
+        .center_y()
+        .children(glyph.map(|g| rune::icon(g, 14.0).color(c.icon_muted)))
+        .child(rune::text(title).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0).shrink());
+    if count > 0 {
+        h = h.child(rune::text(count.to_string()).key(format!("{key}-count")).font(k.ty.small).color(c.text_muted));
+    }
+    h
 }

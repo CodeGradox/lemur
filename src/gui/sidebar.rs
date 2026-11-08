@@ -8,89 +8,11 @@ use super::{Key, Lemur, List, Right, icons, key, worktree_label};
 use crate::config::{Agent, Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use rune::{Color, El, LoopSpec, PointerPress, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
-use rune_kit::shell::{RowStatus, Sidebar, SidebarHeader, SidebarRow, SidebarSection};
-use rune_kit::{IconButton, IconButtonVariant, Kit};
+use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarHeader, SidebarRow, SidebarSection};
+use rune_kit::Kit;
 
 /// Points the pointer travels before a press on a row becomes a drag.
 const SLOP: f32 = 4.0;
-
-/// A row of the sidebar being dragged into a new place in its list: the list, the row's
-/// index there before the drag, where it would land, how far the pointer went, and the
-/// rows' pitch (their height and the gap between them).
-#[derive(Clone, Debug, PartialEq)]
-pub struct RowDrag {
-    pub list: String,
-    from: usize,
-    to: usize,
-    dy: f32,
-    pitch: f32,
-}
-
-impl RowDrag {
-    /// How far row `index` sits from its place: the dragged row with the pointer, and the
-    /// rows between its place and its target a step toward the gap it left.
-    fn shift(&self, index: usize) -> f32 {
-        let from = self.from;
-        if index == from {
-            self.dy
-        } else if from < index && index <= self.to {
-            -self.pitch
-        } else if self.to <= index && index < from {
-            self.pitch
-        } else {
-            0.0
-        }
-    }
-}
-
-/// Makes `row`, the `index`th of `count` rows of `list` (all one height), draggable into a
-/// new place: the rows between step aside, and a drop calls `drop(from, to)`. A press that
-/// doesn't move is still a click.
-fn draggable(
-    s: &Lemur,
-    row: El,
-    list: &str,
-    index: usize,
-    count: usize,
-    drop: impl Fn(&mut Lemur, usize, usize) + 'static,
-    k: &Kit,
-) -> El {
-    let mut row = row;
-    if let Some(d) = s.row_drag.as_ref().filter(|d| d.list == list) {
-        row = row.offset(0.0, d.shift(index));
-        if d.from == index {
-            row = lifted(row, k);
-        }
-    }
-    let list = list.to_string();
-    row.on_drag(move |s: &mut Lemur, d: &mut rune::Drag, tx: &mut Tx| match d.phase {
-        rune::Phase::Down => {}
-        rune::Phase::Move => {
-            if s.row_drag.as_ref().is_none_or(|r| r.list != list) {
-                if d.dy.abs() < SLOP {
-                    return;
-                }
-                s.row_drag = Some(RowDrag { list: list.clone(), from: index, to: index, dy: 0.0, pitch: d.h + 1.0 });
-            }
-            // The rows it passes spring aside; it follows the pointer exactly.
-            tx.animated();
-            if let Some(r) = &mut s.row_drag {
-                r.dy = d.dy;
-                let to = index as f32 + (d.dy / r.pitch).round();
-                r.to = to.clamp(0.0, count.saturating_sub(1) as f32) as usize;
-            }
-        }
-        rune::Phase::Up => {
-            if let Some(r) = s.row_drag.take().filter(|r| r.list == list)
-                && !d.cancelled()
-                && r.from != r.to
-            {
-                tx.instant();
-                drop(s, r.from, r.to);
-            }
-        }
-    })
-}
 
 /// What's being dragged: above the rest, following the pointer exactly, and opaque, so what
 /// it passes doesn't show through.
@@ -189,9 +111,6 @@ pub fn status_dot(color: Color, tip: String, breathes: bool) -> El {
     if breathes { d.looping(LoopSpec::opacity(1.6, 0.0, 0.35, 1.0)) } else { d }
 }
 
-fn small_button(glyph: &'static rune::Icon, label: &str, _: &Kit) -> IconButton {
-    IconButton::new(glyph).variant(IconButtonVariant::GhostMuted).control_size(rune_kit::ControlSize::Small).label(label).help(label)
-}
 
 /// What a right click on a thread offers, and what it runs.
 fn thread_menu(s: &Session) -> PopupMenu {
@@ -217,7 +136,7 @@ fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {
 
 /// A thread's row: its agent's icon, its name, then the issue pinned to it, what helps it
 /// and its age; its dot, a × under the pointer.
-fn thread_row(s: &Lemur, host: &str, t: &Session, k: &Kit) -> El {
+fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &List)>, k: &Kit) -> El {
     let c = &k.c;
     let key = key(host, t);
     let (dot, tip, breathes) = s.activity(&key, t, k);
@@ -238,14 +157,28 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, k: &Kit) -> El {
     if t.silent {
         r = r.trailing(icon(&icons::BELL_OFF, 12.0).color(c.icon_faint).help("Makes no notifications"));
     }
+    // The `index`th of `count` in `list`: dragged, it takes another place there.
+    if let Some((index, count, list)) = place {
+        let state = if s.row_drag_list == *list { s.row_drag } else { Reorder::new().gap(1.0) };
+        let list = list.clone();
+        r = r.reorder(&state, index, count, |s: &mut Lemur| &mut s.row_drag, move |s, from, to| s.reorder(list.clone(), from, to));
+    }
     let (open, close, rename, menu) = (key.clone(), key.clone(), key.clone(), key.clone());
     let picked_menu = thread_menu(t);
+    let hovered = place.map(|(.., list)| list.clone());
     r.on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
         .on_close(move |s: &mut Lemur, _| s.confirm_close_of(close.clone()))
         .on_double_click(move |s: &mut Lemur, _| s.ask_name(Ask::Rename { host: rename.0.clone(), session: rename.1.clone() }))
         .build(k)
         .key(format!("row-{}-{}", key.0, key.1))
         .opacity(if t.away { 0.6 } else { 1.0 })
+        // The lists share one drag: it goes to the one under the pointer as it starts.
+        .on_hover_change(move |s: &mut Lemur, inside, tx: &mut Tx| {
+            if let Some(list) = hovered.clone().filter(|_| inside && s.row_drag.dragging().is_none()) {
+                s.row_drag_list = list;
+                tx.live_only();
+            }
+        })
         .on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
             let key = menu.clone();
             tx.popup_menu(picked_menu.clone(), press, move |s: &mut Lemur, picked, _| {
@@ -260,7 +193,7 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, k: &Kit) -> El {
 /// right-click menu can forget it instead.
 fn gone_row(t: &ClaudeThread, k: &Kit) -> El {
     let (resume, forget, row_resume) = (t.clone(), t.clone(), t.clone());
-    let play = small_button(&icons::PLAY, "Its session is gone: resume Claude", k)
+    let play = icons::button(&icons::PLAY, "Its session is gone: resume Claude")
         .on_press(move |s: &mut Lemur| s.resume(vec![resume.clone()]))
         .build(k);
     SidebarRow::new(t.shown())
@@ -284,32 +217,24 @@ fn gone_row(t: &ClaudeThread, k: &Kit) -> El {
 
 /// A list's threads, then those put away under a row that opens them, then those gone.
 fn threads(s: &Lemur, host: &str, worktree: Option<&str>, sessions: &[Session], gone: &[ClaudeThread], k: &Kit) -> Vec<El> {
-    let list_key = format!("{host}\n{}", worktree.unwrap_or_default());
     let (away, shown): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|t| t.away);
     // Those put away come last in a list, so the rest keep their places for dragging.
     let count = shown.len();
     let list: List = (host.to_string(), worktree.map(str::to_string));
-    let mut rows: Vec<El> = shown
-        .into_iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let list = list.clone();
-            draggable(s, thread_row(s, host, t, k), &list_key, i, count, move |s, from, to| s.reorder(list.clone(), from, to), k)
-        })
-        .collect();
+    let mut rows: Vec<El> = shown.into_iter().enumerate().map(|(i, t)| thread_row(s, host, t, Some((i, count, &list)), k)).collect();
     if !away.is_empty() {
-        let open = s.away_open.contains(&list_key);
-        let toggle = list_key.clone();
+        let open = s.away_open.contains(&list);
+        let toggle = list.clone();
         rows.push(
             SidebarRow::new(format!("Put away ({})", away.len()))
                 .depth(1)
                 .on_select(move |s: &mut Lemur, _| s.toggle_away_list(toggle.clone()))
                 .build(k)
-                .key(format!("away-{list_key}"))
+                .key(format!("away-{host}-{}", worktree.unwrap_or_default()))
                 .opacity(0.7),
         );
         if open {
-            rows.extend(away.into_iter().map(|t| thread_row(s, host, t, k)));
+            rows.extend(away.into_iter().map(|t| thread_row(s, host, t, None, k)));
         }
     }
     rows.extend(gone.iter().map(|t| gone_row(t, k)));
@@ -370,7 +295,7 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
     let path = w.path.clone();
     let (host_s, plus_path, plus_label) = (host.to_string(), w.path.clone(), label.clone());
     let plus_menu = worktree_menu(base, w, hidden, false);
-    let plus = small_button(&icons::PLUS, "New terminal or Claude here, or notes", k)
+    let plus = icons::button(&icons::PLUS, "New terminal or Claude here, or notes")
         .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
             let (host, path, label) = (host_s.clone(), plus_path.clone(), plus_label.clone());
             tx.popup_menu(plus_menu.clone(), format!("plus-{path}"), move |s: &mut Lemur, picked, _| {
@@ -449,13 +374,13 @@ fn project_picked(s: &mut Lemur, picked: &str, index: usize) {
 
 /// A host's row in Other: its name, and + to start a terminal or an agent in its home.
 fn host_row(s: &Lemur, name: &str, home: &str, k: &Kit) -> El {
-    let local = s.cfg.host(name).is_some_and(|c| crate::remote::Remote::new(c).is_local());
-    let glyph = if local { &icons::MONITOR } else { &icons::SERVER };
-    let mut r = SidebarRow::new(if local { "This Mac".to_string() } else { name.to_string() }).icon(glyph);
+    let host = s.cfg.host(name);
+    let glyph = host.map_or(&icons::SERVER, super::picker::host_icon);
+    let mut r = SidebarRow::new(host.map_or_else(|| name.to_string(), super::picker::host_label)).icon(glyph);
     // In its home, once its script has said where that is.
     if !home.is_empty() {
         let (host, dir) = (name.to_string(), home.to_string());
-        let plus = small_button(&icons::PLUS, "New terminal or Claude here", k)
+        let plus = icons::button(&icons::PLUS, "New terminal or Claude here")
             .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
                 let (host, dir) = (host.clone(), dir.clone());
                 tx.popup_menu(new_menu(), format!("host-plus-{host}"), move |s: &mut Lemur, picked, _| {
@@ -481,9 +406,9 @@ pub fn sidebar(s: &Lemur, k: &Kit) -> El {
         .gap(2.0)
         .center_y()
         .child(text("Lemur").font(k.ty.ui_medium).color(c.text_base).grow(1.0))
-        .child(small_button(&icons::SEARCH, "Go to thread (⌘P)", k).on_press(|s: &mut Lemur| s.find_thread()).build(k).key("find-thread"))
-        .child(small_button(&icons::PLUS, "Add project (⌘O)", k).on_press(|s: &mut Lemur| s.open_picker()).build(k).key("add-folder"))
-        .child(small_button(&icons::REFRESH, "Refresh", k).on_press(|s: &mut Lemur| s.refresh()).build(k).key("refresh"));
+        .child(icons::button(&icons::SEARCH, "Go to thread (⌘P)").on_press(|s: &mut Lemur| s.find_thread()).build(k).key("find-thread"))
+        .child(icons::button(&icons::PLUS, "Add project (⌘O)").on_press(|s: &mut Lemur| s.open_picker()).build(k).key("add-folder"))
+        .child(icons::button(&icons::REFRESH, "Refresh").on_press(|s: &mut Lemur| s.refresh()).build(k).key("refresh"));
     let mut sb = Sidebar::new().label("Threads").row_gap(1.0).header(header);
     if !s.loaded {
         sb = sb.child(SidebarRow::new("Loading sessions…").build(k).key("loading").opacity(0.6));
@@ -521,7 +446,7 @@ pub fn sidebar(s: &Lemur, k: &Kit) -> El {
         if !hidden.is_empty() {
             rows.push(
                 SidebarRow::new("Hidden")
-                    .trailing(icon(&icons::CHEVRON_DOWN, 12.0).color(c.icon_faint).icon_rotation(if base.hidden_open { 0.0 } else { -1.5708 }))
+                    .trailing(super::meter::chevron(!base.hidden_open, k))
                     .on_select(move |s: &mut Lemur, _| s.toggle_hidden(index))
                     .build(k)
                     .key(format!("hidden-{index}"))
@@ -531,7 +456,7 @@ pub fn sidebar(s: &Lemur, k: &Kit) -> El {
                 rows.extend(hidden);
             }
         }
-        let menu_button = small_button(&icons::ELLIPSIS, "Project", k)
+        let menu_button = icons::button(&icons::ELLIPSIS, "Project")
             .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| {
                 tx.popup_menu(project_menu(s, index), format!("project-menu-{index}"), move |s: &mut Lemur, picked, _| {
                     if let Some(p) = picked {
@@ -632,7 +557,6 @@ impl Lemur {
     /// Opens the notes panel on a worktree's notes.
     pub fn open_notes(&mut self, host: &str, worktree: &str, label: &str) {
         self.show_notes(host, worktree, label);
-        self.right = Some(Right::Notes);
         self.right_last = Right::Notes;
         self.inspector.set_open(true);
     }

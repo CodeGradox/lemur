@@ -10,7 +10,7 @@ use super::{Key, Lemur, icons, key, sessions, worktree_label};
 use crate::snapshot::{Activity, Helper, Session};
 use rune::{El, ScrollSpec, col, row, text};
 use rune_kit::shell::{RowStatus, SidebarRow};
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::Kit;
 
 impl Lemur {
     /// The agents' threads, and threads running helpers, as the panel lists
@@ -62,12 +62,7 @@ impl Lemur {
             return;
         }
         let at = self.active.as_ref().and_then(|a| agents.iter().position(|k| k == a));
-        let n = agents.len();
-        let next = match (at, back) {
-            (Some(i), false) => (i + 1) % n,
-            (Some(i), true) => (i + n - 1) % n,
-            (None, _) => 0,
-        };
+        let next = at.map_or(0, |i| super::card::step(i, agents.len(), back));
         let (host, session) = agents[next].clone();
         self.open(host, session);
     }
@@ -103,9 +98,6 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
     col().key("agents-panel").w_full().h_full().min_h(0.0).child(body)
 }
 
-fn small_button(glyph: &'static rune::Icon, label: &str) -> IconButton {
-    IconButton::new(glyph).variant(IconButtonVariant::GhostMuted).control_size(ControlSize::Small).label(label).help(label)
-}
 
 /// An agent's thread: its name, where it runs, and what it's doing, in words
 /// too when that's for you to see to.
@@ -131,7 +123,7 @@ fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
     if !shown {
         let peek = key.clone();
         trailing = trailing.child(
-            small_button(&icons::EYE, "Peek at it")
+            icons::button(&icons::EYE, "Peek at it")
                 .on_press(move |s: &mut Lemur| s.peek(peek.clone()))
                 .build(k)
                 .key(format!("agent-{i}-peek"))
@@ -141,7 +133,7 @@ fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
     // On hover, and always once silenced: that's worth seeing.
     if t.agent().is_some() {
         let (silence, silent) = (key.clone(), t.silent);
-        let bell = small_button(if silent { &icons::BELL_OFF } else { &icons::BELL }, silence_label(silent))
+        let bell = icons::button(if silent { &icons::BELL_OFF } else { &icons::BELL }, silence_label(silent))
             .on_press(move |s: &mut Lemur| s.set_silent(silence.clone(), !silent))
             .build(k)
             .key(format!("agent-{i}-silence"));

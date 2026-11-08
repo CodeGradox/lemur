@@ -3,6 +3,7 @@
 //! all). What's typed narrows them down; ↑↓ picks one and ⏎ opens it. Also what starts at
 //! once, without a name: a terminal (⌘T) or an agent, and the menu offering them.
 
+use super::card;
 use super::icons;
 use super::snackbar::Kind;
 use super::{Key, Lemur, sessions, worktree_label};
@@ -69,7 +70,7 @@ enum Done {
 }
 
 /// A field showing `text`, all of it selected so typing replaces it, with the keyboard.
-fn field(text: &str) -> TextEdit {
+pub(super) fn field(text: &str) -> TextEdit {
     let mut e = TextEdit::new(text);
     e.anchor = 0;
     e.focused = true;
@@ -110,12 +111,10 @@ impl Lemur {
             _ => None,
         };
         self.prompt = Some(Prompt { what, input: field(&name), branch, branches: vec![], from: None, error: None, go: None });
-        self.typing = true;
     }
 
     pub fn close_prompt(&mut self) {
         self.prompt = None;
-        self.typing = false;
     }
 
     /// ⌘J: asks for a new agent's thread or shell where the one on show runs: its worktree,
@@ -125,14 +124,8 @@ impl Lemur {
             return;
         }
         let Some(key) = self.active.clone() else { return };
-        let (dir, base) = match self.project_of(&key.0, &key.1) {
-            Some((base, worktree)) => (worktree.path.clone(), Some(base)),
-            None => match self.session_of(&key) {
-                Some(s) => (s.path.clone(), None),
-                // Not listed yet: there's no telling where it runs.
-                None => return self.ask_name(Ask::Find),
-            },
-        };
+        // Not listed yet: there's no telling where it runs.
+        let Some((dir, base)) = self.place_of(&key) else { return self.ask_name(Ask::Find) };
         self.ask_name(Ask::NewThread { host: key.0, base, dir, agent: Some(Agent::Claude) });
     }
 
@@ -230,7 +223,7 @@ impl Lemur {
             }
             _ => 0,
         };
-        let next = if back { (now + total - 1) % total } else { (now + 1) % total };
+        let next = card::step(now, total, back);
         if next < kinds {
             if let Some(prompt) = &mut self.prompt {
                 prompt.go = None;
@@ -284,14 +277,13 @@ impl Lemur {
             return;
         }
         let Some(Prompt { what, .. }) = self.prompt.take() else { return };
-        self.typing = false;
         let cfg = self.cfg.clone();
         let doing = match &what {
             Ask::Rename { .. } => "renaming",
             Ask::Find => return,
             _ => "starting",
         };
-        self.status = Some((format!("{doing} {name}…"), Kind::Progress));
+        let said = self.busy(format!("{doing} {name}…"));
         self.in_background(
             move || match what {
                 // The name is the worktree's: its thread shows what its program calls it.
@@ -307,19 +299,16 @@ impl Lemur {
                     actions::rename_session(&cfg, &host, &session, &name).map(|session| Done::Renamed { host, session, name })
                 }
             },
-            |s, done| {
+            move |s, done| {
+                s.done(&said);
                 match done {
                     Ok(Done::Started(started, note)) => {
-                        s.status = note.map(|note| (note, Kind::Warning));
-                        if let Some(claude) = started.claude {
-                            s.keep_thread(claude);
+                        if let Some(note) = note {
+                            s.status = Some((note, Kind::Warning));
                         }
-                        s.open_fresh(started.host, started.session);
+                        s.started(started);
                     }
-                    Ok(Done::Renamed { host, session, name }) => {
-                        s.status = None;
-                        s.follow_rename(host, session, name);
-                    }
+                    Ok(Done::Renamed { host, session, name }) => s.follow_rename(host, session, name),
                     Err(e) => s.fail(e),
                 }
                 s.refresh();
@@ -364,13 +353,7 @@ impl Lemur {
             return;
         }
         let Some(key) = self.active.clone() else { return };
-        let dir = match self.worktree_of(&key.0, &key.1) {
-            Some((worktree, _)) => worktree,
-            None => match self.session_of(&key) {
-                Some(s) => s.path.clone(),
-                None => return,
-            },
-        };
+        let Some((dir, _)) = self.place_of(&key) else { return };
         self.start_now(key.0, dir, None);
     }
 
@@ -378,24 +361,27 @@ impl Lemur {
     /// runs, and shows it.
     pub fn start_now(&mut self, host: String, dir: String, agent: Option<Agent>) {
         let label = default_label(agent);
-        self.status = Some((format!("starting {label}…"), Kind::Progress));
+        let said = self.busy(format!("starting {label}…"));
         let cfg = self.cfg.clone();
         self.in_background(
             move || actions::start_in(&cfg, &host, &dir, label, agent),
-            |s, started| {
+            move |s, started| {
+                s.done(&said);
                 match started {
-                    Ok(started) => {
-                        s.status = None;
-                        if let Some(claude) = started.claude {
-                            s.keep_thread(claude);
-                        }
-                        s.open_fresh(started.host, started.session);
-                    }
+                    Ok(started) => s.started(started),
                     Err(e) => s.fail(e),
                 }
                 s.refresh();
             },
         );
+    }
+
+    /// A thread was started: it's kept to resume if it's Claude's, and shows.
+    fn started(&mut self, started: actions::Started) {
+        if let Some(claude) = started.claude {
+            self.keep_thread(claude);
+        }
+        self.open_fresh(started.host, started.session);
     }
 }
 
@@ -471,39 +457,8 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
         Ask::Rename { host, session } => (&icons::PENCIL, format!("Rename {}", s.label_of(host, session)), "⏎ rename · esc cancel"),
     };
     let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
-    let pick_row = |id: String, label: String, detail: Option<String>, lead: El, picked: bool| {
-        let mut r = row()
-            .key(id)
-            .px(8.0)
-            .h(28.0)
-            .gap(8.0)
-            .center_y()
-            .radius(k.radius.sm)
-            .cursor(rune::Cursor::Pointer)
-            .child(lead)
-            .child(text(label).font(k.ty.ui).color(if picked { c.text_contrast } else { c.text_base }));
-        if let Some(d) = detail {
-            r = r.child(text(d).font(k.ty.small).color(if picked { c.text_contrast } else { c.text_faint }).truncate());
-        }
-        if picked { r.fill(c.bg_accent) } else { k.interactive(r) }
-    };
-    let mut card = col()
-        .key("spotlight")
-        .w(560.0)
-        .radius(k.radius.lg)
-        .fill(c.surface_raised)
-        .border(1.0, c.border_base)
-        .shadow(12.0, 40.0, c.scrim)
-        .clip_rounded(k.radius.lg)
-        .child(
-            row()
-                .px(12.0)
-                .h(34.0)
-                .gap(8.0)
-                .center_y()
-                .child(icon(glyph, 14.0).color(c.icon_muted))
-                .child(text(what).font(k.ty.ui_medium).color(c.text_base).truncate()),
-        );
+    let pick_row = |id: String, label: String, detail: Option<String>, lead: El, picked: bool| card::pick_row(id, Some(lead), label, detail, None, picked, k);
+    let mut card = card::surface("spotlight", card::WIDTH, k).child(card::title("spotlight-title", glyph, what, k));
     if is_new {
         let mut kinds = col().key("kinds").padding(4.0).gap(2.0);
         for (i, agent) in KINDS.iter().enumerate() {
@@ -518,7 +473,7 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
                     .on_press(move |s: &mut Lemur| s.pick_kind(a)),
             );
         }
-        card = card.child(kinds).child(rune::el().w_full().h(1.0).fill(c.border_weak));
+        card = card.child(kinds).child(card::divider(k));
     }
     let input = TextInput::new(&prompt.input)
         .placeholder(if prompt.what == Ask::Find { "Go to a thread…" } else { "name" })
@@ -536,15 +491,11 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
                 s.step(false);
                 true
             }
-            K::Escape => {
-                s.close_prompt();
-                true
-            }
             _ => false,
         })
         .build(k)
         .key("spotlight-input");
-    card = card.child(row().px(8.0).py(6.0).child(input));
+    card = card.child(card::field(input));
     if listed {
         let matches = s.matches(prompt);
         if !matches.is_empty() {
@@ -562,7 +513,7 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
                         }),
                 );
             }
-            card = card.child(rune::el().w_full().h(1.0).fill(c.border_weak)).child(rows);
+            card = card.child(card::divider(k)).child(rows);
         }
     }
     if let Some(branch) = &prompt.branch {
@@ -603,13 +554,5 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
         Some((e, _)) => (e.clone(), true),
         None => (hint.to_string(), false),
     };
-    card.child(
-        row()
-            .key("spotlight-footer")
-            .px(12.0)
-            .h(28.0)
-            .center_y()
-            .fill(c.layer_01)
-            .child(text(footer).font(k.ty.small).color(if error { c.danger.fg } else { c.text_faint }).truncate()),
-    )
+    card.child(card::footer("spotlight-footer", footer, error, k))
 }

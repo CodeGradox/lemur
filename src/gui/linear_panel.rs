@@ -59,8 +59,6 @@ pub struct LinearPanel {
     /// Linear is being asked for yours, or for a pinned issue.
     asking_mine: bool,
     asking_issue: bool,
-    /// The search field had the keyboard at the last frame.
-    had_keyboard: bool,
     /// Linear's page asking you to approve Lemur, opened in the browser before the next
     /// frame: Settings' button has no `Tx` to open it with.
     approve: Option<String>,
@@ -81,7 +79,6 @@ impl Default for LinearPanel {
             issues: HashMap::new(),
             asking_mine: false,
             asking_issue: false,
-            had_keyboard: false,
             approve: None,
         }
     }
@@ -103,7 +100,7 @@ impl Lemur {
     /// the first snapshot comes in, it asks whether the sign-in kept still works.
     pub(super) fn follow_linear(&mut self) {
         self.check_linear();
-        if self.right != Some(Right::Linear) {
+        if self.right() != Some(Right::Linear) {
             return;
         }
         let thread = self.active.clone().map(|key| {
@@ -209,7 +206,6 @@ impl Lemur {
     }
 
     /// What Settings says of Lemur's Linear sign-in, and why the last went wrong, if it did.
-    #[allow(dead_code)]
     pub(super) fn linear_account_status(&self) -> (String, Option<String>) {
         match &self.panels.linear.account {
             Account::Checking => ("Checking…".into(), None),
@@ -222,7 +218,6 @@ impl Lemur {
 
     /// What Settings offers for the sign-in, and what that runs: Sign out signed in, Cancel
     /// signing in, else Sign in.
-    #[allow(dead_code)]
     pub(super) fn linear_account_action(&self) -> (&'static str, fn(&mut Lemur)) {
         match &self.panels.linear.account {
             Account::SignedIn(_) => ("Sign out", Lemur::sign_out_linear),
@@ -357,25 +352,12 @@ impl Lemur {
         if let Some(thread) = kept {
             self.keep_thread(ClaudeThread { issue: issue.clone(), ..thread });
         }
-        self.changes += 1;
         self.follow_linear();
-        let cfg = self.cfg.clone();
-        self.in_background(
-            move || actions::set_issue(&cfg, &key.0, &key.1, issue.as_deref()),
-            |s, saved| {
-                // Refreshes that started before herdr-core had it are stale too.
-                s.changes += 1;
-                if let Err(e) = saved {
-                    s.fail(e);
-                }
-                s.refresh();
-            },
-        );
+        self.write_core(move |cfg| actions::set_issue(cfg, &key.0, &key.1, issue.as_deref()));
     }
 
     /// A link to a Linear issue pasted into a thread pins that issue to it, unless it has
     /// one.
-    #[allow(dead_code)]
     pub(super) fn pasted(&mut self, key: &Key, text: &str) {
         let Some(issue) = linear::issue_in(text) else { return };
         if self.session_of(key).is_some_and(|s| s.issue.is_none()) {
@@ -392,24 +374,24 @@ impl Lemur {
         tx.blur();
     }
 
+    /// The search field has the keyboard.
+    pub(super) fn linear_editing(&self) -> bool {
+        self.right() == Some(Right::Linear) && self.panels.linear.query.focused
+    }
+
     /// Before each frame: Linear's page to approve Lemur opens in the browser, and the
-    /// search field took the keyboard, or gave it back to a click elsewhere or the panel
-    /// hidden. True if that changed anything.
+    /// search field, hidden, lets go of the keyboard, so it doesn't take it back as it
+    /// shows again. True if that changed anything.
     pub(super) fn linear_poll(&mut self, tx: &mut Tx) -> bool {
+        let shown = self.right() == Some(Right::Linear);
         let p = &mut self.panels.linear;
         if let Some(url) = p.approve.take() {
             let _ = tx.open_url(&url);
         }
-        let has = self.right == Some(Right::Linear) && p.query.focused;
-        if has == p.had_keyboard {
+        if shown || !p.query.focused {
             return false;
         }
-        p.had_keyboard = has;
-        // Hidden, it doesn't take the keyboard back as it shows again.
-        if !has {
-            p.query.focused = false;
-        }
-        self.typing = has;
+        p.query.focused = false;
         true
     }
 }
@@ -583,17 +565,7 @@ fn signed_out(state: &Account, k: &Kit) -> El {
 pub fn view(s: &Lemur, k: &Kit) -> El {
     let p = &s.panels.linear;
     let c = &k.c;
-    let title = match &p.thread {
-        Some((_, label, _)) => format!("Linear · {label}"),
-        None => "Linear".to_string(),
-    };
-    let header = row()
-        .key("linear-head")
-        .w_full()
-        .h(40.0)
-        .px(12.0)
-        .center_y()
-        .child(text(title).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0).shrink());
+    let header = super::panels::header("linear-head", None, "Linear", p.thread.as_ref().map(|(_, l, _)| l.as_str()), 0, k);
     let panel = col().key("linear-panel").w_full().h_full().min_h(0.0).child(header);
     if !p.signed_in() {
         return panel.child(signed_out(&p.account, k));

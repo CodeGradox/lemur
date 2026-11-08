@@ -4,7 +4,7 @@
 //! it as a label on the terminal (`lemur.away`), so it stays away across
 //! restarts, and from any Mac.
 
-use super::{Key, Lemur, key};
+use super::{Key, Lemur, List, key};
 use crate::actions;
 use crate::config::ThreadOrder;
 use crate::snapshot::Session;
@@ -37,7 +37,7 @@ impl Lemur {
     }
 
     /// Opens or folds the "Put away" of the list `list`.
-    pub(super) fn toggle_away_list(&mut self, list: String) {
+    pub(super) fn toggle_away_list(&mut self, list: List) {
         if !self.away_open.remove(&list) {
             self.away_open.insert(list);
         }
@@ -66,20 +66,7 @@ impl Lemur {
     }
 
     fn save_away(&mut self, (host, session): Key, away: bool) {
-        self.changes += 1;
-                let cfg = self.cfg.clone();
-        self.in_background(
-            move || actions::set_away(&cfg, &host, &session, away),
-            |this, saved| {
-                // Refreshes that started before herdr-core had it are stale.
-                this.changes += 1;
-                if let Err(e) = saved {
-                    this.fail(e);
-                }
-                this.refresh();
-            },
-        )
-        ;
+        self.write_core(move |cfg| actions::set_away(cfg, &host, &session, away));
     }
 
     /// The threads put away that need you now: they come back.

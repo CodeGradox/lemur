@@ -16,10 +16,10 @@ use super::{Key, Lemur, Right, icons};
 use crate::notes;
 use edits::Edit;
 use rune::{
-    Chord, Color, El, Family, Key as K, KeyEvent, Link, LinkPaint, Mods, ScrollSpec, Span, TextEdit, TextStyle, Tx, col, el, icon, memo, row, text,
+    Chord, Color, El, Family, Key as K, KeyEvent, Link, LinkPaint, Mods, ScrollSpec, Span, TextEdit, TextStyle, Tx, col, memo, text,
     text_input,
 };
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::Kit;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -38,8 +38,6 @@ pub struct Notes {
     wait: Option<Key>,
     /// ⌘ is down: URLs and boxes are links.
     cmd: bool,
-    /// The editor has the keyboard, as the view last told.
-    keyboard: bool,
 }
 
 struct Shown {
@@ -65,7 +63,6 @@ impl Notes {
             error: None,
             wait: None,
             cmd: false,
-            keyboard: false,
         }
     }
 
@@ -159,15 +156,11 @@ impl Lemur {
     /// them.
     pub(super) fn notes_hidden(&mut self) {
         self.panels.notes.edit.focused = false;
-        self.notes_keyboard(false);
     }
 
-    /// The editor took the keyboard, or gave it back to the terminal.
-    fn notes_keyboard(&mut self, on: bool) {
-        if self.panels.notes.keyboard != on {
-            self.panels.notes.keyboard = on;
-            self.typing = on;
-        }
+    /// The editor has the keyboard.
+    pub(super) fn notes_editing(&self) -> bool {
+        self.right() == Some(Right::Notes) && self.panels.notes.edit.focused
     }
 
     /// The notes' keys besides the editor's: Enter goes on with a list, Tab
@@ -270,20 +263,9 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
     let c = &k.c;
     let n = &s.panels.notes;
     // Folded away, the notes leave the keyboard to the terminal.
-    let on_show = s.right == Some(Right::Notes);
-    let title = match &n.shown {
-        Some(shown) => format!("Notes · {}", shown.label),
-        None => "Notes".to_string(),
-    };
-    let mut header = row()
-        .key("notes-header")
-        .w_full()
-        .h(40.0)
-        .px(12.0)
-        .gap(8.0)
-        .center_y()
-        .child(icon(&icons::FILE_TEXT, 14.0).color(c.icon_muted))
-        .child(text(title).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0));
+    let on_show = s.right() == Some(Right::Notes);
+    let label = n.shown.as_ref().map(|shown| shown.label.as_str());
+    let mut header = super::panels::header("notes-header", Some(&icons::FILE_TEXT), "Notes", label, 0, k);
     if n.shown.is_some() {
         header = header
             .child(list_button("notes-bullets", &icons::LIST, "Bullet list", false, k))
@@ -301,25 +283,11 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
         panel = panel
             .child(col().key("notes-error").w_full().px(12.0).py(8.0).child(text(error.clone()).font(k.ty.small).color(c.danger.fg).wrap()));
     }
-    // Tells the state when the editor takes the keyboard or gives it back:
-    // each mounts once it changes, as `view`'s appearance probe does.
-    let keyboard = n.edit.focused && on_show;
-    let probe = el()
-        .key(if keyboard { "notes-keyboard-on" } else { "notes-keyboard-off" })
-        .size(1.0, 1.0)
-        .absolute(0.0, 0.0)
-        .opacity(0.0)
-        .a11y_hidden()
-        .on_layout(move |s: &mut Lemur, _| s.notes_keyboard(keyboard));
-    panel.child(probe)
+    panel
 }
 
 fn list_button(key: &str, glyph: &'static rune::Icon, tip: &str, boxed: bool, k: &Kit) -> El {
-    IconButton::new(glyph)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tip)
-        .help(tip)
+    icons::button(glyph, tip)
         .on_press(move |s: &mut Lemur| s.notes_bullet(boxed))
         .build(k)
         .key(key)
