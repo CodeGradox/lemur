@@ -7,10 +7,8 @@
 use super::Lemur;
 use crate::config::Host;
 use crate::remote::{Remote, sh_path};
-use gpui_kit::component::ActiveTheme;
-use gpui_kit::component::h_flex;
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::*;
+use rune::{El, row, text};
+use rune_kit::Kit;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -36,7 +34,7 @@ pub(super) struct Changes {
 
 impl Lemur {
     /// Asks the worktree on show for its changes, in the background.
-    pub(super) fn ask_changes(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn ask_changes(&mut self) {
         let Some((host, w)) = self.active_worktree() else {
             return;
         };
@@ -49,55 +47,37 @@ impl Lemur {
         }
         let path = place.1.clone();
         self.in_background(
-            cx,
             move || diff_in(&host, &path),
-            move |this, diff, _, cx| {
+            move |this, diff| {
                 this.diffs.asking.remove(&place);
                 // Not a repository, or no answer: nothing to show.
                 match diff {
                     Some(diff) => this.diffs.known.insert(place, diff),
                     None => this.diffs.known.remove(&place),
                 };
-                cx.notify();
             },
-        )
-        .detach();
+        );
     }
 
     /// "+12 -3" for the worktree on show, once known and while it has
     /// changes; how many files on hover.
-    pub(super) fn changes_item(&self, host: &str, path: &str, cx: &App) -> Option<AnyElement> {
-        let diff = *self
-            .diffs
-            .known
-            .get(&(host.to_string(), path.to_string()))?;
+    pub(super) fn changes_item(&self, host: &str, path: &str, k: &Kit) -> Option<El> {
+        let diff = *self.diffs.known.get(&(host.to_string(), path.to_string()))?;
         if diff.files == 0 {
             return None;
         }
-        let theme = cx.theme();
-        let tip: SharedString = format!(
+        let tip = format!(
             "{} file{} changed since the last commit, staged or not. Files git doesn't track yet aren't counted.",
             diff.files,
             if diff.files == 1 { "" } else { "s" }
-        )
-        .into();
+        );
         Some(
-            h_flex()
-                .id("changes")
-                .debug_selector(|| "changes".into())
-                .gap_1()
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                .child(
-                    div()
-                        .text_color(theme.success)
-                        .child(format!("+{}", diff.added)),
-                )
-                .child(
-                    div()
-                        .text_color(theme.danger)
-                        .child(format!("-{}", diff.removed)),
-                )
-                .into_any_element(),
+            row()
+                .key("changes")
+                .gap(4.0)
+                .help(tip)
+                .child(text(format!("+{}", diff.added)).font(k.ty.small).color(k.c.success.fg))
+                .child(text(format!("-{}", diff.removed)).font(k.ty.small).color(k.c.danger.fg)),
         )
     }
 }

@@ -1,558 +1,622 @@
-//! An attached terminal's screen: the bytes herdr-core relays, parsed by
-//! alacritty_terminal into a grid. Knows nothing about drawing.
+//! A thread's terminal: attached through herdr-core, its bytes parsed by Ghostty's core
+//! (`grid`), drawn by Rune run by run at their columns. Every opened thread keeps its own,
+//! so switching is instant and scrollback survives.
 
-use crate::config::{Terminal, TerminalColors, parse_hex};
-use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Color, Processor, Rgb, StdSyncHandler};
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use super::grid::{Grid, Row, Size};
+use super::palette::{Palette, hex};
+use super::snackbar::Kind;
+use super::{Key, Lemur};
+use crate::config::Host;
+use crate::hc::{self, Core, Stream};
+use futures::StreamExt;
+use rune::tok::Family;
+use rune::{El, TextStyle, col, el, memo, text};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-#[derive(Clone)]
-pub struct Listener(UnboundedSender<Event>);
+/// The least time between attaching again on its own after a drop.
+const RETRY: Duration = Duration::from_secs(2);
+/// Output is drawn at most this often, about 30 times a second, as Herdr does; right
+/// after typing (`TYPING`), at once.
+pub const OUTPUT_EVERY: Duration = Duration::from_millis(33);
+const TYPING: Duration = Duration::from_millis(200);
+/// How long a terminal's stream stays quiet before its first paint counts as over: at
+/// least this, however quick the line...
+const PAINT_QUIET: Duration = Duration::from_millis(100);
+/// ...and at most this, however slow.
+const PAINT_QUIET_MOST: Duration = Duration::from_secs(1);
+/// How long input waits for it at most.
+const PAINT_LONGEST: Duration = Duration::from_secs(5);
+/// How often a waiting terminal looks.
+pub const PAINT_LOOK: Duration = Duration::from_millis(25);
+/// Points between the grid and the frame's edge.
+pub const PAD: f32 = 8.0;
 
-impl EventListener for Listener {
-    fn send_event(&self, event: Event) {
-        let _ = self.0.unbounded_send(event);
-    }
+/// Where a view is with its terminal's byte stream.
+enum Attachment {
+    /// Input meanwhile waits in `held`.
+    Attaching,
+    /// The core, and the channel the terminal's bytes come on.
+    Attached(Arc<Core>, u32),
+    /// The stream ended: the program exited, or the line dropped.
+    Ended,
 }
 
-/// Grid size in cells, plus the cell size in pixels (for programs that ask).
+/// Input waiting for the terminal to attach and paint.
+enum Held {
+    Bytes(Vec<u8>),
+    Paste(String),
+}
+
+/// The terminal font, and a cell's size in it, in points.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Size {
-    pub cols: u16,
-    pub lines: u16,
-    pub cell_width: u16,
-    pub cell_height: u16,
+pub struct Metrics {
+    pub family: &'static str,
+    pub size: f32,
+    pub cell_w: f32,
+    pub cell_h: f32,
 }
 
-impl Size {
-    pub fn window(self) -> WindowSize {
-        WindowSize {
-            num_lines: self.lines,
-            num_cols: self.cols,
-            cell_width: self.cell_width,
-            cell_height: self.cell_height,
-        }
-    }
-}
-
-impl Dimensions for Size {
-    fn total_lines(&self) -> usize {
-        self.lines as usize
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.lines as usize
-    }
-
-    fn columns(&self) -> usize {
-        self.cols as usize
-    }
-}
-
-/// A terminal's grid, fed what its program prints.
-pub struct Screen {
-    pub term: Arc<FairMutex<Term<Listener>>>,
-    parser: Processor<StdSyncHandler>,
-    events: UnboundedReceiver<Event>,
-    size: Size,
-    /// Lines it keeps above the screen to scroll back through.
-    scrollback: u32,
-}
-
-impl Screen {
-    pub fn new(size: Size, scrollback: u32) -> Screen {
-        let (tx, events) = unbounded();
-        let term = Term::new(config(scrollback), &size, Listener(tx));
-        Screen {
-            term: Arc::new(FairMutex::new(term)),
-            parser: Processor::new(),
-            events,
+impl Metrics {
+    /// The font at `size`, with Menlo's advance (1233 of 2048 units an em) until a probe of
+    /// the real font says otherwise.
+    pub fn new(family: &str, size: f64) -> Metrics {
+        let size = size as f32;
+        Metrics {
+            family: Box::leak(family.to_owned().into_boxed_str()),
             size,
-            scrollback,
+            cell_w: size * 1233.0 / 2048.0,
+            cell_h: (size * 1.3).round(),
         }
     }
 
-    /// Lines it keeps to scroll back through.
-    pub fn scrollback(&self) -> u32 {
-        self.scrollback
+    pub fn style(self, bold: bool) -> TextStyle {
+        TextStyle::new(self.size, if bold { 700.0 } else { 400.0 }).family(Family::Named(self.family)).lh(self.cell_h)
     }
+}
 
-    /// Keeps `lines` to scroll back through from now on; fewer drops the
-    /// oldest.
-    pub fn set_scrollback(&mut self, lines: u32) {
-        if lines != self.scrollback {
-            self.scrollback = lines;
-            self.term.lock().set_options(config(lines));
+pub struct TermView {
+    pub host: Host,
+    pub session: String,
+    pub grid: Option<Grid>,
+    /// The screen an attach paints, once it's attached: until then the last one shows,
+    /// and stays if the attach fails.
+    fresh: Option<Grid>,
+    attachment: Attachment,
+    /// Which attach this view is on: a reader of an earlier one is ignored.
+    attach: u64,
+    /// The stream dropped while its program may still run.
+    lost: bool,
+    tried: Option<Instant>,
+    held: Vec<Held>,
+    /// The core's first paint is over, which it doesn't say: its stream has gone quiet a
+    /// while (see `PAINT_QUIET`).
+    pub painted: bool,
+    last_output: Option<Instant>,
+    attached_at: Option<Instant>,
+    quiet: Duration,
+    pub typed_at: Option<Instant>,
+    pub drawn_at: Option<Instant>,
+    /// Wheel travel short of a whole line, kept for the next.
+    pub scroll_rest: f32,
+    /// The cell a press the program was told about was last at.
+    pub pressed: Option<(u16, u16)>,
+    /// A selection is being dragged out.
+    pub selecting: bool,
+    /// The link under the pointer while ⌘ is held: underlined, and a click opens it.
+    pub hover: Option<super::term_links::Link>,
+    /// What an input method is still composing, shown at the cursor until it's typed.
+    pub marked: Option<String>,
+    /// Shown in the window's snackbars while this terminal is.
+    pub status: Option<(String, Kind)>,
+    /// The cells it's shown at, and what the core was last told: the colours and cell size
+    /// it's shown in, and whether it has the keyboard.
+    pub size: Size,
+    told_display: Option<serde_json::Value>,
+    told_focus: Option<bool>,
+}
+
+impl Drop for TermView {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+impl TermView {
+    fn new(host: Host, session: String, size: Size) -> TermView {
+        TermView {
+            host,
+            session,
+            grid: None,
+            fresh: None,
+            attachment: Attachment::Ended,
+            attach: 0,
+            lost: false,
+            tried: None,
+            held: Vec::new(),
+            painted: false,
+            last_output: None,
+            attached_at: None,
+            quiet: PAINT_QUIET,
+            typed_at: None,
+            drawn_at: None,
+            scroll_rest: 0.0,
+            pressed: None,
+            selecting: false,
+            hover: None,
+            marked: None,
+            status: None,
+            size,
+            told_display: None,
+            told_focus: None,
         }
     }
 
-    /// Feeds in what the program printed.
-    pub fn advance(&mut self, bytes: &[u8]) {
-        let mut term = self.term.lock();
-        self.parser.advance(&mut *term, bytes);
+    /// Its stream ended, so it shows what it last had.
+    pub fn exited(&self) -> bool {
+        matches!(self.attachment, Attachment::Ended)
     }
 
-    /// When an update the program asked to show all at once (synchronized
-    /// output) has to show, even if it never says it's done.
-    pub fn sync_deadline(&self) -> Option<Instant> {
-        self.parser.sync_timeout().sync_timeout()
+    pub fn is_attached(&self) -> bool {
+        matches!(self.attachment, Attachment::Attached(..))
     }
 
-    /// Shows a synchronized update as it stands.
-    pub fn stop_sync(&mut self) {
-        let mut term = self.term.lock();
-        self.parser.stop_sync(&mut *term);
+    /// Whether its stream dropped while its program may still run.
+    pub fn disconnected(&self) -> bool {
+        self.lost && self.exited()
     }
 
-    /// What the terminal had to say since last asked: answers for the
-    /// program, text for the clipboard, ...
-    pub fn events(&mut self) -> Vec<Event> {
-        std::iter::from_fn(|| self.events.try_recv().ok()).collect()
+    fn detach(&mut self) {
+        if let Attachment::Attached(core, channel) = &self.attachment {
+            core.detach(*channel);
+        }
+        self.attachment = Attachment::Ended;
     }
 
-    /// Resizes the grid; false if that's no change.
-    pub fn resize(&mut self, size: Size) -> bool {
-        if size == self.size || size.cols == 0 || size.lines == 0 {
+    /// No longer shown: its program is told it lost focus (vim's FocusLost, Claude's paused
+    /// spinner), as it would be shown again.
+    pub fn hidden(&mut self) {
+        self.tell_focus(false);
+    }
+
+    pub fn tell_focus(&mut self, focused: bool) {
+        if let Attachment::Attached(core, channel) = &self.attachment
+            && self.told_focus != Some(focused)
+        {
+            core.focus(*channel, focused);
+            self.told_focus = Some(focused);
+        }
+    }
+
+    /// Tells the core the colours and cell size it's shown in, which it answers programs
+    /// that ask with, when they change.
+    pub fn tell_display(&mut self, display: serde_json::Value) {
+        if let Attachment::Attached(core, channel) = &self.attachment
+            && self.told_display.as_ref() != Some(&display)
+        {
+            core.facts(*channel, &display);
+            self.told_display = Some(display);
+        }
+    }
+
+    /// Sends what you typed, or holds it while the terminal attaches and paints.
+    pub fn write(&mut self, bytes: Vec<u8>) {
+        self.typed_at = Some(Instant::now());
+        match &self.attachment {
+            Attachment::Attached(core, channel) if self.painted => core.input(*channel, &bytes),
+            Attachment::Attaching | Attachment::Attached(..) => self.held.push(Held::Bytes(bytes)),
+            Attachment::Ended => {}
+        }
+    }
+
+    /// Pastes `text` as if typed, bracketed when the program asked for it.
+    pub fn paste_text(&mut self, text: &str) {
+        let waiting = match &self.attachment {
+            Attachment::Attaching => true,
+            Attachment::Attached(..) => !self.painted,
+            Attachment::Ended => false,
+        };
+        if waiting {
+            self.held.push(Held::Paste(text.to_string()));
+            return;
+        }
+        let bracketed = self.grid.as_ref().is_some_and(Grid::bracketed_paste);
+        self.write(super::keys::paste(text, bracketed));
+    }
+
+    /// Typed: the view goes back to the bottom, where output shows.
+    pub fn send(&mut self, bytes: Vec<u8>) {
+        if let Some(g) = &mut self.grid {
+            g.scroll_to_bottom();
+            g.clear_selection();
+        }
+        self.write(bytes);
+    }
+
+    fn send_held(&mut self) {
+        if !self.is_attached() {
+            return;
+        }
+        for input in std::mem::take(&mut self.held) {
+            match input {
+                Held::Bytes(bytes) => self.write(bytes),
+                Held::Paste(text) => self.paste_text(&text),
+            }
+        }
+    }
+
+    /// Feeds relayed bytes in; false once the stream is over.
+    fn ingest(&mut self, batch: Vec<Stream>) -> bool {
+        let Some(grid) = &mut self.grid else { return false };
+        let mut open = true;
+        // Its program ended: the thread goes from the sidebar, and this with it.
+        let mut over = false;
+        for item in batch {
+            match item {
+                Stream::Data(bytes) => {
+                    grid.write(&bytes);
+                    if let Attachment::Attached(core, channel) = &self.attachment {
+                        core.credit(*channel, bytes.len());
+                    }
+                    self.last_output = Some(Instant::now());
+                }
+                Stream::Closed(why) => {
+                    open = false;
+                    over = matches!(why["reason"].as_str(), Some("exited" | "killed"));
+                }
+                Stream::Lost => open = false,
+            }
+        }
+        let replies = grid.take_replies();
+        if !replies.is_empty() {
+            self.write(replies);
+        }
+        if !open {
+            self.attachment = Attachment::Ended;
+            self.lost = !over;
+            self.status = (!over).then(|| ("disconnected · reconnecting…".into(), Kind::Warning));
+        }
+        open
+    }
+
+    /// Whether the first paint is over, as `PAINT_QUIET` says; it then sends what waited.
+    /// True while it's still waiting.
+    fn check_paint(&mut self) -> bool {
+        if self.painted || !self.is_attached() {
             return false;
         }
-        self.size = size;
-        self.term.lock().resize(size);
-        true
+        let over = self.last_output.is_some_and(|t| t.elapsed() >= self.quiet)
+            || self.attached_at.is_some_and(|t| t.elapsed() >= PAINT_LONGEST);
+        if over {
+            self.painted = true;
+            self.send_held();
+        }
+        !over
     }
 
-    #[cfg(test)]
-    pub fn size(&self) -> Size {
-        self.size
-    }
-}
-
-/// alacritty's settings for a terminal keeping `scrollback` lines.
-fn config(scrollback: u32) -> Config {
-    Config {
-        scrolling_history: scrollback as usize,
-        ..Config::default()
-    }
-}
-
-/// Terminal colors for one appearance. Programs can override any entry
-/// with OSC 4/10/11.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Palette {
-    ansi: [Rgb; 16],
-    pub foreground: Rgb,
-    pub background: Rgb,
-    cursor: Rgb,
-}
-
-/// One color a palette sets.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Slot {
-    Foreground,
-    Background,
-    Cursor,
-    /// 0-7 normal, 8-15 bright: black, red, green, yellow, blue, magenta,
-    /// cyan, white.
-    Ansi(usize),
-}
-
-/// Every slot with its name, as Settings lists them.
-pub const SLOTS: [(Slot, &str); 19] = [
-    (Slot::Background, "Background"),
-    (Slot::Foreground, "Foreground"),
-    (Slot::Cursor, "Cursor"),
-    (Slot::Ansi(0), "Black"),
-    (Slot::Ansi(1), "Red"),
-    (Slot::Ansi(2), "Green"),
-    (Slot::Ansi(3), "Yellow"),
-    (Slot::Ansi(4), "Blue"),
-    (Slot::Ansi(5), "Magenta"),
-    (Slot::Ansi(6), "Cyan"),
-    (Slot::Ansi(7), "White"),
-    (Slot::Ansi(8), "Bright black"),
-    (Slot::Ansi(9), "Bright red"),
-    (Slot::Ansi(10), "Bright green"),
-    (Slot::Ansi(11), "Bright yellow"),
-    (Slot::Ansi(12), "Bright blue"),
-    (Slot::Ansi(13), "Bright magenta"),
-    (Slot::Ansi(14), "Bright cyan"),
-    (Slot::Ansi(15), "Bright white"),
-];
-
-/// One Half Dark, as the WezTerm scheme of that name.
-pub const DARK: Palette = Palette {
-    ansi: [
-        rgb(0x282c34),
-        rgb(0xe17079),
-        rgb(0x98c379),
-        rgb(0xe5c07b),
-        rgb(0x61afef),
-        rgb(0xc678dd),
-        rgb(0x56b6c2),
-        rgb(0xdcdfe4),
-        rgb(0x8c939f),
-        rgb(0xe17079),
-        rgb(0x98c379),
-        rgb(0xe5c07b),
-        rgb(0x61afef),
-        rgb(0xc678dd),
-        rgb(0x56b6c2),
-        rgb(0xffffff),
-    ],
-    foreground: rgb(0xdcdfe4),
-    background: rgb(0x282c34),
-    cursor: rgb(0x979db4),
-};
-
-/// One Half Light, as the WezTerm scheme of that name.
-pub const LIGHT: Palette = Palette {
-    ansi: [
-        rgb(0x383a42),
-        rgb(0xce4136),
-        rgb(0x318332),
-        rgb(0x986801),
-        rgb(0x356ce5),
-        rgb(0xa626a4),
-        rgb(0x007ab2),
-        rgb(0xa0a1a7),
-        rgb(0x696c77),
-        rgb(0xce4136),
-        rgb(0x318332),
-        rgb(0x986801),
-        rgb(0x356ce5),
-        rgb(0xa626a4),
-        rgb(0x007ab2),
-        rgb(0xfafafa),
-    ],
-    foreground: rgb(0x383a42),
-    background: rgb(0xfafafa),
-    cursor: rgb(0x4f525e),
-};
-
-/// Sets one color of the dark or light palette, or with `None` puts lemur's
-/// own back; the config keeps only what differs from lemur's own.
-pub fn set_color(terminal: &mut Terminal, dark: bool, slot: Slot, color: Option<Rgb>) {
-    let defaults = Palette::default_for(dark);
-    let mut palette = Palette::themed(dark, terminal);
-    palette.set(slot, color.unwrap_or(defaults.get(slot)));
-    let colors = palette.overrides(defaults);
-    if dark {
-        terminal.dark = colors;
-    } else {
-        terminal.light = colors;
+    /// Brings the rows up to the screen, at most every `OUTPUT_EVERY` unless you just
+    /// typed. Some(true) when they changed, Some(false) when nothing waits, None when it's
+    /// to look again in a moment.
+    pub fn draw(&mut self) -> Option<bool> {
+        let grid = self.grid.as_mut()?;
+        if !grid.stale {
+            return Some(false);
+        }
+        let typing = self.typed_at.is_some_and(|t| t.elapsed() < TYPING);
+        let due = self.drawn_at.is_none_or(|t| t.elapsed() >= OUTPUT_EVERY);
+        if !typing && !due {
+            return None;
+        }
+        self.drawn_at = Some(Instant::now());
+        Some(grid.refresh().unwrap_or(false))
     }
 }
 
-/// `#rrggbb`.
-pub fn hex(c: Rgb) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
-}
-
-const fn rgb(hex: u32) -> Rgb {
-    Rgb {
-        r: (hex >> 16) as u8,
-        g: (hex >> 8) as u8,
-        b: hex as u8,
-    }
-}
-
-impl Palette {
-    /// lemur's own colors for dark or light.
-    pub fn default_for(dark: bool) -> &'static Palette {
-        if dark { &DARK } else { &LIGHT }
+impl Lemur {
+    /// The size terminals are shown at now, in cells.
+    pub(super) fn cell_size(&self) -> Size {
+        let m = self.metrics;
+        let (w, h) = self.term_area;
+        let px = |p: f32| (p * 2.0).round() as u16;
+        Size {
+            cols: (((w - 2.0 * PAD) / m.cell_w).floor() as u16).max(2),
+            lines: (((h - 2.0 * PAD) / m.cell_h).floor() as u16).max(1),
+            cell_width: px(m.cell_w),
+            cell_height: px(m.cell_h),
+        }
     }
 
-    /// The colors for dark or light: Settings' over lemur's own.
-    pub fn themed(dark: bool, terminal: &Terminal) -> Palette {
-        let mut palette = *Palette::default_for(dark);
-        let colors = if dark {
-            &terminal.dark
-        } else {
-            &terminal.light
+    pub(super) fn palette(&self) -> Palette {
+        Palette::themed(self.dark, &self.prefs.terminal)
+    }
+
+    /// What the core tells programs that ask about colours and cell size.
+    fn display(&self) -> serde_json::Value {
+        let p = self.palette();
+        let size = self.cell_size();
+        serde_json::json!({
+            "fg": hex(p.foreground),
+            "bg": hex(p.background),
+            "cursor": hex(p.cursor),
+            "cell": [size.cell_width, size.cell_height],
+        })
+    }
+
+    /// The terminal of thread `key` on host `h`, made and attached the first time, and
+    /// attached again once its stream ended.
+    pub(super) fn terminal_for(&mut self, key: &Key, h: Host) {
+        if !self.terminals.contains_key(key) {
+            let view = TermView::new(h, key.1.clone(), self.cell_size());
+            self.terminals.insert(key.clone(), view);
+            self.connect(key);
+        } else if self.terminals.get(key).is_some_and(TermView::exited) {
+            self.connect(key);
+        }
+    }
+
+    /// (Re)attaches `key`'s terminal, e.g. after the line to its host dropped. The core
+    /// paints its screen and scrollback first.
+    pub(super) fn connect(&mut self, key: &Key) {
+        let size = self.cell_size();
+        let scrollback = self.prefs.terminal.scrollback;
+        let palette = self.palette();
+        let display = self.display();
+        let Some(view) = self.terminals.get_mut(key) else { return };
+        view.detach();
+        let Ok(fresh) = Grid::new(size, scrollback, &palette) else { return };
+        match view.grid {
+            Some(_) => view.fresh = Some(fresh),
+            None => view.grid = Some(fresh),
+        }
+        view.size = size;
+        view.attachment = Attachment::Attaching;
+        view.attach += 1;
+        view.painted = false;
+        view.last_output = None;
+        view.held.clear();
+        view.tried = Some(Instant::now());
+        view.told_display = Some(display.clone());
+        view.told_focus = None;
+        // Reconnecting, it still says so until it's back.
+        if !view.lost {
+            view.status = None;
+        }
+        let (host, session, attach) = (view.host.clone(), view.session.clone(), view.attach);
+        let back = self.bg.back();
+        let key = key.clone();
+        let reader_key = key.clone();
+        self.bg.run(
+            move || {
+                // A terminal on a host still being reached can take seconds.
+                let (core, _) = hc::for_host(&host)?;
+                let attached = core.attach(&session, size.cols, size.lines, scrollback, display)?;
+                let channel = attached.channel;
+                // Its bytes, a batch at a time, until the stream ends.
+                let mut stream = attached.stream;
+                std::thread::spawn(move || {
+                    while let Some(first) = futures::executor::block_on(stream.next()) {
+                        let mut batch = vec![first];
+                        while let Ok(more) = stream.try_recv() {
+                            batch.push(more);
+                        }
+                        let key = reader_key.clone();
+                        if !back.send(move |s| s.ingest(&key, attach, batch)) {
+                            return;
+                        }
+                    }
+                });
+                anyhow::Ok((core, channel))
+            },
+            move |s, attached| s.attached(&key, attach, attached),
+        );
+    }
+
+    fn attached(&mut self, key: &Key, attach: u64, result: anyhow::Result<(Arc<Core>, u32)>) {
+        let size = self.cell_size();
+        let active = self.active.as_ref() == Some(key);
+        let focused = self.keyboard_on_terminal();
+        let Some(view) = self.terminals.get_mut(key).filter(|v| v.attach == attach) else {
+            // The view went, or attached again, meanwhile: let this one go.
+            if let Ok((core, channel)) = result {
+                core.detach(channel);
+            }
+            return;
         };
-        let parse = |hex: &Option<String>| hex.as_deref().and_then(parse_hex).map(rgb);
-        let slots = [
-            (Slot::Foreground, &colors.foreground),
-            (Slot::Background, &colors.background),
-            (Slot::Cursor, &colors.cursor),
-        ];
-        for (slot, hex) in slots {
-            if let Some(c) = parse(hex) {
-                palette.set(slot, c);
+        match result {
+            Ok((core, channel)) => {
+                // The terminal takes the size it's shown at: the attach asked for the size
+                // known then, often before the first layout.
+                core.resize(channel, size.cols, size.lines);
+                view.attachment = Attachment::Attached(core, channel);
+                let answered_in = view.tried.map_or(Duration::ZERO, |t| t.elapsed());
+                view.quiet = (answered_in * 2).clamp(PAINT_QUIET, PAINT_QUIET_MOST);
+                view.attached_at = Some(Instant::now());
+                if let Some(mut fresh) = view.fresh.take() {
+                    let _ = fresh.resize(size);
+                    view.grid = Some(fresh);
+                }
+                if std::mem::take(&mut view.lost) {
+                    view.status = None;
+                }
+                if active {
+                    view.tell_focus(focused);
+                }
+            }
+            Err(e) => {
+                // Tried again once the terminal runs.
+                view.attachment = Attachment::Ended;
+                view.held.clear();
+                view.fresh = None;
+                view.lost = true;
+                view.status = Some((format!("{e:#} · trying again"), Kind::Error));
             }
         }
-        for (offset, list) in [(0, &colors.ansi), (8, &colors.brights)] {
-            for (i, hex) in list.iter().flatten().take(8).enumerate() {
-                if let Some(c) = parse_hex(hex).map(rgb) {
-                    palette.set(Slot::Ansi(offset + i), c);
+    }
+
+    fn ingest(&mut self, key: &Key, attach: u64, batch: Vec<Stream>) {
+        let Some(view) = self.terminals.get_mut(key).filter(|v| v.attach == attach) else { return };
+        view.ingest(batch);
+    }
+
+    /// Each poll: terminals waiting for their first paint send what waited once it's over,
+    /// and the one on show draws new output. Some(delay) to look again then.
+    pub(super) fn tick_terminals(&mut self) -> (bool, Option<Duration>) {
+        let mut again = None;
+        let shown: Vec<Key> = self.active.iter().chain(self.peek.iter()).cloned().collect();
+        let mut changed = false;
+        for (k, view) in &mut self.terminals {
+            if view.check_paint() {
+                again = Some(PAINT_LOOK);
+            }
+            if shown.contains(k) {
+                changed |= view.draw().unwrap_or(false);
+                // Output waiting for its turn, or for its program to let go of the screen.
+                if view.grid.as_ref().is_some_and(|g| g.stale) {
+                    again = Some(again.map_or(OUTPUT_EVERY, |a: Duration| a.min(OUTPUT_EVERY)));
                 }
             }
         }
-        palette
+        (changed, again)
     }
 
-    pub fn get(&self, slot: Slot) -> Rgb {
-        match slot {
-            Slot::Foreground => self.foreground,
-            Slot::Background => self.background,
-            Slot::Cursor => self.cursor,
-            Slot::Ansi(i) => self.ansi[i],
-        }
-    }
-
-    pub fn set(&mut self, slot: Slot, color: Rgb) {
-        match slot {
-            Slot::Foreground => self.foreground = color,
-            Slot::Background => self.background = color,
-            Slot::Cursor => self.cursor = color,
-            Slot::Ansi(i) => self.ansi[i] = color,
-        }
-    }
-
-    /// What differs from `defaults`, as the config writes it.
-    fn overrides(&self, defaults: &Palette) -> TerminalColors {
-        let differs = |slot| (self.get(slot) != defaults.get(slot)).then(|| hex(self.get(slot)));
-        let eight = |offset: usize| {
-            (offset..offset + 8)
-                .any(|i| self.ansi[i] != defaults.ansi[i])
-                .then(|| {
-                    self.ansi[offset..offset + 8]
-                        .iter()
-                        .map(|c| hex(*c))
-                        .collect()
-                })
-        };
-        TerminalColors {
-            foreground: differs(Slot::Foreground),
-            background: differs(Slot::Background),
-            cursor: differs(Slot::Cursor),
-            ansi: eight(0),
-            brights: eight(8),
-        }
-    }
-
-    /// Faint text: a third of the way toward the background, so it works on
-    /// light and dark alike.
-    pub fn dim(&self, c: Rgb) -> Rgb {
-        let mix = |a: u8, b: u8| ((a as u16 * 2 + b as u16) / 3) as u8;
-        let bg = self.background;
-        Rgb {
-            r: mix(c.r, bg.r),
-            g: mix(c.g, bg.g),
-            b: mix(c.b, bg.b),
-        }
-    }
-
-    /// Behind selected text: a quarter of the way toward the foreground.
-    pub fn selection(&self) -> Rgb {
-        let mix = |a: u8, b: u8| ((a as u16 + b as u16 * 3) / 4) as u8;
-        let (fg, bg) = (self.foreground, self.background);
-        Rgb {
-            r: mix(fg.r, bg.r),
-            g: mix(fg.g, bg.g),
-            b: mix(fg.b, bg.b),
-        }
-    }
-
-    /// Resolves a cell color: program overrides first, then the palette.
-    pub fn resolve(&self, color: Color, colors: &Colors) -> Rgb {
-        match color {
-            Color::Spec(rgb) => rgb,
-            Color::Named(n) => self.indexed(n as usize, colors),
-            Color::Indexed(i) => self.indexed(i as usize, colors),
-        }
-    }
-
-    pub fn indexed(&self, i: usize, colors: &Colors) -> Rgb {
-        colors[i].unwrap_or_else(|| self.slot(i))
-    }
-
-    /// xterm's 256 colors, then alacritty's named slots (foreground = 256, ...).
-    fn slot(&self, i: usize) -> Rgb {
-        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-        match i {
-            0..16 => self.ansi[i],
-            16..232 => {
-                let i = i - 16;
-                Rgb {
-                    r: LEVELS[i / 36],
-                    g: LEVELS[(i / 6) % 6],
-                    b: LEVELS[i % 6],
-                }
-            }
-            232..=255 => {
-                let v = 8 + 10 * (i - 232) as u8;
-                Rgb { r: v, g: v, b: v }
-            }
-            257 => self.background,
-            258 => self.cursor,
-            259..=266 => self.dim(self.ansi[i - 259]),
-            268 => self.dim(self.foreground),
-            // Foreground (256) and bright foreground (267).
-            _ => self.foreground,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alacritty_terminal::vte::ansi::NamedColor;
-
-    const SIZE: Size = Size {
-        cols: 40,
-        lines: 5,
-        cell_width: 8,
-        cell_height: 16,
-    };
-
-    #[test]
-    fn palette_covers_the_xterm_ranges() {
-        let colors = Colors::default();
-        let p = &DARK;
-        assert_eq!(
-            p.resolve(Color::Indexed(16), &colors),
-            Rgb { r: 0, g: 0, b: 0 }
-        );
-        assert_eq!(
-            p.resolve(Color::Indexed(231), &colors),
-            Rgb {
-                r: 255,
-                g: 255,
-                b: 255
-            }
-        );
-        assert_eq!(
-            p.resolve(Color::Indexed(232), &colors),
-            Rgb { r: 8, g: 8, b: 8 }
-        );
-        assert_eq!(
-            p.resolve(Color::Named(NamedColor::Background), &colors),
-            DARK.background
-        );
-        assert_eq!(
-            p.resolve(Color::Named(NamedColor::Red), &colors),
-            DARK.ansi[1]
-        );
-    }
-
-    #[test]
-    fn light_palette_and_dimming() {
-        let colors = Colors::default();
-        assert_eq!(
-            Palette::default_for(false).resolve(Color::Named(NamedColor::Background), &colors),
-            LIGHT.background
-        );
-        // Dimming moves toward the background in both appearances.
-        assert!(LIGHT.dim(rgb(0x000000)).r > 0);
-        assert!(DARK.dim(rgb(0xffffff)).r < 255);
-    }
-
-    #[test]
-    fn settings_colors_go_over_lemens_own() {
-        let mut terminal = Terminal::default();
-        assert_eq!(Palette::themed(true, &terminal), DARK);
-        set_color(&mut terminal, true, Slot::Background, Some(rgb(0x000000)));
-        set_color(&mut terminal, true, Slot::Ansi(9), Some(rgb(0xff0000)));
-        let dark = Palette::themed(true, &terminal);
-        assert_eq!(dark.background, rgb(0x000000));
-        assert_eq!(dark.get(Slot::Ansi(9)), rgb(0xff0000));
-        assert_eq!(dark.get(Slot::Ansi(1)), DARK.get(Slot::Ansi(1)));
-        // Only what differs is kept, and light is left alone.
-        assert_eq!(terminal.dark.background.as_deref(), Some("#000000"));
-        assert_eq!(
-            (
-                terminal.dark.foreground.as_ref(),
-                terminal.dark.ansi.as_ref()
-            ),
-            (None, None)
-        );
-        assert_eq!(
-            terminal.dark.brights.as_ref().map(|b| b[1].as_str()),
-            Some("#ff0000")
-        );
-        assert_eq!(Palette::themed(false, &terminal), LIGHT);
-        // Back to lemur's own empties it again.
-        set_color(&mut terminal, true, Slot::Background, None);
-        set_color(&mut terminal, true, Slot::Ansi(9), None);
-        assert_eq!(terminal.dark, TerminalColors::default());
-    }
-
-    fn screen_text(screen: &Screen) -> String {
-        let term = screen.term.lock();
-        let mut out = String::new();
-        let mut last_line = None;
-        for cell in term.grid().display_iter() {
-            if last_line.is_some_and(|l| l != cell.point.line) {
-                out.push('\n');
-            }
-            last_line = Some(cell.point.line);
-            out.push(cell.c);
-        }
-        out
-    }
-
-    #[test]
-    fn output_reaches_the_grid_and_answers_reach_the_program() {
-        let mut screen = Screen::new(SIZE, 100);
-        screen.advance(b"hello\r\n\x1b[6n");
-        assert!(screen_text(&screen).starts_with("hello"));
-        // The cursor position the program asked for, to send it.
-        let answers: Vec<String> = screen
-            .events()
-            .into_iter()
-            .filter_map(|e| match e {
-                Event::PtyWrite(text) => Some(text),
-                _ => None,
+    /// Attaches again each terminal whose stream dropped, once its program runs again, as
+    /// Herdr does: after the line to its host or to herdr-core comes back, or a kept
+    /// program's new shell starts.
+    pub(super) fn reconnect_terminals(&mut self) {
+        let running: std::collections::HashSet<Key> = super::sessions(&self.snap)
+            .flat_map(|(h, s)| {
+                let own = s.running.then(|| super::key(h, s));
+                let helpers = s.helpers.iter().filter(|x| x.terminal);
+                own.into_iter().chain(helpers.map(move |x| (h.to_string(), x.id.clone())))
             })
+            .chain(self.setups.keys().cloned())
             .collect();
-        assert_eq!(answers, ["\x1b[2;1R"]);
+        let again: Vec<Key> = self
+            .terminals
+            .iter()
+            .filter(|(k, v)| running.contains(*k) && v.disconnected() && v.tried.is_none_or(|t| t.elapsed() >= RETRY))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in again {
+            self.connect(&k);
+        }
     }
 
-    #[test]
-    fn scrollback_keeps_as_many_lines_as_set() {
-        let history = |screen: &Screen| screen.term.lock().grid().history_size();
-        let mut screen = Screen::new(SIZE, 50);
-        let lines: String = (0..200).map(|i| format!("{i}\r\n")).collect();
-        screen.advance(lines.as_bytes());
-        assert_eq!(history(&screen), 50);
-        // Fewer drops the oldest at once; more keeps what comes next.
-        screen.set_scrollback(20);
-        assert_eq!(history(&screen), 20);
-        screen.set_scrollback(80);
-        screen.advance(lines.as_bytes());
-        assert_eq!(history(&screen), 80);
+    /// The terminals take the size the pane gives them.
+    pub(super) fn fit_terminals(&mut self) {
+        let size = self.cell_size();
+        for view in self.terminals.values_mut() {
+            if view.size == size {
+                continue;
+            }
+            view.size = size;
+            if let Some(g) = &mut view.grid {
+                let _ = g.resize(size);
+            }
+            if let Attachment::Attached(core, channel) = &view.attachment {
+                core.resize(*channel, size.cols, size.lines);
+            }
+        }
     }
 
-    #[test]
-    fn the_grid_follows_resizes() {
-        let mut screen = Screen::new(SIZE, 100);
-        assert!(!screen.resize(SIZE), "no change");
-        let larger = Size {
-            cols: 60,
-            lines: 8,
-            ..SIZE
-        };
-        assert!(screen.resize(larger));
-        let term = screen.term.lock();
-        assert_eq!((term.columns(), term.screen_lines()), (60, 8));
+    /// Settings changed the colours, or the app went light or dark.
+    pub(super) fn recolor_terminals(&mut self) {
+        let palette = self.palette();
+        let display = self.display();
+        for view in self.terminals.values_mut() {
+            for g in view.grid.iter_mut().chain(view.fresh.iter_mut()) {
+                let _ = g.set_palette(&palette);
+            }
+            view.tell_display(display.clone());
+        }
     }
 
-    /// An update the program shows all at once waits for its end, or its
-    /// deadline.
-    #[test]
-    fn synchronized_output_shows_when_done() {
-        let mut screen = Screen::new(SIZE, 100);
-        screen.advance(b"\x1b[?2026hpartial");
-        assert!(!screen_text(&screen).contains("partial"));
-        assert!(screen.sync_deadline().is_some());
-        screen.stop_sync();
-        assert!(screen_text(&screen).contains("partial"));
-        assert_eq!(screen.sync_deadline(), None);
+    /// The keyboard is the terminal's: nothing else (a field, a spotlight) has it.
+    pub(super) fn keyboard_on_terminal(&self) -> bool {
+        self.prompt.is_none() && self.dialog.is_none() && !self.panels_overlaid() && !self.typing && !self.editing()
+    }
+
+    /// A text field of the window's has the keyboard. Rune keeps each field's `focused`, so
+    /// a click elsewhere, which takes the keyboard from it, gives it back to the terminal.
+    pub(super) fn editing(&self) -> bool {
+        self.prompt.as_ref().is_some_and(|p| p.input.focused || p.branch.as_ref().is_some_and(|b| b.focused)) || self.panels_editing()
+    }
+
+    /// The peek has the keyboard: nothing's over it.
+    pub(super) fn keyboard_on_peek(&self) -> bool {
+        self.peek.is_some() && self.keyboard_on_terminal()
     }
 }
+
+/// One row: backgrounds, then each run of text at its column.
+fn row_el(id: &str, y: usize, row: &Row, m: Metrics) -> El {
+    let mut e = el().key(format!("tr-{id}-{y}")).w_full().h(m.cell_h);
+    for f in &row.fills {
+        e = e.child(el().absolute(f32::from(f.col) * m.cell_w, 0.0).size(f32::from(f.cells) * m.cell_w, m.cell_h).fill(f.color));
+    }
+    for &(col, c, color) in &row.blocks {
+        let Some((rects, opacity)) = super::grid::block(c) else { continue };
+        let x = f32::from(col) * m.cell_w;
+        for [l, t, r, b] in rects {
+            let at = el().absolute(x + l * m.cell_w, t * m.cell_h).size((r - l) * m.cell_w, (b - t) * m.cell_h);
+            e = e.child(at.fill(color.alpha(color.a * opacity)));
+        }
+    }
+    for r in &row.runs {
+        let mut style = m.style(r.bold);
+        if r.italic {
+            style = style.italic();
+        }
+        let x = f32::from(r.col) * m.cell_w;
+        e = e.child(text(r.text.clone()).key(format!("tr-{id}-{y}-{}", r.col)).font(style).color(r.fg).absolute(x, 0.0));
+        let line = |y: f32| el().absolute(x, y).size(f32::from(r.cells) * m.cell_w, 1.0).fill(r.fg);
+        if r.underline {
+            e = e.child(line(m.cell_h - 3.0));
+        }
+        if r.strike {
+            e = e.child(line((m.cell_h / 2.0).round()));
+        }
+    }
+    e
+}
+
+/// A terminal's screen: its rows and its cursor, a block while it has the keyboard and an
+/// outline otherwise.
+pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El {
+    let Some(g) = &view.grid else {
+        return col().key(format!("screen-{id}")).w_full().h_full();
+    };
+    let grid = g.frame();
+    let mut rows = col().key(format!("grid-{id}")).w(f32::from(g.size().cols) * m.cell_w);
+    for (y, row) in grid.rows.iter().enumerate() {
+        // A row Ghostty didn't rebuild keeps the elements built for it last time.
+        rows = rows.child(memo(format!("tr-{id}-{y}"), (row.version, m.cell_w.to_bits(), m.cell_h.to_bits()), || row_el(id, y, row, m)));
+    }
+    if let Some(link) = &view.hover {
+        let x = f32::from(link.start) * m.cell_w;
+        let w = f32::from(link.end - link.start) * m.cell_w;
+        rows = rows.child(el().key(format!("link-{id}")).absolute(x, f32::from(link.row + 1) * m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
+    }
+    if let Some((x, y)) = grid.cursor {
+        let (cx, cy) = (f32::from(x) * m.cell_w, f32::from(y) * m.cell_h);
+        let at = el().key(format!("cursor-{id}")).absolute(cx, cy).size(m.cell_w, m.cell_h);
+        // The input method's window opens at the cursor while the terminal has the keyboard.
+        rows = rows.child(if focused { at.fill(grid.cursor_color.alpha(0.7)).ime_cursor() } else { at.border(1.0, grid.cursor_color) });
+        if let Some(marked) = &view.marked {
+            let w = marked.chars().count() as f32 * m.cell_w;
+            rows = rows
+                .child(el().absolute(cx, cy).size(w, m.cell_h).fill(grid.bg))
+                .child(text(marked.clone()).key(format!("marked-{id}")).font(m.style(false)).color(grid.fg).absolute(cx, cy))
+                .child(el().absolute(cx, cy + m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
+        }
+    }
+    // A terminal's screen changes in place: no springs, fades or exits.
+    col().key(format!("screen-{id}")).w_full().h_full().padding(PAD).fill(grid.bg).child(rows.instant_changes())
+}
+
+/// The text of `key`'s screen, for tests.
+#[cfg(test)]
+pub(super) fn lines(s: &Lemur, key: &Key) -> Vec<String> {
+    s.terminals.get(key).and_then(|v| v.grid.as_ref()).map(|g| g.lines()).unwrap_or_default()
+}
+

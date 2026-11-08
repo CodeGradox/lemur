@@ -5,25 +5,22 @@
 //! its × takes it off the list for good, and leaves what it links to alone.
 //! An artifact's pencil gives it a name of your own.
 
-use super::icons;
-use crate::config::Host;
+use super::{Lemur, Right, icons, worktree_label};
+use crate::config::{Host, leaf};
 use crate::gh::{self, Problem, PullRequest, State};
 use crate::links::{self, Artifact, Place, Store};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, IconName, Sizable, StyledExt, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
-use std::path::PathBuf;
+use rune::{El, Key as K, ScrollSpec, TextEdit, Tx, col, icon, row, text};
+use rune_kit::shell::SidebarRow;
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, TextInput};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 /// How often a worktree's logs are read and `gh` asked while the panel
 /// shows: an agent's log can be hundreds of megabytes.
 const EVERY: Duration = Duration::from_secs(30);
 
-pub(super) struct LinksPanel {
-    /// Where the links are kept, if anywhere.
+pub struct LinksPanel {
+    /// The list kept, `~/.lemur/links.json`; tests have none.
     file: Option<PathBuf>,
     store: Store,
     /// The host and folder shown, and what it's called.
@@ -39,24 +36,24 @@ pub(super) struct LinksPanel {
     asked: Option<Instant>,
     /// The artifact being given a name.
     renaming: Option<Renaming>,
-    _task: Option<Task<()>>,
 }
 
 /// An artifact being given a name: its link, and the field for it.
 struct Renaming {
     url: String,
-    input: Entity<InputState>,
-    _events: Subscription,
+    input: TextEdit,
 }
 
 fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// What reading a folder found: its scan, and what `gh` said of its pull requests.
+type Found = anyhow::Result<(links::Scan, Option<gh::Looked>)>;
+
 impl LinksPanel {
-    pub(super) fn new(file: Option<PathBuf>) -> Self {
+    pub fn new(data_dir: Option<&Path>) -> LinksPanel {
+        let file = data_dir.map(|d| d.join("links.json"));
         let store = file.as_deref().map(Store::load).unwrap_or_default();
         LinksPanel {
             file,
@@ -69,33 +66,6 @@ impl LinksPanel {
             gh_problem: None,
             asked: None,
             renaming: None,
-            _task: None,
-        }
-    }
-
-    /// Shows folder `path` on `host`, called `label`, and reads its logs if
-    /// that's new, or due.
-    pub(super) fn show(&mut self, host: Host, path: String, label: String, cx: &mut Context<Self>) {
-        let same = self.shows(&host.name, &path);
-        self.place = Some((host, path, label));
-        if !same {
-            self.error = None;
-            self.gh_problem = None;
-            self.renaming = None;
-        }
-        if !same || self.asked.is_none_or(|at| at.elapsed() >= EVERY) {
-            self.refresh(cx);
-        }
-        cx.notify();
-    }
-
-    /// Nothing on show to tell the links of.
-    pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
-        if self.place.take().is_some() {
-            self.error = None;
-            self.gh_problem = None;
-            self.renaming = None;
-            cx.notify();
         }
     }
 
@@ -107,75 +77,7 @@ impl LinksPanel {
     }
 
     fn shows(&self, host: &str, path: &str) -> bool {
-        self.place
-            .as_ref()
-            .is_some_and(|(h, p, _)| h.name == host && p == path)
-    }
-
-    /// Reads the logs of the folder on show, those written since the last
-    /// time, and asks `gh` about its pull requests. Another folder being read
-    /// is left to ask again when it shows: it may be taking a while, as
-    /// with the network down.
-    pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some((host, path, _)) = self.place.clone() else {
-            return;
-        };
-        let asked = (host.name.clone(), path.clone());
-        if self.loading.as_ref() == Some(&asked) {
-            return;
-        }
-        self.loading = Some(asked);
-        self.asked = Some(Instant::now());
-        let started = now();
-        let known = self.store.place(&host.name, &path);
-        let minutes = known.and_then(|place| place.minutes(started));
-        let wanted = known.map_or(vec![], Place::wanted);
-        let finished = known.map_or(vec![], Place::finished);
-        let tool = self.gh.clone();
-        self._task = Some(cx.spawn(async move |this, cx| {
-            let (host, path, found) = cx
-                .background_spawn(async move {
-                    let found = links::scan(&host, &path, minutes).map(|scan| {
-                        let looked = scan.repo.as_deref().map(|repo| {
-                            let mut numbers = wanted;
-                            for number in &scan.prs {
-                                if !numbers.contains(number) && !finished.contains(number) {
-                                    numbers.push(*number);
-                                }
-                            }
-                            gh::look(&tool, repo, scan.branch.as_deref(), &numbers)
-                        });
-                        (scan, looked)
-                    });
-                    (host, path, found)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.loading = None;
-                let shown = this.shows(&host.name, &path);
-                match found {
-                    Ok((scan, looked)) => {
-                        if shown {
-                            this.error = None;
-                            this.gh_problem = looked.as_ref().and_then(|l| l.problem);
-                        }
-                        let place = this.store.place_mut(&host.name, &path);
-                        place.add(scan.artifacts);
-                        // Noted whatever `gh` says, as these logs aren't read again.
-                        place.link_prs(&scan.prs);
-                        if let Some(looked) = looked {
-                            place.add_prs(looked.prs, &looked.settled);
-                        }
-                        place.looked = Some(started);
-                        this.save();
-                    }
-                    Err(e) if shown => this.error = Some(format!("{e:#}")),
-                    Err(_) => {}
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.place.as_ref().is_some_and(|(h, p, _)| h.name == host && p == path)
     }
 
     fn save(&mut self) {
@@ -202,75 +104,14 @@ impl LinksPanel {
         self.shown().map_or(&[], |place| &place.prs)
     }
 
-    /// Takes `url` off the list of the folder on show.
-    fn remove(&mut self, url: &str, cx: &mut Context<Self>) {
-        let Some((host, path, _)) = &self.place else {
-            return;
-        };
-        self.store.place_mut(&host.name, path).remove(url);
-        self.save();
-        cx.notify();
-    }
-
-    /// Asks for a name for the artifact `url`, in its row. Enter, or the
-    /// keyboard going elsewhere, keeps what's typed; Esc doesn't. Once the
-    /// field is gone, the keyboard goes back to the thread on show.
-    fn start_renaming(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
-        let place = self.shown();
-        let artifact = place.and_then(|p| p.links.iter().find(|l| l.url == url));
-        let name = place
-            .zip(artifact)
-            .map(|(place, artifact)| place.name_of(artifact).to_string())
-            .unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
-        let events =
-            cx.subscribe_in(
-                &input,
-                window,
-                |this, _, event: &InputEvent, _, cx| match event {
-                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
-                        this.finish_renaming(true, cx)
-                    }
-                    _ => {}
-                },
-            );
-        input.update(cx, |i, cx| {
-            i.focus(window, cx);
-            i.select_all(window, cx);
-        });
-        self.renaming = Some(Renaming {
-            url,
-            input,
-            _events: events,
-        });
-        cx.notify();
-    }
-
-    /// Done with the name asked for; with `keep`, it's kept.
-    fn finish_renaming(&mut self, keep: bool, cx: &mut Context<Self>) {
-        let Some(renaming) = self.renaming.take() else {
-            return;
-        };
-        if keep && let Some((host, path, _)) = &self.place {
-            let name = renaming.input.read(cx).value().to_string();
-            self.store
-                .place_mut(&host.name, path)
-                .rename(&renaming.url, &name, now());
-            self.save();
-        }
-        cx.notify();
+    /// What to call `artifact`: the name you gave it, else the agent's.
+    fn name_of<'a>(&'a self, artifact: &'a Artifact) -> &'a str {
+        self.shown().map_or(artifact.name(), |p| p.name_of(artifact))
     }
 
     #[cfg(test)]
     pub(super) fn listed(&self) -> (bool, Vec<String>) {
-        let names = match self.shown() {
-            Some(place) => place
-                .links
-                .iter()
-                .map(|a| place.name_of(a).to_string())
-                .collect(),
-            None => vec![],
-        };
+        let names = self.links().iter().map(|a| self.name_of(a).to_string()).collect();
         (self.loading.is_some(), names)
     }
 
@@ -279,594 +120,353 @@ impl LinksPanel {
         let prs = self.prs().iter().map(|pr| (pr.number, pr.state)).collect();
         (self.loading.is_some(), prs)
     }
+}
 
-    /// A pull request's row: its state, number and title.
-    fn pr_row(&self, i: usize, pr: &PullRequest, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.theme();
-        let color: Hsla = match pr.state {
-            State::Open => theme.success,
-            State::Draft => theme.muted_foreground,
-            State::Merged => rgb(0x8250df).into(),
-            State::Closed => theme.danger,
-        };
-        let (open, tip, remove) = (
-            pr.url.clone(),
-            SharedString::from(pr.url.clone()),
-            pr.url.clone(),
-        );
-        let muted = theme.muted_foreground;
-        let (hover, radius) = (theme.sidebar_accent.opacity(0.5), theme.radius);
-        let (number, state) = (pr.number, pr.state);
-        h_flex()
-            .id(SharedString::from(format!("pr-{i}")))
-            .debug_selector(move || format!("pr {number} {}", state.name()))
-            .px_2()
-            .py_0p5()
-            .gap_2()
-            .items_center()
-            .rounded(radius)
-            .text_sm()
-            .cursor_pointer()
-            .hover(|row| row.bg(hover))
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            .on_click(move |_, _, cx| cx.open_url(&open))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .rounded_sm()
-                    .text_xs()
-                    .text_color(color)
-                    .bg(color.opacity(0.15))
-                    .child(pr.state.name()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(muted)
-                    .child(format!("#{}", pr.number)),
-            )
-            .child(div().flex_1().min_w_0().truncate().child(pr.title.clone()))
-            .child(
-                div()
-                    .debug_selector(move || format!("pr-remove {i}"))
-                    .child(
-                        Button::new(SharedString::from(format!("pr-remove-{i}")))
-                            .icon(IconName::Close)
-                            .ghost()
-                            .xsmall()
-                            .tooltip("Take it off this list")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove(&remove, cx);
-                            })),
-                    ),
-            )
+impl Lemur {
+    /// Points the Links panel at where the thread on show runs: its worktree, or its
+    /// folder outside every worktree.
+    pub(super) fn show_links(&mut self) {
+        let place = self.active.clone().and_then(|key| {
+            let (path, _) = self.place_of(&key)?;
+            let host = self.cfg.host(&key.0)?.clone();
+            let label = match self.project_of(&key.0, &key.1) {
+                Some((_, w)) => worktree_label(w),
+                None => leaf(&path).to_string(),
+            };
+            Some((host, path, label))
+        });
+        match place {
+            Some((host, path, label)) => self.links_show(host, path, label),
+            None => self.links_clear(),
+        }
     }
+
+    /// The panel goes by the thread on show (see `Lemur::follow_shown`).
+    pub(super) fn links_follow_shown(&mut self) {
+        if self.right != Some(Right::Links) {
+            return;
+        }
+        let on = self.active.is_none();
+        let place = self.active.as_ref().and_then(|k| Some((k.0.clone(), self.place_of(k)?.0)));
+        if on || place.is_some_and(|(host, path)| !self.panels.links.is_on(Some((&host, &path)))) {
+            self.show_links();
+        }
+    }
+
+    /// Shows folder `path` on `host`, called `label`, and reads its logs if
+    /// that's new, or due.
+    fn links_show(&mut self, host: Host, path: String, label: String) {
+        let p = &mut self.panels.links;
+        let same = p.shows(&host.name, &path);
+        p.place = Some((host, path, label));
+        if !same {
+            p.error = None;
+            p.gh_problem = None;
+            self.drop_renaming();
+        }
+        let p = &self.panels.links;
+        if !same || p.asked.is_none_or(|at| at.elapsed() >= EVERY) {
+            self.refresh_links();
+        }
+    }
+
+    /// Nothing on show to tell the links of.
+    fn links_clear(&mut self) {
+        let p = &mut self.panels.links;
+        if p.place.take().is_some() {
+            p.error = None;
+            p.gh_problem = None;
+            self.drop_renaming();
+        }
+    }
+
+    /// Reads the logs of the folder on show, those written since the last
+    /// time, and asks `gh` about its pull requests. Another folder being read
+    /// is left to ask again when it shows: it may be taking a while, as
+    /// with the network down.
+    fn refresh_links(&mut self) {
+        let p = &mut self.panels.links;
+        let Some((host, path, _)) = p.place.clone() else { return };
+        let asked = (host.name.clone(), path.clone());
+        if p.loading.as_ref() == Some(&asked) {
+            return;
+        }
+        p.loading = Some(asked);
+        p.asked = Some(Instant::now());
+        let started = now();
+        let known = p.store.place(&host.name, &path);
+        let minutes = known.and_then(|place| place.minutes(started));
+        let wanted = known.map_or(vec![], Place::wanted);
+        let finished = known.map_or(vec![], Place::finished);
+        let tool = p.gh.clone();
+        self.in_background(
+            move || {
+                let found = links::scan(&host, &path, minutes).map(|scan| {
+                    let looked = scan.repo.as_deref().map(|repo| {
+                        let mut numbers = wanted;
+                        for number in &scan.prs {
+                            if !numbers.contains(number) && !finished.contains(number) {
+                                numbers.push(*number);
+                            }
+                        }
+                        gh::look(&tool, repo, scan.branch.as_deref(), &numbers)
+                    });
+                    (scan, looked)
+                });
+                (host, path, found)
+            },
+            move |s, (host, path, found)| s.links_found(&host.name, &path, started, found),
+        );
+    }
+
+    /// What reading folder `path` on `host`, started at `started`, found. It's kept
+    /// whichever folder shows by now.
+    fn links_found(&mut self, host: &str, path: &str, started: u64, found: Found) {
+        let p = &mut self.panels.links;
+        if p.loading.as_ref().is_some_and(|(h, l)| h == host && l == path) {
+            p.loading = None;
+        }
+        let shown = p.shows(host, path);
+        match found {
+            Ok((scan, looked)) => {
+                if shown {
+                    p.error = None;
+                    p.gh_problem = looked.as_ref().and_then(|l| l.problem);
+                }
+                let place = p.store.place_mut(host, path);
+                place.add(scan.artifacts);
+                // Noted whatever `gh` says, as these logs aren't read again.
+                place.link_prs(&scan.prs);
+                if let Some(looked) = looked {
+                    place.add_prs(looked.prs, &looked.settled);
+                }
+                place.looked = Some(started);
+                p.save();
+            }
+            Err(e) if shown => p.error = Some(format!("{e:#}")),
+            Err(_) => {}
+        }
+    }
+
+    /// Takes `url` off the list of the folder on show.
+    fn remove_link(&mut self, url: &str) {
+        let p = &mut self.panels.links;
+        let Some((host, path, _)) = &p.place else { return };
+        p.store.place_mut(&host.name, path).remove(url);
+        p.save();
+    }
+
+    /// Asks for a name for the artifact `url`, in its row. Enter, or the
+    /// keyboard going elsewhere, keeps what's typed; Esc doesn't. Once the
+    /// field is gone, the keyboard goes back to the thread on show.
+    fn start_renaming(&mut self, url: String) {
+        // Another's name being given is kept, as the keyboard goes elsewhere.
+        self.finish_renaming(true);
+        let p = &mut self.panels.links;
+        let name = p.links().iter().find(|l| l.url == url).map(|a| p.name_of(a).to_string()).unwrap_or_default();
+        // All of it selected, so typing replaces it.
+        let mut input = TextEdit::new(name);
+        input.anchor = 0;
+        input.focused = true;
+        p.renaming = Some(Renaming { url, input });
+        self.typing = true;
+    }
+
+    /// Done with the name asked for; with `keep`, it's kept.
+    fn finish_renaming(&mut self, keep: bool) {
+        let p = &mut self.panels.links;
+        let Some(renaming) = p.renaming.take() else { return };
+        self.typing = false;
+        if keep && let Some((host, path, _)) = &p.place {
+            p.store.place_mut(&host.name, path).rename(&renaming.url, &renaming.input.text, now());
+            p.save();
+        }
+    }
+
+    /// The panel goes elsewhere: a name being given is let go.
+    fn drop_renaming(&mut self) {
+        if self.panels.links.renaming.take().is_some() {
+            self.typing = false;
+        }
+    }
+
+    /// Before each frame: the name being given lost the keyboard, to a click elsewhere or
+    /// the panel hidden. What's typed is kept, as with Enter. True if that changed anything.
+    pub(super) fn links_keyboard(&mut self) -> bool {
+        let Some(r) = &self.panels.links.renaming else { return false };
+        if self.right == Some(Right::Links) && r.input.focused {
+            return false;
+        }
+        self.finish_renaming(true);
+        true
+    }
+}
+
+/// The panel's title, and how many it lists.
+fn header(title: String, count: usize, k: &Kit) -> El {
+    let c = &k.c;
+    let mut h = row()
+        .key("links-head")
+        .w_full()
+        .h(40.0)
+        .px(12.0)
+        .gap(8.0)
+        .center_y()
+        .child(text(title).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0).shrink());
+    if count > 0 {
+        h = h.child(text(count.to_string()).key("links-count").font(k.ty.small).color(c.text_muted));
+    }
+    h
 }
 
 /// A section's name, over its rows.
-fn section(name: &'static str, muted: Hsla) -> Div {
-    div()
-        .px_1()
-        .pt_2()
-        .pb_0p5()
-        .text_xs()
-        .text_color(muted)
-        .child(name)
+fn section(name: &'static str, k: &Kit) -> El {
+    text(name).font(k.ty.small).color(k.c.text_muted).px(4.0).pt(8.0).pb(2.0)
 }
 
-impl Render for LinksPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
-        let title = match &self.place {
-            Some((_, _, label)) => format!("Links · {label}"),
-            None => "Links".to_string(),
-        };
-        let links = self.links().to_vec();
-        let prs = self.prs().to_vec();
-        let count = links.len() + prs.len();
-        let empty = match (&self.place, &self.error) {
-            (None, _) => Some("Open a thread to see its worktree's links.".to_string()),
-            (_, Some(e)) => Some(e.clone()),
-            _ if count == 0 && self.loading.is_some() => Some("Looking for links…".into()),
-            _ if count == 0 => Some(
-                "No links here yet. This branch's pull requests, and the artifacts and pull requests agents use or post, show up here."
-                    .into(),
-            ),
-            _ => None,
-        };
-        // Why there may be pull requests missing.
-        let gh_note = self.gh_problem.map(|problem| match problem {
-            Problem::Missing => "Install GitHub's gh to see pull requests here.",
-            Problem::SignedOut => "Run gh auth login to see pull requests here.",
+/// A small button on a row, shown under the pointer.
+fn row_button(glyph: &'static rune::Icon, tip: &str, key: String, k: &Kit, press: impl Fn(&mut Lemur) + 'static) -> El {
+    IconButton::new(glyph)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(tip)
+        .help(tip)
+        .on_press(press)
+        .build(k)
+        .key(key)
+        .group_opacity(0.0, 1.0)
+}
+
+/// A pull request's row: its state, number and title.
+fn pr_row(i: usize, pr: &PullRequest, k: &Kit) -> El {
+    let c = &k.c;
+    let color = match pr.state {
+        State::Open => c.success.fg,
+        State::Draft => c.text_muted,
+        State::Merged => rune::color::hex("#8250df").unwrap_or(c.info.fg),
+        State::Closed => c.danger.fg,
+    };
+    let state = row()
+        .h(18.0)
+        .px(6.0)
+        .center()
+        .radius(k.radius.sm)
+        .fill(color.alpha(0.15))
+        .child(text(pr.state.name()).font(k.ty.small_medium).color(color));
+    let (open, remove) = (pr.url.clone(), pr.url.clone());
+    let r = row()
+        .key(format!("links-pr-{i}"))
+        .w_full()
+        .h(28.0)
+        .px(8.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.md)
+        .hover_group()
+        .cursor(rune::Cursor::Pointer)
+        .help(pr.url.clone())
+        .child(state)
+        .child(text(format!("#{}", pr.number)).font(k.ty.ui).color(c.text_faint))
+        .child(text(pr.title.clone()).font(k.ty.ui).color(c.text_muted).truncate().grow(1.0).shrink())
+        .child(row_button(&icons::X, "Take it off this list", format!("links-pr-remove-{i}"), k, move |s| s.remove_link(&remove)))
+        .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
+            let _ = tx.open_url(&open);
         });
-        let pr_rows: Vec<_> = prs
-            .iter()
-            .enumerate()
-            .map(|(i, pr)| self.pr_row(i, pr, cx))
-            .collect();
-        let names: Vec<String> = links
-            .iter()
-            .map(|a| self.shown().map_or(a.name(), |p| p.name_of(a)).to_string())
-            .collect();
-        let rows = links.iter().enumerate().map(|(i, artifact)| {
-            if let Some(renaming) = self.renaming.as_ref().filter(|r| r.url == artifact.url) {
-                return h_flex()
-                    .id(SharedString::from(format!("artifact-{i}")))
-                    .debug_selector(move || format!("artifact-renaming {i}"))
-                    .px_2()
-                    .py_0p5()
-                    .gap_2()
-                    .items_center()
-                    .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                        if e.keystroke.key == "escape" {
-                            this.finish_renaming(false, cx);
-                        }
-                    }))
-                    .child(icons::artifact().small())
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&renaming.input).small()),
-                    );
-            }
-            let (open, tip, remove, rename) = (
-                artifact.url.clone(),
-                SharedString::from(artifact.url.clone()),
-                artifact.url.clone(),
-                artifact.url.clone(),
-            );
-            let name = names[i].clone();
-            let selector = format!("artifact {i} {name}");
-            h_flex()
-                .id(SharedString::from(format!("artifact-{i}")))
-                .debug_selector(move || selector)
-                .px_2()
-                .py_0p5()
-                .gap_2()
-                .items_center()
-                .rounded(theme.radius)
-                .text_sm()
-                .cursor_pointer()
-                .hover(|row| row.bg(theme.sidebar_accent.opacity(0.5)))
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                .on_click(move |_, _, cx| cx.open_url(&open))
-                .child(icons::artifact().small())
-                .child(div().flex_1().min_w_0().truncate().child(name))
-                .child(
-                    div()
-                        .debug_selector(move || format!("artifact-rename {i}"))
-                        .child(
-                            Button::new(SharedString::from(format!("artifact-rename-{i}")))
-                                .icon(icons::pencil())
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Give it a name of your own")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.start_renaming(rename.clone(), window, cx);
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .debug_selector(move || format!("artifact-remove {i}"))
-                        .child(
-                            Button::new(SharedString::from(format!("artifact-remove-{i}")))
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Take it off this list")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.remove(&remove, cx);
-                                })),
-                        ),
-                )
-        });
-        let list = v_flex()
-            .id("links-list")
-            .flex_1()
-            .min_h_0()
-            .px_2()
-            .gap_0p5()
-            .overflow_y_scroll()
-            .when(!pr_rows.is_empty(), |list| {
-                list.child(section("Pull requests", muted))
+    k.interactive(r)
+}
+
+/// An artifact's row: its name, a pencil to give it one and its ×; or, being named, a
+/// field for the name.
+fn artifact_row(p: &LinksPanel, i: usize, artifact: &Artifact, k: &Kit) -> El {
+    if let Some(r) = p.renaming.as_ref().filter(|r| r.url == artifact.url) {
+        // A field of its own rather than the sidebar row's: that one hands the keyboard to
+        // the sidebar when it goes, and here it goes back to the thread on show.
+        let field = TextInput::new(&r.input)
+            .plain()
+            .width(None)
+            .on_edit(|s: &mut Lemur| &mut s.panels.links.renaming.as_mut().expect("a name being given").input)
+            .on_submit(|s: &mut Lemur, _| s.finish_renaming(true))
+            .on_key(|s: &mut Lemur, ev, _| {
+                if ev.key == K::Escape {
+                    s.finish_renaming(false);
+                    return true;
+                }
+                false
             })
-            .children(pr_rows)
-            .children(gh_note.map(|note| {
-                div()
-                    .debug_selector(|| "gh-note".into())
-                    .p_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(note)
-            }))
-            .when(!links.is_empty(), |list| {
-                list.child(section("Artifacts", muted))
-            })
-            .children(rows)
-            .children(empty.map(|e| div().p_1().text_sm().text_color(muted).child(e)));
-        v_flex()
-            .size_full()
-            .child(
-                h_flex()
-                    .h_10()
-                    .flex_shrink_0()
-                    .px_3()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_semibold()
-                            .child(title),
-                    )
-                    .when(count > 0, |h| {
-                        h.child(div().text_xs().text_color(muted).child(count.to_string()))
-                    }),
-            )
-            .child(list)
+            .build(k)
+            .key(format!("links-name-{i}"));
+        return row()
+            .key(format!("links-renaming-{i}"))
+            .w_full()
+            .h(28.0)
+            .px(8.0)
+            .gap(6.0)
+            .center_y()
+            .radius(k.radius.md)
+            .fill(k.c.pressed)
+            .child(icon(&icons::SHAPES, 16.0).color(k.c.icon_muted))
+            .child(field.grow(1.0).shrink());
     }
+    let line = SidebarRow::new(p.name_of(artifact)).icon(&icons::SHAPES);
+    let (open, rename, remove) = (artifact.url.clone(), artifact.url.clone(), artifact.url.clone());
+    let buttons = row()
+        .gap(2.0)
+        .center_y()
+        .child(row_button(&icons::PENCIL, "Give it a name of your own", format!("links-artifact-rename-{i}"), k, move |s| {
+            s.start_renaming(rename.clone())
+        }))
+        .child(row_button(&icons::X, "Take it off this list", format!("links-artifact-remove-{i}"), k, move |s| s.remove_link(&remove)));
+    line.trailing(buttons)
+        .on_select(move |_: &mut Lemur, tx: &mut Tx| {
+            let _ = tx.open_url(&open);
+        })
+        .build(k)
+        .key(format!("links-artifact-{i}"))
+        .help(artifact.url.clone())
+}
+
+pub fn view(s: &Lemur, k: &Kit) -> El {
+    let p = &s.panels.links;
+    let c = &k.c;
+    let title = match &p.place {
+        Some((_, _, label)) => format!("Links · {label}"),
+        None => "Links".to_string(),
+    };
+    let (links, prs) = (p.links(), p.prs());
+    let count = links.len() + prs.len();
+    let empty = match (&p.place, &p.error) {
+        (None, _) => Some("Open a thread to see its worktree's links.".to_string()),
+        (_, Some(e)) => Some(e.clone()),
+        _ if count == 0 && p.loading.is_some() => Some("Looking for links…".into()),
+        _ if count == 0 => Some(
+            "No links here yet. This branch's pull requests, and the artifacts and pull requests agents use or post, show up here."
+                .into(),
+        ),
+        _ => None,
+    };
+    // Why there may be pull requests missing.
+    let gh_note = p.gh_problem.map(|problem| match problem {
+        Problem::Missing => "Install GitHub's gh to see pull requests here.",
+        Problem::SignedOut => "Run gh auth login to see pull requests here.",
+    });
+    let mut list = col().key("links-list").w_full().grow(1.0).min_h(0.0).px(8.0).pb(8.0).gap(1.0).scroll(ScrollSpec { stick_bottom: false });
+    if !prs.is_empty() {
+        list = list.child(section("Pull requests", k));
+    }
+    list = list.children(prs.iter().enumerate().map(|(i, pr)| pr_row(i, pr, k)));
+    if let Some(note) = gh_note {
+        list = list.child(text(note).key("links-gh-note").font(k.ty.small).color(c.text_muted).wrap().padding(4.0));
+    }
+    if !links.is_empty() {
+        list = list.child(section("Artifacts", k));
+    }
+    list = list.children(links.iter().enumerate().map(|(i, a)| artifact_row(p, i, a, k)));
+    if let Some(e) = empty {
+        list = list.child(text(e).key("links-empty").font(k.ty.ui).color(c.text_muted).wrap().padding(4.0));
+    }
+    col().key("links-panel").w_full().h_full().min_h(0.0).child(header(title, count, k)).child(list)
 }
 
 #[cfg(test)]
-mod tests {
-    // Not `super::*`: gpui's `test` would stand in for the plain one.
-    use super::LinksPanel;
-    use crate::gh::State;
-    use crate::test_support::{HcServer, TempDir, fake_gh, git_in, wait_until};
-    use gpui_kit::{AppContext, Entity, Modifiers};
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    const ONE: &str = "1hJWkh1hjNLMZjGxLk1zCD";
-    const TWO: &str = "2VWjSVh3UGph6KPNmbpbzY";
-
-    fn opened(
-        file: PathBuf,
-        cx: &mut gpui::TestAppContext,
-    ) -> (Entity<LinksPanel>, &mut gpui::VisualTestContext) {
-        let mut panel = None;
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|_| LinksPanel::new(Some(file)));
-            panel = Some(view.clone());
-            gpui_kit::base::Root::new(view, window, cx)
-        });
-        (panel.unwrap(), cx)
-    }
-
-    /// Links in a worktree's logs on its host list by themselves, each to
-    /// its own worktree, and open with a click. One taken off stays off,
-    /// the next time Lemur starts too, though the log still has it.
-    #[gpui::test]
-    fn an_artifact_can_be_given_a_name(cx: &mut gpui::TestAppContext) {
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let server = HcServer::new("links-name");
-        let host = server.config().hosts.remove(0);
-        let dir = TempDir::new("links-name");
-        let file = dir.join("links.json");
-        let logs = server.claude_config().join("projects/-srv-api");
-        std::fs::create_dir_all(&logs).unwrap();
-        let log = format!(
-            "{{\"message\":{{\"content\":\"[Handover](https://claude.ai/artifact/{ONE})\"}},\
-             \"type\":\"assistant\",\"timestamp\":\"2026-11-01\"}}\n"
-        );
-        std::fs::write(logs.join("a.jsonl"), log).unwrap();
-        let (panel, cx) = opened(file.clone(), cx);
-        panel.update(cx, |p, cx| {
-            p.show(host.clone(), "/srv/api".into(), "api".into(), cx)
-        });
-        let shows = |name: &str, cx: &mut gpui::VisualTestContext| {
-            wait_until(Duration::from_secs(10), || {
-                cx.run_until_parked();
-                panel.read_with(cx, |p, _| p.listed().1 == [name])
-            })
-        };
-        assert!(shows("Handover", cx));
-        let click = |selector: &str, cx: &mut gpui::VisualTestContext| {
-            let selector: &'static str = selector.to_string().leak();
-            let at = cx.debug_bounds(selector).expect(selector).center();
-            cx.simulate_click(at, Modifiers::none());
-            cx.run_until_parked();
-        };
-
-        // Esc leaves it as it was.
-        click("artifact-rename 0", cx);
-        assert!(cx.debug_bounds("artifact-renaming 0").is_some(), "it asks");
-        cx.simulate_input("Not this");
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("artifact-renaming 0").is_none());
-        assert!(shows("Handover", cx));
-
-        // What's typed takes the place of what was there.
-        click("artifact-rename 0", cx);
-        cx.simulate_input("My doc");
-        cx.simulate_keystrokes("enter");
-        assert!(shows("My doc", cx));
-        assert!(cx.debug_bounds("artifact 0 My doc").is_some());
-        let kept = std::fs::read_to_string(&file).unwrap();
-        assert!(kept.contains("My doc"), "{kept}");
-
-        // Emptied, it goes back to what the agent called it.
-        click("artifact-rename 0", cx);
-        cx.simulate_keystrokes("backspace enter");
-        assert!(shows("Handover", cx));
-    }
-
-    #[gpui::test]
-    fn another_folder_doesnt_wait_for_the_one_being_read(cx: &mut gpui::TestAppContext) {
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let server = HcServer::new("links-wait");
-        let host = server.config().hosts.remove(0);
-        let dir = TempDir::new("links-wait");
-        let (panel, cx) = opened(dir.join("links.json"), cx);
-        panel.update(cx, |p, cx| {
-            p.show(host.clone(), "/srv/slow".into(), "slow".into(), cx);
-            p.show(host.clone(), "/srv/next".into(), "next".into(), cx);
-            let reading = p.loading.as_ref().map(|(_, path)| path.as_str());
-            assert_eq!(reading, Some("/srv/next"), "asked at once");
-        });
-        cx.run_until_parked();
-    }
-
-    #[gpui::test]
-    fn links_list_by_themselves_and_stay_off_once_removed(cx: &mut gpui::TestAppContext) {
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let server = HcServer::new("links-panel");
-        let host = server.config().hosts.remove(0);
-        let dir = TempDir::new("links-panel");
-        let file = dir.join("links.json");
-        let logs = server.claude_config().join("projects/-srv-api");
-        std::fs::create_dir_all(&logs).unwrap();
-        let line = |id: &str, title: &str, at: &str| {
-            format!(
-                "{{\"message\":{{\"content\":\"[{title}](https://claude.ai/artifact/{id})\"}},\"type\":\"assistant\",\"timestamp\":\"{at}\"}}\n"
-            )
-        };
-        std::fs::write(logs.join("a.jsonl"), line(ONE, "Handover", "2026-11-01")).unwrap();
-
-        let (panel, cx) = opened(file.clone(), cx);
-        let listed = |panel: &Entity<LinksPanel>, cx: &mut gpui::VisualTestContext| {
-            panel.read_with(cx, |p, _| p.listed())
-        };
-        let shows =
-            |panel: &Entity<LinksPanel>, names: &[&str], cx: &mut gpui::VisualTestContext| {
-                wait_until(Duration::from_secs(10), || {
-                    cx.run_until_parked();
-                    let (loading, got) = listed(panel, cx);
-                    !loading && got == names
-                })
-            };
-        panel.update(cx, |p, cx| {
-            p.show(host.clone(), "/srv/api".into(), "api".into(), cx)
-        });
-        assert!(shows(&panel, &["Handover"], cx), "{:?}", listed(&panel, cx));
-
-        // A click on it opens it; on its ×, it doesn't.
-        let row = cx.debug_bounds("artifact 0 Handover").expect("its row");
-        cx.simulate_click(row.center(), Modifiers::none());
-        assert_eq!(
-            cx.opened_url().as_deref(),
-            Some(format!("https://claude.ai/artifact/{ONE}").as_str())
-        );
-
-        // A new link, in the log since the last look, goes on top.
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(logs.join("a.jsonl"))
-            .and_then(|mut log| {
-                std::io::Write::write_all(&mut log, line(TWO, "Report", "2026-11-02").as_bytes())
-            })
-            .unwrap();
-        panel.update(cx, |p, cx| p.refresh(cx));
-        assert!(
-            shows(&panel, &["Report", "Handover"], cx),
-            "{:?}",
-            listed(&panel, cx)
-        );
-
-        let remove = cx.debug_bounds("artifact-remove 0").expect("its ×");
-        let opened_before = cx.opened_url();
-        cx.simulate_click(remove.center(), Modifiers::none());
-        assert_eq!(listed(&panel, cx).1, ["Handover"]);
-        assert_eq!(cx.opened_url(), opened_before, "it didn't open");
-
-        // Read from the start again, and by a new Lemur: it stays off.
-        panel.update(cx, |p, cx| {
-            let (host, path) = (host.name.clone(), "/srv/api");
-            p.store.place_mut(&host, path).looked = None;
-            p.refresh(cx);
-        });
-        assert!(shows(&panel, &["Handover"], cx), "{:?}", listed(&panel, cx));
-        let again = cx.new(|_| LinksPanel::new(Some(file)));
-        again.update(cx, |p, cx| {
-            p.show(host.clone(), "/srv/api".into(), "api".into(), cx)
-        });
-        assert!(shows(&again, &["Handover"], cx), "{:?}", listed(&again, cx));
-
-        // Another worktree has its own.
-        panel.update(cx, |p, cx| {
-            p.show(host.clone(), "/srv/other".into(), "other".into(), cx)
-        });
-        assert!(shows(&panel, &[], cx), "{:?}", listed(&panel, cx));
-    }
-
-    /// A worktree's pull requests list with what `gh` says of them, and
-    /// change as it does: those of its branch, and those agents linked to, of
-    /// its repository only. A click opens one, and × takes it off for good.
-    /// A merged one isn't asked after again. Without `gh`, or signed out,
-    /// the panel says so, and links agents posted meanwhile aren't lost.
-    #[gpui::test]
-    fn pull_requests_list_with_what_gh_says(cx: &mut gpui::TestAppContext) {
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        let server = HcServer::new("links-prs");
-        let host = server.config().hosts.remove(0);
-        let dir = TempDir::new("links-prs");
-        let repo = dir.join("api");
-        std::fs::create_dir(&repo).unwrap();
-        git_in(&repo, &["init", "-q", "-b", "main"]);
-        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        git_in(
-            &repo,
-            &["remote", "add", "origin", "git@github.com:owner/api.git"],
-        );
-        git_in(&repo, &["checkout", "-q", "-b", "fix/thing"]);
-        let path = repo.to_string_lossy().into_owned();
-        let folder: String = path
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        let logs = server.claude_config().join("projects").join(folder);
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(
-            logs.join("a.jsonl"),
-            "{\"text\":\"https://github.com/owner/api/pull/40 and https://github.com/zed-industries/zed/pull/38639\",\"type\":\"assistant\",\"timestamp\":\"t\"}\n",
-        )
-        .unwrap();
-        let told = |number: u64, state: &str, draft: bool, title: &str| {
-            format!(
-                "{{\"isDraft\":{draft},\"number\":{number},\"state\":\"{state}\",\"title\":\"{title}\",\"url\":\"https://github.com/owner/api/pull/{number}\"}}"
-            )
-        };
-        // What it says is in files, so it can change.
-        let branch_says = dir.join("branch.json");
-        std::fs::write(
-            &branch_says,
-            format!("[{}]", told(41, "OPEN", true, "Fix the thing")),
-        )
-        .unwrap();
-        let forty_says = dir.join("forty.json");
-        std::fs::write(&forty_says, told(40, "MERGED", false, "An earlier fix")).unwrap();
-        let gh = fake_gh(
-            &dir,
-            &format!(
-                r#"case "$*" in
-  "pr list --repo owner/api --head fix/thing "*) cat '{}' ;;
-  "pr view 40 --repo owner/api "*) cat '{}' ;;
-  *) echo "asked of: $*" >&2; exit 1 ;;
-esac"#,
-                branch_says.display(),
-                forty_says.display()
-            ),
-        );
-
-        let (panel, cx) = opened(dir.join("links.json"), cx);
-        panel.update(cx, |p, _| p.gh = gh.clone());
-        let prs = |cx: &mut gpui::VisualTestContext| panel.read_with(cx, |p, _| p.listed_prs());
-        let shows = |want: &[(u64, State)], cx: &mut gpui::VisualTestContext| {
-            wait_until(Duration::from_secs(10), || {
-                cx.run_until_parked();
-                let (loading, got) = prs(cx);
-                !loading && got == want
-            })
-        };
-        panel.update(cx, |p, cx| {
-            p.show(host.clone(), path.clone(), "api".into(), cx)
-        });
-        assert!(
-            shows(&[(41, State::Draft), (40, State::Merged)], cx),
-            "the open one first, not another project's: {:?}",
-            prs(cx)
-        );
-        assert!(cx.debug_bounds("pr 41 Draft").is_some());
-        assert!(cx.debug_bounds("gh-note").is_none());
-
-        // It's marked ready: so says the panel, and no one asks after 40.
-        std::fs::write(
-            &branch_says,
-            format!("[{}]", told(41, "OPEN", false, "Fix the thing")),
-        )
-        .unwrap();
-        let calls = dir.join("calls");
-        std::fs::remove_file(&calls).unwrap();
-        panel.update(cx, |p, cx| p.refresh(cx));
-        assert!(
-            shows(&[(41, State::Open), (40, State::Merged)], cx),
-            "{:?}",
-            prs(cx)
-        );
-        assert!(cx.debug_bounds("pr 41 Open").is_some());
-        let asked = std::fs::read_to_string(&calls).unwrap();
-        assert!(!asked.contains("pr view 40"), "{asked}");
-
-        let row = cx.debug_bounds("pr 41 Open").unwrap();
-        cx.simulate_click(row.center(), Modifiers::none());
-        assert_eq!(
-            cx.opened_url().as_deref(),
-            Some("https://github.com/owner/api/pull/41")
-        );
-
-        // Taken off, it stays off, though it's still the branch's.
-        let remove = cx.debug_bounds("pr-remove 0").expect("its ×");
-        cx.simulate_click(remove.center(), Modifiers::none());
-        panel.update(cx, |p, cx| p.refresh(cx));
-        assert!(shows(&[(40, State::Merged)], cx), "{:?}", prs(cx));
-
-        // Signed out: it says so, and a link posted meanwhile waits for `gh`.
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(logs.join("a.jsonl"))
-            .and_then(|mut log| {
-                std::io::Write::write_all(
-                    &mut log,
-                    b"{\"text\":\"https://github.com/owner/api/pull/42\",\"type\":\"assistant\",\"timestamp\":\"t\"}\n",
-                )
-            })
-            .unwrap();
-        let signed_out = TempDir::new("links-prs-out");
-        let out = fake_gh(
-            &signed_out,
-            "echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4",
-        );
-        panel.update(cx, |p, cx| {
-            p.gh = out;
-            p.refresh(cx);
-        });
-        assert!(
-            wait_until(Duration::from_secs(10), || {
-                cx.run_until_parked();
-                cx.debug_bounds("gh-note").is_some()
-            }),
-            "it says so"
-        );
-
-        // By now that log is too old to be read again: only the note of it
-        // is left.
-        let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(logs.join("a.jsonl"))
-            .unwrap()
-            .set_modified(long_ago)
-            .unwrap();
-        let forty_two = dir.join("forty-two");
-        std::fs::write(&forty_two, told(42, "OPEN", false, "Posted meanwhile")).unwrap();
-        let back = fake_gh(&dir, &format!("cat '{}'", forty_two.display()));
-        panel.update(cx, |p, cx| {
-            p.gh = back;
-            p.refresh(cx);
-        });
-        assert!(
-            wait_until(Duration::from_secs(10), || {
-                cx.run_until_parked();
-                prs(cx).1.iter().any(|(number, _)| *number == 42)
-            }),
-            "{:?}",
-            prs(cx)
-        );
-        assert!(cx.debug_bounds("gh-note").is_none(), "it can say now");
-    }
-}
+#[path = "links_panel_tests.rs"]
+pub(super) mod tests;

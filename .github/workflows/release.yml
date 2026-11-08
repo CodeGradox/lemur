@@ -28,10 +28,9 @@ jobs:
       - name: Install the pinned toolchain
         run: |
           xcodebuild -version
-          # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
-          # Metal toolchain as a separate download.
-          xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
-              xcodebuild -downloadComponent MetalToolchain
+          # The terminal is Ghostty's, built from its source with Zig.
+          brew install zig
+          zig version
           rust="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$rust"
           rustup toolchain install "$rust" --profile minimal
@@ -99,10 +98,9 @@ jobs:
         run: |
           test "$(uname -m)" = "$ARCH"
           xcodebuild -version
-          # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
-          # Metal toolchain as a separate download.
-          xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
-              xcodebuild -downloadComponent MetalToolchain
+          # The terminal is Ghostty's, built from its source with Zig.
+          brew install zig
+          zig version
           rust="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$rust"
           rustup toolchain install "$rust" --profile minimal

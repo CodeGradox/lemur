@@ -1,120 +1,68 @@
-//! Icons lemur draws that gpui-kit doesn't ship with: Lucide's, as
-//! gpui-kit's own are (ISC, see `icons/LICENSE-LUCIDE`).
+//! Lemur's icons: Claude's spark, and Lucide's (ISC, see `icons/LICENSE-LUCIDE`). Each draws
+//! in its element's colour (`icon(&X, size).color(..)`).
 
-use gpui_kit::component::Icon;
+use rune::Icon;
 
-/// A linked worktree: a branch off the project.
-pub fn git_branch() -> Icon {
-    Icon::empty().data(include_bytes!("icons/git-branch.svg"))
+/// Claude's logo (Anthropic), as Zed ships it.
+pub static CLAUDE: Icon = Icon {
+    name: "lemur-claude",
+    view: 16.0,
+    body: r#"<path fill="currentColor" d="M4.35443 9.97775L6.71495 8.65418L6.75443 8.53883L6.71495 8.47508H6.59948L6.20456 8.45081L4.8557 8.41436L3.68608 8.36579L2.55291 8.30507L2.26734 8.24438L2 7.89224L2.02734 7.71617L2.26734 7.55528L2.61063 7.58564L3.37013 7.63724L4.50937 7.71617L5.3357 7.76474L6.56 7.89224H6.75443L6.78176 7.81331L6.71495 7.76474L6.66329 7.71617L5.48456 6.91778L4.20861 6.07388L3.54025 5.58815L3.17873 5.34227L2.99646 5.11157L2.91747 4.60764L3.24557 4.24639L3.68608 4.27675L3.79848 4.30711L4.24506 4.65014L5.19899 5.38781L6.44456 6.30458L6.62684 6.45635L6.69974 6.40475L6.70886 6.36833L6.62684 6.23171L5.94938 5.00834L5.22632 3.76372L4.9043 3.24766L4.81924 2.93802C4.78886 2.81053 4.7676 2.70427 4.7676 2.57374L5.14127 2.06678L5.34785 2L5.84609 2.06678L6.0557 2.24893L6.36557 2.95624L6.86684 4.07033L7.64456 5.58512L7.87241 6.0344L7.99391 6.45029L8.03948 6.57779H8.11847V6.50492L8.18228 5.6519L8.30075 4.6046L8.41619 3.25677L8.4557 2.87731L8.64404 2.42196L9.01772 2.17607L9.30938 2.31571L9.54938 2.65874L9.51596 2.88034L9.37316 3.80622L9.09368 5.25728L8.9114 6.22868H9.01772L9.13925 6.10727L9.6314 5.45459L10.4577 4.42246L10.8223 4.01265L11.2476 3.56033L11.521 3.3448H12.0375L12.4172 3.90944L12.2471 4.49228L11.7154 5.1662L11.275 5.73692L10.643 6.58691L10.2481 7.26689L10.2846 7.32152L10.3787 7.31243L11.8066 7.00886L12.5782 6.86921L13.4987 6.71135L13.915 6.90563L13.9605 7.10297L13.7965 7.50671L12.8122 7.74956L11.6577 7.98026L9.93824 8.38706L9.91697 8.40224L9.94127 8.43257L10.716 8.50544L11.0471 8.52365H11.8582L13.3681 8.63597L13.763 8.89703L14 9.21578L13.9605 9.45863L13.3529 9.76829L12.5327 9.57398L10.6187 9.11864L9.96254 8.95472H9.8714V9.00935L10.4182 9.54365L11.4208 10.4483L12.6754 11.614L12.7393 11.9023L12.5782 12.13L12.4081 12.1057L11.3053 11.277L10.88 10.9036L9.91697 10.0931H9.85316V10.1781L10.075 10.5029L11.2476 12.2636L11.3083 12.804L11.2233 12.98L10.9195 13.0863L10.5853 13.0255L9.89873 12.0632L9.19088 10.9795L8.61974 10.0081L8.54987 10.0476L8.21267 13.6752L8.05469 13.8604L7.69013 14L7.38632 13.7693L7.22531 13.3959L7.38632 12.6582L7.58075 11.6959L7.73873 10.9309L7.88153 9.98078L7.96658 9.66506L7.96052 9.64382L7.89062 9.65291L7.17368 10.6365L6.08303 12.1088L5.22026 13.0316L5.01368 13.1136L4.65519 12.9284L4.68861 12.5975L4.88911 12.303L6.08303 10.7852L6.80303 9.84416L7.26785 9.30077L7.26482 9.22187H7.23746L4.06582 11.2801L3.50076 11.3529L3.25772 11.1252L3.2881 10.7518L3.40354 10.6304L4.35747 9.97469L4.35443 9.97775Z"/>"#,
+};
+
+macro_rules! lucide {
+    ($($id:ident, $name:literal, $body:literal;)*) => {
+        $(
+            pub static $id: Icon = Icon {
+                name: concat!("lucide-", $name),
+                view: 24.0,
+                body: concat!(
+                    r#"<g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">"#,
+                    $body,
+                    "</g>"
+                ),
+            };
+        )*
+    };
 }
 
-/// A host lemur reaches over SSH.
-pub fn server() -> Icon {
-    Icon::empty().data(include_bytes!("icons/server.svg"))
-}
-
-/// This Mac.
-pub fn monitor() -> Icon {
-    Icon::empty().data(include_bytes!("icons/monitor.svg"))
-}
-
-/// A worktree's changes since its last commit.
-pub fn file_diff() -> Icon {
-    Icon::empty().data(include_bytes!("icons/file-diff.svg"))
-}
-
-/// Giving something another name.
-pub fn pencil() -> Icon {
-    Icon::empty().data(include_bytes!("icons/pencil.svg"))
-}
-
-/// Codex's threads: code, not a logo of OpenAI's.
-pub fn code_xml() -> Icon {
-    Icon::empty().data(include_bytes!("icons/code-xml.svg"))
-}
-
-/// A thread's notifications, to silence.
-pub fn bell() -> Icon {
-    Icon::empty().data(include_bytes!("icons/bell.svg"))
-}
-
-/// A thread silenced.
-pub fn bell_off() -> Icon {
-    Icon::empty().data(include_bytes!("icons/bell-off.svg"))
-}
-
-/// A Linear issue.
-pub fn ticket() -> Icon {
-    Icon::empty().data(include_bytes!("icons/ticket.svg"))
-}
-
-/// Links: Claude artifacts and pull requests.
-pub fn link() -> Icon {
-    Icon::empty().data(include_bytes!("icons/link.svg"))
-}
-
-/// A Claude artifact.
-pub fn artifact() -> Icon {
-    Icon::empty().data(include_bytes!("icons/shapes.svg"))
-}
-
-/// The language dictation listens for.
-pub fn languages() -> Icon {
-    Icon::empty().data(include_bytes!("icons/languages.svg"))
-}
-
-/// Stops dictation listening.
-pub fn circle_stop() -> Icon {
-    Icon::empty().data(include_bytes!("icons/circle-stop.svg"))
-}
-
-/// The Shortcuts page.
-pub fn keyboard() -> Icon {
-    Icon::empty().data(include_bytes!("icons/keyboard.svg"))
-}
-
-#[cfg(test)]
-mod tests {
-    use gpui_kit::AssetSource;
-    use gpui_kit::assets::{Assets, IconName, IconNamed};
-    use std::path::Path;
-
-    /// `Assets` holds only some of gpui-kit's icons, and one it doesn't hold
-    /// draws as nothing, with no error to see: each icon Lemur names by
-    /// name must be in it. The rest go in `icons/`, as those above.
-    #[test]
-    fn every_icon_named_is_one_lemur_ships() {
-        fn check(dir: &Path, missing: &mut Vec<String>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    check(&path, missing);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    for (at, needle) in text.match_indices("IconName::") {
-                        let rest = &text[at + needle.len()..];
-                        let name: String = rest
-                            .chars()
-                            .take_while(|c| c.is_ascii_alphanumeric())
-                            .collect();
-                        // What isn't an icon's name, as `ALL` here.
-                        let Some(icon) = IconName::ALL.iter().find(|i| format!("{i:?}") == name)
-                        else {
-                            continue;
-                        };
-                        let shipped = Assets.load(&IconNamed::path(*icon));
-                        if !shipped.is_ok_and(|bytes| bytes.is_some()) {
-                            missing.push(format!("{name} in {}", path.display()));
-                        }
-                    }
-                }
-            }
-        }
-        let mut missing = vec![];
-        check(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut missing,
-        );
-        assert!(missing.is_empty(), "not in the bundle: {missing:#?}");
-    }
+lucide! {
+    BELL, "bell", r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>"#;
+    BELL_OFF, "bell-off", r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/><path d="m2 2 20 20"/><path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/>"#;
+    BOT, "bot", r#"<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>"#;
+    CHEVRON_DOWN, "chevron-down", r#"<path d="m6 9 6 6 6-6"/>"#;
+    CIRCLE_ALERT, "circle-alert", r#"<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>"#;
+    CIRCLE_CHECK, "circle-check", r#"<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>"#;
+    CIRCLE_STOP, "circle-stop", r#"<circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1"/>"#;
+    CODE_XML, "code-xml", r#"<path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/>"#;
+    ELLIPSIS, "ellipsis", r#"<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>"#;
+    EXTERNAL_LINK, "external-link", r#"<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#;
+    EYE, "eye", r#"<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>"#;
+    FILE_DIFF, "file-diff", r#"<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M9 10h6"/><path d="M12 13V7"/><path d="M9 17h6"/>"#;
+    FILE_TEXT, "file-text", r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>"#;
+    FOLDER, "folder", r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#;
+    GIT_BRANCH, "git-branch", r#"<path d="M15 6a9 9 0 0 0-9 9V3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>"#;
+    KEYBOARD, "keyboard", r#"<path d="M10 8h.01"/><path d="M12 12h.01"/><path d="M14 8h.01"/><path d="M16 12h.01"/><path d="M18 8h.01"/><path d="M6 8h.01"/><path d="M7 16h10"/><path d="M8 12h.01"/><rect width="20" height="16" x="2" y="4" rx="2"/>"#;
+    LANGUAGES, "languages", r#"<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>"#;
+    LINK, "link", r#"<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>"#;
+    LIST, "list", r#"<path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/>"#;
+    LIST_TODO, "list-todo", r#"<path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><rect x="3" y="4" width="6" height="6" rx="1"/>"#;
+    MAXIMIZE, "maximize-2", r#"<path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/><path d="M9 21H3v-6"/>"#;
+    MIC, "mic", r#"<path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/>"#;
+    MINUS, "minus", r#"<path d="M5 12h14"/>"#;
+    MONITOR, "monitor", r#"<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>"#;
+    PALETTE, "palette", r#"<path d="M12 22a1 1 0 0 1 0-20 10 9 0 0 1 10 9 5 5 0 0 1-5 5h-2.25a1.75 1.75 0 0 0-1.4 2.8l.3.4a1.75 1.75 0 0 1-1.4 2.8z"/><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/>"#;
+    PENCIL, "pencil", r#"<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>"#;
+    PLAY, "play", r#"<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>"#;
+    PLUS, "plus", r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#;
+    REFRESH, "refresh-cw", r#"<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>"#;
+    ROTATE_CCW, "rotate-ccw", r#"<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>"#;
+    SEARCH, "search", r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#;
+    SERVER, "server", r#"<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>"#;
+    SHAPES, "shapes", r#"<path d="M8.3 10a.7.7 0 0 1-.626-1.079L11.4 3a.7.7 0 0 1 1.198-.043L16.3 8.9a.7.7 0 0 1-.572 1.1Z"/><rect x="3" y="14" width="7" height="7" rx="1"/><circle cx="17.5" cy="17.5" r="3.5"/>"#;
+    SQUARE_TERMINAL, "square-terminal", r#"<path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/>"#;
+    SUN, "sun", r#"<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>"#;
+    TICKET, "ticket", r#"<path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/>"#;
+    TRIANGLE_ALERT, "triangle-alert", r#"<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>"#;
+    X, "x", r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#;
 }

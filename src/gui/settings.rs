@@ -1,677 +1,708 @@
 //! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font,
 //! scrollback and colors, the language dictation listens for, whether to
-//! show Claude's plan usage, and Lemur's Linear sign-in. Changes apply at
-//! once in every window and are saved to the config file.
+//! show Claude's and Codex's plan usage, Lemur's Linear sign-in, herdr-core's
+//! versions, and every shortcut. Changes apply at once and are saved to the
+//! config file.
+//!
+//! It's a page over the whole window, not a window of its own as it was: Rune gives each
+//! window a state of its own, and what Settings changes is this one's, which the terminals
+//! follow at once.
 
-use super::linear_panel::{self, LinearAccount};
-use super::meter::{ClaudeFound, CodexFound};
-use super::sidebar::{claude_icon, codex_icon};
-use super::terminal::{Palette, SLOTS, Slot, set_color};
-use crate::config::{
-    Config, FONT_SIZES, Language, SCROLLBACKS, Terminal, ThemeChoice, ThreadOrder,
-};
+use super::palette::{Palette, Rgb, SLOTS, Slot, hex, rgb, set_color};
+use super::terminal::Metrics;
+use super::{Lemur, icons};
+use crate::config::{Agent, Config, FONT_SIZES, Language, SCROLLBACKS, ThemeChoice, ThreadOrder, parse_hex};
 use crate::core_update::{self, Versions};
-use alacritty_terminal::vte::ansi::Rgb;
-use gpui_kit::component::Disableable;
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::setting::{
-    NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
-};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable, Theme, ThemeMode, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
-use std::path::PathBuf;
-use std::sync::LazyLock;
+use rune::{El, Icon, Key as K, PopupMenu, ScrollSpec, TextEdit, Tx, col, el, icon, row, text};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Select, SelectAppearance, Switch, TextInput};
 
-actions!(settings, [CloseWindow]);
-
-/// Key context of the Settings window.
-pub const CONTEXT: &str = "Settings";
-
-/// The settings every window follows. Change them with [`Prefs::update`].
-#[derive(Clone, Default)]
-pub struct Prefs {
-    pub theme: ThemeChoice,
-    pub dictation_language: Language,
-    pub thread_order: ThreadOrder,
-    pub terminal: Terminal,
-    /// Whether the sidebar shows how much of Claude's plan is used.
-    pub claude_usage: bool,
-    /// Whether it shows how much of Codex's is.
-    pub codex_usage: bool,
-    /// The herdr-cores Lemur uses on this Mac, whose versions Settings
-    /// shows.
-    pub cores: core_update::Cores,
-    /// The config file that keeps changes; tests have none.
-    file: Option<PathBuf>,
-    /// Why the last change couldn't be saved.
-    error: Option<String>,
+/// Settings' pages, as its list has them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Page {
+    #[default]
+    Appearance,
+    Terminal,
+    Colors,
+    Dictation,
+    Claude,
+    Codex,
+    Core,
+    Shortcuts,
+    Linear,
 }
 
-impl Global for Prefs {}
+/// Each page with its key and its name.
+const PAGES: [(Page, &str, &str); 9] = [
+    (Page::Appearance, "appearance", "Appearance"),
+    (Page::Terminal, "terminal", "Terminal"),
+    (Page::Colors, "colors", "Terminal colors"),
+    (Page::Dictation, "dictation", "Dictation"),
+    (Page::Claude, "claude", "Claude"),
+    (Page::Codex, "codex", "Codex"),
+    (Page::Core, "core", "herdr-core"),
+    (Page::Shortcuts, "shortcuts", "Shortcuts"),
+    (Page::Linear, "linear", "Linear"),
+];
 
-impl Prefs {
-    pub fn new(cfg: &Config, file: Option<PathBuf>) -> Self {
-        Prefs {
-            theme: cfg.theme,
-            dictation_language: cfg.dictation_language,
-            thread_order: cfg.thread_order,
-            terminal: cfg.terminal.clone(),
-            claude_usage: cfg.claude_usage,
-            codex_usage: cfg.codex_usage,
-            cores: core_update::Cores::of(cfg),
-            file,
-            error: None,
-        }
-    }
-
-    /// A host was added: Settings asks and updates the cores it takes.
-    pub fn hosts_changed(cfg: &Config, cx: &mut App) {
-        if cx.has_global::<Prefs>() {
-            cx.global_mut::<Prefs>().cores = core_update::Cores::of(cfg);
-        }
-    }
-
-    /// The config file changes are saved to; tests have none.
-    pub fn config_file(&self) -> Option<&std::path::Path> {
-        self.file.as_deref()
-    }
-
-    /// The current settings; the defaults until the app sets them.
-    pub fn get(cx: &App) -> &Prefs {
-        static DEFAULT: LazyLock<Prefs> = LazyLock::new(Prefs::default);
-        cx.try_global().unwrap_or(&DEFAULT)
-    }
-
-    /// Changes the settings: every window follows, and the config file keeps them.
-    pub fn update(cx: &mut App, change: impl FnOnce(&mut Prefs)) {
-        let mut prefs = Prefs::get(cx).clone();
-        let theme = prefs.theme;
-        change(&mut prefs);
-        prefs.error = prefs.file.as_deref().and_then(|path| {
-            Config::save_settings(
-                path,
-                prefs.theme,
-                prefs.dictation_language,
-                prefs.thread_order,
-                &prefs.terminal,
-                prefs.claude_usage,
-                prefs.codex_usage,
-            )
-            .err()
-            .map(|e| format!("{e:#}"))
-        });
-        cx.set_global(prefs);
-        if Prefs::get(cx).theme != theme {
-            apply_theme(None, cx);
-        }
+fn page_icon(page: Page) -> &'static Icon {
+    match page {
+        Page::Appearance => &icons::SUN,
+        Page::Terminal => &icons::SQUARE_TERMINAL,
+        Page::Colors => &icons::PALETTE,
+        Page::Dictation => &icons::MIC,
+        Page::Claude => &icons::CLAUDE,
+        Page::Codex => &icons::CODE_XML,
+        Page::Core => &icons::SERVER,
+        Page::Shortcuts => &icons::KEYBOARD,
+        Page::Linear => &icons::TICKET,
     }
 }
 
-/// Goes light or dark as the theme setting says; `window` when one is at hand.
-pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
-    match Prefs::get(cx).theme {
-        ThemeChoice::System => Theme::sync_system_appearance(window, cx),
-        ThemeChoice::Light => Theme::change(ThemeMode::Light, window, cx),
-        ThemeChoice::Dark => Theme::change(ThemeMode::Dark, window, cx),
-    }
-}
-
-/// The Settings window while it's open, so ⌘, brings it forward instead of
-/// opening another.
-struct Open(AnyWindowHandle);
-
-impl Global for Open {}
-
-pub fn open(cx: &mut App) {
-    if let Some(&Open(window)) = cx.try_global::<Open>()
-        && window
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
-        return;
-    }
-    let options = WindowOptions {
-        titlebar: Some(TitlebarOptions {
-            title: Some("Settings".into()),
-            ..Default::default()
-        }),
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(760.0), px(480.0)),
-            cx,
-        ))),
-        ..Default::default()
-    };
-    if let Ok((window, _)) = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(window, cx))
-    }) {
-        cx.set_global(Open(window));
-    }
-}
-
-struct SettingsView {
-    /// Installed monospaced fonts, as dropdown options.
-    fonts: Vec<(SharedString, SharedString)>,
-    /// A picker for each terminal color, dark then light.
-    pickers: Vec<Picker>,
-    focus: FocusHandle,
-    _prefs: Subscription,
-    _found: Subscription,
-    _codex_found: Subscription,
-    _linear: Subscription,
+#[derive(Default)]
+pub struct Settings {
+    /// Over the window, on `page`.
+    pub open: bool,
+    page: Page,
+    /// Monospaced fonts installed on this Mac, once listed.
+    fonts: Option<Vec<String>>,
+    /// The font size and the scrollback as typed.
+    font_size: TextEdit,
+    scrollback: TextEdit,
+    /// A terminal color being typed: for a dark Lemur or a light one, which, and its field.
+    color: Option<(bool, Slot, TextEdit)>,
     /// herdr-core's versions here and on each machine, once asked.
     core: Option<Result<Versions, String>>,
     /// Updating it, and then what that did, or why it didn't.
     updating: bool,
     core_note: Option<(String, bool)>,
-    _pickers: Vec<Subscription>,
+    /// Why the last change couldn't be saved.
+    error: Option<String>,
+    /// The most lines of scrollback the terminals were given.
+    given: Option<u32>,
 }
 
-struct Picker {
-    dark: bool,
-    slot: Slot,
-    label: &'static str,
-    state: Entity<ColorPickerState>,
+/// A size as typed: whole ones without the ".0".
+fn number(size: f64) -> String {
+    if size.fract() == 0.0 { format!("{size:.0}") } else { size.to_string() }
 }
 
-impl SettingsView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus = cx.focus_handle();
-        // Focused, so ⌘W closes it before anything is clicked.
-        focus.focus(window, cx);
-        let fonts = monospace_fonts(cx)
-            .into_iter()
-            .map(|f| (f.clone(), f))
-            .collect();
-        let terminal = Prefs::get(cx).terminal.clone();
-        let (mut pickers, mut subscriptions) = (vec![], vec![]);
-        for dark in [true, false] {
-            let palette = Palette::themed(dark, &terminal);
-            for (slot, label) in SLOTS {
-                let color = to_hsla(palette.get(slot));
-                let state = cx.new(|cx| ColorPickerState::new(window, cx).default_value(color));
-                subscriptions.push(cx.subscribe_in(
-                    &state,
-                    window,
-                    move |_, _, event: &ColorPickerEvent, _, cx| {
-                        let ColorPickerEvent::Change(color) = event;
-                        let color = color.map(to_rgb);
-                        Prefs::update(cx, |p| set_color(&mut p.terminal, dark, slot, color));
-                    },
-                ));
-                pickers.push(Picker {
-                    dark,
-                    slot,
-                    label,
-                    state,
-                });
-            }
+/// A field showing `text`, all of it selected so typing replaces it, with the keyboard.
+fn field(text: &str) -> TextEdit {
+    let mut e = TextEdit::new(text);
+    e.anchor = 0;
+    e.focused = true;
+    e
+}
+
+impl Lemur {
+    /// ⌘,: opens Settings over the window. Like the spotlight, it waits under what's over
+    /// the window already.
+    pub(super) fn open_settings(&mut self, _tx: &mut Tx) {
+        if self.panels.settings.open || self.overlaid() {
+            return;
         }
-        // Tests don't ask the release site.
-        if !cfg!(test) {
-            cx.defer_in(window, |this: &mut Self, _, cx| this.check_core(cx));
+        let terminal = &self.prefs.terminal;
+        let (size, lines) = (number(terminal.font_size), terminal.scrollback);
+        let st = &mut self.panels.settings;
+        st.open = true;
+        st.font_size = TextEdit::new(size);
+        st.scrollback = TextEdit::new(lines.to_string());
+        st.color = None;
+        st.given.get_or_insert(lines);
+        // Tests ask neither this Mac's fonts nor the release site.
+        if cfg!(test) {
+            return;
         }
-        SettingsView {
-            fonts,
-            pickers,
-            focus,
-            _prefs: cx.observe_global_in::<Prefs>(window, |this, window, cx| {
-                this.sync_pickers(window, cx);
-                cx.notify();
-            }),
-            _found: cx.observe_global::<ClaudeFound>(|_, cx| cx.notify()),
-            _codex_found: cx.observe_global::<CodexFound>(|_, cx| cx.notify()),
-            _linear: cx.observe_global::<LinearAccount>(|_, cx| cx.notify()),
-            core: None,
-            updating: false,
-            core_note: None,
-            _pickers: subscriptions,
+        if st.fonts.is_none() {
+            self.in_background(monospace_fonts, |s, fonts| s.panels.settings.fonts = Some(fonts));
         }
+        self.check_core();
     }
 
-    /// Shows each terminal color as Settings have it, after a reset or a
-    /// change elsewhere.
-    fn sync_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let terminal = Prefs::get(cx).terminal.clone();
-        for p in &self.pickers {
-            let color = to_hsla(Palette::themed(p.dark, &terminal).get(p.slot));
-            if p.state.read(cx).value() != Some(color) {
-                p.state
-                    .update(cx, |state, cx| state.set_value(color, window, cx));
-            }
-        }
+    /// Esc, ⌘W or Done: back to the window.
+    pub(super) fn close_settings(&mut self) {
+        let st = &mut self.panels.settings;
+        st.open = false;
+        st.color = None;
     }
 
-    /// The colors for a dark or a light app, each with a reset to
-    /// lemur's own.
-    fn color_group(&self, dark: bool) -> SettingGroup {
-        let items = self.pickers.iter().filter(|p| p.dark == dark).map(|p| {
-            let (state, slot) = (p.state.clone(), p.slot);
-            let field = SettingField::render(move |_, _, _| ColorPicker::new(&state).small())
-                .on_reset(
-                    move |cx| {
-                        Palette::themed(dark, &Prefs::get(cx).terminal).get(slot)
-                            != Palette::default_for(dark).get(slot)
-                    },
-                    move |_, cx| {
-                        Prefs::update(cx, |p| set_color(&mut p.terminal, dark, slot, None))
-                    },
-                );
-            SettingItem::new(p.label, field)
+    /// Keeps the settings in the config file, or says why it couldn't.
+    fn save_settings(&mut self) {
+        let p = &self.prefs;
+        let saved = p.config_file().map(|file| {
+            Config::save_settings(file, p.theme, p.dictation_language, p.thread_order, &p.terminal, p.claude_usage, p.codex_usage)
         });
-        let (title, description) = if dark {
-            ("Dark", "While Lemur is dark. Starts as One Half Dark.")
-        } else {
-            ("Light", "While Lemur is light. Starts as One Half Light.")
+        self.panels.settings.error = match saved {
+            Some(Err(e)) => Some(format!("{e:#}")),
+            _ => None,
         };
-        SettingGroup::new()
-            .title(title)
-            .description(description)
-            .items(items)
     }
-}
 
-/// `item` with its help text under it, across the page. Given as the item's
-/// description it would sit beside what the item sets, as large as it needs, and
-/// leave that too little room. Searching finds both by what either says.
-fn described(item: SettingItem, help: impl Into<SharedString>) -> [SettingItem; 2] {
-    let help: SharedString = help.into();
-    let title = match &item {
-        SettingItem::Item { title, .. } => title.clone(),
-        SettingItem::Element { .. } => SharedString::default(),
-    };
-    let (shown, selector) = (help.clone(), format!("help {title}"));
-    [
-        item.keywords([help.clone()]),
-        SettingItem::render(move |_, _, cx| {
-            let selector = selector.clone();
-            div()
-                .debug_selector(move || selector)
-                // Close under its item, past most of the gap between a
-                // group's items.
-                .mt(px(-12.0))
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(shown.clone())
-        })
-        .keywords([title, help]),
-    ]
-}
-
-impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let themes = ThemeChoice::ALL
-            .map(|t| (t.as_str().into(), theme_label(t).into()))
-            .to_vec();
-        let theme = SettingField::dropdown(
-            themes,
-            |cx| Prefs::get(cx).theme.as_str().into(),
-            |value: SharedString, cx| {
-                let theme = ThemeChoice::ALL
-                    .into_iter()
-                    .find(|t| t.as_str() == value.as_ref())
-                    .unwrap_or_default();
-                Prefs::update(cx, |p| p.theme = theme);
-            },
-        )
-        .default_value(ThemeChoice::default().as_str());
-        let defaults = Terminal::default();
-        let font = SettingField::scrollable_dropdown(
-            self.fonts.clone(),
-            |cx| Prefs::get(cx).terminal.font_family.clone().into(),
-            |family: SharedString, cx| {
-                Prefs::update(cx, |p| p.terminal.font_family = family.to_string())
-            },
-        )
-        .default_value(defaults.font_family);
-        let font_size = SettingField::number_input(
-            NumberFieldOptions {
-                min: *FONT_SIZES.start(),
-                max: *FONT_SIZES.end(),
-                step: 1.0,
-            },
-            |cx| Prefs::get(cx).terminal.font_size,
-            |size, cx| Prefs::update(cx, |p| p.terminal.font_size = size),
-        )
-        .default_value(defaults.font_size);
-        let scrollback = SettingField::number_input(
-            NumberFieldOptions {
-                min: f64::from(*SCROLLBACKS.start()),
-                max: f64::from(*SCROLLBACKS.end()),
-                step: 1000.0,
-            },
-            |cx| f64::from(Prefs::get(cx).terminal.scrollback),
-            |lines, cx| {
-                let lines = (lines.round() as u32).min(*SCROLLBACKS.end());
-                Prefs::update(cx, |p| p.terminal.scrollback = lines)
-            },
-        )
-        .default_value(f64::from(defaults.scrollback));
-        let languages = Language::ALL
-            .map(|l| (l.as_str().into(), language_label(l).into()))
-            .to_vec();
-        let language = SettingField::dropdown(
-            languages,
-            |cx| Prefs::get(cx).dictation_language.as_str().into(),
-            |value: SharedString, cx| {
-                let language = Language::ALL
-                    .into_iter()
-                    .find(|l| l.as_str() == value.as_ref())
-                    .unwrap_or_default();
-                Prefs::update(cx, |p| p.dictation_language = language);
-            },
-        )
-        .default_value(Language::default().as_str());
-        let thread_orders = ThreadOrder::ALL
-            .map(|o| (o.as_str().into(), thread_order_label(o).into()))
-            .to_vec();
-        let thread_order = SettingField::dropdown(
-            thread_orders,
-            |cx| Prefs::get(cx).thread_order.as_str().into(),
-            |value: SharedString, cx| {
-                let order = ThreadOrder::ALL
-                    .into_iter()
-                    .find(|o| o.as_str() == value.as_ref())
-                    .unwrap_or_default();
-                Prefs::update(cx, |p| p.thread_order = order);
-            },
-        )
-        .default_value(ThreadOrder::default().as_str());
-        // Offered once Lemur has seen Claude Code; turned on, it can be
-        // turned off whatever happens.
-        let found = cx.try_global::<ClaudeFound>().is_some_and(|f| f.0);
-        let usage_on = Prefs::get(cx).claude_usage;
-        let usage = SettingItem::new(
-            "Show plan usage",
-            SettingField::switch(
-                |cx| Prefs::get(cx).claude_usage,
-                |on, cx| Prefs::update(cx, |p| p.claude_usage = on),
-            ),
-        )
-        .disabled(!found && !usage_on);
-        let usage = described(
-            usage,
-            if found || usage_on {
-                "How much of your Claude plan is used, above the hosts' load in the sidebar. \
-             Lemur runs Claude Code's /usage every 10 minutes (30 while Lemur isn't in front) \
-             on the host where Claude ran last; Claude Code asks, with its own sign-in."
-            } else {
-                "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, \
-             then turn this on."
-            },
-        );
-        let codex_found = cx.try_global::<CodexFound>().is_some_and(|f| f.0);
-        let codex_on = Prefs::get(cx).codex_usage;
-        let codex_usage = SettingItem::new(
-            "Show plan usage",
-            SettingField::switch(
-                |cx| Prefs::get(cx).codex_usage,
-                |on, cx| Prefs::update(cx, |p| p.codex_usage = on),
-            ),
-        )
-        .disabled(!codex_found && !codex_on);
-        let codex_usage = described(
-            codex_usage,
-            if codex_found || codex_on {
-                "How much of your ChatGPT plan's Codex use is used, above the hosts' load in the \
-             sidebar. Lemur asks Codex's app server every 10 minutes (30 while Lemur isn't in \
-             front) on the host where Codex ran last; Codex asks, with its own sign-in. Signed \
-             in with an API key there's no plan: it shows the tokens Codex used there, from \
-             Codex's session logs."
-            } else {
-                "Lemur hasn't seen Codex on your hosts yet. Start a Codex thread, then turn this on."
-            },
-        );
-        let (status, error) = linear_panel::settings_status(cx);
-        let (action, act) = linear_panel::settings_action(cx);
-        let account = SettingItem::new(
-            "Account",
-            SettingField::render(move |_, _, _| {
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(div().text_sm().child(status.clone()))
-                    .child(
-                        Button::new("linear-account")
-                            .small()
-                            .label(action)
-                            .on_click(move |_, _, cx| act(cx)),
-                    )
-            }),
-        );
-        let linear = described(
-            account,
-            error.unwrap_or_else(|| {
-                "Lemur signs in with its own Linear app, and only reads: it searches issues and \
-             shows the one pinned to a thread. The sign-in is kept in your Keychain, where \
-             only Lemur can read it."
-                    .into()
-            }),
-        );
-        let settings = Settings::new("settings").sidebar_width(px(200.0)).pages([
-            SettingPage::new("Appearance")
-                .icon(IconName::Sun)
-                .group(SettingGroup::new().items(described(
-                    SettingItem::new("Theme", theme),
-                    "System follows macOS's light or dark mode.",
-                ))),
-            SettingPage::new("Terminal")
-                .icon(IconName::SquareTerminal)
-                .group(
-                    SettingGroup::new()
-                        .items(described(
-                            SettingItem::new("Font", font),
-                            "Monospaced fonts installed on this Mac.",
-                        ))
-                        .items(described(
-                            SettingItem::new("Font size", font_size),
-                            "In points.",
-                        ))
-                        .items(described(
-                            SettingItem::new("Scrollback", scrollback),
-                            "Lines each terminal keeps to scroll back through. A thousand \
-                             lines of a terminal 130 columns wide take about 3 MB. herdr-core \
-                             keeps about 2,600 of its own, which come back when Lemur \
-                             attaches again. More apply at once; fewer when a terminal \
-                             attaches again, as when Lemur starts.",
-                        )),
-                ),
-            SettingPage::new("Terminal colors")
-                .icon(IconName::Palette)
-                .groups([self.color_group(true), self.color_group(false)]),
-            SettingPage::new("Dictation")
-                .icon(gpui_kit::assets::IconName::Mic)
-                .group(SettingGroup::new().items(described(
-                    SettingItem::new("Language", language),
-                    "What ⌘D listens for. The dictation bar switches it too.",
-                ))),
-            SettingPage::new("Claude")
-                .icon(claude_icon())
-                .group(SettingGroup::new().items(usage)),
-            SettingPage::new("Codex")
-                .icon(codex_icon())
-                .group(SettingGroup::new().items(codex_usage)),
-            SettingPage::new("herdr-core")
-                .icon(super::icons::server())
-                .group(self.core_group(cx)),
-            SettingPage::new("Shortcuts")
-                .icon(super::icons::keyboard())
-                .group(SettingGroup::new().items(described(
-                    SettingItem::new("Thread order", thread_order),
-                    "The order ⌃Tab goes through the worktree's threads in, and ⌃⇧Tab \
-                     back, and which one shows when you close one. By last opened starts \
-                     with the thread opened before this one, as ⌘Tab does with apps.",
-                )))
-                .groups(SHORTCUTS.iter().map(|(title, shortcuts)| {
-                    SettingGroup::new()
-                        .title(*title)
-                        .items(shortcuts.iter().flat_map(|s| {
-                            let item = SettingItem::new(
-                                s.what,
-                                SettingField::render(|_, _, _| s.how.render()),
-                            );
-                            match s.more {
-                                Some(more) => described(item, more).to_vec(),
-                                None => vec![item],
-                            }
-                        }))
-                })),
-            SettingPage::new("Linear")
-                .icon(super::icons::ticket())
-                .group(SettingGroup::new().items(linear)),
-        ]);
-        let error = Prefs::get(cx).error.clone();
-        let danger = cx.theme().danger;
-        v_flex()
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(|_: &CloseWindow, window, _| window.remove_window())
-            .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(div().flex_1().min_h_0().child(settings))
-            .when_some(error, |this, error| {
-                this.child(
-                    div()
-                        .px_4()
-                        .py_2()
-                        .text_sm()
-                        .text_color(danger)
-                        .child(format!("Couldn't save: {error}")),
-                )
-            })
+    /// The view picks light or dark by it; the terminals follow once it has.
+    fn set_theme(&mut self, theme: ThemeChoice) {
+        self.prefs.theme = theme;
+        self.save_settings();
     }
-}
 
-impl SettingsView {
+    fn set_language(&mut self, language: Language) {
+        self.prefs.dictation_language = language;
+        self.save_settings();
+    }
+
+    fn set_thread_order(&mut self, order: ThreadOrder) {
+        self.prefs.thread_order = order;
+        self.save_settings();
+    }
+
+    fn set_font_family(&mut self, family: String) {
+        self.prefs.terminal.font_family = family;
+        self.refont();
+    }
+
+    fn set_font_size(&mut self, size: f64) {
+        self.prefs.terminal.font_size = size;
+        self.refont();
+    }
+
+    /// The terminal font changed: the terminals take its cells, and fit the pane in them.
+    fn refont(&mut self) {
+        let t = &self.prefs.terminal;
+        self.metrics = Metrics::new(&t.font_family, t.font_size);
+        self.fit_terminals();
+        self.save_settings();
+    }
+
+    /// More lines apply to the terminals at once; fewer once a terminal attaches again.
+    /// Typing a number passes through smaller ones, which would drop history for good
+    /// (beyond what herdr-core keeps).
+    fn set_scrollback(&mut self, lines: u32) {
+        self.prefs.terminal.scrollback = lines;
+        self.save_settings();
+        let given = self.panels.settings.given.get_or_insert(lines);
+        if lines > *given {
+            *given = lines;
+            for g in self.terminals.values_mut().filter_map(|v| v.grid.as_mut()) {
+                let _ = g.set_scrollback(lines);
+            }
+        }
+    }
+
+    /// Sets a terminal color for a dark or a light Lemur, or with `None` puts lemur's own
+    /// back; the terminals take it at once.
+    fn set_terminal_color(&mut self, dark: bool, slot: Slot, color: Option<Rgb>) {
+        set_color(&mut self.prefs.terminal, dark, slot, color);
+        self.save_settings();
+        self.recolor_terminals();
+    }
+
+    fn set_usage(&mut self, agent: Agent, on: bool) {
+        match agent {
+            Agent::Claude => self.prefs.claude_usage = on,
+            Agent::Codex => self.prefs.codex_usage = on,
+        }
+        self.save_settings();
+        self.follow_meter_setting();
+    }
+
+    fn font_size_typed(&mut self) {
+        let typed = self.panels.settings.font_size.text.trim().parse::<f64>().ok();
+        if let Some(size) = typed.filter(|v| FONT_SIZES.contains(v) && *v != self.prefs.terminal.font_size) {
+            self.set_font_size(size);
+        }
+    }
+
+    /// − and +, or ↓ and ↑ in the field: a point smaller or larger.
+    fn step_font_size(&mut self, steps: i32) {
+        let size = (self.prefs.terminal.font_size.round() + f64::from(steps)).clamp(*FONT_SIZES.start(), *FONT_SIZES.end());
+        self.panels.settings.font_size.replace_text(number(size));
+        self.set_font_size(size);
+    }
+
+    fn scrollback_typed(&mut self) {
+        let typed = self.panels.settings.scrollback.text.trim().parse::<u32>().ok();
+        if let Some(lines) = typed.filter(|v| SCROLLBACKS.contains(v) && *v != self.prefs.terminal.scrollback) {
+            self.set_scrollback(lines);
+        }
+    }
+
+    /// − and +: a thousand lines fewer or more.
+    fn step_scrollback(&mut self, steps: i32) {
+        let lines = i64::from(self.prefs.terminal.scrollback) + i64::from(steps) * 1000;
+        let lines = lines.clamp(i64::from(*SCROLLBACKS.start()), i64::from(*SCROLLBACKS.end())) as u32;
+        self.panels.settings.scrollback.replace_text(lines.to_string());
+        self.set_scrollback(lines);
+    }
+
+    /// Types the color of `slot`, for a dark Lemur or a light one.
+    fn edit_color(&mut self, dark: bool, slot: Slot) {
+        let now = Palette::themed(dark, &self.prefs.terminal).get(slot);
+        self.panels.settings.color = Some((dark, slot, field(&hex(now))));
+    }
+
+    fn color_typed(&mut self) {
+        let Some((dark, slot, edit)) = &self.panels.settings.color else { return };
+        let (dark, slot) = (*dark, *slot);
+        if let Some(color) = parse_hex(edit.text.trim()).map(rgb)
+            && Palette::themed(dark, &self.prefs.terminal).get(slot) != color
+        {
+            self.set_terminal_color(dark, slot, Some(color));
+        }
+    }
+
     /// Asks which herdr-core runs here and on each machine, and the latest.
-    fn check_core(&mut self, cx: &mut Context<Self>) {
-        self.core = None;
-        cx.notify();
-        let cores = Prefs::get(cx).cores.clone();
-        cx.spawn(async move |this, cx| {
-            let versions = cx
-                .background_spawn(async move { core_update::check(&cores) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.core = Some(versions.map_err(|e| format!("{e:#}")));
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+    fn check_core(&mut self) {
+        self.panels.settings.core = None;
+        let cores = self.prefs.cores.clone();
+        self.in_background(
+            move || core_update::check(&cores),
+            |s, versions| s.panels.settings.core = Some(versions.map_err(|e| format!("{e:#}"))),
+        );
     }
 
-    /// Brings what's behind up to the latest: here first, then the machines.
-    fn update_core(&mut self, cx: &mut Context<Self>) {
-        let Some(Ok(versions)) = &self.core else {
-            return;
-        };
+    /// Brings what's behind up to the latest: here first, then the machines. Settings says
+    /// how it went, and asks again.
+    fn update_cores(&mut self) {
+        let st = &mut self.panels.settings;
+        let Some(Ok(versions)) = &st.core else { return };
         let outdated = versions.outdated();
-        if outdated.is_empty() || self.updating {
+        if outdated.is_empty() || st.updating {
             return;
         }
-        self.updating = true;
-        self.core_note = None;
-        cx.notify();
-        let cores = Prefs::get(cx).cores.clone();
-        cx.spawn(async move |this, cx| {
-            let done = cx
-                .background_spawn(async move { core_update::update(&outdated, &cores) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.updating = false;
-                this.core_note = Some(match done {
+        st.updating = true;
+        st.core_note = None;
+        let cores = self.prefs.cores.clone();
+        self.in_background(
+            move || core_update::update(&outdated, &cores),
+            |s, done| {
+                let st = &mut s.panels.settings;
+                st.updating = false;
+                st.core_note = Some(match done {
                     Ok(note) => (note, false),
                     Err(e) => (format!("{e:#}"), true),
                 });
-                this.check_core(cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Each herdr-core's version, the latest, and Update.
-    fn core_group(&self, cx: &mut Context<Self>) -> SettingGroup {
-        let text =
-            |s: String| SettingField::render(move |_, _, _| div().text_sm().child(s.clone()));
-        let group = SettingGroup::new().description(
-            "herdr-core runs Lemur's terminals, here and on each host. An update keeps them running.",
+                s.check_core();
+            },
         );
-        let versions = match &self.core {
-            None => return group.item(SettingItem::new("Versions", text("Asking…".into()))),
-            Some(Err(e)) => {
-                return group.item(SettingItem::new(
-                    "Versions",
-                    text(format!("Couldn't ask: {e}")),
-                ));
-            }
-            Some(Ok(v)) => v.clone(),
-        };
-        let latest = versions.latest.clone();
-        let shown = |v: &Option<String>| match (v, &latest) {
-            (None, _) => "unknown".to_string(),
-            (Some(v), Some(l)) if core_update::newer(l, v) => format!("{v} · {l} is out"),
-            (Some(v), Some(_)) => format!("{v} · up to date"),
-            (Some(v), None) => v.clone(),
-        };
-        let mut here = shown(&versions.here);
-        if let Some(by) = &versions.managed {
-            here += &format!(" · {by} updates it");
-        }
-        let mut group = group.item(SettingItem::new("This Mac", text(here)));
-        for (name, v) in &versions.machines {
-            group = group.item(SettingItem::new(name.clone(), text(shown(v))));
-        }
-        let outdated = versions.outdated();
-        let what = update_summary(&versions);
-        let this = cx.entity().downgrade();
-        let updating = self.updating;
-        let can = !outdated.is_empty() && !updating;
-        let buttons = SettingField::render(move |_, _, _| {
-            let (update, check) = (this.clone(), this.clone());
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("update-core")
-                        .small()
-                        .primary()
-                        .label(if updating { "Updating…" } else { "Update" })
-                        .disabled(!can)
-                        .on_click(move |_, _, cx| {
-                            update.update(cx, |v, cx| v.update_core(cx)).ok();
-                        }),
-                )
-                .child(
-                    Button::new("check-core")
-                        .small()
-                        .label("Check again")
-                        .disabled(updating)
-                        .on_click(move |_, _, cx| {
-                            check.update(cx, |v, cx| v.check_core(cx)).ok();
-                        }),
-                )
-        });
-        let mut group = group.items(described(SettingItem::new("Update", buttons), what));
-        if let Some((note, failed)) = self.core_note.clone() {
-            let color = if failed {
-                cx.theme().danger
-            } else {
-                cx.theme().muted_foreground
-            };
-            group = group.item(SettingItem::new(
-                "",
-                SettingField::render(move |_, _, _| {
-                    div().text_sm().text_color(color).child(note.clone())
-                }),
-            ));
-        }
-        group
     }
+}
+
+/// Settings over the window, while it's open: its pages on the left, the one picked beside
+/// them, and why a change couldn't be saved under both.
+pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
+    let st = &s.panels.settings;
+    if !st.open {
+        return None;
+    }
+    let c = &k.c;
+    let mut nav = col().key("settings-nav").w(200.0).h_full().padding(8.0).gap(2.0);
+    for (page, id, name) in PAGES {
+        let on = st.page == page;
+        let r = row()
+            .key(format!("settings-page-{id}"))
+            .h(28.0)
+            .px(8.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .cursor(rune::Cursor::Pointer)
+            .child(icon(page_icon(page), 14.0).color(if on { c.icon_base } else { c.icon_muted }))
+            .child(text(name).font(if on { k.ty.ui_medium } else { k.ty.ui }).color(c.text_base));
+        let r = if on { r.fill(c.layer_02) } else { k.interactive(r) };
+        nav = nav.child(r.on_press(move |s: &mut Lemur| {
+            s.panels.settings.page = page;
+            s.panels.settings.color = None;
+        }));
+    }
+    let name = PAGES.iter().find(|(p, ..)| *p == st.page).map_or("", |(_, _, name)| name);
+    let groups = match st.page {
+        Page::Appearance => appearance(s, k),
+        Page::Terminal => terminal(s, k),
+        Page::Colors => vec![color_group(s, true, k), color_group(s, false, k)],
+        Page::Dictation => dictation(s, k),
+        Page::Claude => usage(s, Agent::Claude, k),
+        Page::Codex => usage(s, Agent::Codex, k),
+        Page::Core => core(s, k),
+        Page::Shortcuts => shortcuts::page(s, k),
+        Page::Linear => linear(s, k),
+    };
+    let content = col()
+        .key("settings-content")
+        .w_full()
+        .padding(24.0)
+        .gap(20.0)
+        .child(text(name).font(k.ty.body_medium).color(c.text_base))
+        .children(groups);
+    let pane = col()
+        .key(format!("settings-{name}"))
+        .grow(1.0)
+        .min_w(0.0)
+        .h_full()
+        .min_h(0.0)
+        .border_sides([0.0, 0.0, 0.0, 1.0], c.border_weak)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(content);
+    let mut body = col().w_full().h_full().min_h(0.0).child(row().w_full().grow(1.0).min_h(0.0).child(nav).child(pane));
+    if let Some(error) = &st.error {
+        body = body.child(
+            row()
+                .key("settings-error")
+                .w_full()
+                .px(16.0)
+                .py(8.0)
+                .border_sides([1.0, 0.0, 0.0, 0.0], c.border_weak)
+                .child(text(format!("Couldn't save: {error}")).font(k.ty.ui).color(c.danger.fg).wrap()),
+        );
+    }
+    let done = Button::new("Done")
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Small)
+        .on_press(|s: &mut Lemur| s.close_settings())
+        .build(k)
+        .key("settings-done");
+    let page = rune_kit::Page::new(body).title("Settings").trailing(done).frame_inset(6.0).build(k);
+    Some(el().key("settings").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).child(page))
+}
+
+/// A setting: its name beside what sets it, and its help under both, across the page, so it
+/// leaves what sets it the room it needs however narrow the window.
+fn item(id: &str, title: &str, control: El, help: Option<String>, k: &Kit) -> El {
+    let c = &k.c;
+    let line = row()
+        .w_full()
+        .min_h(28.0)
+        .gap(16.0)
+        .center_y()
+        .child(text(title.to_owned()).font(k.ty.ui).color(c.text_base).grow(1.0).shrink().truncate())
+        .child(control);
+    let mut e = col().key(format!("setting-{id}")).w_full().py(if help.is_some() { 10.0 } else { 6.0 }).gap(4.0).child(line);
+    if let Some(help) = help {
+        e = e.child(text(help).key(format!("help-{id}")).w_full().font(k.ty.caption()).color(c.text_muted).wrap());
+    }
+    e
+}
+
+/// Settings that go together, under a title and what they're about, if they have them.
+fn group(title: Option<&str>, about: Option<&str>, items: Vec<El>, k: &Kit) -> El {
+    let c = &k.c;
+    let mut g = col().w_full().gap(6.0);
+    if let Some(title) = title {
+        g = g.child(text(title.to_owned()).font(k.ty.ui_medium).color(c.text_base));
+    }
+    if let Some(about) = about {
+        g = g.child(text(about.to_owned()).w_full().font(k.ty.caption()).color(c.text_muted).wrap());
+    }
+    let mut card = col().w_full().px(14.0).radius(k.radius.md).border(1.0, c.border_weak).fill(c.layer_01);
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            card = card.child(el().w_full().h(1.0).fill(c.border_weak));
+        }
+        card = card.child(item);
+    }
+    g.child(card)
+}
+
+/// A pop-up button showing `current`'s name among `options` (`(id, name)`), which offers
+/// them in a native menu and runs `pick` with the one picked.
+fn picker(id: &str, label: &str, options: Vec<(String, String)>, current: &str, pick: fn(&mut Lemur, &str), k: &Kit) -> El {
+    let shown = options.iter().find(|(o, _)| o == current).map_or_else(|| current.to_owned(), |(_, n)| n.clone());
+    let (anchor, current) = (format!("settings-{id}-trigger"), current.to_owned());
+    Select::new(format!("settings-{id}"), &[shown.as_str()])
+        .current(Some(&shown))
+        .label(label)
+        .appearance(SelectAppearance::Field)
+        .width(220.0)
+        .trigger(k)
+        .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
+            let menu = PopupMenu::picker(options.iter().map(|(o, n)| (o.as_str(), n.as_str())), &current);
+            tx.popup_menu(menu, anchor.as_str(), move |s: &mut Lemur, picked, _| {
+                if let Some(picked) = picked {
+                    pick(s, picked);
+                }
+            });
+        })
+}
+
+/// A number field with − and + beside it: ↓ and ↑ in it step it too.
+fn stepper(id: &str, edit: &TextEdit, access: fn(&mut Lemur) -> &mut TextEdit, typed: fn(&mut Lemur), by: fn(&mut Lemur, i32), invalid: bool, k: &Kit) -> El {
+    let input = TextInput::new(edit)
+        .width(Some(90.0))
+        .invalid(invalid)
+        .on_edit(access)
+        .on_change(move |s: &mut Lemur, _| typed(s))
+        .on_submit(|_: &mut Lemur, tx| tx.blur())
+        .on_key(move |s: &mut Lemur, ev, _| match ev.key {
+            K::Up => {
+                by(s, 1);
+                true
+            }
+            K::Down => {
+                by(s, -1);
+                true
+            }
+            _ => false,
+        })
+        .build(k)
+        .key(format!("settings-{id}"));
+    let step = |glyph: &'static Icon, label: &str, steps: i32| {
+        IconButton::new(glyph)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(label)
+            .on_press(move |s: &mut Lemur| by(s, steps))
+            .build(k)
+            .key(format!("settings-{id}-{}", if steps < 0 { "less" } else { "more" }))
+    };
+    row().gap(4.0).center_y().child(step(&icons::MINUS, "Fewer", -1)).child(input).child(step(&icons::PLUS, "More", 1))
+}
+
+fn appearance(s: &Lemur, k: &Kit) -> Vec<El> {
+    let themes = ThemeChoice::ALL.iter().map(|t| (t.as_str().to_owned(), theme_label(*t).to_owned())).collect();
+    let theme = picker(
+        "theme",
+        "Theme",
+        themes,
+        s.prefs.theme.as_str(),
+        |s, id| s.set_theme(ThemeChoice::ALL.into_iter().find(|t| t.as_str() == id).unwrap_or_default()),
+        k,
+    );
+    vec![group(None, None, vec![item("theme", "Theme", theme, Some("System follows macOS's light or dark mode.".into()), k)], k)]
+}
+
+fn terminal(s: &Lemur, k: &Kit) -> Vec<El> {
+    let st = &s.panels.settings;
+    let t = &s.prefs.terminal;
+    let mut fonts = st.fonts.clone().unwrap_or_default();
+    if !fonts.contains(&t.font_family) {
+        fonts.insert(0, t.font_family.clone());
+    }
+    let fonts = fonts.into_iter().map(|f| (f.clone(), f)).collect();
+    let font = picker("font", "Font", fonts, &t.font_family, |s, family| s.set_font_family(family.to_owned()), k);
+    let size_ok = st.font_size.text.trim().parse::<f64>().is_ok_and(|v| FONT_SIZES.contains(&v));
+    let size = stepper(
+        "font-size",
+        &st.font_size,
+        |s| &mut s.panels.settings.font_size,
+        Lemur::font_size_typed,
+        Lemur::step_font_size,
+        !size_ok,
+        k,
+    );
+    let lines_ok = st.scrollback.text.trim().parse::<u32>().is_ok_and(|v| SCROLLBACKS.contains(&v));
+    let lines = stepper(
+        "scrollback",
+        &st.scrollback,
+        |s| &mut s.panels.settings.scrollback,
+        Lemur::scrollback_typed,
+        Lemur::step_scrollback,
+        !lines_ok,
+        k,
+    );
+    let listed = if st.fonts.is_some() { "Monospaced fonts installed on this Mac." } else { "Monospaced fonts installed on this Mac, once they're listed." };
+    vec![group(
+        None,
+        None,
+        vec![
+            item("font", "Font", font, Some(listed.into()), k),
+            item("font-size", "Font size", size, Some(format!("In points, {} to {}.", FONT_SIZES.start(), FONT_SIZES.end())), k),
+            item(
+                "scrollback",
+                "Scrollback",
+                lines,
+                Some(
+                    "Lines each terminal keeps to scroll back through. A thousand lines of a terminal 130 columns wide \
+                     take about 3 MB. herdr-core keeps about 2,600 of its own, which come back when Lemur attaches \
+                     again. More apply at once; fewer when a terminal attaches again, as when Lemur starts."
+                        .into(),
+                ),
+                k,
+            ),
+        ],
+        k,
+    )]
+}
+
+/// A slot's key: its name, lowercased and joined with dashes.
+fn slot_id(label: &str) -> String {
+    label.to_lowercase().replace(' ', "-")
+}
+
+/// The colors for a dark or a light Lemur, each with a reset to lemur's own.
+fn color_group(s: &Lemur, dark: bool, k: &Kit) -> El {
+    let c = &k.c;
+    let palette = Palette::themed(dark, &s.prefs.terminal);
+    let defaults = Palette::default_for(dark);
+    let side = if dark { "dark" } else { "light" };
+    let items = SLOTS
+        .iter()
+        .map(|&(slot, label)| {
+            let id = format!("{side}-{}", slot_id(label));
+            let color = palette.get(slot);
+            let typing = s.panels.settings.color.as_ref().filter(|(d, sl, _)| *d == dark && *sl == slot);
+            let value = match typing {
+                Some((_, _, edit)) => TextInput::new(edit)
+                    .width(Some(96.0))
+                    .invalid(parse_hex(edit.text.trim()).is_none())
+                    .on_edit(|s: &mut Lemur| &mut s.panels.settings.color.as_mut().expect("a color being typed").2)
+                    .on_change(|s: &mut Lemur, _| s.color_typed())
+                    // The field goes, and the keyboard with it.
+                    .on_submit(|s: &mut Lemur, _| s.panels.settings.color = None)
+                    .on_key(|s: &mut Lemur, ev, _| {
+                        let done = ev.key == K::Escape;
+                        if done {
+                            s.panels.settings.color = None;
+                        }
+                        done
+                    })
+                    .build(k)
+                    .key(format!("hex-{id}")),
+                None => row()
+                    .key(format!("hex-{id}"))
+                    .w(96.0)
+                    .h(28.0)
+                    .px(8.0)
+                    .center_y()
+                    .radius(k.radius.md)
+                    .cursor(rune::Cursor::Text)
+                    .child(text(hex(color)).font(k.ty.ui).color(c.text_muted))
+                    .help("Type a color")
+                    .on_press(move |s: &mut Lemur| s.edit_color(dark, slot)),
+            };
+            let swatch = el()
+                .key(format!("swatch-{id}"))
+                .size(18.0, 18.0)
+                .radius(4.0)
+                .fill(rune::color::hex(&hex(color)).unwrap_or(c.black))
+                .border(1.0, c.border_base);
+            let mut control = row().gap(8.0).center_y();
+            if color != defaults.get(slot) {
+                control = control.child(
+                    IconButton::new(&icons::ROTATE_CCW)
+                        .variant(IconButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .label(format!("Put lemur's own back: {}", hex(defaults.get(slot))))
+                        .help(format!("Put lemur's own back: {}", hex(defaults.get(slot))))
+                        .on_press(move |s: &mut Lemur| {
+                            s.panels.settings.color = None;
+                            s.set_terminal_color(dark, slot, None);
+                        })
+                        .build(k)
+                        .key(format!("reset-{id}")),
+                );
+            }
+            item(&id, label, control.child(swatch).child(value), None, k)
+        })
+        .collect();
+    let (title, about) = if dark {
+        ("Dark", "While Lemur is dark. Starts as One Half Dark.")
+    } else {
+        ("Light", "While Lemur is light. Starts as One Half Light.")
+    };
+    group(Some(title), Some(about), items, k)
+}
+
+fn dictation(s: &Lemur, k: &Kit) -> Vec<El> {
+    let languages = Language::ALL.iter().map(|l| (l.as_str().to_owned(), language_label(*l).to_owned())).collect();
+    let language = picker(
+        "language",
+        "Language",
+        languages,
+        s.prefs.dictation_language.as_str(),
+        |s, id| s.set_language(Language::ALL.into_iter().find(|l| l.as_str() == id).unwrap_or_default()),
+        k,
+    );
+    let help = "What ⌘D listens for. The dictation bar switches it too.";
+    vec![group(None, None, vec![item("language", "Language", language, Some(help.into()), k)], k)]
+}
+
+/// Whether the sidebar shows how much of `agent`'s plan is used. Offered once Lemur has seen
+/// it; turned on, it can be turned off whatever happens.
+fn usage(s: &Lemur, agent: Agent, k: &Kit) -> Vec<El> {
+    let (on, found) = match agent {
+        Agent::Claude => (s.prefs.claude_usage, s.claude_found()),
+        Agent::Codex => (s.prefs.codex_usage, s.codex_found()),
+    };
+    let id = match agent {
+        Agent::Claude => "claude-usage",
+        Agent::Codex => "codex-usage",
+    };
+    let switch = Switch::new(on)
+        .label("Show plan usage")
+        .hide_label()
+        .disabled(!found && !on)
+        .on_toggle(move |s: &mut Lemur| s.set_usage(agent, !on))
+        .build(k)
+        .key(format!("settings-{id}"));
+    let help = match (agent, found || on) {
+        (Agent::Claude, true) => {
+            "How much of your Claude plan is used, above the hosts' load in the sidebar. Lemur runs Claude Code's \
+             /usage every 10 minutes (30 while Lemur isn't in front) on the host where Claude ran last; Claude Code \
+             asks, with its own sign-in."
+        }
+        (Agent::Claude, false) => "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, then turn this on.",
+        (Agent::Codex, true) => {
+            "How much of your ChatGPT plan's Codex use is used, above the hosts' load in the sidebar. Lemur asks \
+             Codex's app server every 10 minutes (30 while Lemur isn't in front) on the host where Codex ran last; \
+             Codex asks, with its own sign-in. Signed in with an API key there's no plan: it shows the tokens Codex \
+             used there, from Codex's session logs."
+        }
+        (Agent::Codex, false) => "Lemur hasn't seen Codex on your hosts yet. Start a Codex thread, then turn this on.",
+    };
+    vec![group(None, None, vec![item(id, "Show plan usage", switch, Some(help.into()), k)], k)]
+}
+
+fn core(s: &Lemur, k: &Kit) -> Vec<El> {
+    let st = &s.panels.settings;
+    let c = &k.c;
+    let value = |t: String| text(t).font(k.ty.ui).color(c.text_muted);
+    let about = Some("herdr-core runs Lemur's terminals, here and on each host. An update keeps them running.");
+    let versions = match &st.core {
+        None => return vec![group(None, about, vec![item("core-versions", "Versions", value("Asking…".into()), None, k)], k)],
+        Some(Err(e)) => {
+            return vec![group(None, about, vec![item("core-versions", "Versions", value(format!("Couldn't ask: {e}")), None, k)], k)];
+        }
+        Some(Ok(v)) => v,
+    };
+    let shown = |v: &Option<String>| match (v, &versions.latest) {
+        (None, _) => "unknown".to_string(),
+        (Some(v), Some(l)) if core_update::newer(l, v) => format!("{v} · {l} is out"),
+        (Some(v), Some(_)) => format!("{v} · up to date"),
+        (Some(v), None) => v.clone(),
+    };
+    let mut here = shown(&versions.here);
+    if let Some(by) = &versions.managed {
+        here += &format!(" · {by} updates it");
+    }
+    let mut items = vec![item("core-here", "This Mac", value(here), None, k)];
+    for (name, v) in &versions.machines {
+        items.push(item(&format!("core-{name}"), name, value(shown(v)), None, k));
+    }
+    let can = !versions.outdated().is_empty() && !st.updating;
+    let buttons = row()
+        .gap(8.0)
+        .child(
+            Button::new(if st.updating { "Updating…" } else { "Update" })
+                .variant(ButtonVariant::Contrast)
+                .control_size(ControlSize::Small)
+                .disabled(!can)
+                .on_press(|s: &mut Lemur| s.update_cores())
+                .build(k)
+                .key("settings-core-update"),
+        )
+        .child(
+            Button::new("Check again")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .disabled(st.updating)
+                .on_press(|s: &mut Lemur| s.check_core())
+                .build(k)
+                .key("settings-core-check"),
+        );
+    items.push(item("core-update", "Update", buttons, Some(update_summary(versions)), k));
+    if let Some((note, failed)) = &st.core_note {
+        let ink = if *failed { c.danger.fg } else { c.text_muted };
+        items.push(row().key("settings-core-note").w_full().py(10.0).child(text(note.clone()).w_full().font(k.ty.caption()).color(ink).wrap()));
+    }
+    vec![group(None, about, items, k)]
 }
 
 /// What Update does, or why there's nothing for it to do.
@@ -683,243 +714,38 @@ fn update_summary(versions: &Versions) -> String {
     if !outdated.is_empty() {
         return format!("Updates {}.", versions.describe(&outdated));
     }
-    // Behind, but this Mac's isn't Lemur's to update, and the hosts get
-    // what this Mac has.
+    // Behind, but this Mac's isn't Lemur's to update, and the hosts get what this Mac has.
     match &versions.managed {
-        Some(by)
-            if versions
-                .here
-                .as_deref()
-                .is_some_and(|v| core_update::newer(latest, v)) =>
-        {
+        Some(by) if versions.here.as_deref().is_some_and(|v| core_update::newer(latest, v)) => {
             format!("{by} updates this Mac's herdr-core; then Lemur can update the hosts.")
         }
         _ => "Everything is up to date.".to_string(),
     }
 }
 
-/// A shortcut on the Shortcuts page.
-struct Shortcut {
-    what: &'static str,
-    how: Press,
-    more: Option<&'static str>,
-}
-
-/// How a shortcut goes: keys, one after another as alternatives, or a
-/// click with keys held.
-enum Press {
-    Keys(&'static [&'static str]),
-    Click(&'static str),
-}
-
-impl Press {
-    fn render(&self) -> AnyElement {
-        match self {
-            Press::Keys(keys) => h_flex()
-                .gap_1()
-                .children(
-                    keys.iter()
-                        .filter_map(|key| Keystroke::parse(key).ok())
-                        .map(Kbd::new),
-                )
-                .into_any_element(),
-            Press::Click(click) => div().text_sm().child(*click).into_any_element(),
-        }
-    }
-}
-
-const fn keys(what: &'static str, keys: &'static [&'static str]) -> Shortcut {
-    Shortcut {
-        what,
-        how: Press::Keys(keys),
-        more: None,
-    }
-}
-
-/// lemur's shortcuts, group by group: the keys `bind_keys` binds, and the
-/// ones the terminal, the notes and the spotlights take themselves.
-const SHORTCUTS: &[(&str, &[Shortcut])] = &[
-    (
-        "Window",
-        &[
-            Shortcut {
-                what: "Command palette",
-                how: Press::Keys(&["cmd-shift-p"]),
-                more: Some("Every command by name, with its key."),
-            },
-            keys("Toggle the sidebar", &["cmd-b"]),
-            Shortcut {
-                what: "Toggle the right panel",
-                how: Press::Keys(&["cmd-r"]),
-                more: Some("The panel that showed last: the notes at first."),
-            },
-            keys("Toggle the agents", &["cmd-shift-a"]),
-            keys("Add a project", &["cmd-o"]),
-            keys("Settings", &["cmd-,"]),
-            keys("Close Settings", &["cmd-w"]),
-            keys("Hide Lemur", &["cmd-h"]),
-            keys("Hide the other apps", &["alt-cmd-h"]),
-            keys("Quit Lemur", &["cmd-q"]),
-        ],
-    ),
-    (
-        "Threads",
-        &[
-            Shortcut {
-                what: "New terminal",
-                how: Press::Keys(&["cmd-t"]),
-                more: Some("A new tab where the thread on show runs."),
-            },
-            Shortcut {
-                what: "New Claude or Codex thread or shell, or go to one",
-                how: Press::Keys(&["cmd-j"]),
-                more: Some("Named, where the thread on show runs; type to find another thread."),
-            },
-            keys("Go to a thread", &["cmd-p"]),
-            Shortcut {
-                what: "Close the thread on show",
-                how: Press::Keys(&["cmd-w"]),
-                more: Some("Asking first while something runs in it."),
-            },
-            Shortcut {
-                what: "Next thread in the worktree",
-                how: Press::Keys(&["ctrl-tab"]),
-                more: Some("In the order set above; hold ⌃ and press Tab again to go further."),
-            },
-            keys("Previous thread in the worktree", &["ctrl-shift-tab"]),
-            keys(
-                "Move the tab left or right",
-                &["cmd-shift-left", "cmd-shift-right"],
-            ),
-            Shortcut {
-                what: "Go to a tab",
-                how: Press::Keys(&["cmd-1", "cmd-9"]),
-                more: Some("⌘1 shows the first tab, ⌘2 the second, and so on up to the ninth."),
-            },
-        ],
-    ),
-    (
-        "Dictation",
-        &[
-            Shortcut {
-                what: "Dictate",
-                how: Press::Keys(&["cmd-d"]),
-                more: Some(
-                    "Opens a bar under the terminal that writes down what you say; again stops listening, and once more adds to it.",
-                ),
-            },
-            Shortcut {
-                what: "Paste it into the thread on show",
-                how: Press::Keys(&["cmd-enter"]),
-                more: Some("Without sending it. From the terminal too, after switching threads."),
-            },
-            keys("Throw it away", &["escape"]),
-        ],
-    ),
-    (
-        "Terminal",
-        &[
-            Shortcut {
-                what: "Paste",
-                how: Press::Keys(&["cmd-v"]),
-                more: Some("An image or copied files go to the host, and their paths are pasted."),
-            },
-            Shortcut {
-                what: "Open a link",
-                how: Press::Click("⌘-click"),
-                more: Some("Holding ⌘ underlines it first."),
-            },
-        ],
-    ),
-    (
-        "Notes",
-        &[
-            Shortcut {
-                what: "Open a link",
-                how: Press::Click("⌘-click"),
-                more: Some("Holding ⌘ underlines it first."),
-            },
-            Shortcut {
-                what: "Make a link",
-                how: Press::Keys(&["cmd-k"]),
-                more: Some(
-                    "Of the selected text, to the URL on the clipboard; in a link, it selects the URL.",
-                ),
-            },
-            Shortcut {
-                what: "Link the selected text",
-                how: Press::Keys(&["cmd-v"]),
-                more: Some("Pasting a URL over text on one line."),
-            },
-            Shortcut {
-                what: "Tick a box",
-                how: Press::Click("⌘-click"),
-                more: Some("The [ ] of a - [ ] item; again unticks it."),
-            },
-            keys(
-                "Tick the box on the cursor's line",
-                &["cmd-enter", "shift-cmd-u"],
-            ),
-            keys("Make the lines a checklist", &["shift-cmd-l"]),
-            Shortcut {
-                what: "Next list item",
-                how: Press::Keys(&["enter"]),
-                more: Some("At the end of a list item; on an empty one, it ends the list."),
-            },
-            keys("Indent a list item", &["tab", "cmd-]"]),
-            keys("Outdent a list item", &["shift-tab", "cmd-["]),
-            Shortcut {
-                what: "Move the lines up or down",
-                how: Press::Keys(&["ctrl-cmd-up", "ctrl-cmd-down"]),
-                more: Some("A list item takes its nested items along."),
-            },
-        ],
-    ),
-    (
-        "Naming in the spotlight",
-        &[
-            keys("Pick Claude or Shell, for a new thread", &["up", "down"]),
-            keys("Start or rename", &["enter"]),
-            keys("Next field", &["tab"]),
-            keys("Cancel", &["escape"]),
-        ],
-    ),
-    (
-        "Adding a project",
-        &[
-            keys("Choose a folder", &["up", "down"]),
-            keys("Go into the folder", &["tab"]),
-            keys("Add it", &["enter"]),
-            keys("Close", &["escape"]),
-        ],
-    ),
-];
-
-fn to_hsla(c: Rgb) -> Hsla {
-    rgb(u32::from(c.r) << 16 | u32::from(c.g) << 8 | u32::from(c.b)).into()
-}
-
-fn to_rgb(c: Hsla) -> Rgb {
-    let c: Rgba = c.into();
-    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Rgb {
-        r: channel(c.r),
-        g: channel(c.g),
-        b: channel(c.b),
-    }
+fn linear(s: &Lemur, k: &Kit) -> Vec<El> {
+    let (status, error) = s.linear_account_status();
+    let (action, act) = s.linear_account_action();
+    let control = row().gap(12.0).center_y().child(text(status).font(k.ty.ui).color(k.c.text_muted)).child(
+        Button::new(action)
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut Lemur| act(s))
+            .build(k)
+            .key("settings-linear-account"),
+    );
+    let help = error.unwrap_or_else(|| {
+        "Lemur signs in with its own Linear app, and only reads: it searches issues and shows the one pinned to a \
+         thread. The sign-in is kept in your Keychain, where only Lemur can read it."
+            .into()
+    });
+    vec![group(None, None, vec![item("linear-account", "Account", control, Some(help), k)], k)]
 }
 
 pub fn language_label(language: Language) -> &'static str {
     match language {
         Language::English => "English",
         Language::Norwegian => "Norwegian Bokmål",
-    }
-}
-
-fn thread_order_label(order: ThreadOrder) -> &'static str {
-    match order {
-        ThreadOrder::Tabs => "Along the tabs",
-        ThreadOrder::Recent => "By last opened",
     }
 }
 
@@ -931,172 +757,34 @@ fn theme_label(theme: ThemeChoice) -> &'static str {
     }
 }
 
-/// Installed font families whose letters all have the same width.
-fn monospace_fonts(cx: &App) -> Vec<SharedString> {
-    let text = cx.text_system();
-    text.all_font_names()
+/// Installed font families whose letters all have the same width, by name. A leading dot
+/// marks macOS's private system fonts.
+fn monospace_fonts() -> Vec<String> {
+    use skrifa::MetadataProvider;
+    use skrifa::instance::{LocationRef, Size};
+    let mut fonts = fontique::Collection::new(fontique::CollectionOptions { shared: false, system_fonts: true });
+    let names: Vec<String> = fonts.family_names().filter(|n| !n.starts_with('.')).map(str::to_owned).collect();
+    let mut mono: Vec<String> = names
         .into_iter()
-        // A leading dot marks macOS's private system fonts.
-        .filter(|name| !name.starts_with('.'))
         .filter(|name| {
-            let id = text.resolve_font(&font(name.clone()));
-            let width = |c| text.advance(id, px(16.0), c).map(|s| s.width).ok();
+            let Some(family) = fonts.family_by_name(name) else { return false };
+            let Some(font) = family.default_font() else { return false };
+            let Some(data) = font.load(None) else { return false };
+            let Ok(face) = skrifa::FontRef::from_index(data.as_ref(), font.index()) else { return false };
+            let (map, metrics) = (face.charmap(), face.glyph_metrics(Size::unscaled(), LocationRef::default()));
+            let width = |c: char| map.map(c).and_then(|g| metrics.advance_width(g));
             let i = width('i');
             i.is_some() && i == width('m') && i == width('W')
         })
-        .map(SharedString::from)
-        .collect()
+        .collect();
+    mono.sort_by_key(|n| n.to_lowercase());
+    mono.dedup();
+    mono
 }
+
+#[path = "settings_shortcuts.rs"]
+mod shortcuts;
 
 #[cfg(test)]
-mod tests {
-    // Not `super::*`: GPUI's `test` macro would shadow the built-in one.
-    use super::{Prefs, Press, SHORTCUTS, SettingsView, open, to_hsla, update_summary};
-    use crate::config::ThemeChoice;
-    use crate::core_update::Versions;
-    use crate::gui::terminal::{DARK, Palette, Slot, set_color};
-    use gpui_kit::component::ActiveTheme;
-    use gpui_kit::{Keystroke, hsla};
-    use gpui_kit::{px, size};
-
-    /// With nothing Lemur can update, Update says why, though this Mac's
-    /// herdr-core is behind: a package manager updates it.
-    #[test]
-    fn update_says_why_theres_nothing_to_do() {
-        let behind = Versions {
-            here: Some("0.1.15".into()),
-            managed: Some("homebrew".into()),
-            machines: vec![("agent".into(), Some("0.1.15".into()))],
-            latest: Some("0.1.16".into()),
-        };
-        assert_eq!(
-            update_summary(&behind),
-            "homebrew updates this Mac's herdr-core; then Lemur can update the hosts."
-        );
-        let current = Versions {
-            here: Some("0.1.16".into()),
-            machines: vec![("agent".into(), Some("0.1.16".into()))],
-            ..behind.clone()
-        };
-        assert_eq!(update_summary(&current), "Everything is up to date.");
-        let ours = Versions {
-            managed: None,
-            ..behind
-        };
-        assert_eq!(
-            update_summary(&ours),
-            "Updates this Mac 0.1.15, agent 0.1.15."
-        );
-    }
-
-    /// Help text goes under its item, across the page, so it leaves what the
-    /// item sets the room it needs, however narrow the window.
-    #[gpui::test]
-    fn help_text_goes_under_its_item(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_kit::init);
-        let (_, cx) = cx.add_window_view(SettingsView::new);
-        cx.simulate_resize(size(px(760.0), px(514.0)));
-        cx.run_until_parked();
-        let help = cx.debug_bounds("help Theme").expect("Theme's help text");
-        // The page is what's left of the window beside Settings' own list.
-        let page = px(760.0 - 200.0);
-        assert!(
-            help.size.width > page * 0.8,
-            "{:?} of {page:?}",
-            help.size.width
-        );
-    }
-
-    /// A color picked in Settings becomes that slot's color and is kept;
-    /// a reset puts lemur's own back, in the picker too.
-    #[gpui::test]
-    fn picked_terminal_colors_are_kept(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_kit::init);
-        let (view, cx) = cx.add_window_view(SettingsView::new);
-        let background = view.read_with(cx, |v, _| {
-            let p = &v.pickers[0];
-            assert!(p.dark && p.slot == Slot::Background);
-            p.state.clone()
-        });
-        let red = hsla(0.0, 1.0, 0.5, 1.0);
-        cx.update(|window, cx| background.update(cx, |s, cx| s.select_color(red, window, cx)));
-        cx.run_until_parked();
-        let terminal = cx.update(|_, cx| Prefs::get(cx).terminal.clone());
-        assert_eq!(terminal.dark.background.as_deref(), Some("#ff0000"));
-        assert_eq!(
-            Palette::themed(false, &terminal).background,
-            Palette::default_for(false).background
-        );
-
-        cx.update(|_, cx| {
-            Prefs::update(cx, |p| {
-                set_color(&mut p.terminal, true, Slot::Background, None)
-            })
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            background.read_with(cx, |s, _| s.value()),
-            Some(to_hsla(DARK.background))
-        );
-        assert!(cx.update(|_, cx| Prefs::get(cx).terminal.dark.is_empty()));
-    }
-
-    #[gpui::test]
-    fn the_theme_setting_switches_light_and_dark(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_kit::init);
-        cx.update(|cx| {
-            Prefs::update(cx, |p| p.theme = ThemeChoice::Dark);
-            assert!(cx.theme().is_dark());
-            Prefs::update(cx, |p| p.theme = ThemeChoice::Light);
-            assert!(!cx.theme().is_dark());
-        });
-    }
-
-    /// The Shortcuts page's keys parse, and the window's, the threads' and
-    /// dictation's are the ones bound.
-    #[gpui::test]
-    fn the_shortcuts_page_shows_bound_keys(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            crate::gui::bind_keys(cx);
-            let keymap = cx.key_bindings();
-            let keymap = keymap.borrow();
-            for (group, shortcuts) in SHORTCUTS {
-                for shortcut in *shortcuts {
-                    let Press::Keys(keys) = shortcut.how else {
-                        continue;
-                    };
-                    for key in keys {
-                        let stroke = Keystroke::parse(key).unwrap();
-                        if ["Window", "Threads", "Dictation"].contains(group) {
-                            let bound = keymap.bindings().any(|b| {
-                                b.keystrokes().len() == 1
-                                    && b.keystrokes()[0].to_string() == stroke.to_string()
-                            });
-                            assert!(bound, "{key} isn't bound");
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// ⌘, brings an open Settings window forward rather than opening another;
-    /// once it's closed, ⌘, opens a new one.
-    #[gpui::test]
-    fn settings_open_in_one_window(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_kit::init);
-        let windows = |cx: &mut gpui::TestAppContext| cx.update(|cx| cx.windows());
-        cx.update(open);
-        cx.update(open);
-        let open_windows = windows(cx);
-        assert_eq!(open_windows.len(), 1);
-
-        open_windows[0]
-            .update(cx, |_, window, _| window.remove_window())
-            .unwrap();
-        cx.run_until_parked();
-        assert!(windows(cx).is_empty());
-        cx.update(open);
-        assert_eq!(windows(cx).len(), 1);
-    }
-}
+#[path = "settings_tests.rs"]
+mod tests;

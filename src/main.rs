@@ -34,8 +34,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the window (the default)
-    Gui,
+    /// Open the window (the default). Rune's flags check it headless, as `lemur gui --snap
+    /// shot.png`, `--tree tree.json` or `--script events.json`
+    Gui {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        rune: Vec<String>,
+    },
     /// Print hosts, bases, worktrees and sessions
     Ls,
     /// Start a thread in a new worktree, or in an existing one with --worktree
@@ -91,8 +95,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load()?;
-    match cli.cmd.unwrap_or(Cmd::Gui) {
-        Cmd::Gui => {
+    match cli.cmd.unwrap_or(Cmd::Gui { rune: vec![] }) {
+        Cmd::Gui { .. } => {
             login_path::add();
             gui::run(cfg)
         }

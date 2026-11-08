@@ -61,8 +61,8 @@ fixture app the same way, without credentials.
 ## Tests on main
 
 Every push to `main` runs **Build Lemur** (`.github/workflows/release.yml`)
-for the tests only: it installs the Rust version from `mise.toml`, Xcode's
-Metal toolchain and herdr-core (`scripts/install-herdr-core.sh`: a pinned
+for the tests only: it installs the Rust version from `mise.toml`, Zig
+and herdr-core (`scripts/install-herdr-core.sh`: a pinned
 version, checked against its checksum), and runs the tests. It gets no secrets and
 publishes nothing. A newer push cancels a run still going for an older one.
 These runs keep the compiled dependencies in GitHub's cache

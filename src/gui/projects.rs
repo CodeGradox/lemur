@@ -1,20 +1,19 @@
 //! Projects and their worktrees: adding, folding, coloring, ordering,
 //! hiding and removing them.
 
-use super::folder_picker::{FolderPicker, HostChoice, PickerEvent};
-use super::settings::Prefs;
 use super::snackbar::Kind;
-use super::{Lemur, move_item, moved_to};
+use super::{Dialog, Lemur, move_item, moved_to};
 use crate::actions;
 use crate::browse;
 use crate::config::{Base, Config, Host, home};
 use crate::snapshot;
-use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, WindowExt, v_flex};
-use gpui_kit::*;
-use std::cell::Cell;
-use std::rc::Rc;
+
+/// A host a folder can be added from: one of lemur's, or one it doesn't have yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostChoice {
+    pub host: Host,
+    pub configured: bool,
+}
 
 /// A worktree to remove, and the threads to close first.
 #[derive(Clone)]
@@ -31,31 +30,8 @@ pub(super) struct Removal {
 }
 
 impl Lemur {
-    pub(super) fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlaid() {
-            return;
-        }
-        let hosts = host_choices(&self.cfg);
-        let picker = cx.new(|cx| FolderPicker::new(hosts, window, cx));
-        let events = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
-            match event {
-                PickerEvent::Add { host, path } => this.add_folder(host.clone(), path.clone(), cx),
-                PickerEvent::SetUp(host) => this.set_up_host(host.clone(), cx),
-                PickerEvent::Dismiss => {}
-            }
-            this.close_picker(window, cx);
-        });
-        self.picker = Some((picker, events));
-        cx.notify();
-    }
-
-    pub(super) fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
-        self.focus_terminal(window, cx);
-    }
-
     /// Adds a repository to the sidebar, and to the config file so it stays.
-    pub(super) fn add_folder(&mut self, choice: HostChoice, path: String, cx: &mut Context<Self>) {
+    pub(super) fn add_folder(&mut self, choice: HostChoice, path: String) {
         let host = choice.host;
         if self
             .cfg
@@ -63,38 +39,37 @@ impl Lemur {
             .iter()
             .any(|b| b.host == host.name && b.path == path)
         {
-            self.note(format!("{path} is in the sidebar already"), cx);
+            self.note(format!("{path} is in the sidebar already"));
             return;
         }
         let new_host = self.cfg.host(&host.name).is_none();
         let base = Base::new(&host.name, &path);
-        if let Some(file) = Prefs::get(cx).config_file() {
+        if let Some(file) = self.prefs.config_file() {
             let saved = Config::save_folder(file, new_host.then_some(&host), &base);
             if let Err(e) = saved {
-                self.fail(e, cx);
+                self.fail(e);
                 return;
             }
         }
         if new_host {
             self.cfg.hosts.push(host);
-            Prefs::hosts_changed(&self.cfg, cx);
+            self.prefs.cores = crate::core_update::Cores::of(&self.cfg);
         }
         self.cfg.bases.push(base);
-        self.refresh(cx).detach();
-        cx.notify();
+        self.refresh();
     }
 
     /// Folds a project away in the sidebar, or opens it again.
-    pub(super) fn toggle_project(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn toggle_project(&mut self, index: usize) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
         base.collapsed = !base.collapsed;
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Folds a worktree's threads away in the sidebar, or opens them again.
-    pub(super) fn toggle_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
+    pub(super) fn toggle_worktree(&mut self, index: usize, worktree: &str) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
@@ -103,21 +78,21 @@ impl Lemur {
         if base.collapsed_worktrees.len() == folded {
             base.collapsed_worktrees.push(worktree.to_string());
         }
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Opens a project's Hidden row, or folds it again.
-    pub(super) fn toggle_hidden(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn toggle_hidden(&mut self, index: usize) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
         base.hidden_open = !base.hidden_open;
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Unfolds what keeps a thread's row out of sight: its project, its
     /// worktree, and the Hidden row the worktree is under.
-    pub(super) fn reveal(&mut self, host: &str, session: &str, cx: &mut Context<Self>) {
+    pub(super) fn reveal(&mut self, host: &str, session: &str) {
         let Some((index, worktree)) = self
             .project_of(host, session)
             .map(|(index, w)| (index, w.path.clone()))
@@ -135,7 +110,7 @@ impl Lemur {
         base.collapsed = false;
         base.collapsed_worktrees.retain(|p| *p != worktree);
         base.hidden_open |= hidden;
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Colors a worktree's folder icon, or with `None` takes its color off.
@@ -143,9 +118,7 @@ impl Lemur {
         &mut self,
         index: usize,
         worktree: &str,
-        color: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
+        color: Option<&str>) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
@@ -155,7 +128,7 @@ impl Lemur {
                 .insert(worktree.to_string(), color.to_string()),
             None => base.worktree_colors.remove(worktree),
         };
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Moves a worktree to its project's Hidden section, or with `hidden`
@@ -164,9 +137,7 @@ impl Lemur {
         &mut self,
         index: usize,
         worktree: &str,
-        hidden: bool,
-        cx: &mut Context<Self>,
-    ) {
+        hidden: bool) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
@@ -174,7 +145,7 @@ impl Lemur {
         if hidden {
             base.hidden_worktrees.push(worktree.to_string());
         }
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Moves a worktree within its project, `from` and `to` counting the
@@ -184,9 +155,7 @@ impl Lemur {
         &mut self,
         index: usize,
         from: usize,
-        to: usize,
-        cx: &mut Context<Self>,
-    ) {
+        to: usize) {
         let Some(view) = self
             .snap
             .hosts
@@ -214,13 +183,13 @@ impl Lemur {
         self.cfg.bases[index].worktree_order = order;
         // A refresh already under way sorts by the old order.
         self.changes += 1;
-        self.save_look(index, cx);
+        self.save_look(index);
     }
 
     /// Moves the project at `from` in the config's bases to `to`: the
     /// sidebar shows them in that order, and the config file's `[[bases]]`
     /// keep it.
-    pub(super) fn reorder_projects(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+    pub(super) fn reorder_projects(&mut self, from: usize, to: usize) {
         if !move_item(&mut self.cfg.bases, from, to) {
             return;
         }
@@ -229,12 +198,11 @@ impl Lemur {
         // snapshots on their way that use the old numbers.
         self.renumber_bases(|i| Some(moved_to(i, from, to)));
         self.changes += 1;
-        if let Some(file) = Prefs::get(cx).config_file()
+        if let Some(file) = self.prefs.config_file()
             && let Err(e) = Config::save_project_order(file, &self.cfg.bases)
         {
-            self.fail(e, cx);
+            self.fail(e);
         }
-        cx.notify();
     }
 
     /// Renumbers the views of the config's bases, in the snapshot and in
@@ -250,44 +218,33 @@ impl Lemur {
 
     /// Keeps how a project shows in the sidebar in the config file: its
     /// fold, and its worktrees' order, colors, folds and which are hidden.
-    fn save_look(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(file) = Prefs::get(cx).config_file()
+    fn save_look(&mut self, index: usize) {
+        if let Some(file) = self.prefs.config_file()
             && let Err(e) = Config::save_project_look(file, &self.cfg.bases[index])
         {
-            self.fail(e, cx);
+            self.fail(e);
         }
-        cx.notify();
     }
 
     /// Asks before taking a project out of lemur; nothing on the host changes.
     pub(super) fn confirm_remove_project(
         &mut self,
-        project: Base,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let this = cx.entity().downgrade();
+        project: Base) {
         let description = format!(
             "Only Lemur forgets it. {} on {}, its worktrees and running threads stay as they are.",
             project.path, project.host
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let (this, project) = (this.clone(), project.clone());
-            alert
-                .title(format!("Remove {} from Lemur?", project.name()))
-                .description(description.clone())
-                .show_cancel(true)
-                .ok_text("Remove")
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.remove_project(&project, cx))
-                        .ok();
-                    true
-                })
+        self.dialog = Some(Dialog {
+            title: format!("Remove {} from Lemur?", project.name()),
+            description,
+            ok: "Remove",
+            check: None,
+            on_ok: Box::new(move |s, _| s.remove_project(&project)),
         });
     }
 
     /// Takes a project out of the sidebar and the config file.
-    pub(super) fn remove_project(&mut self, project: &Base, cx: &mut Context<Self>) {
+    pub(super) fn remove_project(&mut self, project: &Base) {
         let Some(index) = self
             .cfg
             .bases
@@ -296,10 +253,10 @@ impl Lemur {
         else {
             return;
         };
-        if let Some(file) = Prefs::get(cx).config_file()
+        if let Some(file) = self.prefs.config_file()
             && let Err(e) = Config::remove_folder(file, project)
         {
-            self.fail(e, cx);
+            self.fail(e);
             return;
         }
         self.cfg.bases.remove(index);
@@ -315,8 +272,7 @@ impl Lemur {
         self.changes += 1;
         // A name field may be asking about it.
         self.prompt = None;
-        self.refresh(cx).detach();
-        cx.notify();
+        self.refresh();
     }
 
     /// What removing a worktree takes with it: the threads running there.
@@ -346,10 +302,7 @@ impl Lemur {
     pub(super) fn confirm_remove_worktree(
         &mut self,
         removal: Removal,
-        kept: Option<actions::Kept>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+        kept: Option<actions::Kept>) {
         let Removal {
             host,
             worktree,
@@ -363,11 +316,12 @@ impl Lemur {
             Some(actions::Kept::Changes | actions::Kept::Locked(_))
         );
         // The first time asks whether to delete the folder too.
-        let mut ask_delete = None;
+        let mut ask_delete: Option<String> = None;
         let mut close = sessions.clone();
         let named = |list: &[String]| -> Vec<String> {
             list.iter().map(|s| self.label_of(host, s)).collect()
         };
+        let ask_delete_shown = kept.is_none();
         let (title, description, ok) = match kept {
             None => {
                 ask_delete = Some(format!("Also delete {worktree} on {host}"));
@@ -401,59 +355,30 @@ impl Lemur {
                 )
             }
         };
-        let delete = Rc::new(Cell::new(*delete));
-        let this = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (this, removal, delete, close) =
-                (this.clone(), removal.clone(), delete.clone(), close.clone());
-            let mut text = v_flex().gap_3().child(description.clone());
-            if let Some(label) = &ask_delete {
-                let delete = delete.clone();
-                text = text.child(
-                    div().debug_selector(|| "delete-folder".into()).child(
-                        Checkbox::new("delete-folder")
-                            .label(label.clone())
-                            .checked(delete.get())
-                            .on_click(move |checked, window, _| {
-                                delete.set(*checked);
-                                window.refresh();
-                            }),
-                    ),
-                );
-            }
-            alert
-                .icon(Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning))
-                .title(title.clone())
-                .description(text)
-                .show_cancel(true)
-                .ok_text(ok)
-                .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, _, cx| {
-                    let removal = Removal {
-                        sessions: close.clone(),
-                        delete: delete.get(),
-                        ..removal.clone()
-                    };
-                    this.update(cx, |this, cx| this.remove_worktree(removal, force, cx))
-                        .ok();
-                    true
-                })
+        let checked = *delete;
+        self.dialog = Some(Dialog {
+            title,
+            description,
+            ok,
+            check: ask_delete.map(|label| (label, checked)),
+            on_ok: Box::new(move |s, delete| {
+                let delete = if ask_delete_shown { delete } else { removal.delete };
+                let removal = Removal { sessions: close, delete, ..removal };
+                s.remove_worktree(removal, force);
+            }),
         });
     }
 
     pub(super) fn remove_worktree(
         &mut self,
         removal: Removal,
-        force: bool,
-        cx: &mut Context<Self>,
-    ) {
+        force: bool) {
         self.status = Some((format!("removing {}…", removal.label), Kind::Progress));
-        cx.notify();
         let cfg = self.cfg.clone();
         // Asked while it was still there.
         let Some(base) = self.project_of_removal(&removal) else {
             self.status = None;
-            self.note(format!("{}'s project has gone", removal.label), cx);
+            self.note(format!("{}'s project has gone", removal.label));
             return;
         };
         let Removal {
@@ -463,30 +388,28 @@ impl Lemur {
             ..
         } = removal.clone();
         self.in_background(
-            cx,
             move || actions::remove_worktree(&cfg, base, &worktree, &sessions, force, delete),
-            move |this, removed, window, cx| {
+            move |this, removed| {
                 this.status = None;
                 match removed {
                     Ok(()) => {
                         if let Some(base) = this.project_of_removal(&removal) {
-                            this.forget_worktree(base, &removal.worktree, cx);
+                            this.forget_worktree(base, &removal.worktree);
                         }
                     }
                     // Threads it wasn't to close keep it until you say; git
                     // keeps a locked or changed worktree unless forced.
                     Err(e) => match (force, actions::why_kept(&e)) {
                         (_, Some(kept @ actions::Kept::Threads(_))) | (false, Some(kept)) => {
-                            this.confirm_remove_worktree(removal, Some(kept), window, cx)
+                            this.confirm_remove_worktree(removal, Some(kept))
                         }
-                        _ => this.fail(e, cx),
+                        _ => this.fail(e),
                     },
                 }
-                this.refresh(cx).detach();
-                cx.notify();
-            },
+                this.refresh();
+                    },
         )
-        .detach();
+        ;
     }
 
     /// Where a worktree being removed's project is in the config by now.
@@ -500,7 +423,7 @@ impl Lemur {
     /// Forgets a removed worktree's color, place in the order, that it was
     /// hidden, and its fold, so a new one in its folder starts open; and
     /// the threads kept to resume in it.
-    fn forget_worktree(&mut self, index: usize, worktree: &str, cx: &mut Context<Self>) {
+    fn forget_worktree(&mut self, index: usize, worktree: &str) {
         let Some(base) = self.cfg.bases.get_mut(index) else {
             return;
         };
@@ -517,7 +440,7 @@ impl Lemur {
             changed |= list.len() != had;
         }
         if changed {
-            self.save_look(index, cx);
+            self.save_look(index);
         }
         // Nothing resumes where it was.
         let inside = format!("{worktree}/");
@@ -528,7 +451,7 @@ impl Lemur {
             .filter(|t| t.host == host && (t.path == worktree || t.path.starts_with(&inside)))
             .map(|t| t.session.clone())
             .collect();
-        self.forget_threads(&host, &threads, cx);
+        self.forget_threads(&host, &threads);
     }
 }
 
@@ -558,7 +481,7 @@ fn removing(label: &str, names: &[String]) -> (String, String, &'static str) {
 
 /// The hosts a folder can be added from: lemur's own, then the SSH config's
 /// other aliases, then this Mac.
-fn host_choices(cfg: &Config) -> Vec<HostChoice> {
+pub(super) fn host_choices(cfg: &Config) -> Vec<HostChoice> {
     let mut choices: Vec<HostChoice> = cfg
         .hosts
         .iter()

@@ -27,7 +27,7 @@ sh scripts/build-app.sh  # build/Lemur.app; drag it into Applications
 cargo install --path . --locked  # the lemur command, for `lemur ls`, `lemur paste` and the rest
 ```
 
-Building needs Xcode 26 or newer (GPUI compiles Metal shaders, and dictation's helper is Swift for macOS 26), and the tests need herdr-core. [docs/releases.md](docs/releases.md) covers the disk image and signed releases.
+Building needs Xcode 26 or newer (dictation's helper is Swift for macOS 26) and Zig (`brew install zig`, or `mise install`: the terminal is Ghostty's, built from its source), and the tests need herdr-core. `lemur gui --snap shot.png` draws the window off screen into a PNG, as the tests see it (Rune's flags follow `gui`: `--size 1280x820`, `--theme light`, `--script events.json`). [docs/releases.md](docs/releases.md) covers the disk image and signed releases.
 
 ## Config
 

@@ -1,30 +1,18 @@
-//! Names asked for in the spotlight: for a new worktree, a new thread or
-//! a rename, and what happens once one is given.
+//! The spotlight: names asked for a new worktree, a new thread or a rename, and threads to
+//! go to (⌘J lists them under the new thread's name, the worktree's first; ⌘P lists them
+//! all). What's typed narrows them down; ↑↓ picks one and ⏎ opens it. Also what starts at
+//! once, without a name: a terminal (⌘T) or an agent, and the menu offering them.
 
-use super::sidebar::{claude_icon, codex_icon};
+use super::icons;
 use super::snackbar::Kind;
-use super::{Ask, Lemur, Prompt, sessions, spotlight, worktree_label};
+use super::{Key, Lemur, sessions, worktree_label};
 use crate::actions;
 use crate::config::{Agent, ClaudeThread, leaf};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::select::{SearchableVec, Select, SelectState};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, IndexPath, Sizable, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
+use rune::{El, Key as K, PopupItem, PopupMenu, TextEdit, Tx, col, icon, row, text};
+use rune_kit::{Kit, TextInput};
 
-actions!(new_thread, [Up, Down]);
-
-/// Key context of the spotlight for a new thread, or one to go to.
-const NEW_THREAD: &str = "NewThread";
-
-/// ↑↓ pick what a new thread runs, or a thread to go to. The
-/// name field goes first and passes on the keys it has no use for.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", Up, Some(NEW_THREAD)),
-        KeyBinding::new("down", Down, Some(NEW_THREAD)),
-    ]);
-}
+/// How many threads the spotlight lists at most.
+const SHOWN: usize = 8;
 
 /// What a new thread can run, as they're listed: an agent, or a shell.
 pub(super) const KINDS: [Option<Agent>; 3] = [Some(Agent::Claude), Some(Agent::Codex), None];
@@ -38,35 +26,63 @@ pub(super) fn default_label(agent: Option<Agent>) -> &'static str {
     }
 }
 
-/// A new worktree's branch, empty for none, and the branch it starts
-/// from, picked from the host's branches once they've loaded.
-pub(super) struct WorktreeFields {
-    pub(super) branch: Entity<InputState>,
-    pub(super) from: Entity<SelectState<SearchableVec<String>>>,
-    _events: Subscription,
-    _load: Task<()>,
+/// What the name field is asking for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Ask {
+    /// With `agent` running in it, or with none just a shell.
+    NewWorktree { base: usize, agent: Option<Agent> },
+    /// `agent`, or with none just a shell, in `dir` on `host`: a worktree of project `base`,
+    /// or the folder of a thread outside every project.
+    NewThread { host: String, base: Option<usize>, dir: String, agent: Option<Agent> },
+    Rename { host: String, session: String },
+    /// Nothing new: a thread to go to.
+    Find,
+}
+
+/// A name being asked for, in the spotlight.
+pub struct Prompt {
+    pub what: Ask,
+    pub input: TextEdit,
+    /// For a new worktree: its branch, empty for none, and the branch it starts from,
+    /// picked from the host's branches once they've loaded.
+    pub branch: Option<TextEdit>,
+    pub branches: Vec<String>,
+    pub from: Option<String>,
+    /// Why the name typed can't be used, and that name.
+    pub error: Option<(String, String)>,
+    /// The thread picked to go to, among those listed.
+    pub go: Option<usize>,
+}
+
+/// A thread to go to, as the spotlight lists it.
+pub struct Match {
+    pub key: Key,
+    pub label: String,
+    /// `project › worktree`, or its host's name outside every project.
+    pub place: String,
 }
 
 enum Done {
     /// With a note about how it went, if there's one.
     Started(actions::Started, Option<String>),
-    Renamed {
-        host: String,
-        session: String,
-        name: String,
-    },
+    Renamed { host: String, session: String, name: String },
+}
+
+/// A field showing `text`, all of it selected so typing replaces it, with the keyboard.
+fn field(text: &str) -> TextEdit {
+    let mut e = TextEdit::new(text);
+    e.anchor = 0;
+    e.focused = true;
+    e
 }
 
 impl Lemur {
-    /// Opens the name field, selected so typing replaces it. It asks for a
-    /// label, which several threads can share: it starts as what the thread
-    /// runs, a free random name for a worktree, or the label it has, not what
-    /// its program calls it.
-    pub(super) fn ask_name(&mut self, what: Ask, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the name field, selected so typing replaces it. It asks for a label, which
+    /// several threads can share: it starts as what the thread runs, a free random name for
+    /// a worktree, or the label it has, not what its program calls it.
+    pub fn ask_name(&mut self, what: Ask) {
         let name = match &what {
-            Ask::NewWorktree { base, .. } => {
-                actions::random_name(|n| self.worktree_taken(*base, n))
-            }
+            Ask::NewWorktree { base, .. } => actions::random_name(|n| self.worktree_taken(*base, n)),
             Ask::NewThread { agent, .. } => default_label(*agent).to_string(),
             Ask::Rename { host, session } => sessions(&self.snap)
                 .find(|(h, s)| h == host && s.name == *session)
@@ -74,217 +90,171 @@ impl Lemur {
                 .unwrap_or_else(|| self.label_of(host, session)),
             Ask::Find => String::new(),
         };
-        let placeholder = match &what {
-            Ask::Find => "Go to a thread…",
-            _ => "name",
-        };
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(placeholder)
-                .default_value(name)
-        });
-        let events =
-            cx.subscribe_in(
-                &input,
-                window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    // A thread picked to go to opens; otherwise the name
-                    // starts or renames.
-                    InputEvent::PressEnter { .. } => match this.prompt.as_ref() {
-                        Some(Prompt {
-                            what: Ask::Find,
-                            go,
-                            ..
-                        }) => {
-                            let go = *go;
-                            this.go_to(go, window, cx);
+        let branch = match &what {
+            Ask::NewWorktree { base, .. } => {
+                let cfg = self.cfg.clone();
+                let base = *base;
+                self.in_background(
+                    move || actions::branches(&cfg, base),
+                    |s, branches| {
+                        if let (Ok(branches), Some(p)) = (branches, &mut s.prompt) {
+                            p.from = branches.first().cloned();
+                            p.branches = branches;
                         }
-                        Some(Prompt { go: Some(i), .. }) => {
-                            let i = *i;
-                            this.go_to(Some(i), window, cx);
-                        }
-                        _ => this.submit(cx),
                     },
-                    // Enter also reports a change; only new text answers the error.
-                    InputEvent::Change => {
-                        if let Some(prompt) = &mut this.prompt {
-                            let text = prompt.input.read(cx).value();
-                            if prompt.error.as_ref().is_some_and(|(_, name)| *name != text) {
-                                prompt.error = None;
-                            }
-                            // What's listed changed, so the pick starts over.
-                            prompt.go = None;
-                        }
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            );
-        input.update(cx, |i, cx| {
-            i.focus(window, cx);
-            i.select_all(window, cx);
-        });
-        let worktree = match &what {
-            Ask::NewWorktree { base, .. } => Some(self.worktree_fields(*base, window, cx)),
+                );
+                let mut b = TextEdit::new("");
+                b.focused = false;
+                Some(b)
+            }
             _ => None,
         };
-        self.prompt = Some(Prompt {
-            what,
-            input,
-            worktree,
-            error: None,
-            go: None,
-            _events: events,
-        });
-        cx.notify();
+        self.prompt = Some(Prompt { what, input: field(&name), branch, branches: vec![], from: None, error: None, go: None });
+        self.typing = true;
     }
 
-    /// The branch field, empty, and the branches of `base` to start from,
-    /// the default one picked once they've loaded. Without them, the host
-    /// picks its default branch.
-    fn worktree_fields(
-        &self,
-        base: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> WorktreeFields {
-        let branch = cx.new(|cx| InputState::new(window, cx).placeholder("none, to detach"));
-        let from = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
-                .searchable(true)
-        });
-        let events =
-            cx.subscribe_in(
-                &branch,
-                window,
-                |this, _, event: &InputEvent, _, cx| match event {
-                    InputEvent::PressEnter { .. } => this.submit(cx),
-                    InputEvent::Change => {
-                        if let Some(prompt) = &mut this.prompt {
-                            prompt.error = None;
-                        }
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            );
-        let cfg = self.cfg.clone();
-        let load = self.in_background(
-            cx,
-            move || actions::branches(&cfg, base),
-            |this, branches, window, cx| {
-                let fields = this.prompt.as_ref().and_then(|p| p.worktree.as_ref());
-                if let (Ok(branches), Some(fields)) = (branches, fields) {
-                    fields.from.update(cx, |from, cx| {
-                        from.set_items(SearchableVec::new(branches), window, cx);
-                        from.set_selected_index(Some(IndexPath::default()), window, cx);
-                    });
-                }
+    pub fn close_prompt(&mut self) {
+        self.prompt = None;
+        self.typing = false;
+    }
+
+    /// ⌘J: asks for a new agent's thread or shell where the one on show runs: its worktree,
+    /// or its folder outside every worktree.
+    pub fn new_thread_here(&mut self) {
+        if self.overlaid() {
+            return;
+        }
+        let Some(key) = self.active.clone() else { return };
+        let (dir, base) = match self.project_of(&key.0, &key.1) {
+            Some((base, worktree)) => (worktree.path.clone(), Some(base)),
+            None => match self.session_of(&key) {
+                Some(s) => (s.path.clone(), None),
+                // Not listed yet: there's no telling where it runs.
+                None => return self.ask_name(Ask::Find),
             },
-        );
-        WorktreeFields {
-            branch,
-            from,
-            _events: events,
-            _load: load,
+        };
+        self.ask_name(Ask::NewThread { host: key.0, base, dir, agent: Some(Agent::Claude) });
+    }
+
+    /// ⌘P: the spotlight, to go to any thread.
+    pub fn find_thread(&mut self) {
+        if !self.overlaid() {
+            self.ask_name(Ask::Find);
         }
     }
 
-    /// The name field, in the spotlight: what it's for, the name, and a
-    /// hint or why the name can't be used. What a new thread runs is picked
-    /// above the name.
-    pub(super) fn prompt_card(&self, prompt: &Prompt, cx: &Context<Self>) -> Div {
-        let mut kind = None;
-        let mut listed = false;
-        let (icon, what, hint) = match &prompt.what {
-            Ask::NewWorktree { base, agent } => {
-                kind = Some(*agent);
-                (
-                    IconName::Folder,
-                    format!("New worktree in {}", self.cfg.bases[*base].name()),
-                    "↑↓ Claude, Codex or shell · ⏎ start · esc cancel",
-                )
+    /// The text changed: an error about the name it had goes, and the pick starts over.
+    fn prompt_changed(&mut self) {
+        if let Some(prompt) = &mut self.prompt {
+            let text = prompt.input.text.clone();
+            if prompt.error.as_ref().is_some_and(|(_, name)| *name != text) {
+                prompt.error = None;
             }
-            Ask::NewThread {
-                host, dir, agent, ..
-            } => {
-                // While a thread is picked, what to start isn't.
-                kind = Some(*agent).filter(|_| prompt.go.is_none());
-                listed = true;
-                (
-                    IconName::Plus,
-                    format!("New in {}, or go to", self.worktree_name(host, dir)),
-                    "↑↓ Claude, Codex, shell or a thread · ⏎ start or go · esc cancel",
-                )
-            }
-            Ask::Find => {
-                listed = true;
-                (
-                    IconName::Search,
-                    "Go to a thread".to_string(),
-                    "↑↓ pick · ⏎ go · esc cancel",
-                )
-            }
-            Ask::Rename { host, session } => (
-                IconName::CaseSensitive,
-                format!("Rename {}", self.label_of(host, session)),
-                "⏎ rename · esc cancel",
-            ),
-        };
-        let footer = match &prompt.error {
-            Some((error, _)) => spotlight::footer(error.clone(), true, cx),
-            None => spotlight::footer(hint, false, cx),
-        };
-        let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
-        spotlight::card(cx)
-            .child(spotlight::title(icon, what, cx))
-            .when(listed || is_new, |card| {
-                card.key_context(NEW_THREAD)
-                    .on_action(cx.listener(|this, _: &Up, window, cx| this.step(true, window, cx)))
-                    .on_action(
-                        cx.listener(|this, _: &Down, window, cx| this.step(false, window, cx)),
-                    )
-            })
-            .when(is_new, |card| card.child(kinds(kind, cx)))
-            .child(
-                div()
-                    .p_1()
-                    .child(Input::new(&prompt.input).appearance(false)),
-            )
-            // A rename or a new worktree's name isn't a thread to go to:
-            // a click on one would drop what's typed.
-            .when(listed, |card| card.children(self.match_rows(prompt, cx)))
-            .when_some(prompt.worktree.as_ref(), |card, fields| {
-                card.child(
-                    v_flex()
-                        .px_3()
-                        .pb_2()
-                        .gap_2()
-                        .child(field("Branch", Input::new(&fields.branch).small(), cx))
-                        .child(field(
-                            "From",
-                            Select::new(&fields.from)
-                                .small()
-                                .placeholder("the default branch")
-                                .search_placeholder("Search branches"),
-                            cx,
-                        )),
-                )
-            })
-            .child(footer)
+            prompt.go = None;
+        }
     }
 
-    /// Picks what the new thread asked for runs: `agent`, or with none a
-    /// shell. A thread's name follows, unless you typed one.
-    pub(super) fn pick_kind(
-        &mut self,
-        agent: Option<Agent>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(prompt) = &mut self.prompt else {
-            return;
+    /// ⏎: a thread picked to go to opens; otherwise the name starts or renames.
+    pub(super) fn prompt_enter(&mut self) {
+        let Some(prompt) = &self.prompt else { return };
+        match (&prompt.what, prompt.go) {
+            (Ask::Find, go) => {
+                self.go_to(go);
+            }
+            (_, Some(i)) => {
+                self.go_to(Some(i));
+            }
+            _ => self.submit(),
+        }
+    }
+
+    /// The threads to go to for what's typed: each word of it is in a thread's name, place or
+    /// host. ⌘J lists the threads of its worktree or folder first, then its project's; ⌘P
+    /// those opened last, the one on show at the end.
+    pub fn matches(&self, prompt: &Prompt) -> Vec<Match> {
+        let typed = prompt.input.text.to_lowercase();
+        let query = match &prompt.what {
+            // The name it starts with isn't something you searched for.
+            Ask::NewThread { agent, .. } if typed == default_label(*agent) => "",
+            _ => typed.trim(),
         };
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let mut found: Vec<(usize, Match)> = sessions(&self.snap)
+            .map(|(host, s)| {
+                let key: Key = (host.to_string(), s.name.clone());
+                let (place, label) = self.titles(host, &s.name);
+                let place = place.unwrap_or_else(|| host.to_string());
+                let rank = match &prompt.what {
+                    Ask::NewThread { host: here, base, dir, .. } => {
+                        let in_project = self.project_of(host, &s.name).map(|(index, w)| (Some(index) == *base, w.path == *dir));
+                        match in_project {
+                            Some((_, true)) => 0,
+                            Some((true, false)) => 1,
+                            None if host == here && s.path == *dir => 0,
+                            _ => 2,
+                        }
+                    }
+                    // The one on show last: ⏎ goes to the one before it.
+                    _ if self.active.as_ref() == Some(&key) => usize::MAX,
+                    _ => self.recent.iter().position(|k| *k == key).unwrap_or(usize::MAX - 1),
+                };
+                (rank, Match { key, label, place })
+            })
+            .filter(|(_, m)| {
+                let text = format!("{} {} {}", m.label, m.place, m.key.0).to_lowercase();
+                words.iter().all(|w| text.contains(w))
+            })
+            .collect();
+        // Stable: the sidebar's order within a rank.
+        found.sort_by_key(|(rank, _)| *rank);
+        found.into_iter().map(|(_, m)| m).take(SHOWN).collect()
+    }
+
+    /// Moves the pick one down (or with `back` up): for a new thread, through what it can
+    /// run, then the threads to go to.
+    pub fn step(&mut self, back: bool) {
+        let Some(prompt) = &self.prompt else { return };
+        let (kinds, count) = match prompt.what {
+            Ask::NewWorktree { .. } => (KINDS.len(), 0),
+            Ask::NewThread { .. } => (KINDS.len(), self.matches(prompt).len()),
+            _ => (0, self.matches(prompt).len()),
+        };
+        let total = kinds + count;
+        if total == 0 {
+            return;
+        }
+        let now = match (&prompt.what, prompt.go) {
+            (_, Some(i)) => kinds + i,
+            (Ask::NewThread { agent, .. } | Ask::NewWorktree { agent, .. }, None) => {
+                KINDS.iter().position(|k| k == agent).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let next = if back { (now + total - 1) % total } else { (now + 1) % total };
+        if next < kinds {
+            if let Some(prompt) = &mut self.prompt {
+                prompt.go = None;
+            }
+            self.pick_kind(KINDS[next]);
+        } else if let Some(prompt) = &mut self.prompt {
+            prompt.go = Some(next - kinds);
+        }
+    }
+
+    /// Opens the thread picked, or with none picked the first; false if there's none.
+    pub fn go_to(&mut self, pick: Option<usize>) -> bool {
+        let Some(prompt) = &self.prompt else { return false };
+        let Some(m) = self.matches(prompt).into_iter().nth(pick.unwrap_or(0)) else { return false };
+        self.close_prompt();
+        let (host, session) = m.key;
+        self.open(host, session);
+        true
+    }
+
+    /// Picks what the new thread asked for runs: `agent`, or with none a shell. A thread's
+    /// name follows, unless you typed one.
+    pub fn pick_kind(&mut self, agent: Option<Agent>) {
+        let Some(prompt) = &mut self.prompt else { return };
         let (picked, named) = match &mut prompt.what {
             Ask::NewThread { agent: picked, .. } => (picked, true),
             // Its name is the worktree's.
@@ -292,77 +262,29 @@ impl Lemur {
             _ => return,
         };
         prompt.go = None;
-        let input = &prompt.input;
         if *picked != agent {
-            let typed = input.read(cx).value() != default_label(*picked);
+            let typed = prompt.input.text != default_label(*picked);
             *picked = agent;
             if named && !typed {
-                input.update(cx, |i, cx| {
-                    i.set_value(default_label(agent), window, cx);
-                    i.select_all(window, cx);
-                });
+                prompt.input = field(default_label(agent));
             }
         }
-        // A click on a kind took the keyboard.
-        input.update(cx, |i, cx| i.focus(window, cx));
-        cx.notify();
+        prompt.input.focused = true;
     }
 
-    /// ⌘J: asks for a new agent's thread or shell where the one on show runs:
-    /// its worktree, or its folder outside every worktree.
-    pub(super) fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlaid() {
-            return;
-        }
-        let Some(key) = self.active.clone() else {
-            return;
-        };
-        let (dir, base) = match self.project_of(&key.0, &key.1) {
-            Some((base, worktree)) => (worktree.path.clone(), Some(base)),
-            None => match self.session_of(&key) {
-                Some(s) => (s.path.clone(), None),
-                // Not listed yet: there's no telling where it runs.
-                None => return self.ask_name(Ask::Find, window, cx),
-            },
-        };
-        let ask = Ask::NewThread {
-            host: key.0,
-            base,
-            dir,
-            agent: Some(Agent::Claude),
-        };
-        self.ask_name(ask, window, cx);
-    }
-
-    pub(super) fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.prompt = None;
-        self.focus_terminal(window, cx);
-    }
-
-    fn submit(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = &mut self.prompt else {
-            return;
-        };
-        let text = prompt.input.read(cx).value().to_string();
+    fn submit(&mut self) {
+        let Some(prompt) = &mut self.prompt else { return };
+        let text = prompt.input.text.clone();
         let name = text.trim().to_string();
-        let (branch, from) = match &prompt.worktree {
-            Some(fields) => {
-                let branch = fields.branch.read(cx).value().trim().to_string();
-                let from = fields.from.read(cx).selected_value().cloned();
-                ((!branch.is_empty()).then_some(branch), from)
-            }
-            None => (None, None),
-        };
-        let valid = actions::validate_name(&name)
-            .and_then(|()| branch.as_deref().map_or(Ok(()), actions::validate_branch));
+        let branch = prompt.branch.as_ref().map(|b| b.text.trim().to_string()).filter(|b| !b.is_empty());
+        let from = prompt.from.clone();
+        let valid = actions::validate_name(&name).and_then(|()| branch.as_deref().map_or(Ok(()), actions::validate_branch));
         if let Err(e) = valid {
             prompt.error = Some((format!("{e:#}"), text));
-            cx.notify();
             return;
         }
-        let Some(Prompt { what, .. }) = self.prompt.take() else {
-            return;
-        };
+        let Some(Prompt { what, .. }) = self.prompt.take() else { return };
+        self.typing = false;
         let cfg = self.cfg.clone();
         let doing = match &what {
             Ask::Rename { .. } => "renaming",
@@ -370,114 +292,58 @@ impl Lemur {
             _ => "starting",
         };
         self.status = Some((format!("{doing} {name}…"), Kind::Progress));
-        cx.notify();
         self.in_background(
-            cx,
             move || match what {
-                // The name is the worktree's: its thread shows what its program
-                // calls it.
-                Ask::NewWorktree { base, agent } => actions::new_worktree_thread(
-                    &cfg,
-                    base,
-                    &name,
-                    default_label(agent),
-                    agent,
-                    branch.as_deref(),
-                    from.as_deref(),
-                )
-                .map(|(started, note)| Done::Started(started, note)),
-                Ask::NewThread {
-                    host, dir, agent, ..
-                } => actions::start_in(&cfg, &host, &dir, &name, agent)
-                    .map(|started| Done::Started(started, None)),
+                // The name is the worktree's: its thread shows what its program calls it.
+                Ask::NewWorktree { base, agent } => {
+                    actions::new_worktree_thread(&cfg, base, &name, default_label(agent), agent, branch.as_deref(), from.as_deref())
+                        .map(|(started, note)| Done::Started(started, note))
+                }
+                Ask::NewThread { host, dir, agent, .. } => {
+                    actions::start_in(&cfg, &host, &dir, &name, agent).map(|started| Done::Started(started, None))
+                }
                 Ask::Find => unreachable!("going to a thread starts nothing"),
                 Ask::Rename { host, session } => {
-                    actions::rename_session(&cfg, &host, &session, &name).map(|session| {
-                        Done::Renamed {
-                            host,
-                            session,
-                            name,
-                        }
-                    })
+                    actions::rename_session(&cfg, &host, &session, &name).map(|session| Done::Renamed { host, session, name })
                 }
             },
-            |this, done, window, cx| {
+            |s, done| {
                 match done {
                     Ok(Done::Started(started, note)) => {
-                        this.status = note.map(|note| (note, Kind::Warning));
+                        s.status = note.map(|note| (note, Kind::Warning));
                         if let Some(claude) = started.claude {
-                            this.keep_thread(claude, cx);
+                            s.keep_thread(claude);
                         }
-                        this.open_fresh(started.host, started.session, window, cx);
+                        s.open_fresh(started.host, started.session);
                     }
-                    Ok(Done::Renamed {
-                        host,
-                        session,
-                        name,
-                    }) => {
-                        this.status = None;
-                        this.follow_rename(host, session, name, cx);
+                    Ok(Done::Renamed { host, session, name }) => {
+                        s.status = None;
+                        s.follow_rename(host, session, name);
                     }
-                    Err(e) => this.fail(e, cx),
+                    Err(e) => s.fail(e),
                 }
-                this.refresh(cx).detach();
+                s.refresh();
             },
-        )
-        .detach();
+        );
     }
 
-    /// Shows a thread's new label at once, and keeps it with the thread
-    /// kept to resume.
-    fn follow_rename(
-        &mut self,
-        host: String,
-        session: String,
-        name: String,
-        cx: &mut Context<Self>,
-    ) {
-        let kept = self
-            .cfg
-            .threads
-            .iter()
-            .find(|t| t.host == host && t.session == session)
-            .cloned();
+    /// Shows a thread's new label at once, and keeps it with the thread kept to resume.
+    fn follow_rename(&mut self, host: String, session: String, name: String) {
+        let kept = self.cfg.threads.iter().find(|t| t.host == host && t.session == session).cloned();
         if let Some(thread) = kept {
             let label = Some(name.clone());
-            self.keep_thread(ClaudeThread { label, ..thread }, cx);
+            self.keep_thread(ClaudeThread { label, ..thread });
         }
-        let shown = self
-            .snap
-            .hosts
-            .iter_mut()
-            .filter(|h| h.name == host)
-            .flat_map(|h| {
-                let in_bases = h.bases.iter_mut().flat_map(|b| b.worktrees.iter_mut());
-                in_bases
-                    .flat_map(|w| w.sessions.iter_mut())
-                    .chain(h.other.iter_mut())
-            });
-        for s in shown.filter(|s| s.name == session) {
+        let key = (host, session);
+        if let Some(s) = self.session_mut(&key) {
             s.label = name.clone();
-            s.own_label = name.clone();
+            s.own_label = name;
         }
-        cx.notify();
-    }
-
-    /// What the sidebar calls a thread.
-    pub(super) fn label_of(&self, host: &str, session: &str) -> String {
-        sessions(&self.snap)
-            .find(|(h, s)| *h == host && s.name == session)
-            .map(|(_, s)| s.label.clone())
-            .unwrap_or_else(|| actions::label(leaf(session)).to_string())
     }
 
     /// A worktree's name as the sidebar shows it.
     fn worktree_name(&self, host: &str, path: &str) -> String {
-        self.snap
-            .worktrees(host)
-            .find(|w| w.path == path)
-            .map(worktree_label)
-            .unwrap_or_else(|| leaf(path).to_string())
+        self.snap.worktrees(host).find(|w| w.path == path).map(worktree_label).unwrap_or_else(|| leaf(path).to_string())
     }
 
     /// Whether `base` already has a worktree called `name`.
@@ -490,51 +356,260 @@ impl Lemur {
             .flat_map(|v| v.worktrees.iter())
             .any(|w| leaf(&w.path) == name)
     }
+
+    /// ⌘T: a terminal where the thread on show runs: its worktree, or its folder outside
+    /// every worktree.
+    pub fn new_terminal_here(&mut self) {
+        if self.overlaid() {
+            return;
+        }
+        let Some(key) = self.active.clone() else { return };
+        let dir = match self.worktree_of(&key.0, &key.1) {
+            Some((worktree, _)) => worktree,
+            None => match self.session_of(&key) {
+                Some(s) => s.path.clone(),
+                None => return,
+            },
+        };
+        self.start_now(key.0, dir, None);
+    }
+
+    /// Starts `agent`, or with none a shell, in `dir` on `host`, labelled after what it
+    /// runs, and shows it.
+    pub fn start_now(&mut self, host: String, dir: String, agent: Option<Agent>) {
+        let label = default_label(agent);
+        self.status = Some((format!("starting {label}…"), Kind::Progress));
+        let cfg = self.cfg.clone();
+        self.in_background(
+            move || actions::start_in(&cfg, &host, &dir, label, agent),
+            |s, started| {
+                match started {
+                    Ok(started) => {
+                        s.status = None;
+                        if let Some(claude) = started.claude {
+                            s.keep_thread(claude);
+                        }
+                        s.open_fresh(started.host, started.session);
+                    }
+                    Err(e) => s.fail(e),
+                }
+                s.refresh();
+            },
+        );
+    }
 }
 
-/// What a new thread can run, to pick from: `picked` is highlighted, and with
-/// none nothing is.
-fn kinds(picked: Option<Option<Agent>>, cx: &Context<Lemur>) -> Div {
-    let theme = cx.theme();
-    let row = |label: &'static str, icon: Icon, kind: Option<Agent>| {
-        h_flex()
-            .id(label)
-            .debug_selector(move || format!("kind {label}"))
-            .px_2()
-            .py_1()
-            .gap_2()
-            .rounded(theme.radius)
-            .text_sm()
-            .cursor_pointer()
-            .when(picked == Some(kind), |row| {
-                row.bg(theme.accent).text_color(theme.accent_foreground)
-            })
-            .child(icon.small())
-            .child(label)
-            .on_click(cx.listener(move |this, _, window, cx| this.pick_kind(kind, window, cx)))
+/// What can start in a folder, as a menu: a terminal or an agent at once, or one named in
+/// the spotlight, each with the key that does it for the thread on show.
+pub fn new_menu() -> PopupMenu {
+    let key = |a: super::Action| a.key_label().and_then(|k| k.parse().ok());
+    let mut terminal = PopupItem::new("new-terminal", "New terminal").symbol("apple.terminal");
+    if let Some(k) = key(super::Action::NewTerminal) {
+        terminal = terminal.key_equivalent(k);
+    }
+    let mut named = PopupItem::new("new-named", "Claude, Codex or shell, named…").symbol("plus");
+    if let Some(k) = key(super::Action::NewThreadHere) {
+        named = named.key_equivalent(k);
+    }
+    PopupMenu::new()
+        .item(terminal)
+        .item(PopupItem::new("new-claude", "New Claude").symbol("sparkle"))
+        .item(PopupItem::new("new-codex", "New Codex").symbol("chevron.left.forwardslash.chevron.right"))
+        .item(named)
+}
+
+/// Runs what `new_menu` picked, in `dir` on `host`, a worktree of project `base` or any
+/// folder. True if it was one of its items.
+pub fn new_picked(s: &mut Lemur, picked: &str, host: &str, dir: &str, base: Option<usize>) -> bool {
+    let (host, dir) = (host.to_string(), dir.to_string());
+    match picked {
+        "new-terminal" => s.start_now(host, dir, None),
+        "new-claude" => s.start_now(host, dir, Some(Agent::Claude)),
+        "new-codex" => s.start_now(host, dir, Some(Agent::Codex)),
+        "new-named" => s.ask_name(Ask::NewThread { host, base, dir, agent: Some(Agent::Claude) }),
+        _ => return false,
+    }
+    true
+}
+
+/// A thread's icon: its agent's, or a terminal.
+pub fn agent_icon(agent: Option<Agent>, k: &Kit) -> El {
+    let (glyph, ink) = match agent {
+        Some(Agent::Claude) => (&icons::CLAUDE, rune::color::hex("#d97757").unwrap()),
+        Some(Agent::Codex) => (&icons::CODE_XML, rune::color::hex("#4f8fe8").unwrap()),
+        None => (&icons::SQUARE_TERMINAL, k.c.icon_muted),
     };
-    v_flex()
-        .p_1()
-        .gap_0p5()
-        .border_b_1()
-        .border_color(theme.border)
-        .child(row("Claude", claude_icon(), Some(Agent::Claude)))
-        .child(row("Codex", codex_icon(), Some(Agent::Codex)))
-        .child(row("Shell", Icon::new(IconName::SquareTerminal), None))
+    row().size(16.0, 16.0).center().child(icon(glyph, 14.0).color(ink))
 }
 
-/// A line of the new worktree's fields: what it is, then the field.
-fn field(label: &str, input: impl IntoElement, cx: &App) -> Div {
-    let selector = format!("field {label}");
-    h_flex()
-        .debug_selector(move || selector)
-        .gap_2()
+/// The spotlight, over the window: what it's for, what a new thread runs, the name, the
+/// threads to go to, a new worktree's branch and start, and a hint or why the name can't be
+/// used.
+pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
+    let c = &k.c;
+    let mut kind = None;
+    let mut listed = false;
+    let (glyph, what, hint) = match &prompt.what {
+        Ask::NewWorktree { base, agent } => {
+            kind = Some(*agent);
+            (&icons::FOLDER, format!("New worktree in {}", s.cfg.bases[*base].name()), "↑↓ Claude, Codex or shell · ⏎ start · esc cancel")
+        }
+        Ask::NewThread { host, dir, agent, .. } => {
+            // While a thread is picked, what to start isn't.
+            kind = Some(*agent).filter(|_| prompt.go.is_none());
+            listed = true;
+            (
+                &icons::PLUS,
+                format!("New in {}, or go to", s.worktree_name(host, dir)),
+                "↑↓ Claude, Codex, shell or a thread · ⏎ start or go · esc cancel",
+            )
+        }
+        Ask::Find => {
+            listed = true;
+            (&icons::SEARCH, "Go to a thread".to_string(), "↑↓ pick · ⏎ go · esc cancel")
+        }
+        Ask::Rename { host, session } => (&icons::PENCIL, format!("Rename {}", s.label_of(host, session)), "⏎ rename · esc cancel"),
+    };
+    let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
+    let pick_row = |id: String, label: String, detail: Option<String>, lead: El, picked: bool| {
+        let mut r = row()
+            .key(id)
+            .px(8.0)
+            .h(28.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .cursor(rune::Cursor::Pointer)
+            .child(lead)
+            .child(text(label).font(k.ty.ui).color(if picked { c.text_contrast } else { c.text_base }));
+        if let Some(d) = detail {
+            r = r.child(text(d).font(k.ty.small).color(if picked { c.text_contrast } else { c.text_faint }).truncate());
+        }
+        if picked { r.fill(c.bg_accent) } else { k.interactive(r) }
+    };
+    let mut card = col()
+        .key("spotlight")
+        .w(560.0)
+        .radius(k.radius.lg)
+        .fill(c.surface_raised)
+        .border(1.0, c.border_base)
+        .shadow(12.0, 40.0, c.scrim)
+        .clip_rounded(k.radius.lg)
         .child(
-            div()
-                .w(px(56.0))
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.to_string()),
-        )
-        .child(div().flex_1().child(input))
+            row()
+                .px(12.0)
+                .h(34.0)
+                .gap(8.0)
+                .center_y()
+                .child(icon(glyph, 14.0).color(c.icon_muted))
+                .child(text(what).font(k.ty.ui_medium).color(c.text_base).truncate()),
+        );
+    if is_new {
+        let mut kinds = col().key("kinds").padding(4.0).gap(2.0);
+        for (i, agent) in KINDS.iter().enumerate() {
+            let name = match agent {
+                Some(Agent::Claude) => "Claude",
+                Some(Agent::Codex) => "Codex",
+                None => "Shell",
+            };
+            let a = *agent;
+            kinds = kinds.child(
+                pick_row(format!("kind-{i}"), name.into(), None, agent_icon(a, k), kind == Some(a))
+                    .on_press(move |s: &mut Lemur| s.pick_kind(a)),
+            );
+        }
+        card = card.child(kinds).child(rune::el().w_full().h(1.0).fill(c.border_weak));
+    }
+    let input = TextInput::new(&prompt.input)
+        .placeholder(if prompt.what == Ask::Find { "Go to a thread…" } else { "name" })
+        .width(None)
+        .plain()
+        .on_edit(|s: &mut Lemur| &mut s.prompt.as_mut().expect("a prompt").input)
+        .on_change(|s: &mut Lemur, _| s.prompt_changed())
+        .on_submit(|s: &mut Lemur, _| s.prompt_enter())
+        .on_key(|s: &mut Lemur, ev, _| match ev.key {
+            K::Up => {
+                s.step(true);
+                true
+            }
+            K::Down => {
+                s.step(false);
+                true
+            }
+            K::Escape => {
+                s.close_prompt();
+                true
+            }
+            _ => false,
+        })
+        .build(k)
+        .key("spotlight-input");
+    card = card.child(row().px(8.0).py(6.0).child(input));
+    if listed {
+        let matches = s.matches(prompt);
+        if !matches.is_empty() {
+            let picked = match prompt.what {
+                Ask::Find => Some(prompt.go.unwrap_or(0)),
+                _ => prompt.go,
+            };
+            let mut rows = col().key("matches").padding(4.0).gap(2.0);
+            for (i, m) in matches.into_iter().enumerate() {
+                let agent = s.session_of(&m.key).and_then(|s| s.agent());
+                rows = rows.child(
+                    pick_row(format!("go-{i}"), m.label, Some(m.place), agent_icon(agent, k), picked == Some(i))
+                        .on_press(move |s: &mut Lemur| {
+                            s.go_to(Some(i));
+                        }),
+                );
+            }
+            card = card.child(rune::el().w_full().h(1.0).fill(c.border_weak)).child(rows);
+        }
+    }
+    if let Some(branch) = &prompt.branch {
+        let line = |label: &str, field: El| {
+            row().gap(8.0).center_y().child(text(label.to_owned()).font(k.ty.small).color(c.text_muted).w(56.0)).child(field.grow(1.0))
+        };
+        let branch_field = TextInput::new(branch)
+            .placeholder("none, to detach")
+            .width(None)
+            .on_edit(|s: &mut Lemur| s.prompt.as_mut().and_then(|p| p.branch.as_mut()).expect("a branch field"))
+            .on_change(|s: &mut Lemur, _| {
+                if let Some(p) = &mut s.prompt {
+                    p.error = None;
+                }
+            })
+            .on_submit(|s: &mut Lemur, _| s.submit())
+            .build(k)
+            .key("branch");
+        let from = prompt.from.clone().unwrap_or_else(|| "the default branch".into());
+        let from_button = rune_kit::Button::new(from)
+            .variant(rune_kit::ButtonVariant::Outline)
+            .on_press_tx(|s: &mut Lemur, tx: &mut Tx| {
+                let Some(p) = &s.prompt else { return };
+                let items: Vec<(String, String)> = p.branches.iter().map(|b| (b.clone(), b.clone())).collect();
+                let current = p.from.clone().unwrap_or_default();
+                let menu = PopupMenu::picker(items.iter().map(|(a, b)| (a.as_str(), b.as_str())), current.as_str());
+                tx.popup_menu(menu, "from", |s: &mut Lemur, picked, _| {
+                    if let (Some(picked), Some(p)) = (picked, &mut s.prompt) {
+                        p.from = Some(picked.to_string());
+                    }
+                });
+            })
+            .build(k)
+            .key("from");
+        card = card.child(col().key("worktree-fields").px(12.0).pb(8.0).gap(8.0).child(line("Branch", branch_field)).child(line("From", from_button)));
+    }
+    let (footer, error) = match &prompt.error {
+        Some((e, _)) => (e.clone(), true),
+        None => (hint.to_string(), false),
+    };
+    card.child(
+        row()
+            .key("spotlight-footer")
+            .px(12.0)
+            .h(28.0)
+            .center_y()
+            .fill(c.layer_01)
+            .child(text(footer).font(k.ty.small).color(if error { c.danger.fg } else { c.text_faint }).truncate()),
+    )
 }

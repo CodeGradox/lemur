@@ -1,102 +1,44 @@
-//! Links in the terminal, found where the pointer is: an OSC 8 hyperlink's
-//! URI, or else a URL or a file path written out in the text.
-
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::Term;
-use alacritty_terminal::term::cell::Flags;
+//! Links in a terminal, found where the pointer is: a link a program put on its text (OSC 8),
+//! or a URL or a file path written out in the text.
 
 /// A link on screen and where it goes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link {
     pub url: String,
-    /// `url` is a path on the session's host, as programs print them,
-    /// rather than a web link.
+    /// `url` is a path on the session's host, as programs print them, rather than a web link.
     pub file: bool,
-    /// Where it's drawn: one (screen line, first column, end column) a row.
-    pub spans: Vec<(usize, usize, usize)>,
+    /// Where it's drawn: its row, first column and the column after its last.
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
 }
 
-/// The link at screen column `col` of screen line `line`, if any. A URL
-/// or path can run on across rows the terminal wrapped, though not across
-/// rows a program broke itself.
-pub fn link_at<T>(term: &Term<T>, col: usize, line: usize) -> Option<Link> {
-    let grid = term.grid();
-    let offset = grid.display_offset() as i32;
-    let last = Column(grid.columns().checked_sub(1)?);
-    let wrapped = |line: i32| grid[Line(line)][last].flags.contains(Flags::WRAPLINE);
-    let at = Line(line as i32 - offset);
-    if at < grid.topmost_line() || at > grid.bottommost_line() {
-        return None;
-    }
-    // The row's whole logical line, as the terminal wrapped it.
-    let mut first = at.0;
-    while first > grid.topmost_line().0 && wrapped(first - 1) {
-        first -= 1;
-    }
-    let mut end = at.0;
-    while end < grid.bottommost_line().0 && wrapped(end) {
-        end += 1;
-    }
-    // Its characters and where each is; the spacer after a wide one isn't one.
-    let mut cells: Vec<(char, Point, usize)> = vec![];
-    for row in first..=end {
-        for column in 0..grid.columns() {
-            let point = Point::new(Line(row), Column(column));
-            let cell = &grid[point];
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
-            }
-            let width = if cell.flags.contains(Flags::WIDE_CHAR) {
-                2
-            } else {
-                1
-            };
-            let c = if cell.c == '\0' { ' ' } else { cell.c };
-            cells.push((c, point, width));
-        }
-    }
-    let pointer = Point::new(at, Column(col));
-    let here = cells.iter().rposition(|(_, point, _)| *point <= pointer)?;
-    let (start, stop, url, file) = match grid[cells[here].1].hyperlink() {
-        // Any program's output sets these, with text that needn't match:
-        // only web links open, as for a URL written out.
-        Some(link) if !is_web(link.uri()) => return None,
-        Some(link) => {
-            let same = |i: &usize| grid[cells[*i].1].hyperlink().as_ref() == Some(&link);
-            let start = (0..here).rev().take_while(same).last().unwrap_or(here);
-            let stop = (here..cells.len()).take_while(same).last()? + 1;
-            (start, stop, link.uri().to_string(), false)
-        }
+/// The link over column `col` of a row, given the row's characters and their columns
+/// (`Grid::line_cells`).
+pub fn link_at(cells: &[(char, u16)], row: u16, col: u16) -> Option<Link> {
+    let here = cells.iter().rposition(|(_, c)| *c <= col)?;
+    let text: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
+    let (start, stop, url, file) = match url_at(&text, here) {
+        Some((start, stop)) => (start, stop, text[start..stop].iter().collect(), false),
         None => {
-            let text: Vec<char> = cells.iter().map(|(c, _, _)| *c).collect();
-            match url_at(&text, here) {
-                Some((start, stop)) => (start, stop, text[start..stop].iter().collect(), false),
-                None => {
-                    let (start, end, stop) = path_at(&text, here)?;
-                    (start, stop, text[start..end].iter().collect(), true)
-                }
-            }
+            let (start, end, stop) = path_at(&text, here)?;
+            (start, stop, text[start..end].iter().collect(), true)
         }
     };
-    let mut spans: Vec<(usize, usize, usize)> = vec![];
-    for &(_, point, width) in &cells[start..stop] {
-        let Ok(screen) = usize::try_from(point.line.0 + offset) else {
-            continue;
-        };
-        if screen >= grid.screen_lines() {
-            continue;
-        }
-        let (column, until) = (point.column.0, point.column.0 + width);
-        match spans.last_mut() {
-            Some((line, _, end)) if *line == screen => *end = until,
-            _ => spans.push((screen, column, until)),
-        }
+    let end = cells.get(stop).map_or(cells.last()?.1 + 1, |(_, c)| *c);
+    Some(Link { url, file, row, start: cells[start].1, end })
+}
+
+/// The link `uri` a program put on column `col` of row `row` (OSC 8), over the columns
+/// around it `same` says link there too, of `cols`. Any program's output sets these, with
+/// text that needn't match: only web links open, as for a URL written out.
+pub fn hyperlinked(uri: String, row: u16, col: u16, cols: u16, same: impl Fn(u16) -> bool) -> Option<Link> {
+    if !is_web(&uri) {
+        return None;
     }
-    Some(Link { url, file, spans })
+    let start = (0..col).rev().take_while(|c| same(*c)).last().unwrap_or(col);
+    let end = (col..cols).take_while(|c| same(*c)).last()? + 1;
+    Some(Link { url: uri, file: false, row, start, end })
 }
 
 const SCHEMES: [&str; 2] = ["https://", "http://"];
@@ -111,7 +53,7 @@ fn is_web(uri: &str) -> bool {
 
 /// The URL written out in `text` over the character at `at`: its first
 /// character and the one after its last.
-pub(super) fn url_at(text: &[char], at: usize) -> Option<(usize, usize)> {
+pub fn url_at(text: &[char], at: usize) -> Option<(usize, usize)> {
     let mut from = 0;
     while let Some((start, scheme)) = next_scheme(text, from) {
         let mut end = start + scheme;
@@ -153,7 +95,7 @@ fn ends_url(c: char) -> bool {
 /// `Cargo.toml`, maybe with `:line` or `:line:column` after it. Its first
 /// character, the one after the path, and the one after its line and
 /// column.
-pub(super) fn path_at(text: &[char], at: usize) -> Option<(usize, usize, usize)> {
+pub fn path_at(text: &[char], at: usize) -> Option<(usize, usize, usize)> {
     if ends_path(*text.get(at)?) {
         return None;
     }
@@ -237,9 +179,7 @@ fn trimmed(url: &[char]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::terminal::{Screen, Size};
 
-    /// The URL in `text` at the first character of `at`.
     fn url(text: &str, at: &str) -> Option<String> {
         let chars: Vec<char> = text.chars().collect();
         let at = text[..text.find(at).expect(at)].chars().count();
@@ -311,85 +251,14 @@ mod tests {
 
     /// What a shell printing `script` shows in a 30-column terminal; it
     /// must show `shown`.
-    fn printed(script: &str, shown: &str) -> Screen {
-        let out = std::process::Command::new("sh")
-            .args(["-c", script])
-            .output()
-            .expect("running sh");
-        let mut screen = Screen::new(
-            Size {
-                cols: 30,
-                lines: 6,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            100,
-        );
-        screen.advance(&out.stdout);
-        let text = {
-            let term = screen.term.lock();
-            let grid = term.grid();
-            (0..grid.screen_lines())
-                .map(|line| {
-                    (0..grid.columns())
-                        .map(|col| grid[Line(line as i32)][Column(col)].c)
-                        .collect::<String>()
-                })
-                .collect::<String>()
-        };
-        assert!(text.contains(shown), "{text:?}");
-        screen
-    }
-
     #[test]
-    fn a_url_runs_on_across_wrapped_rows() {
-        let screen = printed(
-            "printf 'go https://example.com/a/long/path/here now'",
-            "now",
-        );
-        let term = screen.term.lock();
-        let link = link_at(&term, 2, 1).expect("on the wrapped row");
-        assert_eq!(link.url, "https://example.com/a/long/path/here");
-        assert_eq!(link.spans, [(0, 3, 30), (1, 0, 9)]);
-        assert_eq!(link_at(&term, 0, 0), None);
-    }
-
-    #[test]
-    fn an_osc_8_link_goes_to_its_uri() {
-        let screen = printed(
-            r"printf 'read \033]8;;https://lemur.dev/docs\033\\the docs\033]8;;\033\\ now'",
-            "now",
-        );
-        let term = screen.term.lock();
-        let link = link_at(&term, 7, 0).expect("on the text");
-        assert_eq!(link.url, "https://lemur.dev/docs");
-        assert_eq!(link.spans, [(0, 5, 13)]);
-        assert_eq!(link_at(&term, 14, 0), None);
-    }
-
-    #[test]
-    fn a_path_written_out_links_to_its_file() {
-        let screen = printed("printf 'edit src/gui/links.rs:42 now'", "now");
-        let term = screen.term.lock();
-        let link = link_at(&term, 8, 0).expect("on the path");
-        assert_eq!(link.url, "src/gui/links.rs");
-        assert!(link.file);
-        assert_eq!(link.spans, [(0, 5, 24)]);
-        let web = link_at(&term, 26, 0);
-        assert_eq!(web, None, "now");
-    }
-
-    /// Text can hide any URI; only a web link's opens.
-    #[test]
-    fn an_osc_8_link_elsewhere_doesnt_open() {
-        let screen = printed(
-            r"printf '\033]8;;file:///etc/passwd\033\\safe\033]8;;\033\\ \033]8;;HTTPS://x.dev\033\\web\033]8;;\033\\ end'",
-            "end",
-        );
-        let term = screen.term.lock();
-        assert_eq!(link_at(&term, 1, 0), None);
-        let web = link_at(&term, 6, 0).expect("on the web link");
-        assert_eq!(web.url, "HTTPS://x.dev");
-        assert!(is_web("http://a") && !is_web("javascript:alert(1)") && !is_web("ht"));
+    fn a_link_knows_its_columns() {
+        let cells: Vec<(char, u16)> = "see https://example.com/a now".chars().zip(0..).collect();
+        let link = link_at(&cells, 3, 10).unwrap();
+        assert_eq!((link.url.as_str(), link.file, link.start, link.end), ("https://example.com/a", false, 4, 25));
+        let cells: Vec<(char, u16)> = "Read(src/main.rs:12)".chars().zip(0..).collect();
+        let link = link_at(&cells, 0, 8).unwrap();
+        assert_eq!((link.url.as_str(), link.file), ("src/main.rs", true));
+        assert!(link_at(&cells, 0, 1).is_none());
     }
 }
