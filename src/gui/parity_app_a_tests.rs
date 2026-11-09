@@ -285,13 +285,16 @@ fn dragging_the_top_bar_moves_the_window() {
 }
 
 /// v2 `dragging_the_sidebars_top_moves_the_window`: the sidebar's top row too, where the
-/// window's buttons are.
+/// window's buttons are, its title with them.
 #[test]
 fn dragging_the_sidebars_top_moves_the_window() {
     let mut rt = window(toml::from_str("").unwrap());
     frames(&mut rt, 30);
-    let (x, y) = bare_point(&rt, "sidebar-titlebar");
+    let (x, y) = bare_point(&rt, "sidebar-head");
     assert_eq!(press_and_move(&mut rt, x, y), Some(TitlebarAction::Drag));
+    rt.pointer_up(x + 3.0, y);
+    let (x, y) = rt.find("sidebar-title").expect("the title");
+    assert_eq!(press_and_move(&mut rt, x, y), Some(TitlebarAction::Drag), "on the title");
 }
 
 /// v2 `a_top_bar_button_keeps_its_press`: a press on a top row's button is the button's:
@@ -366,10 +369,11 @@ fn dragging_a_side_panels_edge_resizes_it() {
     drag_grip(&mut rt, "sidebar-grip", 400.4 - w);
     assert_eq!(widths(&rt.state).0, 400.0);
     assert_eq!(kept(&rt.state), (Some(400.0), None));
-    drag_grip(&mut rt, "sidebar-grip", 100.0 - 400.0);
-    assert_eq!(widths(&rt.state).0, 180.0, "its minimum");
+    // Short of half its minimum, which would fold it.
+    drag_grip(&mut rt, "sidebar-grip", super::SIDEBAR.0 * 0.6 - 400.0);
+    assert_eq!(widths(&rt.state).0, super::SIDEBAR.0, "its minimum");
     assert!(rt.state.sidebar.is_open());
-    drag_grip(&mut rt, "sidebar-grip", super::SIDEBAR_WIDTH - 180.0);
+    drag_grip(&mut rt, "sidebar-grip", super::SIDEBAR_WIDTH - super::SIDEBAR.0);
     assert_eq!(kept(&rt.state), (None, None), "back at lemur's own width");
 
     rt.update(|s, _| s.toggle_right(Right::Notes));

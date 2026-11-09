@@ -842,3 +842,23 @@ fn a_pane_takes_its_width_back_as_the_window_grows() {
     settle(&mut rt);
     assert_eq!(rt.state.sidebar.width(), 600.0);
 }
+
+/// The sidebar's title and its buttons are on the title bar's row, as in v2, and its buttons
+/// take presses there rather than dragging the window.
+#[test]
+fn the_sidebars_title_is_on_the_title_bars_row() {
+    let server = HcServer::new("rtitle");
+    let mut rt = window(server.config());
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    for b in ["sidebar-head", "find-thread", "add-folder", "refresh"] {
+        let (_, y) = rt.find(b).unwrap_or_else(|| panic!("no {b}"));
+        assert!(y < rune_kit::shell::TOOLBAR_HEIGHT, "{b} at {y}, under the title bar");
+    }
+    let (toggle, _) = rt.find("sidebar-toggle").expect("the sidebar's toggle");
+    let (refresh, _) = rt.find("refresh").expect("refresh");
+    assert!(refresh < toggle, "refresh at {refresh}, past the toggle at {toggle}");
+    click(&mut rt, "find-thread");
+    assert!(rt.state.prompt.is_some(), "Go to thread opened");
+}

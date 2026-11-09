@@ -75,8 +75,9 @@ pub type List = (String, Option<String>);
 const REFRESH: Duration = Duration::from_secs(3);
 /// What the terminal keeps of the window's width, however wide the panes beside it are dragged.
 const MIN_TERMINAL: f32 = 320.0;
-/// The sidebar's width range, and the right panel's.
-const SIDEBAR: (f32, f32) = (180.0, 640.0);
+/// The sidebar's width range, and the right panel's. The sidebar's least keeps its title
+/// row's buttons past the traffic lights.
+const SIDEBAR: (f32, f32) = (210.0, 640.0);
 const INSPECTOR: (f32, f32) = (240.0, 900.0);
 /// How long changes herdr-core tells of are gathered into one snapshot.
 const BURST: Duration = Duration::from_millis(30);

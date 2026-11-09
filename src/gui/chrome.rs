@@ -11,7 +11,7 @@ use crate::config::Agent;
 use crate::machine;
 use crate::snapshot::Activity;
 use rune::{Cx, El, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
-use rune_kit::shell::{SidebarToggle, SplitView, TabItem, TabItemStatus, TabOrientation, TabOverflow, TabReorder, TabStrip, Toolbar};
+use rune_kit::shell::{SplitView, TabItem, TabItemStatus, TabOrientation, TabOverflow, TabReorder, TabStrip, Toolbar};
 use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, Kit};
 
 /// How many tabs have a key (⌘1 to ⌘9).
@@ -486,6 +486,10 @@ fn dialog(d: &super::Dialog, k: &Kit, layer: &mut Vec<El>) {
 /// The whole window.
 pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut toolbar = Toolbar::new();
+    // Past the traffic lights while the sidebar, which has it otherwise, is away.
+    if !s.sidebar.is_open() {
+        toolbar = toolbar.leading(sidebar::toggle(false, k));
+    }
     if let Some(tabs) = tabs(s, k) {
         toolbar = toolbar.leading(tabs);
     }
@@ -493,13 +497,13 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
         toolbar = toolbar.trailing(b);
     }
     let split = SplitView::new(main_pane(s, k))
-        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k))
+        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k, cx.titlebar_inset()))
         .inspector(&s.inspector, |s: &mut Lemur| &mut s.inspector, panels::right(s, k))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(FRAME)
         .sidebar_padding(0.0, FRAME)
-        .sidebar_toggle(SidebarToggle::new().in_header().shortcut("⌘B"))
+        .hide_sidebar_toggle()
         .reduced_motion(cx.is_reduced_motion())
         .build(k);
     let mut root = el().key("window").w_full().h_full().child(split);

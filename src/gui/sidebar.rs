@@ -8,11 +8,16 @@ use super::{Key, Lemur, List, Right, icons, key, worktree_label};
 use crate::config::{Agent, Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use rune::{Color, El, LoopSpec, PointerPress, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
-use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarHeader, SidebarRow, SidebarSection};
+use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarHeader, SidebarRow, SidebarSection, TOOLBAR_HEIGHT};
 use rune_kit::Kit;
 
 /// Points the pointer travels before a press on a row becomes a drag.
 const SLOP: f32 = 4.0;
+/// Points between the traffic lights and the sidebar's title, as Herdr leaves.
+const PAST_LIGHTS: f32 = 20.0;
+/// Points between the title row's last button and the sidebar's edge: the toggle lines up
+/// with the rows' buttons under it, as Herdr's does.
+const TITLE_END: f32 = 16.0;
 
 /// What's being dragged: above the rest, following the pointer exactly, and opaque, so what
 /// it passes doesn't show through.
@@ -397,20 +402,38 @@ fn host_row(s: &Lemur, name: &str, home: &str, k: &Kit) -> El {
     r.build(k).key(format!("host-{name}"))
 }
 
-pub fn sidebar(s: &Lemur, k: &Kit) -> El {
+/// The button that folds the sidebar away (`open`) or brings it back: Lucide's, as the
+/// buttons beside it, not the kit's.
+pub fn toggle(open: bool, k: &Kit) -> El {
+    let label = if open { "Hide sidebar (⌘B)" } else { "Show sidebar (⌘B)" };
+    icons::button(&icons::PANEL_LEFT, label).on_press(|s: &mut Lemur| s.sidebar.toggle()).build(k).key("sidebar-toggle").expanded(open)
+}
+
+/// The sidebar, its title on the title bar's row past the traffic lights, `lights` points
+/// from the window's edge (none in full screen).
+pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
     let c = &k.c;
+    // On the title bar's row over the sidebar, as in v2 and Herdr, the sidebar's toggle at
+    // its end. Between its buttons it drags the window, as the bar under it.
+    // The title shows whole or not at all: a narrow sidebar leaves no stub of it.
+    let whole = rune::text::measure("Lemur", &[], k.ty.ui_medium, None).0;
+    let title = rune::memo::layout_size("sidebar-title").is_none_or(|[w, _]| w + 0.5 >= whole);
     let header = row()
         .key("sidebar-head")
-        .w_full()
-        .h(28.0)
-        .px(4.0)
+        .pin(Some(0.0), Some(-TOOLBAR_HEIGHT), Some(0.0), None)
+        .h(TOOLBAR_HEIGHT)
+        .pl(if lights > 0.0 { lights + PAST_LIGHTS } else { 12.0 })
+        .pr(TITLE_END)
         .gap(2.0)
         .center_y()
-        .child(text("Lemur").font(k.ty.ui_medium).color(c.text_base).grow(1.0))
+        .fill(super::look::sidebar(k.dark))
+        .window_drag()
+        .child(text("Lemur").key("sidebar-title").font(k.ty.ui_medium).color(c.text_base).truncate_fade().grow(1.0).opacity(if title { 1.0 } else { 0.0 }))
         .child(icons::button(&icons::SEARCH, "Go to thread (⌘P)").on_press(|s: &mut Lemur| s.find_thread()).build(k).key("find-thread"))
         .child(icons::button(&icons::PLUS, "Add project (⌘O)").on_press(|s: &mut Lemur| s.open_picker()).build(k).key("add-folder"))
-        .child(icons::button(&icons::REFRESH, "Refresh").on_press(|s: &mut Lemur| s.refresh()).build(k).key("refresh"));
-    let mut sb = Sidebar::new().label("Threads").row_gap(1.0).header(header);
+        .child(icons::button(&icons::REFRESH, "Refresh").on_press(|s: &mut Lemur| s.refresh()).build(k).key("refresh"))
+        .child(toggle(true, k));
+    let mut sb = Sidebar::new().label("Threads").row_gap(1.0);
     if !s.loaded {
         sb = sb.child(SidebarRow::new("Loading sessions…").build(k).key("loading").opacity(0.6));
     }
@@ -508,7 +531,7 @@ pub fn sidebar(s: &Lemur, k: &Kit) -> El {
         sb = sb.section(SidebarSection::new("Other").key("other").rows(other));
     }
     let foot = col().key("sidebar-foot").w_full().children(super::panels::sidebar_foot(s, k)).child(s.machines(k));
-    sb.footer(foot).build(k).fill(super::look::sidebar(k.dark))
+    sb.footer(foot).build(k).fill(super::look::sidebar(k.dark)).child(header)
 }
 
 impl Lemur {
