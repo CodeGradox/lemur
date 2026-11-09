@@ -799,3 +799,46 @@ fn another_thread_shows_its_own_screen() {
         assert_eq!(drawn(&rt).as_deref(), Some(word));
     }
 }
+
+/// An arrow that only moves the shell's cursor moves it on screen at once.
+#[test]
+fn the_cursor_follows_an_arrow() {
+    let server = HcServer::new("rarrow");
+    let t = server.run("/", &[], &["sh"]);
+    let mut rt = loaded(&server);
+    open(&mut rt, &t);
+    assert!(wait_for(&mut rt, 10.0, |s| s.terminals.get(&key(&t)).is_some_and(|v| v.painted)), "painted");
+    type_text(&mut rt, "abc");
+    let k = key(&t);
+    assert!(wait_for(&mut rt, 10.0, |s| super::terminal::lines(s, &k).iter().any(|l| l.ends_with("abc"))), "typed");
+    let _ = wait_for(&mut rt, 0.3, |_| false);
+    let (x, _) = rt.find("cursor-main").expect("the cursor");
+    press(&mut rt, K::Left, Mods::default());
+    let start = std::time::Instant::now();
+    while rt.find("cursor-main").is_some_and(|(at, _)| at >= x) && start.elapsed() < Duration::from_secs(5) {
+        let _ = wait_for(&mut rt, 0.05, |_| false);
+    }
+    assert!(rt.find("cursor-main").is_some_and(|(at, _)| at < x), "the cursor stayed at {x}");
+}
+
+/// A pane that gave way to the terminal in a narrow window takes its width back as the
+/// window grows, and keeps it in the config meanwhile.
+#[test]
+fn a_pane_takes_its_width_back_as_the_window_grows() {
+    let server = HcServer::new("rpanes");
+    let mut rt = window(server.config());
+    rt.update(|s, _| s.sidebar.set_width(600.0));
+    let settle = |rt: &mut Runtime<Lemur>| {
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+    };
+    settle(&mut rt);
+    rt.set_viewport((800.0, 600.0), 2.0);
+    settle(&mut rt);
+    assert_eq!(rt.state.sidebar.width(), 480.0, "800 less the terminal's 320");
+    assert_eq!(rt.state.cfg.sidebar_width, Some(600.0));
+    rt.set_viewport((1400.0, 900.0), 2.0);
+    settle(&mut rt);
+    assert_eq!(rt.state.sidebar.width(), 600.0);
+}

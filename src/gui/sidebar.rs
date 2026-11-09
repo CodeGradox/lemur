@@ -97,7 +97,8 @@ impl Lemur {
                 },
                 false,
             ),
-            Activity::Working => (c.success.icon, "Working".into(), true),
+            // Still while Lemur is in the background: breathing, it would draw every frame.
+            Activity::Working => (c.success.icon, "Working".into(), self.looking),
             _ if self.done.contains(key) => (c.info.icon, "Done".into(), false),
             Activity::Idle => (c.text_muted.alpha(0.5), "Idle".into(), false),
             Activity::Unknown => (c.text_muted.alpha(0.5), "No Claude found".into(), false),
@@ -507,7 +508,7 @@ pub fn sidebar(s: &Lemur, k: &Kit) -> El {
         sb = sb.section(SidebarSection::new("Other").key("other").rows(other));
     }
     let foot = col().key("sidebar-foot").w_full().children(super::panels::sidebar_foot(s, k)).child(s.machines(k));
-    sb.footer(foot).build(k)
+    sb.footer(foot).build(k).fill(super::look::sidebar(k.dark))
 }
 
 impl Lemur {

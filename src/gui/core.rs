@@ -13,9 +13,8 @@ use std::collections::{HashMap, HashSet};
 const AWAY: u32 = 5;
 
 impl Lemur {
-    /// The first refresh, the ticks, and the watch on herdr-core's changes.
+    /// The ticks, the first of which refreshes, and the watch on herdr-core's changes.
     pub(super) fn start(&mut self) {
-        self.refresh();
         self.tick();
         self.watch();
     }
@@ -68,7 +67,7 @@ impl Lemur {
                 }
                 let mut changes = futures::stream::select_all(streams);
                 // The window's gone: nothing to watch for.
-                if !back.send(|s| s.recompose()) {
+                if !back.send(|s| s.watch_connected()) {
                     return;
                 }
                 while let Some(true) = futures::executor::block_on(changes.next()) {
@@ -108,6 +107,17 @@ impl Lemur {
                 }
             },
         );
+    }
+
+    /// The watch reaches the cores it can, the first time or again. A refresh that ran while
+    /// one was down kept its host's error, which filing the terminals again would only show
+    /// again: then everything is fetched again.
+    pub(super) fn watch_connected(&mut self) {
+        if self.data.iter().any(|d| d.error.is_some()) {
+            self.refresh();
+        } else {
+            self.recompose();
+        }
     }
 
     /// Files the terminals as they are now under what the last refresh found, as herdr-core
@@ -284,6 +294,8 @@ impl Lemur {
         }
         self.bring_back(&key);
         self.active = Some(key.clone());
+        // Its tab scrolls into view, shown again or not (`reveal_tab`).
+        self.revealed = None;
         if let Some(view) = self.terminals.get_mut(&key) {
             view.tell_focus(true);
             // Drawn at once, not at its next output.

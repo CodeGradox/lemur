@@ -31,6 +31,8 @@ lucide! {
     BELL_OFF, "bell-off", r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/><path d="m2 2 20 20"/><path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/>"#;
     BOT, "bot", r#"<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>"#;
     CHEVRON_DOWN, "chevron-down", r#"<path d="m6 9 6 6 6-6"/>"#;
+    CHEVRON_LEFT, "chevron-left", r#"<path d="m15 18-6-6 6-6"/>"#;
+    CHEVRON_RIGHT, "chevron-right", r#"<path d="m9 18 6-6-6-6"/>"#;
     CIRCLE_ALERT, "circle-alert", r#"<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>"#;
     CIRCLE_CHECK, "circle-check", r#"<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>"#;
     CIRCLE_STOP, "circle-stop", r#"<circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1"/>"#;

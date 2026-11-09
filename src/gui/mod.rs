@@ -23,11 +23,16 @@ mod icons;
 pub(crate) mod keys;
 mod linear_panel;
 mod links_panel;
+mod look;
 mod meter;
 mod notes;
 mod notify;
 mod palette;
 mod panels;
+#[cfg(test)]
+mod parity_app_a_tests;
+#[cfg(test)]
+mod parity_app_b_tests;
 mod peek;
 mod picker;
 mod projects;
@@ -42,6 +47,10 @@ mod term_links;
 mod terminal;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod parity_terminal_tests;
+#[cfg(test)]
+mod parity_differential_confirm;
 
 use crate::attach::Active;
 use crate::config::{Config, Host, Language, Terminal, ThemeChoice, ThreadOrder};
@@ -64,6 +73,11 @@ pub type Key = (String, String);
 pub type List = (String, Option<String>);
 
 const REFRESH: Duration = Duration::from_secs(3);
+/// What the terminal keeps of the window's width, however wide the panes beside it are dragged.
+const MIN_TERMINAL: f32 = 320.0;
+/// The sidebar's width range, and the right panel's.
+const SIDEBAR: (f32, f32) = (180.0, 640.0);
+const INSPECTOR: (f32, f32) = (240.0, 900.0);
 /// How long changes herdr-core tells of are gathered into one snapshot.
 const BURST: Duration = Duration::from_millis(30);
 /// What closing a shell with jobs ends.
@@ -207,6 +221,16 @@ pub struct Lemur {
     /// The window is in front. Out of sight, where a refresh still costs each host a
     /// `claude agents`, the refresh ticks and the meters ask less often.
     pub looking: bool,
+    /// The window's width, which the panes fit in; the widths the sidebar and the right
+    /// panel were last given, and the ones fitting left them at.
+    window_w: f32,
+    wanted: (f32, f32),
+    fitted: (f32, f32),
+    /// The thread on show and the window's width when its tab was last scrolled into view;
+    /// None to scroll it again.
+    revealed: Option<(Key, f32)>,
+    /// The tab the tab bar's ‹ or › last scrolled to (`chrome::scroll_arrows`).
+    tab_aim: Option<String>,
     /// herdr-core tells of changes while this is set.
     watching: bool,
 }
@@ -299,8 +323,8 @@ impl Lemur {
             active: None,
             recent: vec![],
             cycling: None,
-            sidebar: PaneState::new(sidebar_width).range(180.0, 640.0),
-            inspector: PaneState::new(notes_width).range(240.0, 900.0).collapsed(),
+            sidebar: PaneState::new(sidebar_width).range(SIDEBAR.0, SIDEBAR.1),
+            inspector: PaneState::new(notes_width).range(INSPECTOR.0, INSPECTOR.1).collapsed(),
             prompt: None,
             fresh: HashMap::new(),
             done: HashSet::new(),
@@ -331,6 +355,11 @@ impl Lemur {
             diffs: changes::Changes::default(),
             ticks: 0,
             looking: true,
+            window_w: 0.0,
+            wanted: (sidebar_width, notes_width),
+            fitted: (sidebar_width, notes_width),
+            revealed: None,
+            tab_aim: None,
             watching: false,
         }
     }
@@ -405,6 +434,30 @@ impl Lemur {
         }
     }
 
+    /// The sidebar and the right panel give way to the terminal: each is as wide as it was
+    /// last made, by a drag or a double click on its edge, but leaves the terminal
+    /// `MIN_TERMINAL` beside the other, and takes its width back as the window grows.
+    fn fit_panes(&mut self) {
+        // A width other than the one fitted last was made by hand.
+        if self.sidebar.width() != self.fitted.0 {
+            self.wanted.0 = self.sidebar.width();
+        }
+        if self.inspector.width() != self.fitted.1 {
+            self.wanted.1 = self.inspector.width();
+        }
+        if self.window_w > 0.0 {
+            let fit = |pane: &PaneState, wanted: f32, other: f32, (min, max): (f32, f32)| {
+                let most = (self.window_w - other - MIN_TERMINAL).clamp(min, max);
+                let mut fitted = if most == pane.max_width() { pane.clone() } else { pane.clone().range(min, most) };
+                fitted.set_width(wanted);
+                fitted
+            };
+            self.sidebar = fit(&self.sidebar, self.wanted.0, self.inspector.shown_width(), SIDEBAR);
+            self.inspector = fit(&self.inspector, self.wanted.1, self.sidebar.shown_width(), INSPECTOR);
+        }
+        self.fitted = (self.sidebar.width(), self.inspector.width());
+    }
+
     /// The pane the terminal shows in was laid out at `w` by `h`.
     fn set_term_area(&mut self, w: f32, h: f32) {
         if (w, h) != self.term_area {
@@ -422,12 +475,25 @@ impl Lemur {
         }
     }
 
+    /// The tab on show scrolls into view when another thread shows, however it was picked,
+    /// or the window's width changes. Scrolled away by hand, it stays put till then.
+    fn reveal_tab(&mut self, tx: &mut Tx) {
+        let now = self.active.clone().map(|k| (k, self.window_w));
+        if now != self.revealed {
+            if let Some(((_, session), _)) = &now {
+                tx.scroll_into_view_in("tabs-scroll", format!("t-{session}"));
+            }
+            self.revealed = now;
+            self.tab_aim = None;
+        }
+    }
+
     /// Keeps the side panels' widths in the config file once a drag has changed them.
     fn save_panel_widths(&mut self) {
         if self.sidebar.is_resizing() || self.inspector.is_resizing() {
             return;
         }
-        let now = (self.sidebar.width(), self.inspector.width());
+        let now = self.wanted;
         if now == self.saved_widths {
             return;
         }
@@ -450,7 +516,7 @@ fn kit(s: &Lemur, cx: &Cx<Lemur>) -> (Kit, bool) {
         ThemeChoice::Light => false,
         ThemeChoice::Dark => true,
     };
-    (Kit::neutral(dark), dark)
+    (look::kit(dark), dark)
 }
 
 fn view(s: &Lemur, cx: &mut Cx<Lemur>) -> El {
@@ -475,6 +541,7 @@ fn view(s: &Lemur, cx: &mut Cx<Lemur>) -> El {
         .a11y_hidden()
         .on_layout(|s: &mut Lemur, [_, _, w, _]| s.set_cell_width(w));
     rune_kit::root(body.child(probe).child(font), layer)
+        .on_layout(|s: &mut Lemur, [_, _, w, _]| s.window_w = w)
         .on_window_focus(|s: &mut Lemur, focused, _| {
             s.looking = focused;
             // And for the notifications.
@@ -531,10 +598,13 @@ fn poll(s: &mut Lemur, _: f64, tx: &mut Tx) -> bool {
     }
     let (drawn, again) = s.tick_terminals();
     changed |= drawn;
+    s.copy_programs_copies(tx);
     if let Some(again) = again {
         tx.wake_after(again);
     }
+    s.fit_panes();
     s.save_panel_widths();
+    s.reveal_tab(tx);
     changed |= s.panels_poll(tx);
     changed
 }

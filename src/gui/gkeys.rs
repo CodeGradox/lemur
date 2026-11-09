@@ -60,7 +60,13 @@ pub fn translate(ev: &KeyEvent, base: Option<char>) -> Option<Translated> {
             let key = key_for(unshifted);
             // A Control chord types no text of its own: the encoder makes ^C from the key.
             let text = (!m.ctrl).then(|| t.clone());
-            let consumed = if m.shift && text.is_some() { GMods::SHIFT } else { GMods::empty() };
+            let mut consumed = if m.shift && text.is_some() { GMods::SHIFT } else { GMods::empty() };
+            // Option makes characters on a Mac (| from a Norwegian 7): one it made is the text,
+            // not an Alt chord, also to a program using the kitty keyboard protocol, as in
+            // Ghostty's own app.
+            if m.alt && text.is_some() && c.to_lowercase().next() != Some(unshifted) {
+                consumed |= GMods::ALT;
+            }
             Some(Translated { key, mods, consumed, unshifted, text })
         }
         Key::Enter => named(GKey::Enter),

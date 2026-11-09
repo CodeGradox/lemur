@@ -175,6 +175,13 @@ impl Lemur {
         true
     }
 
+    /// What terminals' programs put on the clipboard (OSC 52), on show or not, goes there.
+    pub(super) fn copy_programs_copies(&mut self, tx: &mut Tx) {
+        for text in self.terminals.values().filter_map(|v| v.grid.as_ref()).flat_map(|g| g.take_copies()) {
+            tx.copy(text);
+        }
+    }
+
     /// ⌘C on the terminal at the front: what's selected goes to the clipboard.
     pub(super) fn copy_selection(&mut self, tx: &mut Tx) -> bool {
         let Some(text) = self.front().and_then(|k| self.terminals.get(&k)).and_then(|v| v.grid.as_ref()?.selected_text()) else {

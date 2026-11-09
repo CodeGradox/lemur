@@ -2,7 +2,7 @@
 //! (`grid`), drawn by Rune run by run at their columns. Every opened thread keeps its own,
 //! so switching is instant and scrollback survives.
 
-use super::grid::{Grid, Row, Size};
+use super::grid::{Grid, Line, Row, Shape, Size};
 use super::palette::{Palette, hex};
 use super::snackbar::Kind;
 use super::{Key, Lemur};
@@ -89,6 +89,9 @@ pub struct TermView {
     lost: bool,
     tried: Option<Instant>,
     held: Vec<Held>,
+    /// Attaching again, its program took bracketed pastes: a paste held meanwhile goes as one
+    /// even when the new paint hasn't said so yet, as it says it after the scrollback.
+    bracketed_before: bool,
     /// The core's first paint is over, which it doesn't say: its stream has gone quiet a
     /// while (see `PAINT_QUIET`).
     pub painted: bool,
@@ -134,6 +137,7 @@ impl TermView {
             lost: false,
             tried: None,
             held: Vec::new(),
+            bracketed_before: false,
             painted: false,
             last_output: None,
             attached_at: None,
@@ -220,7 +224,7 @@ impl TermView {
             self.held.push(Held::Paste(text.to_string()));
             return;
         }
-        let bracketed = self.grid.as_ref().is_some_and(Grid::bracketed_paste);
+        let bracketed = self.bracketed_before || self.grid.as_ref().is_some_and(Grid::bracketed_paste);
         self.write(super::keys::paste(text, bracketed));
     }
 
@@ -243,6 +247,7 @@ impl TermView {
                 Held::Paste(text) => self.paste_text(&text),
             }
         }
+        self.bracketed_before = false;
     }
 
     /// Feeds relayed bytes in; false once the stream is over.
@@ -379,6 +384,7 @@ impl Lemur {
         view.painted = false;
         view.last_output = None;
         view.held.clear();
+        view.bracketed_before = view.grid.as_ref().is_some_and(Grid::bracketed_paste);
         view.tried = Some(Instant::now());
         view.told_display = Some(display.clone());
         view.told_focus = None;
@@ -574,15 +580,44 @@ fn row_el(id: &str, y: usize, row: &Row, m: Metrics) -> El {
         }
         let x = f32::from(r.col) * m.cell_w;
         e = e.child(text(r.text.clone()).key(format!("tr-{id}-{y}-{}", r.col)).font(style).color(r.fg).absolute(x, 0.0));
-        let line = |y: f32| el().absolute(x, y).size(f32::from(r.cells) * m.cell_w, 1.0).fill(r.fg);
-        if r.underline {
-            e = e.child(line(m.cell_h - 3.0));
+        let w = f32::from(r.cells) * m.cell_w;
+        let line = |y: f32| el().absolute(x, y).size(w, 1.0).fill(r.fg);
+        match r.underline {
+            Line::None => {}
+            Line::Single => e = e.child(line(m.cell_h - 3.0)),
+            Line::Double => e = e.child(line(m.cell_h - 4.0)).child(line(m.cell_h - 2.0)),
+            // A line waving 2 points down and back every 6, as Chromium draws its spelling
+            // marker: a step a point, the steps at one height drawn as one.
+            Line::Curly => {
+                const WAVE: [f32; 6] = [0.0, 1.0, 2.0, 2.0, 1.0, 0.0];
+                let points = w.ceil() as usize;
+                let mut from = 0;
+                for i in 1..=points {
+                    if i == points || WAVE[i % 6] != WAVE[from % 6] {
+                        let y = m.cell_h - 4.0 + WAVE[from % 6];
+                        e = e.child(el().absolute(x + from as f32, y).size((i - from) as f32, 1.0).fill(r.fg));
+                        from = i;
+                    }
+                }
+            }
         }
         if r.strike {
             e = e.child(line((m.cell_h / 2.0).round()));
         }
     }
     e
+}
+
+/// The character in cell (`x`, `y`), and the run it's in.
+fn under_cursor(rows: &[Row], x: u16, y: u16) -> Option<(String, &super::grid::Run)> {
+    let r = rows.get(usize::from(y))?.runs.iter().find(|r| (r.col..r.col + r.cells).contains(&x))?;
+    // A run of narrow characters has one to a cell; a wide one is a run of its own.
+    let c = if r.text.chars().count() == usize::from(r.cells) {
+        r.text.chars().nth(usize::from(x - r.col))?.to_string()
+    } else {
+        (x == r.col).then(|| r.text.clone())?
+    };
+    (c != " ").then_some((c, r))
 }
 
 /// A terminal's screen: its rows and its cursor, a block while it has the keyboard and an
@@ -601,11 +636,33 @@ pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El
         let (x, w) = (f32::from(start) * m.cell_w, f32::from(end - start) * m.cell_w);
         rows = rows.child(el().key(format!("link-{id}-{i}")).absolute(x, f32::from(row + 1) * m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
     }
-    if let Some((x, y)) = grid.cursor {
+    if let Some((x, y)) = grid.caret {
         let (cx, cy) = (f32::from(x) * m.cell_w, f32::from(y) * m.cell_h);
-        let at = el().key(format!("cursor-{id}")).absolute(cx, cy).size(m.cell_w, m.cell_h);
-        // The input method's window opens at the cursor while the terminal has the keyboard.
-        rows = rows.child(if focused { at.fill(grid.cursor_color.alpha(0.7)).ime_cursor() } else { at.border(1.0, grid.cursor_color) });
+        let at = |key: &str| el().key(format!("{key}-{id}")).absolute(cx, cy).size(m.cell_w, m.cell_h);
+        // The shape its program asks for: a bar, a line under, or a block, which goes hollow
+        // without the keyboard (as v2 drew it).
+        let block = matches!(grid.shape, Shape::Block | Shape::Hollow);
+        let shaped = |key: &str| match grid.shape {
+            Shape::Bar => at(key).size(2.0, m.cell_h),
+            Shape::Underline => el().key(format!("{key}-{id}")).absolute(cx, cy + m.cell_h - 2.0).size(m.cell_w, 2.0),
+            Shape::Block | Shape::Hollow => at(key),
+        };
+        let solid = !block || focused && grid.shape == Shape::Block;
+        // The input method's window opens at the cursor while the terminal has the keyboard,
+        // and stays on while the program hides the cursor to draw its own.
+        let drawn = match (grid.cursor.is_some(), solid) {
+            (true, true) => Some(shaped("cursor").fill(grid.cursor_color.alpha(0.6))),
+            (true, false) => Some(at("cursor").border(1.0, grid.cursor_color)),
+            (false, _) => focused.then(|| at("caret")),
+        };
+        rows = rows.children(drawn.map(|e| if focused { e.ime_cursor() } else { e }));
+        // Over a block, the character under it again, so it reads through.
+        if grid.cursor.is_some() && solid && block {
+            rows = rows.children(under_cursor(&grid.rows, x, y).map(|(c, r)| {
+                let style = if r.italic { m.style(r.bold).italic() } else { m.style(r.bold) };
+                text(c).key(format!("cursor-text-{id}")).font(style).color(r.fg).absolute(cx, cy)
+            }));
+        }
         if let Some(marked) = &view.marked {
             let w = marked.chars().count() as f32 * m.cell_w;
             rows = rows
@@ -616,6 +673,14 @@ pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El
     }
     // A terminal's screen changes in place: no springs, fades or exits.
     col().key(format!("screen-{id}")).w_full().h_full().padding(PAD).fill(grid.bg).child(rows.instant_changes())
+}
+
+#[cfg(test)]
+impl TermView {
+    /// Takes `bytes` in as if the core relayed them, for tests.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.ingest(vec![Stream::Data(bytes.to_vec())]);
+    }
 }
 
 /// The text of `key`'s screen, for tests.

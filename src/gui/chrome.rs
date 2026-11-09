@@ -16,6 +16,13 @@ use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, Kit};
 
 /// How many tabs have a key (⌘1 to ⌘9).
 const NUMBERED_TABS: usize = 9;
+/// Points between the tab bar's scroll arrows and its tabs.
+const ARROW_GAP: f32 = 2.0;
+/// Points between the tabs and +, as the strip keeps before its own trailing action.
+const TAB_GAP: f32 = 6.0;
+/// Points of window around the main pane, and between it and the sidebar: the sidebar's
+/// resize grip, as wide, so the gap shows where to drag.
+const FRAME: f32 = 6.0;
 
 /// A tab's right-click menu, as Herdr's: rename it, start a terminal beside it, put it away,
 /// close it.
@@ -64,11 +71,13 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
     let active = s.active.clone()?;
     let siblings = s.siblings(&active);
     let numbered: Vec<String> = siblings.iter().map(|(_, n)| n.clone()).collect();
+    let mut ids: Vec<String> = Vec::new();
     let items: Vec<TabItem<'_, Lemur>> = siblings
         .iter()
         .enumerate()
         .filter_map(|(i, key)| {
             let t = s.session_of(key)?;
+            ids.push(key.1.clone());
             let shown = s.active.as_ref() == Some(key);
             let status = match t.activity {
                 Activity::NeedsInput => Some(TabItemStatus::Attention),
@@ -147,10 +156,87 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
             let (Some(from), Some(to)) = (at(&numbered[r.from]), at(&numbered[r.to])) else { return };
             s.reorder(list.clone(), from, to);
         });
-    if let Some(plus) = plus {
-        strip = strip.trailing_action(plus);
+    // In the background a working tab's dot holds still, as the sidebar's does.
+    if !s.looking {
+        strip = strip.busy_indicator(|k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), false));
     }
-    Some(strip.build(k))
+    // + after the arrows, as the strip's own trailing action would sit inside them.
+    Some(row().key("tab-row").shrink().min_w(0.0).gap(TAB_GAP).center_y().child(scroll_arrows(strip.build(k), &ids, s.tab_aim.as_deref(), k)).children(plus))
+}
+
+/// Where a tab is in the tab bar's view: cut off at its start or end, by more than half or
+/// less, or wholly in it.
+#[derive(Clone, Copy, PartialEq)]
+enum InView {
+    Before,
+    PartBefore,
+    In,
+    PartAfter,
+    After,
+}
+
+/// The tab bar between ‹ and ›, while its tabs (`ids`) don't all fit: each scrolls it a tab
+/// that way, and dims with none left there. Shortcuts go through the tabs; these show there
+/// are more. `aim` is the tab an arrow last scrolled to: pressed again before it's there, an
+/// arrow goes on from it.
+fn scroll_arrows(strip: El, ids: &[String], aim: Option<&str>, k: &Kit) -> El {
+    use rune::memo::{layout_size, window_layout, window_layout_with};
+    let width = |key: &str| layout_size(key).map_or(0.0, |[w, _]| w);
+    let (list, view) = (width("tabs-list"), width("tabs-scroll"));
+    // Judged as if there were none: the arrows take their room from the view, and mustn't
+    // be what makes the tabs not fit.
+    let arrows = match (layout_size("tabs-back"), layout_size("tabs-forward")) {
+        (Some([back, _]), Some([forward, _])) => back + forward + 2.0 * ARROW_GAP,
+        _ => 0.0,
+    };
+    let bar = row().key("tab-bar").shrink().min_w(0.0).gap(ARROW_GAP).center_y();
+    if list <= view + arrows + 0.5 {
+        return bar.child(strip);
+    }
+    let [sx, _, sw, _] = window_layout("tabs-scroll").unwrap_or_default();
+    let places: Vec<(&String, InView)> = ids
+        .iter()
+        .filter_map(|id| {
+            let at = window_layout_with(&format!("t-{id}"), move |[x, _, w, _]| match () {
+                _ if x + w / 2.0 < sx => InView::Before,
+                _ if x < sx - 0.5 => InView::PartBefore,
+                _ if x + w / 2.0 > sx + sw => InView::After,
+                _ if x + w > sx + sw + 0.5 => InView::PartAfter,
+                _ => InView::In,
+            })?;
+            Some((id, at))
+        })
+        .collect();
+    // A tab that way: the first mostly out of view, as one nearly in would scroll the bar a
+    // point or two; else one a little out.
+    let first = |tabs: &mut dyn Iterator<Item = &(&String, InView)>, most: InView, part: InView| {
+        let tabs: Vec<_> = tabs.filter(|(_, at)| *at == most || *at == part).collect();
+        tabs.iter().find(|(_, at)| *at == most).or(tabs.first()).map(|(id, _)| (*id).clone())
+    };
+    let arriving = places.iter().position(|(id, _)| Some(id.as_str()) == aim).map(|i| (i, places[i].1));
+    let back = match arriving {
+        Some((i, InView::Before | InView::PartBefore)) => i.checked_sub(1).map(|i| places[i].0.clone()),
+        _ => first(&mut places.iter().rev(), InView::Before, InView::PartBefore),
+    };
+    let forward = match arriving {
+        Some((i, InView::After | InView::PartAfter)) => places.get(i + 1).map(|(id, _)| (*id).clone()),
+        _ => first(&mut places.iter(), InView::After, InView::PartAfter),
+    };
+    let arrow = |key: &'static str, glyph: &'static rune::Icon, label: &str, to: Option<String>| {
+        icons::button(glyph, label)
+            .disabled(to.is_none())
+            .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| {
+                if let Some(id) = &to {
+                    tx.scroll_into_view_in("tabs-scroll", format!("t-{id}"));
+                    s.tab_aim = Some(id.clone());
+                }
+            })
+            .build(k)
+            .key(key)
+    };
+    bar.child(arrow("tabs-back", &icons::CHEVRON_LEFT, "Scroll the tabs back", back))
+        .child(strip)
+        .child(arrow("tabs-forward", &icons::CHEVRON_RIGHT, "Scroll the tabs on", forward))
 }
 
 /// The panels' buttons, at the toolbar's end: each shows its panel, or hides it.
@@ -189,6 +275,8 @@ fn pane_header(s: &Lemur, key: &Key, k: &Kit) -> Option<El> {
             .gap(8.0)
             .center_y()
             .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
+            // On the terminal's own background, as if part of it.
+            .fill(rune::color::hex(&super::palette::hex(s.palette().background)).unwrap_or(c.bg_base))
             .child(agent_icon(t.agent(), k))
             .child(text(what).font(k.ty.ui).color(c.text_muted))
             .child(text(t.label.clone()).key("header-name").font(k.ty.ui_medium).color(c.text_base).truncate())
@@ -264,7 +352,15 @@ fn status_bar(s: &Lemur, k: &Kit) -> El {
     let item = |glyph: &'static rune::Icon, label: String| {
         row().gap(5.0).center_y().child(icon(glyph, 13.0).color(c.icon_muted)).child(text(label).font(k.ty.small).color(c.text_muted))
     };
-    let mut bar = row().key("status-bar").w_full().h(26.0).px(12.0).gap(14.0).center_y().border_sides([1.0, 0.0, 0.0, 0.0], c.border_weak);
+    let mut bar = row()
+        .key("status-bar")
+        .w_full()
+        .h(26.0)
+        .px(12.0)
+        .gap(14.0)
+        .center_y()
+        .fill(super::look::status_bar(k.dark))
+        .border_sides([1.0, 0.0, 0.0, 0.0], c.border_weak);
     if let Some((host, _)) = &s.active
         && let Some(h) = s.cfg.host(host)
     {
@@ -375,7 +471,9 @@ fn dialog(d: &super::Dialog, k: &Kit, layer: &mut Vec<El>) {
             }
         })
         .build(k)
-        .key("dialog-ok");
+        .key("dialog-ok")
+        // Return agrees, as in a Mac's alerts.
+        .default_button();
     let buttons = if d.ok == "OK" {
         row().gap(8.0).justify_end().child(ok)
     } else {
@@ -399,7 +497,8 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
         .inspector(&s.inspector, |s: &mut Lemur| &mut s.inspector, panels::right(s, k))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
-        .frame_inset(6.0)
+        .frame_inset(FRAME)
+        .sidebar_padding(0.0, FRAME)
         .sidebar_toggle(SidebarToggle::new().in_header().shortcut("⌘B"))
         .reduced_motion(cx.is_reduced_motion())
         .build(k);

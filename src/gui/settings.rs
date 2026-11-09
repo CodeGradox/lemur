@@ -762,3 +762,13 @@ mod shortcuts;
 #[cfg(test)]
 #[path = "settings_tests.rs"]
 mod tests;
+
+/// The Shortcuts page's keys (not the actions'), group by group, for the window's tests.
+#[cfg(test)]
+pub(super) fn shortcuts_for_tests() -> Vec<(&'static str, Vec<&'static str>)> {
+    let keys = |s: &shortcuts::Shortcut| match s.how {
+        shortcuts::Press::Keys(keys) => keys.to_vec(),
+        _ => vec![],
+    };
+    shortcuts::SHORTCUTS.iter().map(|(group, list)| (*group, list.iter().flat_map(keys).collect())).collect()
+}

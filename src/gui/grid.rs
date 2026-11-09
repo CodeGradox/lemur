@@ -6,12 +6,12 @@ use super::palette::{Palette, Rgb};
 use libghostty_vt::fmt::Format;
 use libghostty_vt::key;
 use libghostty_vt::mouse;
-use libghostty_vt::render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowId, RowIterator};
+use libghostty_vt::render::{CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RenderState, RowId, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen};
 use libghostty_vt::selection::FormatOptions;
 use libghostty_vt::selection::gesture::{DragEvent, Gesture, Geometry, PressEvent, ReleaseEvent};
 use libghostty_vt::style::{self, RgbColor, Underline};
-use libghostty_vt::terminal::{Mode, Point, PointCoordinate, ScrollViewport, SizeReportSize, Terminal};
+use libghostty_vt::terminal::{ClipboardWriteError, Mode, Point, PointCoordinate, ScrollViewport, SizeReportSize, Terminal};
 use rune::{Color, Key, KeyEvent};
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
@@ -51,8 +51,28 @@ pub struct Run {
     pub fg: Color,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: Line,
     pub strike: bool,
+}
+
+/// How a run is underlined: dotted and dashed draw as a single line.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Line {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+}
+
+/// What the cursor looks like, as its program asks (DECSCUSR).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Shape {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+    Hollow,
 }
 
 /// A background over `cells` cells from `col`.
@@ -105,6 +125,10 @@ pub struct Size {
 pub struct Frame {
     pub rows: Vec<Row>,
     pub cursor: Option<(u16, u16)>,
+    /// Where the cursor is, shown or not: a program drawing its own (Claude Code) hides it
+    /// but leaves it where it's typing, where an input method composes.
+    pub caret: Option<(u16, u16)>,
+    pub shape: Shape,
     pub fg: Color,
     pub bg: Color,
     pub cursor_color: Color,
@@ -123,6 +147,8 @@ struct Painter {
     selection: RgbColor,
     /// The frame changed since the view last looked.
     changed: bool,
+    /// The colours the frame was built in.
+    colors: Option<Colors>,
 }
 
 pub struct Grid {
@@ -146,6 +172,8 @@ pub struct Grid {
     replies: Rc<RefCell<Vec<u8>>>,
     /// The size it tells a program that asks.
     told: Rc<Cell<Size>>,
+    /// What its program put on the clipboard (OSC 52), for the view to copy.
+    copies: Rc<RefCell<Vec<String>>>,
     /// Output came since the rows were last brought up to date, or they wait for a hold
     /// to end.
     pub stale: bool,
@@ -177,6 +205,18 @@ impl Grid {
         let replies = Rc::new(RefCell::new(Vec::new()));
         let back = replies.clone();
         t.on_pty_write(move |_, data| back.borrow_mut().extend_from_slice(data))?;
+        // Text only, wherever it's meant for: a Mac has the one clipboard.
+        let copies = Rc::new(RefCell::new(Vec::new()));
+        let put = copies.clone();
+        t.on_clipboard_write(move |_, write| {
+            match write.contents().find(|c| c.mime.starts_with(b"text/plain")) {
+                Some(text) => {
+                    put.borrow_mut().push(String::from_utf8_lossy(text.data).into_owned());
+                    write.reply(Ok(()), false);
+                }
+                None => write.reply(Err(ClipboardWriteError::Unsupported), false),
+            }
+        })?;
         let told = Rc::new(Cell::new(size));
         let asked = told.clone();
         t.on_size(move |_| {
@@ -194,9 +234,10 @@ impl Grid {
             cell_it: CellIterator::new()?,
             scratch: String::new(),
             ids: Vec::new(),
-            frame: Frame { rows: Vec::new(), cursor: None, fg: Color::WHITE, bg: Color::BLACK, cursor_color: Color::WHITE },
+            frame: Frame { rows: Vec::new(), cursor: None, caret: None, shape: Shape::Block, fg: Color::WHITE, bg: Color::BLACK, cursor_color: Color::WHITE },
             selection: RgbColor { r: 0, g: 0, b: 0 },
             changed: false,
+            colors: None,
         }));
         // A program drawing in steps (Claude Code does, every frame) holds the screen
         // meanwhile: what shows is the frame it began with, until it lets go.
@@ -232,6 +273,7 @@ impl Grid {
             epoch: Instant::now(),
             replies,
             told,
+            copies,
             stale: true,
         };
         grid.set_palette(palette)?;
@@ -268,6 +310,11 @@ impl Grid {
     /// What the terminal answered its program with since last asked.
     pub fn take_replies(&self) -> Vec<u8> {
         std::mem::take(&mut *self.replies.borrow_mut())
+    }
+
+    /// What its program put on the clipboard since last asked.
+    pub fn take_copies(&self) -> Vec<String> {
+        std::mem::take(&mut *self.copies.borrow_mut())
     }
 
     pub fn size(&self) -> Size {
@@ -316,8 +363,17 @@ impl Grid {
         // Option/Shift+Enter: Claude Code reads ESC CR as a newline in its prompt, as it did
         // in Lemur before. A program speaking Kitty's keyboard protocol gets that instead.
         let kitty = self.terminal.kitty_keyboard_flags().map(|f| !f.is_empty()).unwrap_or(false);
-        if matches!(ev.key, Key::Enter) && (ev.mods.shift || ev.mods.alt) && !ev.mods.logo && !kitty {
-            return Some(b"\x1b\r".to_vec());
+        if !kitty && !ev.mods.logo {
+            // What these sent in Lemur before, whatever else is held, as shells read them:
+            // modified, the encoder's CSI 27 forms type junk into a zsh or bash line.
+            match ev.key {
+                Key::Enter if ev.mods.shift || ev.mods.alt => return Some(b"\x1b\r".to_vec()),
+                Key::Enter => return Some(b"\r".to_vec()),
+                Key::Escape => return Some(b"\x1b".to_vec()),
+                Key::Tab if ev.mods.shift => return Some(b"\x1b[Z".to_vec()),
+                Key::Tab => return Some(b"\t".to_vec()),
+                _ => {}
+            }
         }
         let k = super::gkeys::translate(ev, base)?;
         self.key_event
@@ -331,6 +387,16 @@ impl Grid {
         let encoded = self.keys.set_options_from_terminal(&self.terminal).encode_to_vec(&self.key_event, &mut out);
         if encoded.is_err() || out.is_empty() {
             out = k.text.map(String::into_bytes).unwrap_or_default();
+        }
+        // ⌃[, ⌃I, ⌃M, ⌃-, ⌃⇧2 and the like, which the encoder leaves to the kitty protocol:
+        // the control byte, as terminals have always sent.
+        if out.is_empty()
+            && ev.mods.ctrl
+            && !kitty
+            && let Key::Text(t) = &ev.key
+            && let Some(byte) = control_byte(t).or_else(|| control_byte(&base?.to_string()))
+        {
+            out = if ev.mods.alt { vec![0x1b, byte] } else { vec![byte] };
         }
         (!out.is_empty()).then_some(out)
     }
@@ -582,17 +648,34 @@ impl Painter {
     /// one Ghostty didn't mark dirty is taken from the last paint by id, wherever it now
     /// sits; the rest are rebuilt from their cells.
     fn paint(&mut self, terminal: &Terminal<'static, '_>) -> Res<()> {
-        let Painter { render, row_it, cell_it, scratch, ids, frame, selection, changed } = self;
+        let Painter { render, row_it, cell_it, scratch, ids, frame, selection, changed, colors: last_colors } = self;
         let snapshot = render.update(terminal)?;
-        if snapshot.dirty()? == Dirty::Clean {
+        // The cursor moving alone (⌥←, Home) leaves the rows clean: it's looked at anyway.
+        let cursor = snapshot.cursor()?;
+        let caret = cursor.viewport.map(|c| (c.x, c.y));
+        let at = caret.filter(|_| cursor.visible);
+        let shape = match cursor.visual_style {
+            CursorVisualStyle::Bar => Shape::Bar,
+            CursorVisualStyle::Underline => Shape::Underline,
+            CursorVisualStyle::BlockHollow => Shape::Hollow,
+            _ => Shape::Block,
+        };
+        if (at, caret, shape) != (frame.cursor, frame.caret, frame.shape) {
+            (frame.cursor, frame.caret, frame.shape) = (at, caret, shape);
+            *changed = true;
+        }
+        // A program setting the default colours (OSC 10, 11, 12, 4) leaves the rows clean, but
+        // every row in those colours changes.
+        let colors = snapshot.colors()?;
+        let recolored = last_colors.as_ref().is_some_and(|c| *c != colors);
+        if snapshot.dirty()? == Dirty::Clean && !recolored {
             return Ok(());
         }
-        let colors = snapshot.colors()?;
         let mut last: HashMap<RowId, Row> = ids.drain(..).zip(frame.rows.drain(..)).collect();
         let mut iter = row_it.update(&snapshot)?;
         while let Some(row) = iter.next() {
             let id = row.id()?;
-            let kept = if row.dirty()? { None } else { last.remove(&id) };
+            let kept = if row.dirty()? || recolored { None } else { last.remove(&id) };
             let built = match kept {
                 Some(r) => r,
                 None => {
@@ -604,13 +687,12 @@ impl Painter {
             ids.push(id);
             row.set_dirty(false)?;
         }
-        let cursor = snapshot.cursor()?;
-        frame.cursor = cursor.viewport.filter(|_| cursor.visible).map(|c| (c.x, c.y));
         frame.fg = rgb(colors.foreground);
         frame.bg = rgb(colors.background);
         frame.cursor_color = rgb(colors.cursor.unwrap_or(colors.foreground));
         snapshot.set_dirty(Dirty::Clean)?;
         *changed = true;
+        *last_colors = Some(colors);
         Ok(())
     }
 }
@@ -660,13 +742,34 @@ pub fn block(c: char) -> Option<(Vec<[f32; 4]>, f32)> {
     Some((rects, 1.0))
 }
 
+/// The control byte ⌃ makes of `key` (one character): letters, and the punctuation and
+/// digits that stand for the rest.
+fn control_byte(key: &str) -> Option<u8> {
+    let mut chars = key.chars();
+    let c = chars.next()?.to_ascii_lowercase();
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(match c {
+        'a'..='z' => c as u8 - b'a' + 1,
+        '@' | '2' | ' ' => 0,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '6' => 0x1e,
+        '_' | '-' | '7' | '/' => 0x1f,
+        '?' | '8' => 0x7f,
+        _ => return None,
+    })
+}
+
 /// What a cell looks like, for joining cells into runs.
 #[derive(Clone, Copy, PartialEq)]
 struct Look {
     fg: RgbColor,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline: Line,
     strike: bool,
 }
 
@@ -692,7 +795,7 @@ fn build_row(cells: &mut CellIteration<'_, '_>, colors: &Colors, selection: RgbC
         let width = if wide == CellWide::Wide { 2 } else { 1 };
         let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
         let mut bg = cell.bg_color()?;
-        let mut look = Look { fg, bold: false, italic: false, underline: false, strike: false };
+        let mut look = Look { fg, bold: false, italic: false, underline: Line::None, strike: false };
         let mut invisible = false;
         if cell.has_styling()? {
             let st = cell.style()?;
@@ -701,8 +804,10 @@ fn build_row(cells: &mut CellIteration<'_, '_>, colors: &Colors, selection: RgbC
                 bg = Some(fg);
                 fg = back;
             }
+            // Faint text: a third of the way toward the background, which reads on light and
+            // dark alike.
             if st.faint {
-                let mid = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
+                let mid = |a: u8, b: u8| ((u16::from(a) * 2 + u16::from(b)) / 3) as u8;
                 let b = colors.background;
                 fg = RgbColor { r: mid(fg.r, b.r), g: mid(fg.g, b.g), b: mid(fg.b, b.b) };
             }
@@ -710,7 +815,12 @@ fn build_row(cells: &mut CellIteration<'_, '_>, colors: &Colors, selection: RgbC
                 fg,
                 bold: st.bold,
                 italic: st.italic,
-                underline: st.underline != Underline::None,
+                underline: match st.underline {
+                    Underline::None => Line::None,
+                    Underline::Double => Line::Double,
+                    Underline::Curly => Line::Curly,
+                    _ => Line::Single,
+                },
                 strike: st.strikethrough,
             };
             invisible = st.invisible;
@@ -744,7 +854,8 @@ fn build_row(cells: &mut CellIteration<'_, '_>, colors: &Colors, selection: RgbC
         }
         let plain = width == 1 && scratch.is_ascii();
         match &mut run {
-            Some((r, l)) if plain && *l == look && r.text.is_ascii() => {
+            // Not across cells the program skipped, where a line under or through would show.
+            Some((r, l)) if plain && *l == look && r.text.is_ascii() && (blanks == 0 || (look.underline == Line::None && !look.strike)) => {
                 for _ in 0..blanks {
                     r.text.push(' ');
                 }
@@ -884,6 +995,28 @@ mod tests {
         }
     }
 
+    /// The cursor moving with nothing else changing, as ⌥← or Home in a shell, shows.
+    #[test]
+    fn the_cursor_moving_alone_shows() {
+        let mut g = grid(20, 3);
+        g.write(b"abc");
+        g.refresh().unwrap();
+        assert_eq!(g.frame().cursor, Some((3, 0)));
+        g.write(b"\x1b[D");
+        assert!(g.refresh().unwrap(), "a change to draw");
+        assert_eq!(g.frame().cursor, Some((2, 0)));
+        g.write(b"\x1b[H");
+        g.refresh().unwrap();
+        assert_eq!(g.frame().cursor, Some((0, 0)));
+        // Hidden, it goes; shown again, it comes back.
+        g.write(b"\x1b[?25l");
+        g.refresh().unwrap();
+        assert_eq!(g.frame().cursor, None);
+        g.write(b"\x1b[?25h");
+        g.refresh().unwrap();
+        assert_eq!(g.frame().cursor, Some((0, 0)));
+    }
+
     #[test]
     fn block_elements_are_painted_not_typed() {
         let mut g = grid(40, 3);
@@ -906,6 +1039,16 @@ mod tests {
         g.write(b"\x1b[6n");
         assert_eq!(g.take_replies(), b"\x1b[1;1R");
         assert!(g.take_replies().is_empty());
+    }
+
+    /// A program copying (OSC 52, as tmux and Neovim do over the network) puts the text on
+    /// the clipboard.
+    #[test]
+    fn a_programs_copy_is_kept_for_the_clipboard() {
+        let mut g = grid(40, 4);
+        g.write(b"\x1b]52;c;aGVsbG8gd29ybGQ=\x07\x1b]52;p;w6lsYW4=\x1b\\");
+        assert_eq!(g.take_copies(), ["hello world", "\u{e9}lan"]);
+        assert!(g.take_copies().is_empty());
     }
 
     #[test]
