@@ -1497,3 +1497,31 @@ fn the_shortcuts_page_shows_bound_keys() {
     // ⌘, and ⌘W, ⌘1 and ⌘9, ⌘⏎: the groups are the ones named.
     assert_eq!(pressed, ["mod+,", "mod+w", "mod+1", "mod+9", "mod+enter"]);
 }
+
+/// A thread just started opens before the snapshot lists it: its tab, once there, comes
+/// into view whole, also when it's the one that makes the tabs overflow and the scroll
+/// arrows take their room.
+#[test]
+fn a_new_tab_comes_into_view() {
+    let server = HcServer::new("newtabview");
+    let mut rt = window(server.config());
+    rt.set_viewport((1280.0, 800.0), 2.0);
+    let mut out = vec![];
+    for count in [2, 3, 12] {
+        let names: Vec<String> = (0..count).map(|i| format!("t{i}")).collect();
+        let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
+        apply(&mut rt, &listed);
+        open(&mut rt, "t0");
+        frames(&mut rt, 40);
+        let new = format!("t{count}");
+        rt.update(|s, _| s.open_fresh("local".into(), new.clone()));
+        frames(&mut rt, 10);
+        let mut listed = listed.clone();
+        listed.push((new.as_str(), Activity::Idle));
+        apply(&mut rt, &listed);
+        if !tab_in_view(&mut rt, &new) {
+            out.push(format!("the {}th of {}", count + 1, count + 1));
+        }
+    }
+    assert!(out.is_empty(), "a new tab out of view: {out:?}");
+}

@@ -479,7 +479,8 @@ impl Lemur {
     /// The tab on show scrolls into view when another thread shows, however it was picked,
     /// or the window's width changes. Scrolled away by hand, it stays put till then.
     fn reveal_tab(&mut self, tx: &mut Tx) {
-        let now = self.active.clone().map(|k| (k, self.window_w));
+        // A thread just started shows before the snapshot lists it, and its tab with it.
+        let now = self.active.clone().filter(|k| self.session_of(k).is_some()).map(|k| (k, self.window_w));
         if now != self.revealed {
             if let Some(((_, session), _)) = &now {
                 tx.scroll_into_view_in("tabs-scroll", format!("t-{session}"));

@@ -316,10 +316,12 @@ pub fn overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
         .on_key(|s: &mut Lemur, ev, tx| match ev.key {
             K::Up => {
                 s.picker_step(true, tx);
+                tx.instant();
                 true
             }
             K::Down => {
                 s.picker_step(false, tx);
+                tx.instant();
                 true
             }
             K::Tab if !ev.mods.shift => {

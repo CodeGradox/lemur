@@ -58,6 +58,9 @@ pub fn pick_row(key: String, lead: Option<El>, label: String, detail: Option<Str
         .gap(8.0)
         .center_y()
         .radius(k.radius.sm)
+        // The pick moves at once: faded, the highlight lingers on two rows at a time. (The
+        // arrow keys' steps land at once whole, their text's colours too: `Tx::instant`.)
+        .motion(rune::Spring::NONE)
         .cursor(rune::Cursor::Pointer)
         .children(lead)
         .child(text(label).font(k.ty.ui).color(ink).truncate().shrink());

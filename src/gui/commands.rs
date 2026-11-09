@@ -120,13 +120,15 @@ pub fn overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
             }
         })
         .on_submit(|s: &mut Lemur, tx| s.run_picked(tx))
-        .on_key(|s: &mut Lemur, ev, _| match ev.key {
+        .on_key(|s: &mut Lemur, ev, tx| match ev.key {
             K::Up => {
                 s.step_palette(true);
+                tx.instant();
                 true
             }
             K::Down => {
                 s.step_palette(false);
+                tx.instant();
                 true
             }
             _ => false,

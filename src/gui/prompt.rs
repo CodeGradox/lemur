@@ -482,13 +482,15 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
         .on_edit(|s: &mut Lemur| &mut s.prompt.as_mut().expect("a prompt").input)
         .on_change(|s: &mut Lemur, _| s.prompt_changed())
         .on_submit(|s: &mut Lemur, _| s.prompt_enter())
-        .on_key(|s: &mut Lemur, ev, _| match ev.key {
+        .on_key(|s: &mut Lemur, ev, tx| match ev.key {
             K::Up => {
                 s.step(true);
+                tx.instant();
                 true
             }
             K::Down => {
                 s.step(false);
+                tx.instant();
                 true
             }
             _ => false,
