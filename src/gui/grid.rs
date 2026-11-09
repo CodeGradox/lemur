@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 /// Pointer positions go to Ghostty in hundredths of a point, which it takes as pixels: whole
 /// numbers, and a cell's width (7.83 points in Menlo at 13) stays exact enough.
 const UNIT: f32 = 100.0;
+/// Each row built gets the next, whichever terminal it's of: the view keeps a row's elements
+/// while its version stays, and the terminal on show can change under it.
+static VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The longest a program may hold the screen (synchronized output) before what it drew
 /// meanwhile shows anyway: one that crashed or forgot to let go would freeze it.
 const HOLD: Duration = Duration::from_secs(1);
@@ -65,7 +69,8 @@ pub struct Row {
     pub fills: Vec<Fill>,
     /// Block elements, painted rather than typed (see [`block`]), by column.
     pub blocks: Vec<(u16, char, Color)>,
-    /// Bumped each time the row is rebuilt, so the view can keep a row it built before.
+    /// A number no other row built has, in any terminal: the view keeps the elements it
+    /// built for a row while the number stays.
     pub version: u64,
 }
 
@@ -113,7 +118,6 @@ struct Painter {
     cell_it: CellIterator<'static>,
     scratch: String,
     ids: Vec<RowId>,
-    version: u64,
     frame: Frame,
     /// What's selected shows on this, in the palette's colours.
     selection: RgbColor,
@@ -190,7 +194,6 @@ impl Grid {
             cell_it: CellIterator::new()?,
             scratch: String::new(),
             ids: Vec::new(),
-            version: 0,
             frame: Frame { rows: Vec::new(), cursor: None, fg: Color::WHITE, bg: Color::BLACK, cursor_color: Color::WHITE },
             selection: RgbColor { r: 0, g: 0, b: 0 },
             changed: false,
@@ -498,9 +501,49 @@ impl Grid {
         (len > 0).then(|| String::from_utf8_lossy(&buf[..len]).into_owned())
     }
 
-    /// Row `y`'s characters and the column each is at, the spacer after a wide one left
-    /// out, for finding the links in it.
-    pub fn line_cells(&self, y: usize) -> Vec<(char, u16)> {
+    /// The line around row `y` as it was printed, over the rows it was wrapped onto: each
+    /// character with its row and column, the spacer after a wide one left out, for finding
+    /// the links in it.
+    pub fn line_cells(&self, y: u16) -> Vec<super::term_links::Cell> {
+        let last = self.size().lines.saturating_sub(1);
+        let (mut top, mut bottom) = (y, y);
+        while top > 0 && self.goes_on(top - 1) {
+            top -= 1;
+        }
+        while bottom < last && self.goes_on(bottom) {
+            bottom += 1;
+        }
+        let mut cells = vec![];
+        for r in top..=bottom {
+            let mut row = self.row_cells(usize::from(r));
+            // Wrapped by its program, a row may be indented to line up under the one before:
+            // the indent isn't part of what it wrapped.
+            if r > top && !self.wraps(r - 1) {
+                let indent = row.iter().take_while(|(c, _)| *c == ' ').count();
+                row.drain(..indent);
+            }
+            cells.extend(row.into_iter().map(|(c, col)| (c, r, col)));
+        }
+        cells
+    }
+
+    /// Whether row `y`'s line goes on onto the next row: the terminal wrapped it, or its
+    /// program did, filling the row to the last column mid-word, as Claude Code does with a
+    /// path longer than the window is wide.
+    fn goes_on(&self, y: u16) -> bool {
+        let cols = self.size().cols;
+        self.wraps(y) || self.row_cells(usize::from(y)).last().is_some_and(|&(c, col)| c != ' ' && col + 1 == cols)
+    }
+
+    /// Whether row `y` goes on onto the next: the terminal wrapped it, rather than the
+    /// program ending the line.
+    fn wraps(&self, y: u16) -> bool {
+        let at = Point::Viewport(PointCoordinate { x: 0, y: u32::from(y) });
+        self.terminal.grid_ref(at).and_then(|g| g.row()).and_then(|r| r.is_wrapped()).unwrap_or(false)
+    }
+
+    /// Row `y`'s characters and the column each is at, the spacer after a wide one left out.
+    fn row_cells(&self, y: usize) -> Vec<(char, u16)> {
         let cols = self.size().cols;
         let mut cells: Vec<Option<char>> = vec![Some(' '); usize::from(cols)];
         if let Some(row) = self.frame().rows.get(y) {
@@ -539,7 +582,7 @@ impl Painter {
     /// one Ghostty didn't mark dirty is taken from the last paint by id, wherever it now
     /// sits; the rest are rebuilt from their cells.
     fn paint(&mut self, terminal: &Terminal<'static, '_>) -> Res<()> {
-        let Painter { render, row_it, cell_it, scratch, ids, version, frame, selection, changed } = self;
+        let Painter { render, row_it, cell_it, scratch, ids, frame, selection, changed } = self;
         let snapshot = render.update(terminal)?;
         if snapshot.dirty()? == Dirty::Clean {
             return Ok(());
@@ -553,8 +596,8 @@ impl Painter {
             let built = match kept {
                 Some(r) => r,
                 None => {
-                    *version += 1;
-                    build_row(&mut cell_it.update(row)?, &colors, *selection, scratch, *version)?
+                    let version = VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    build_row(&mut cell_it.update(row)?, &colors, *selection, scratch, version)?
                 }
             };
             frame.rows.push(built);
@@ -791,11 +834,36 @@ mod tests {
         g.write(b"see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now\r\n");
         g.write(b"\x1b]8;;file:///etc/passwd\x1b\\/tmp/x\x1b]8;;\x1b\\");
         assert_eq!(g.hyperlink(3, 0), None);
+        g.refresh().unwrap();
         let uri = g.hyperlink(6, 0).expect("a link");
-        let link = hyperlinked(uri, 0, 6, 40, |c| g.hyperlink(c, 0).as_deref() == Some("https://example.com/a")).unwrap();
-        assert_eq!((link.url.as_str(), link.start, link.end), ("https://example.com/a", 4, 12));
+        let same = |r: u16, c: u16| g.hyperlink(c, r).as_deref() == Some("https://example.com/a");
+        let link = hyperlinked(uri, &g.line_cells(0), 6, same).unwrap();
+        assert_eq!((link.url.as_str(), link.spans.as_slice()), ("https://example.com/a", &[(0, 4, 12)][..]));
         let other = g.hyperlink(1, 1).expect("a link");
-        assert_eq!(hyperlinked(other, 1, 1, 40, |_| true), None, "not a web link");
+        assert_eq!(hyperlinked(other, &g.line_cells(1), 1, |_, _| true), None, "not a web link");
+    }
+
+    /// A path the terminal wrapped is found whole, from either row; one the program ended
+    /// the line after isn't joined to what follows.
+    #[test]
+    fn a_wrapped_path_is_found_whole() {
+        use super::super::term_links::link_at;
+        let mut g = grid(20, 6);
+        g.write(b"see /srv/app/src/lemur/main.rs:7 now\r\nsrc/a.rs\r\nb.rs\r\n");
+        // As Claude Code wraps a long path: to the row's end, then on, indented.
+        g.write(b"  Read(/srv/app/src/\r\n    gui/term.rs) ok");
+        g.refresh().unwrap();
+        for at in [(0, 6), (1, 3)] {
+            let link = link_at(&g.line_cells(at.0), at).expect("a link");
+            assert_eq!((link.url.as_str(), link.place.as_str()), ("/srv/app/src/lemur/main.rs", ":7"));
+            assert_eq!(link.spans, [(0, 4, 20), (1, 0, 12)]);
+        }
+        let link = link_at(&g.line_cells(2), (2, 2)).expect("a link");
+        assert_eq!((link.url.as_str(), link.spans.as_slice()), ("src/a.rs", &[(2, 0, 8)][..]));
+        for at in [(4, 9), (5, 6)] {
+            let link = link_at(&g.line_cells(at.0), at).expect("a link");
+            assert_eq!((link.url.as_str(), link.spans.as_slice()), ("/srv/app/src/gui/term.rs", &[(4, 7, 20), (5, 4, 15)][..]));
+        }
     }
 
     /// It keeps at least as many lines as set, whatever the width, and drops the rest a

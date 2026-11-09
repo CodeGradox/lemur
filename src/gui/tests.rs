@@ -778,3 +778,24 @@ fn a_right_panel_folded_by_its_edge_is_hidden() {
     press(&mut rt, K::Command('r'), cmd());
     assert_eq!(rt.state.right(), Some(Right::Links));
 }
+
+/// Showing another thread shows its screen, though both drew the same rows the same number
+/// of times.
+#[test]
+fn another_thread_shows_its_own_screen() {
+    let server = HcServer::new("rswap");
+    let [a, b] = ["aaaa", "bbbb"].map(|w| server.run("/", &[], &["sh", "-c", &format!("printf {w}; exec sleep 600")]));
+    let mut rt = loaded(&server);
+    let drawn = |rt: &Runtime<Lemur>| {
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some("tr-main-0-0") && !e.exiting).and_then(|e| e.text)
+    };
+    for (t, word) in [(&a, "aaaa"), (&b, "bbbb"), (&a, "aaaa")] {
+        open(&mut rt, t);
+        let k = key(t);
+        assert!(wait_for(&mut rt, 10.0, |s| super::terminal::lines(s, &k).first().is_some_and(|l| l == word)), "{word} printed");
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(drawn(&rt).as_deref(), Some(word));
+    }
+}

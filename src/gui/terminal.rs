@@ -597,10 +597,9 @@ pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El
         // A row Ghostty didn't rebuild keeps the elements built for it last time.
         rows = rows.child(memo(format!("tr-{id}-{y}"), (row.version, m.cell_w.to_bits(), m.cell_h.to_bits()), || row_el(id, y, row, m)));
     }
-    if let Some(link) = &view.hover {
-        let x = f32::from(link.start) * m.cell_w;
-        let w = f32::from(link.end - link.start) * m.cell_w;
-        rows = rows.child(el().key(format!("link-{id}")).absolute(x, f32::from(link.row + 1) * m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
+    for (i, &(row, start, end)) in view.hover.iter().flat_map(|link| &link.spans).enumerate() {
+        let (x, w) = (f32::from(start) * m.cell_w, f32::from(end - start) * m.cell_w);
+        rows = rows.child(el().key(format!("link-{id}-{i}")).absolute(x, f32::from(row + 1) * m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
     }
     if let Some((x, y)) = grid.cursor {
         let (cx, cy) = (f32::from(x) * m.cell_w, f32::from(y) * m.cell_h);

@@ -26,11 +26,13 @@ impl Lemur {
         let view = self.terminals.get(&self.front()?)?;
         let grid = view.grid.as_ref()?;
         let (col, row) = grid.cell_at(x, y, self.cell());
+        let cells = grid.line_cells(row);
         if let Some(uri) = grid.hyperlink(col, row) {
-            let same = |c: u16| grid.hyperlink(c, row).as_deref() == Some(uri.as_str());
-            return hyperlinked(uri.clone(), row, col, grid.size().cols, same);
+            let here = cells.iter().rposition(|&(_, r, c)| (r, c) <= (row, col))?;
+            let same = |r: u16, c: u16| grid.hyperlink(c, r).as_deref() == Some(uri.as_str());
+            return hyperlinked(uri.clone(), &cells, here, same);
         }
-        link_at(&grid.line_cells(usize::from(row)), row, col)
+        link_at(&cells, (row, col))
     }
 
     /// A press, a drag and a release on the terminal: ⌘-click opens a link; a program that

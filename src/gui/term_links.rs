@@ -9,17 +9,19 @@ pub struct Link {
     pub file: bool,
     /// After a file's path, the `:line` or `:line:column` it was printed with, if any.
     pub place: String,
-    /// Where it's drawn: its row, first column and the column after its last.
-    pub row: u16,
-    pub start: u16,
-    pub end: u16,
+    /// Where it's drawn, on each row it wraps onto: the row, its first column and the column
+    /// after its last.
+    pub spans: Vec<(u16, u16, u16)>,
 }
 
-/// The link over column `col` of a row, given the row's characters and their columns
-/// (`Grid::line_cells`).
-pub fn link_at(cells: &[(char, u16)], row: u16, col: u16) -> Option<Link> {
-    let here = cells.iter().rposition(|(_, c)| *c <= col)?;
-    let text: Vec<char> = cells.iter().map(|(c, _)| *c).collect();
+/// A character on screen: it, its row and its column.
+pub type Cell = (char, u16, u16);
+
+/// The link over (`row`, `col`), given the line there as it was printed: its characters
+/// with their rows and columns, over every row it wraps onto (`Grid::line_cells`).
+pub fn link_at(cells: &[Cell], (row, col): (u16, u16)) -> Option<Link> {
+    let here = cells.iter().rposition(|&(_, r, c)| (r, c) <= (row, col))?;
+    let text: Vec<char> = cells.iter().map(|(c, ..)| *c).collect();
     let (start, stop, url, file, place) = match url_at(&text, here) {
         Some((start, stop)) => (start, stop, text[start..stop].iter().collect(), false, String::new()),
         None => {
@@ -27,20 +29,34 @@ pub fn link_at(cells: &[(char, u16)], row: u16, col: u16) -> Option<Link> {
             (start, stop, text[start..end].iter().collect(), true, text[end..stop].iter().collect())
         }
     };
-    let end = cells.get(stop).map_or(cells.last()?.1 + 1, |(_, c)| *c);
-    Some(Link { url, file, place, row, start: cells[start].1, end })
+    Some(Link { url, file, place, spans: spans(cells, start, stop) })
 }
 
-/// The link `uri` a program put on column `col` of row `row` (OSC 8), over the columns
-/// around it `same` says link there too, of `cols`. Any program's output sets these, with
-/// text that needn't match: only web links open, as for a URL written out.
-pub fn hyperlinked(uri: String, row: u16, col: u16, cols: u16, same: impl Fn(u16) -> bool) -> Option<Link> {
+/// The link `uri` a program put on cell `here` of the line `cells` (OSC 8), over the cells
+/// around it `same` says link there too. Any program's output sets these, with text that
+/// needn't match: only web links open, as for a URL written out.
+pub fn hyperlinked(uri: String, cells: &[Cell], here: usize, same: impl Fn(u16, u16) -> bool) -> Option<Link> {
     if !is_web(&uri) {
         return None;
     }
-    let start = (0..col).rev().take_while(|c| same(*c)).last().unwrap_or(col);
-    let end = (col..cols).take_while(|c| same(*c)).last()? + 1;
-    Some(Link { url: uri, file: false, place: String::new(), row, start, end })
+    let linked = |i: &usize| cells.get(*i).is_some_and(|&(_, r, c)| same(r, c));
+    let start = (0..here).rev().take_while(linked).last().unwrap_or(here);
+    let stop = (here..cells.len()).take_while(linked).last()? + 1;
+    Some(Link { url: uri, file: false, place: String::new(), spans: spans(cells, start, stop) })
+}
+
+/// Where cells `start..stop` of a line are drawn, row by row.
+fn spans(cells: &[Cell], start: usize, stop: usize) -> Vec<(u16, u16, u16)> {
+    let mut spans: Vec<(u16, u16, u16)> = vec![];
+    for (i, &(_, row, col)) in cells.iter().enumerate().take(stop).skip(start) {
+        // To the next cell on its row: a wide character takes two columns.
+        let end = cells.get(i + 1).filter(|(_, r, _)| *r == row).map_or(col + 1, |&(_, _, c)| c);
+        match spans.last_mut() {
+            Some((r, _, e)) if *r == row => *e = end,
+            _ => spans.push((row, col, end)),
+        }
+    }
+    spans
 }
 
 const SCHEMES: [&str; 2] = ["https://", "http://"];
@@ -255,12 +271,26 @@ mod tests {
     /// must show `shown`.
     #[test]
     fn a_link_knows_its_columns() {
-        let cells: Vec<(char, u16)> = "see https://example.com/a now".chars().zip(0..).collect();
-        let link = link_at(&cells, 3, 10).unwrap();
-        assert_eq!((link.url.as_str(), link.file, link.start, link.end), ("https://example.com/a", false, 4, 25));
-        let cells: Vec<(char, u16)> = "Read(src/main.rs:12)".chars().zip(0..).collect();
-        let link = link_at(&cells, 0, 8).unwrap();
+        let row = |text: &str, y: u16| -> Vec<Cell> { text.chars().zip(0..).map(|(c, x)| (c, y, x)).collect() };
+        let cells = row("see https://example.com/a now", 3);
+        let link = link_at(&cells, (3, 10)).unwrap();
+        assert_eq!((link.url.as_str(), link.file, link.spans.as_slice()), ("https://example.com/a", false, &[(3, 4, 25)][..]));
+        let cells = row("Read(src/main.rs:12)", 0);
+        let link = link_at(&cells, (0, 8)).unwrap();
         assert_eq!((link.url.as_str(), link.file, link.place.as_str()), ("src/main.rs", true, ":12"));
-        assert!(link_at(&cells, 0, 1).is_none());
+        assert!(link_at(&cells, (0, 1)).is_none());
+    }
+
+    /// A path the terminal wrapped onto the next row is one link, from either row.
+    #[test]
+    fn a_link_wraps_onto_the_next_row() {
+        let mut cells: Vec<Cell> = "see /srv/app/src/le".chars().zip(0..).map(|(c, x)| (c, 4, x)).collect();
+        cells.extend("mur/main.rs:7 now".chars().zip(0..).map(|(c, x)| (c, 5, x)));
+        for at in [(4, 6), (5, 2)] {
+            let link = link_at(&cells, at).unwrap();
+            assert_eq!(link.url, "/srv/app/src/lemur/main.rs");
+            assert_eq!(link.place, ":7");
+            assert_eq!(link.spans, [(4, 4, 19), (5, 0, 13)]);
+        }
     }
 }
