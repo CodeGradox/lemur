@@ -67,6 +67,7 @@ path = "~/projects/api"
 # name = "api"                    # defaults to the last path component
 # worktree_dir = ".claude/worktrees"
 # collapsed = true                # folded in the sidebar
+# color = "teal"                  # its mark in the sidebar, one of the colors below; gray unset
 # worktree_order = [...]          # worktree paths, in the order they were dragged into
 # worktree_colors = { "/path/to/worktree" = "blue" }  # red orange yellow green teal cyan blue purple pink gray
 # hidden_worktrees = [...]        # worktree paths in the project's Hidden section
@@ -74,7 +75,7 @@ path = "~/projects/api"
 # hidden_open = true              # the Hidden section is open
 ```
 
-Settings (`⌘,`) writes `theme`, `dictation_language`, `notification_dismiss_ms`, `claude_usage`, `codex_usage`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, minimizing the sidebar's foot writes `minimized_usage`, `minimized_codex_usage` and `minimized_hosts`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. Lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, its terminal's address as `session`, `path`, `claude_session` ID, `label`, and the Linear `issue` pinned to it) to resume it. The rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `dictation_language`, `notification_dismiss_ms`, `claude_usage`, `codex_usage`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, minimizing the sidebar's foot writes `minimized_usage`, `minimized_codex_usage` and `minimized_hosts`, and the sidebar writes a project's `collapsed`, `color`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. Lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, its terminal's address as `session`, `path`, `claude_session` ID, `label`, and the Linear `issue` pinned to it) to resume it. The rest of the file, comments included, stays as it is.
 
 New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): Lemur runs `git worktree add` there, then starts what you picked in it.
 
@@ -100,6 +101,7 @@ Run `lemur`. The sidebar lists each base's worktrees and their sessions, in the 
 - Right-click a worktree → **Remove worktree…** to take it out of git; its branch stays. If threads are running in it, the dialog names them: **Close and remove** closes them first, and **Cancel** keeps them and the worktree. Lemur checks the host too, so a thread the sidebar hasn't shown yet, or one whose terminal has `cd`'d into the worktree, is asked about the same way. Its folder stays on the host as plain files unless you tick **Also delete**, which deletes it, read-only parts included. One that's locked (Claude Code locks the worktree its session runs in) asks again before **Remove anyway**, which unlocks it; so does deleting one with uncommitted changes, which drops them. These asks all come before any thread closes, so cancelling one keeps the threads running. The main checkout and plain folders can't be removed this way.
 - Click a project's name to fold it away, or open it again, and a worktree to fold its threads. What's folded stays so, across restarts too. Opening a thread some other way (a popup's **Show**, `⌃Tab`, or on launch) unfolds its project and worktree, and the **Hidden** section it's in, so you can see where it is.
 - Right-click a worktree → **Color** to give its folder icon one of ten colors.
+- A project's name has a mark beside it with its first letter, gray until you pick one of the same colors from its **⋯** → **Color**. A line parts one project from the next.
 - Right-click a worktree → **Hide** to move it into its project's **Hidden** section, at the bottom; click **Hidden** to fold it open and shut. Right-click it there → **Unhide** to move it back to its place.
 - Drag a worktree onto another in the same project to move it there.
 - Drag a project's name onto another's to move it there, whatever their hosts; the config's `[[bases]]` take the new order, each entry with its comments.

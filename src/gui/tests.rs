@@ -862,3 +862,35 @@ fn the_sidebars_title_is_on_the_title_bars_row() {
     click(&mut rt, "find-thread");
     assert!(rt.state.prompt.is_some(), "Go to thread opened");
 }
+
+/// A project's mark is gray until a colour is picked from its menu, and gray picks none
+/// again; a line stands between each group and the next, none over the first.
+#[test]
+fn projects_take_a_color_and_lines_part_them() {
+    let server = HcServer::new("rprojcolor");
+    let mut cfg = server.config();
+    cfg.bases.push(crate::config::Base::new("local", "/srv/api"));
+    cfg.bases.push(crate::config::Base::new("local", "/srv/web"));
+    let mut rt = window(cfg);
+    rt.state.refresh();
+    assert!(wait_for(&mut rt, 10.0, |s| s.loaded), "the first snapshot");
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    let lines: Vec<bool> = ["line-project-0", "line-project-1", "line-other"].iter().map(|k| rt.find(k).is_some()).collect();
+    assert_eq!(lines, [false, true, true], "lines under the first project and before Other");
+
+    let mark = |rt: &Runtime<Lemur>| rt.elements().into_iter().find(|e| e.path.contains("project-1") && e.key.as_deref() == Some("project-mark")).map(|e| e.fill);
+    let gray = mark(&rt).expect("web's mark");
+    click(&mut rt, "project-menu-1");
+    assert!(rt.popup_menu().expect("its menu").find("color:gray").is_some_and(|i| i.is_checked()));
+    rt.resolve_popup(Some("color:teal")).unwrap();
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert_eq!(rt.state.cfg.bases[1].color.as_deref(), Some("teal"));
+    assert_ne!(mark(&rt), Some(gray), "teal now");
+    click(&mut rt, "project-menu-1");
+    rt.resolve_popup(Some("color:gray")).unwrap();
+    assert_eq!(rt.state.cfg.bases[1].color, None, "gray is no colour of its own");
+}

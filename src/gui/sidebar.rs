@@ -8,7 +8,7 @@ use super::{Key, Lemur, List, Right, icons, key, worktree_label};
 use crate::config::{Agent, Base, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, Session, Worktree};
 use rune::{Color, El, LoopSpec, PointerPress, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
-use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarHeader, SidebarRow, SidebarSection, TOOLBAR_HEIGHT};
+use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarRow, TOOLBAR_HEIGHT};
 use rune_kit::Kit;
 
 /// Points the pointer travels before a press on a row becomes a drag.
@@ -69,9 +69,71 @@ fn drags(e: El, id: String, drop: impl Fn(&mut Lemur, f32) + 'static) -> El {
 
 /// A worktree's folder colour, from its name in the config.
 fn worktree_color(base: &Base, worktree: &str) -> Option<Color> {
-    let name = base.worktree_colors.get(worktree)?;
-    let (_, hex) = COLORS.iter().find(|(n, _)| n == name)?;
+    color_named(base.worktree_colors.get(worktree)?)
+}
+
+/// One of `COLORS`, by its name.
+fn color_named(name: &str) -> Option<Color> {
+    let (_, hex) = COLORS.iter().find(|(n, _)| *n == name)?;
     rune::color::hex(&format!("#{hex:06x}"))
+}
+
+/// What sets a project apart from the next: a line, as Slack's and Plane's sidebars have.
+fn divider(key: String, k: &Kit) -> El {
+    el().key(key).w_full().h(1.0).mt(6.0).mb(4.0).fill(k.c.border_base).a11y_hidden()
+}
+
+/// A project's header, as Linear's and ClickUp's: a mark in its colour (gray unless one is
+/// picked) with its initial, its name and its host, the disclosure triangle, then its menu.
+/// A press folds it.
+fn project_header(base: &Base, host: &str, index: usize, menu: El, k: &Kit) -> El {
+    let c = &k.c;
+    let name = base.name();
+    let color = base.color.as_deref().and_then(color_named).or_else(|| color_named("gray")).unwrap_or(c.icon_muted);
+    let initial: String = name.chars().next().map(|ch| ch.to_uppercase().collect()).unwrap_or_default();
+    let mark = row().key("project-mark").size(18.0, 18.0).radius(5.0).fill(color).center().child(text(initial).font(k.ty.text_xsmall_medium).color(Color::WHITE));
+    let triangle = icon(if base.collapsed { k.glyph.triangle_right } else { k.glyph.triangle_down }, 12.0).color(c.icon_faint);
+    let title = row()
+        .gap(6.0)
+        .center_y()
+        .shrink()
+        .min_w(0.0)
+        .child(mark)
+        .child(text(name.clone()).font(k.ty.ui_medium).color(c.text_base).truncate().shrink())
+        .child(text(format!("· {host}")).font(k.ty.small).color(c.text_muted))
+        .child(triangle)
+        .a11y_hidden();
+    let header = row()
+        .key("section-header")
+        .label(format!("{name} · {host}"))
+        .w_full()
+        .h(30.0)
+        .px(6.0)
+        .gap(6.0)
+        .center_y()
+        .radius(k.radius.md)
+        .child(title)
+        .child(el().grow(1.0).a11y_hidden())
+        .child(menu)
+        .on_press(move |s: &mut Lemur| s.toggle_project(index));
+    // Pointer only, as the kit's section headers: in the list's focus group the arrows
+    // step through rows.
+    k.interactive(header).role("button").expanded(!base.collapsed).hover_motion(rune::Anim::INSTANT, rune::Anim::INSTANT).focusable(false)
+}
+
+/// A group that isn't a project (Other, a host that can't be reached): its name as a
+/// project's, over its rows.
+fn group(key: String, title: &str, rows: Vec<El>, k: &Kit) -> El {
+    let header = row()
+        .key("section-header")
+        .role("heading")
+        .label(title.to_owned())
+        .w_full()
+        .h(30.0)
+        .px(8.0)
+        .center_y()
+        .child(text(title.to_owned()).font(k.ty.ui_medium).color(k.c.text_base).truncate().a11y_hidden());
+    col().key(key).role("group").label(title.to_owned()).w_full().gap(2.0).child(header).children(rows)
 }
 
 /// `blue` as `Blue`, for menus.
@@ -360,7 +422,13 @@ fn project_menu(s: &Lemur, index: usize) -> PopupMenu {
     if !gone.is_empty() {
         menu = menu.item(PopupItem::new("resume-all", format!("Resume all threads ({})", gone.len()))).separator();
     }
-    menu.item(PopupItem::new("remove-project", "Remove project…"))
+    // Gray is the mark's own colour.
+    let current = s.cfg.bases.get(index).and_then(|b| b.color.clone()).unwrap_or_else(|| "gray".into());
+    let mut colors = PopupMenu::new();
+    for (name, _) in COLORS {
+        colors = colors.item(PopupItem::new(format!("color:{name}"), title_case(name)).checked(current == name));
+    }
+    menu.submenu("Color", colors).separator().item(PopupItem::new("remove-project", "Remove project…"))
 }
 
 fn project_picked(s: &mut Lemur, picked: &str, index: usize) {
@@ -373,6 +441,10 @@ fn project_picked(s: &mut Lemur, picked: &str, index: usize) {
             if let Some(project) = s.cfg.bases.get(index).cloned() {
                 s.confirm_remove_project(project);
             }
+        }
+        color if color.starts_with("color:") => {
+            let name = &color["color:".len()..];
+            s.set_project_color(index, Some(name).filter(|n| *n != "gray"));
         }
         _ => {}
     }
@@ -441,6 +513,8 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
     // outside them, or why it couldn't be reached.
     let mut projects: Vec<_> = s.snap.hosts.iter().flat_map(|h| h.bases.iter().map(move |b| (h, b))).collect();
     projects.sort_by_key(|(_, b)| b.index);
+    // A line between each group and the next.
+    let mut first = true;
     for (h, b) in projects {
         let index = b.index;
         let base = &s.cfg.bases[index];
@@ -490,19 +564,17 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
             })
             .build(k)
             .key(format!("project-menu-{index}"));
-        // A section of the kit's, but dragged by its header to another place among the
-        // projects.
+        // Dragged by its header to another place among the projects.
         let title = format!("{} · {}", base.name(), h.name);
         let id = format!("project-{index}");
-        let header = SidebarHeader::new(title.clone())
-            .collapsed(base.collapsed)
-            .on_toggle(move |s: &mut Lemur, _| s.toggle_project(index))
-            .action(menu_button)
-            .build(k);
+        let header = project_header(base, &h.name, index, menu_button, k);
         let header = drags(note_place(header, id.clone()), id.clone(), move |s, dy| s.drop_project(index, dy));
         let mut section = col().key(id.clone()).role("group").label(title).w_full().gap(2.0).motion(k.motion.disclosure).child(header);
         if !base.collapsed {
             section = section.children(rows);
+        }
+        if !std::mem::take(&mut first) {
+            sb = sb.child(divider(format!("line-{id}"), k));
         }
         sb = sb.child(lift(s, section, &id, k));
     }
@@ -521,14 +593,20 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
                         .key(format!("set-up-{}", h.name)),
                 );
             }
-            sb = sb.section(SidebarSection::new(h.name.clone()).key(format!("host-section-{}", h.name)).rows(rows));
+            if !std::mem::take(&mut first) {
+                sb = sb.child(divider(format!("line-host-{}", h.name), k));
+            }
+            sb = sb.child(group(format!("host-section-{}", h.name), &h.name, rows, k));
         } else {
             other.push(host_row(s, &h.name, &h.home, k));
             other.extend(threads(s, &h.name, None, &h.other, &h.gone, k));
         }
     }
     if !other.is_empty() {
-        sb = sb.section(SidebarSection::new("Other").key("other").rows(other));
+        if !first {
+            sb = sb.child(divider("line-other".into(), k));
+        }
+        sb = sb.child(group("other".into(), "Other", other, k));
     }
     let foot = col().key("sidebar-foot").w_full().children(super::panels::sidebar_foot(s, k)).child(s.machines(k));
     sb.footer(foot).build(k).fill(super::look::sidebar(k.dark)).child(header)

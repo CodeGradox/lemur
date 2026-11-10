@@ -274,6 +274,9 @@ pub struct Base {
     /// Folded away in the sidebar.
     #[serde(default)]
     pub collapsed: bool,
+    /// The colour of its mark in the sidebar, one of `COLORS`; gray unset.
+    #[serde(default)]
+    pub color: Option<String>,
     /// Its worktrees' paths in the order they were dragged into; others
     /// follow in git's order.
     #[serde(default)]
@@ -371,6 +374,7 @@ impl Base {
             name: None,
             worktree_dir: default_worktree_dir(),
             collapsed: false,
+            color: None,
             worktree_order: vec![],
             worktree_colors: BTreeMap::new(),
             hidden_worktrees: vec![],
@@ -553,6 +557,10 @@ impl Config {
             } else {
                 table.remove("collapsed");
             }
+            match &base.color {
+                Some(color) => table.insert("color", toml_edit::value(color)),
+                None => table.remove("color"),
+            };
             if base.worktree_order.is_empty() {
                 table.remove("worktree_order");
             } else {
@@ -1193,6 +1201,7 @@ path = \"~/projects/api\"
         // A project's look goes in its entry, and its defaults come out.
         let mut site = cfg.bases[1].clone();
         site.collapsed = true;
+        site.color = Some("teal".into());
         site.worktree_colors
             .insert("/srv/site/.worktrees/b".into(), "blue".into());
         site.worktree_order = vec!["/srv/site/.worktrees/b".into(), "/srv/site".into()];
@@ -1203,6 +1212,7 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
         assert!(cfg.bases[1].collapsed);
+        assert_eq!(cfg.bases[1].color.as_deref(), Some("teal"));
         assert_eq!(cfg.bases[1].worktree_order, site.worktree_order);
         assert_eq!(cfg.bases[1].hidden_worktrees, site.hidden_worktrees);
         assert_eq!(cfg.bases[1].collapsed_worktrees, site.collapsed_worktrees);
@@ -1210,6 +1220,7 @@ path = \"~/projects/api\"
         assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
         assert!(cfg.bases[0].hidden_worktrees.is_empty());
         site.worktree_colors.clear();
+        site.color = None;
         site.collapsed = false;
         site.worktree_order.clear();
         site.hidden_worktrees.clear();

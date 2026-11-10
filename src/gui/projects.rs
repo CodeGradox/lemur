@@ -111,6 +111,15 @@ impl Lemur {
         self.save_look(index);
     }
 
+    /// Colours a project's mark in the sidebar, or with `None` makes it gray again.
+    pub(super) fn set_project_color(&mut self, index: usize, color: Option<&str>) {
+        let Some(base) = self.cfg.bases.get_mut(index) else {
+            return;
+        };
+        base.color = color.map(str::to_string);
+        self.save_look(index);
+    }
+
     /// Colors a worktree's folder icon, or with `None` takes its color off.
     pub(super) fn set_worktree_color(
         &mut self,
