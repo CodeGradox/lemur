@@ -37,6 +37,7 @@ Building needs Xcode 26 or newer (dictation's helper is Swift for macOS 26) and 
 # theme = "system"                # or "light" / "dark"; must come before the tables
 # dictation_language = "en-US"    # or "nb-NO", what ⌘D listens for; before the tables too
 # thread_order = "tabs"           # or "recent", the order ⌃Tab and ⌃⇧Tab go in; before the tables too
+# notification_dismiss_ms = 0     # how long a notification shows; 0 keeps it till it's dismissed
 # sidebar_width = 255             # pixels; dragging the sidebar's edge sets it
 # notes_width = 360               # pixels; dragging the notes panel's edge sets it
 
@@ -73,7 +74,7 @@ path = "~/projects/api"
 # hidden_open = true              # the Hidden section is open
 ```
 
-Settings (`⌘,`) writes `theme`, `dictation_language`, `claude_usage`, `codex_usage`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, minimizing the sidebar's foot writes `minimized_usage`, `minimized_codex_usage` and `minimized_hosts`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. Lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, its terminal's address as `session`, `path`, `claude_session` ID, `label`, and the Linear `issue` pinned to it) to resume it. The rest of the file, comments included, stays as it is.
+Settings (`⌘,`) writes `theme`, `dictation_language`, `notification_dismiss_ms`, `claude_usage`, `codex_usage`, `[terminal]`, `[terminal.dark]` and `[terminal.light]` for you, dragging a side panel's edge writes `sidebar_width` or `notes_width`, minimizing the sidebar's foot writes `minimized_usage`, `minimized_codex_usage` and `minimized_hosts`, and the sidebar writes a project's `collapsed`, `worktree_order`, `worktree_colors`, `hidden_worktrees`, `collapsed_worktrees` and `hidden_open`, and the order of the `[[bases]]`. Lemur also keeps a `[[threads]]` entry for each Claude thread (its `host`, its terminal's address as `session`, `path`, `claude_session` ID, `label`, and the Linear `issue` pinned to it) to resume it. The rest of the file, comments included, stays as it is.
 
 New worktrees go in `worktree_dir` (relative to the repo, absolute, or `~/...`): Lemur runs `git worktree add` there, then starts what you picked in it.
 
@@ -159,7 +160,7 @@ Each session's dot comes from the agent itself: Claude Code and Codex (recent ve
 
 ### Notifications
 
-When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. It names the project and worktree under the session's name. **Show** brings Lemur forward and opens that session; **Dismiss** closes the popup. Opening the session from the sidebar closes its popup too, and so does coming back to Lemur while it's the session on show. A popup never keeps the keyboard: if `⌘Tab` back to Lemur hands it to one, it goes on to the main window.
+When a session finishes or starts needing input, a popup appears at the top-right of the main screen, like Zed's, unless it's the session you're looking at in the active window. It names the project and worktree under the session's name. **Show** brings Lemur forward and opens that session; **Dismiss** closes the popup. A popup stays until it's answered, or with **Settings → Notifications → Dismiss after (ms)** set, goes by itself once it has shown that long. Opening the session from the sidebar closes its popup too, and so does coming back to Lemur while it's the session on show. A popup never keeps the keyboard: if `⌘Tab` back to Lemur hands it to one, it goes on to the main window.
 
 To stop a thread's notifications, right-click it or its tab → **Silence notifications**, or use the bell on hover in the agents panel; **Allow notifications** lets them come again. It makes no more popups, and one it already made goes. Its dot and **Needs attention** go on saying what it does, and a crossed-out bell marks it, in the sidebar and the panel. herdr-core keeps it as a label on the terminal (`lemur.silent`), so it stays silent across restarts and from any Mac; a thread resumed in a new terminal starts over.
 

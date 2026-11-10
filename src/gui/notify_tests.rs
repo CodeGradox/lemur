@@ -103,8 +103,53 @@ fn coming_back_answers_the_shown_sessions_popup() {
     assert_eq!(popups(&rt), [key("a")], "you're back; a isn't answered yet");
 }
 
+/// Runs the window for `secs` on its clock.
+fn run_for(rt: &mut Runtime<Lemur>, secs: f64) {
+    for _ in 0..(secs * 60.0).round() as usize {
+        rt.frame(1.0 / 60.0);
+    }
+}
+
+/// With a dismiss period set, a popup goes by itself once it has shown that long, and one
+/// replaced by newer news starts again. Unset, 0, popups stay till they're answered; set
+/// while they show, it holds them to it from when they came.
+#[test]
+fn popups_go_by_themselves_after_the_dismiss_period() {
+    let mut rt = window(toml::from_str("notification_dismiss_ms = 2000").unwrap());
+    rt.window_focus(false);
+    rt.frame(1.0 / 60.0);
+    apply(&mut rt, &[("a", Activity::Working), ("b", Activity::Working)]);
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Working)]);
+    assert_eq!(popups(&rt), [key("a")]);
+    run_for(&mut rt, 1.0);
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Idle)]);
+    assert_eq!(popups(&rt), [key("a"), key("b")]);
+    run_for(&mut rt, 0.9);
+    assert_eq!(popups(&rt), [key("a"), key("b")], "a has shown just under 2 s");
+    run_for(&mut rt, 0.2);
+    assert_eq!(popups(&rt), [key("b")], "a has had its 2 s, b hasn't");
+    // b's news again, as needing input: its popup starts over.
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Working)]);
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::NeedsInput)]);
+    run_for(&mut rt, 1.5);
+    assert_eq!(popups(&rt), [key("b")], "b's newer popup has shown 1.5 s");
+    run_for(&mut rt, 0.6);
+    assert!(popups(&rt).is_empty());
+
+    // 0 keeps them.
+    rt.state.prefs.notification_dismiss_ms = 0;
+    apply(&mut rt, &[("a", Activity::Working), ("b", Activity::NeedsInput)]);
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::NeedsInput)]);
+    run_for(&mut rt, 5.0);
+    assert_eq!(popups(&rt), [key("a")], "no period, no end");
+    // Set now, it counts from when a came.
+    rt.state.prefs.notification_dismiss_ms = 3000;
+    run_for(&mut rt, 0.1);
+    assert!(popups(&rt).is_empty(), "a came over 3 s ago");
+}
+
 fn popup(name: &str) -> Popup {
-    Popup { key: key(name), title: format!("{name} finished"), caption: "api › main  ·  local".into(), asks: false }
+    Popup { key: key(name), title: format!("{name} finished"), caption: "api › main  ·  local".into(), asks: false, since: None }
 }
 
 /// The overlay's Show and Dismiss each answer their own popup, which goes at once.

@@ -1,4 +1,4 @@
-//! Settings (lemur → Settings…, ⌘,): the theme, the terminal's font,
+//! Settings (lemur → Settings…, ⌘,): the theme, how long notifications show, the terminal's font,
 //! scrollback and colors, the language dictation listens for, whether to
 //! show Claude's and Codex's plan usage, Lemur's Linear sign-in, herdr-core's
 //! versions, and every shortcut. Changes apply at once and are saved to the
@@ -21,6 +21,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 pub enum Page {
     #[default]
     Appearance,
+    Notifications,
     Terminal,
     Colors,
     Dictation,
@@ -32,8 +33,9 @@ pub enum Page {
 }
 
 /// Each page with its key, its name and its icon.
-static PAGES: [(Page, &str, &str, &Icon); 9] = [
+static PAGES: [(Page, &str, &str, &Icon); 10] = [
     (Page::Appearance, "appearance", "Appearance", &icons::SUN),
+    (Page::Notifications, "notifications", "Notifications", &icons::BELL),
     (Page::Terminal, "terminal", "Terminal", &icons::SQUARE_TERMINAL),
     (Page::Colors, "colors", "Terminal colors", &icons::PALETTE),
     (Page::Dictation, "dictation", "Dictation", &icons::MIC),
@@ -51,9 +53,10 @@ pub struct Settings {
     page: Page,
     /// Monospaced fonts installed on this Mac, once listed.
     fonts: Option<Vec<String>>,
-    /// The font size and the scrollback as typed.
+    /// The font size, the scrollback and how long notifications show, as typed.
     font_size: TextEdit,
     scrollback: TextEdit,
+    dismiss: TextEdit,
     /// A terminal color being typed: for a dark Lemur or a light one, which, and its field.
     color: Option<(bool, Slot, TextEdit)>,
     /// herdr-core's versions here and on each machine, once asked.
@@ -81,10 +84,12 @@ impl Lemur {
         }
         let terminal = &self.prefs.terminal;
         let (size, lines) = (number(terminal.font_size), terminal.scrollback);
+        let dismiss = self.prefs.notification_dismiss_ms;
         let st = &mut self.panels.settings;
         st.open = true;
         st.font_size = TextEdit::new(size);
         st.scrollback = TextEdit::new(lines.to_string());
+        st.dismiss = TextEdit::new(dismiss.to_string());
         st.color = None;
         st.given.get_or_insert(lines);
         // Tests ask neither this Mac's fonts nor the release site.
@@ -130,6 +135,32 @@ impl Lemur {
     fn set_thread_order(&mut self, order: ThreadOrder) {
         self.prefs.thread_order = order;
         self.save_settings();
+    }
+
+    /// Notifications go by themselves once they've shown `ms`, or with 0 stay till they're
+    /// answered: the ones showing too.
+    fn set_dismiss(&mut self, ms: u32) {
+        self.prefs.notification_dismiss_ms = ms;
+        let saved = self.prefs.config_file().map(|file| Config::save_notification_dismiss(file, ms));
+        self.panels.settings.error = match saved {
+            Some(Err(e)) => Some(format!("{e:#}")),
+            _ => None,
+        };
+    }
+
+    fn dismiss_typed(&mut self) {
+        let typed = self.panels.settings.dismiss.text.trim().parse::<u32>().ok();
+        if let Some(ms) = typed.filter(|v| *v != self.prefs.notification_dismiss_ms) {
+            self.set_dismiss(ms);
+        }
+    }
+
+    /// − and +: a second shorter or longer.
+    fn step_dismiss(&mut self, steps: i32) {
+        let ms = i64::from(self.prefs.notification_dismiss_ms) + i64::from(steps) * 1000;
+        let ms = ms.clamp(0, i64::from(u32::MAX)) as u32;
+        self.panels.settings.dismiss.replace_text(ms.to_string());
+        self.set_dismiss(ms);
     }
 
     fn set_font_family(&mut self, family: String) {
@@ -294,6 +325,7 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
     let name = PAGES.iter().find(|(p, ..)| *p == st.page).map_or("", |(_, _, name, _)| name);
     let groups = match st.page {
         Page::Appearance => appearance(s, k),
+        Page::Notifications => notifications(s, k),
         Page::Terminal => terminal(s, k),
         Page::Colors => vec![color_group(s, true, k), color_group(s, false, k)],
         Page::Dictation => dictation(s, k),
@@ -444,6 +476,14 @@ fn appearance(s: &Lemur, k: &Kit) -> Vec<El> {
         k,
     );
     vec![group(None, None, vec![item("theme", "Theme", theme, Some("System follows macOS's light or dark mode.".into()), k)], k)]
+}
+
+fn notifications(s: &Lemur, k: &Kit) -> Vec<El> {
+    let st = &s.panels.settings;
+    let ok = st.dismiss.text.trim().parse::<u32>().is_ok();
+    let after = stepper("dismiss", &st.dismiss, |s| &mut s.panels.settings.dismiss, Lemur::dismiss_typed, Lemur::step_dismiss, !ok, k);
+    let help = "Milliseconds a notification shows before it goes by itself. 0 keeps it until you dismiss it. Silence a thread to have none from it.";
+    vec![group(None, None, vec![item("dismiss", "Dismiss after (ms)", after, Some(help.into()), k)], k)]
 }
 
 fn terminal(s: &Lemur, k: &Kit) -> Vec<El> {

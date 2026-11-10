@@ -107,6 +107,8 @@ pub struct Prefs {
     pub terminal: Terminal,
     pub claude_usage: bool,
     pub codex_usage: bool,
+    /// Milliseconds a notification shows before it goes by itself; 0 keeps it.
+    pub notification_dismiss_ms: u32,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
 }
@@ -120,6 +122,7 @@ impl Prefs {
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
             codex_usage: cfg.codex_usage,
+            notification_dismiss_ms: cfg.notification_dismiss_ms,
             file,
         }
     }
@@ -592,7 +595,7 @@ fn on_key(s: &mut Lemur, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 /// Before each frame: work that came back, terminals' output, and what's due.
-fn poll(s: &mut Lemur, _: f64, tx: &mut Tx) -> bool {
+fn poll(s: &mut Lemur, now: f64, tx: &mut Tx) -> bool {
     let jobs = s.bg.take();
     let mut changed = !jobs.is_empty();
     for job in jobs {
@@ -607,6 +610,7 @@ fn poll(s: &mut Lemur, _: f64, tx: &mut Tx) -> bool {
     s.fit_panes();
     s.save_panel_widths();
     s.reveal_tab(tx);
+    changed |= s.expire_popups(now, tx);
     changed |= s.panels_poll(tx);
     changed
 }

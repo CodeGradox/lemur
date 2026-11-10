@@ -144,6 +144,37 @@ fn changes_are_kept_in_the_config() {
     assert!(rt.state.panels.settings.error.is_none());
 }
 
+/// How long notifications show is typed in milliseconds, or stepped a second at a time,
+/// and kept in the config; 0, as at first, keeps them till they're answered.
+#[test]
+fn the_notification_dismiss_is_set_and_kept() {
+    let dir = TempDir::new("settings-dismiss");
+    let file = dir.join("config.toml");
+    std::fs::write(&file, "# mine\n").unwrap();
+    let cfg = no_config();
+    let mut rt = window(cfg.clone());
+    rt.state.prefs = Prefs::new(&cfg, Some(file.clone()));
+    rt.update(|s, _| s.open_settings());
+    click(&mut rt, "settings-page-notifications");
+    assert_eq!(rt.state.panels.settings.dismiss.text, "0");
+    click(&mut rt, "settings-dismiss-less");
+    assert_eq!(rt.state.prefs.notification_dismiss_ms, 0, "not below 0");
+    click(&mut rt, "settings-dismiss-more");
+    click(&mut rt, "settings-dismiss-more");
+    assert_eq!(rt.state.prefs.notification_dismiss_ms, 2000);
+    assert!(std::fs::read_to_string(&file).unwrap().contains("notification_dismiss_ms = 2000"));
+    rt.update(|s, _| s.panels.settings.dismiss = super::super::prompt::field(""));
+    click(&mut rt, "settings-dismiss");
+    type_text(&mut rt, "750");
+    assert_eq!(rt.state.prefs.notification_dismiss_ms, 750);
+    rt.update(|s, _| s.panels.settings.dismiss = super::super::prompt::field(""));
+    type_text(&mut rt, "0");
+    assert_eq!(rt.state.prefs.notification_dismiss_ms, 0);
+    let kept = std::fs::read_to_string(&file).unwrap();
+    assert!(kept.contains("# mine") && !kept.contains("notification_dismiss"), "{kept}");
+    assert!(rt.state.panels.settings.error.is_none());
+}
+
 /// A size typed applies once it's one Lemur takes; until then the field says it isn't.
 #[test]
 fn a_font_size_typed_applies_once_its_valid() {

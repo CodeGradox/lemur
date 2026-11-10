@@ -10,9 +10,10 @@
 
 use super::{Key, Lemur, icons};
 use crate::snapshot::Activity;
-use rune::{Align, AppHandle, Cx, El, OverlayHandle, OverlaySpec, ScreenEdge, col, icon, row, text};
+use rune::{Align, AppHandle, Cx, El, OverlayHandle, OverlaySpec, ScreenEdge, Tx, col, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// A popup's size, and the room between two.
 const WIDTH: f32 = 420.0;
@@ -30,6 +31,8 @@ pub struct Popup {
     caption: String,
     /// It needs input, rather than having finished.
     asks: bool,
+    /// When it first showed, on the window's clock, once the poll has seen it.
+    since: Option<f64>,
 }
 
 pub struct Notify {
@@ -94,13 +97,38 @@ impl Lemur {
             // A newer event for the same session replaces its popup.
             let popups = &mut self.panels.notify.popups;
             popups.retain(|p| p.key != key);
-            popups.push(Popup { key, title, caption, asks });
+            popups.push(Popup { key, title, caption, asks, since: None });
             popped = true;
         }
         if popped {
             self.panels.notify.sync(self.dark);
             ask_attention();
         }
+    }
+
+    /// Takes down the popups that have shown as long as Settings say, `now` on the window's
+    /// clock, and wakes the window for the next to go. With no time set they stay till
+    /// they're answered. True if one went.
+    pub(super) fn expire_popups(&mut self, now: f64, tx: &mut Tx) -> bool {
+        let popups = &mut self.panels.notify.popups;
+        for p in popups.iter_mut() {
+            p.since.get_or_insert(now);
+        }
+        let ms = self.prefs.notification_dismiss_ms;
+        if ms == 0 {
+            return false;
+        }
+        let ends = |p: &Popup| p.since.unwrap_or(now) + f64::from(ms) / 1000.0;
+        let before = popups.len();
+        popups.retain(|p| ends(p) > now);
+        if let Some(next) = popups.iter().map(ends).reduce(f64::min) {
+            tx.wake_after(Duration::from_secs_f64(next - now));
+        }
+        if popups.len() == before {
+            return false;
+        }
+        self.panels.notify.sync(self.dark);
+        true
     }
 
     pub(super) fn close_popup(&mut self, key: &Key) {

@@ -55,6 +55,10 @@ pub struct Config {
     /// The same of Codex's.
     #[serde(default)]
     pub codex_usage: bool,
+    /// Milliseconds a notification shows before it goes by itself; 0, the default, keeps
+    /// it until it's dismissed.
+    #[serde(default)]
+    pub notification_dismiss_ms: u32,
     /// The sidebar's foot, minimized to one line each: Claude's usage, Codex's,
     /// and the hosts' load by host name.
     #[serde(default)]
@@ -601,6 +605,19 @@ impl Config {
         })
     }
 
+    /// Saves how long a notification shows before it goes by itself, in milliseconds, to
+    /// the config file at `path`. 0, which keeps it till it's dismissed, goes without saying.
+    pub fn save_notification_dismiss(path: &Path, ms: u32) -> Result<()> {
+        edit(path, |doc| {
+            if ms == 0 {
+                doc.remove("notification_dismiss_ms");
+            } else {
+                doc["notification_dismiss_ms"] = toml_edit::value(i64::from(ms));
+            }
+            Ok(())
+        })
+    }
+
     /// Keeps which of the sidebar's foot is minimized: Claude's usage, Codex's,
     /// and the hosts' load.
     pub fn save_minimized(
@@ -1017,6 +1034,26 @@ path = \"~/projects/api\"
         assert!(!saved.contains("sidebar_width"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert_eq!((cfg.sidebar_width, cfg.notes_width), (None, Some(420.0)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_the_notification_dismiss_keeps_it_before_the_tables() {
+        let path = std::env::temp_dir().join(format!("lemur-dismiss-{}.toml", std::process::id()));
+        std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.notification_dismiss_ms, 0, "unset, notifications stay");
+        Config::save_notification_dismiss(&path, 4500).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("notification_dismiss_ms = 4500\n"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.notification_dismiss_ms, 4500);
+        assert_eq!(cfg.hosts[0].name, "agent");
+
+        // 0 is the default, and leaves the file.
+        Config::save_notification_dismiss(&path, 0).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("notification_dismiss"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 
