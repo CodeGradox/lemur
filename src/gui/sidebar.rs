@@ -2,7 +2,7 @@
 //! right-click; then Other, each host's threads outside every project; the hosts' load at
 //! the foot.
 
-use super::prompt::{Ask, agent_icon, new_menu, new_picked};
+use super::prompt::{Ask, agent_glyph, agent_icon, new_menu, new_picked};
 use super::silence::silence_label;
 use super::{Key, Lemur, List, Right, icons, key, worktree_label};
 use crate::config::{Agent, Base, COLORS, ClaudeThread};
@@ -377,8 +377,12 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
         })
         .build(k)
         .key(format!("plus-{}", w.path));
-    let mut r = SidebarRow::new(label.clone()).avatar(lead).trailing(plus);
-    if folded && !w.sessions.is_empty() {
+    let shows_counts = folded && !w.sessions.is_empty();
+    let counts = shows_counts.then(|| counts(&w.sessions, k));
+    let mut r = SidebarRow::new(label.clone()).avatar(lead).trailing(row().gap(6.0).center_y().children(counts).child(plus));
+    // The counts are icons, so the row says them in words.
+    let mut said = None;
+    if shows_counts {
         let agents = w.sessions.iter().filter(|t| t.agent().is_some()).count();
         let shells = w.sessions.len() - agents;
         let say = |n: usize, one: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") };
@@ -387,9 +391,10 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
             (a, 0) => say(a, "agent"),
             (a, sh) => format!("{}, {}", say(a, "agent"), say(sh, "shell")),
         };
-        r = r.detail(running);
+        said = Some(running);
         if w.sessions.iter().any(|t| t.activity == Activity::NeedsInput) {
             r = r.status(RowStatus::Attention);
+            said = said.map(|running| format!("{running}, Needs attention"));
         }
     }
     let menu = worktree_menu(base, w, hidden, true);
@@ -397,6 +402,10 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
     let id = format!("wt-{}", w.path);
     let drag_path = w.path.clone();
     let built = r.on_select(move |s: &mut Lemur, _| s.toggle_worktree(index, &path)).build(k);
+    let built = match said {
+        Some(said) => built.description(said),
+        None => built,
+    };
     // Dragged onto another worktree of its project, it moves there; its threads follow.
     let built = drags(note_place(lift(s, built, &id, k), id.clone()), id, move |s, dy| s.drop_worktree(index, &drag_path, dy));
     let mut rows = vec![
@@ -416,6 +425,17 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
         rows.extend(threads(s, host, Some(&w.path), &w.sessions, &w.gone, k));
     }
     rows
+}
+
+/// What runs in a folded worktree: each kind of thread's icon and how many there are.
+fn counts(sessions: &[Session], k: &Kit) -> El {
+    let kinds = [(Some(Agent::Claude), "claude"), (Some(Agent::Codex), "codex"), (None, "shell")];
+    row().key("counts").gap(8.0).center_y().a11y_hidden().children(kinds.into_iter().filter_map(|(agent, kind)| {
+        let n = sessions.iter().filter(|t| t.agent() == agent).count();
+        let (glyph, ink) = agent_glyph(agent, k);
+        let count = text(n.to_string()).key(format!("count-{kind}")).font(k.ty.small).color(k.c.text_muted);
+        (n > 0).then(|| row().gap(3.0).center_y().child(icon(glyph, 12.0).color(ink)).child(count))
+    }))
 }
 
 /// A project's menu: resuming its gone threads, and removing it.

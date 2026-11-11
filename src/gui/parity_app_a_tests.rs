@@ -972,7 +972,7 @@ fn projects_fold_and_worktrees_take_a_color() {
 }
 
 /// v2 `a_long_worktree_name_stops_before_what_sits_beside_it`: a folded worktree's long
-/// name ends before what runs in it, and before its button.
+/// name ends before what runs in it, its counts by icon, and before its button.
 #[test]
 fn a_long_worktree_name_stops_before_what_sits_beside_it() {
     let server = HcServer::new("pa-long");
@@ -993,8 +993,10 @@ fn a_long_worktree_name_stops_before_what_sits_beside_it() {
     let rect = |what: &str| info(&rt, what).unwrap_or_else(|| panic!("no {what}")).rect;
     let right = |r: [f32; 4]| r[0] + r[2];
     let (row, label, counts, plus) =
-        (rect(&row_key), rect(&format!("{row_key}/label")), rect(&format!("{row_key}/detail")), rect(&format!("plus-{path}")));
-    assert_eq!(info(&rt, &format!("{row_key}/detail")).and_then(|e| e.text).as_deref(), Some("1 agent, 1 shell"));
+        (rect(&row_key), rect(&format!("{row_key}/label")), rect("counts"), rect(&format!("plus-{path}")));
+    // How many of each, by their icons: no Codex here.
+    let count = |kind: &str| info(&rt, &format!("count-{kind}")).and_then(|e| e.text);
+    assert_eq!((count("claude").as_deref(), count("codex"), count("shell").as_deref()), (Some("1"), None, Some("1")));
     assert!(right(label) <= counts[0] + 0.5, "{label:?} {counts:?}");
     assert!(right(label) <= plus[0] + 0.5, "{label:?} {plus:?}");
     assert!(right(counts) <= right(row) + 0.5 && right(plus) <= right(row) + 0.5, "{counts:?} {plus:?} {row:?}");
@@ -1035,12 +1037,12 @@ fn clicking_a_worktree_folds_its_threads() {
     let row = format!("row-local-{t}");
     let wt = format!("wt-{path}");
     assert!(shows(&rt, &row));
-    assert!(info(&rt, &format!("{wt}/detail")).is_none(), "open, it shows them");
+    assert!(info(&rt, "counts").is_none(), "open, it shows them");
     click(&mut rt, &wt);
     frames(&mut rt, 20);
     assert!(!shows(&rt, &row));
-    // Folded, it says what runs in it.
-    assert_eq!(info(&rt, &format!("{wt}/detail")).and_then(|e| e.text).as_deref(), Some("1 shell"));
+    // Folded, it says what runs in it, by icon.
+    assert_eq!(info(&rt, "count-shell").and_then(|e| e.text).as_deref(), Some("1"));
     click(&mut rt, &wt);
     frames(&mut rt, 20);
     assert!(shows(&rt, &row));

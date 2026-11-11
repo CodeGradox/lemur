@@ -420,12 +420,17 @@ pub fn new_picked(s: &mut Lemur, picked: &str, host: &str, dir: &str, base: Opti
 
 /// A thread's icon: its agent's, or a terminal.
 pub fn agent_icon(agent: Option<Agent>, k: &Kit) -> El {
-    let (glyph, ink) = match agent {
+    let (glyph, ink) = agent_glyph(agent, k);
+    row().size(16.0, 16.0).center().child(icon(glyph, 14.0).color(ink))
+}
+
+/// A thread's glyph and its colour: its agent's, or a terminal.
+pub fn agent_glyph(agent: Option<Agent>, k: &Kit) -> (&'static rune::Icon, rune::Color) {
+    match agent {
         Some(Agent::Claude) => (&icons::CLAUDE, rune::color::hex("#d97757").unwrap()),
         Some(Agent::Codex) => (&icons::CODE_XML, rune::color::hex("#4f8fe8").unwrap()),
         None => (&icons::SQUARE_TERMINAL, k.c.icon_muted),
-    };
-    row().size(16.0, 16.0).center().child(icon(glyph, 14.0).color(ink))
+    }
 }
 
 /// The spotlight, over the window: what it's for, what a new thread runs, the name, the
