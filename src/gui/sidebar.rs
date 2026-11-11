@@ -19,6 +19,14 @@ const PAST_LIGHTS: f32 = 20.0;
 /// with the rows' buttons under it, as Herdr's does.
 const TITLE_END: f32 = 16.0;
 
+/// The kit a sidebar row is built with: rune-kit mutes the name of a row that isn't picked,
+/// and the sidebar's rows have theirs in the text's own colour, as v2 had them.
+fn named(k: &Kit) -> Kit {
+    let mut k = k.clone();
+    k.c.text_muted = k.c.text_base;
+    k
+}
+
 /// What's being dragged: above the rest, following the pointer exactly, and opaque, so what
 /// it passes doesn't show through.
 fn lifted(e: El, k: &Kit) -> El {
@@ -53,6 +61,9 @@ fn drags(e: El, id: String, drop: impl Fn(&mut Lemur, f32) + 'static) -> El {
         rune::Phase::Down => {}
         rune::Phase::Move => {
             if s.moving.is_none() && d.dy.abs() < SLOP {
+                // Not a drag yet, so nothing changed. Rune makes a drag's moves instant, and
+                // the click this may still be would fold or open without its animation.
+                tx.live_only();
                 return;
             }
             tx.animated();
@@ -84,15 +95,14 @@ fn divider(key: String, k: &Kit) -> El {
 }
 
 /// A project's header, as Linear's and ClickUp's: a mark in its colour (gray unless one is
-/// picked) with its initial, its name and its host, the disclosure triangle, then its menu.
-/// A press folds it.
+/// picked) with its initial, its name and its host, then its menu and the arrow the meters at
+/// the foot have, which turns as it folds. A press folds it.
 fn project_header(base: &Base, host: &str, index: usize, menu: El, k: &Kit) -> El {
     let c = &k.c;
     let name = base.name();
     let color = base.color.as_deref().and_then(color_named).or_else(|| color_named("gray")).unwrap_or(c.icon_muted);
     let initial: String = name.chars().next().map(|ch| ch.to_uppercase().collect()).unwrap_or_default();
     let mark = row().key("project-mark").size(18.0, 18.0).radius(5.0).fill(color).center().child(text(initial).font(k.ty.text_xsmall_medium).color(Color::WHITE));
-    let triangle = icon(if base.collapsed { k.glyph.triangle_right } else { k.glyph.triangle_down }, 12.0).color(c.icon_faint);
     let title = row()
         .gap(6.0)
         .center_y()
@@ -101,20 +111,22 @@ fn project_header(base: &Base, host: &str, index: usize, menu: El, k: &Kit) -> E
         .child(mark)
         .child(text(name.clone()).font(k.ty.ui_medium).color(c.text_base).truncate().shrink())
         .child(text(format!("· {host}")).font(k.ty.small).color(c.text_muted))
-        .child(triangle)
         .a11y_hidden();
     let header = row()
         .key("section-header")
         .label(format!("{name} · {host}"))
         .w_full()
         .h(30.0)
-        .px(6.0)
+        // Its end as the rows' under it, so its arrow lines up with theirs.
+        .pl(6.0)
+        .pr(8.0)
         .gap(6.0)
         .center_y()
         .radius(k.radius.md)
         .child(title)
         .child(el().grow(1.0).a11y_hidden())
         .child(menu)
+        .child(super::meter::chevron(base.collapsed, k))
         .on_press(move |s: &mut Lemur| s.toggle_project(index));
     // Pointer only, as the kit's section headers: in the list's focus group the arrows
     // step through rows.
@@ -240,7 +252,7 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
     r.on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
         .on_close(move |s: &mut Lemur, _| s.confirm_close_of(close.clone()))
         .on_double_click(move |s: &mut Lemur, _| s.ask_name(Ask::Rename { host: rename.0.clone(), session: rename.1.clone() }))
-        .build(k)
+        .build(&named(k))
         .key(format!("row-{}-{}", key.0, key.1))
         .opacity(if t.away { 0.6 } else { 1.0 })
         // The lists share one drag: it goes to the one under the pointer as it starts.
@@ -272,7 +284,7 @@ fn gone_row(t: &ClaudeThread, k: &Kit) -> El {
         .depth(1)
         .trailing(play)
         .on_select(move |s: &mut Lemur, _| s.resume(vec![row_resume.clone()]))
-        .build(k)
+        .build(&named(k))
         .key(format!("gone-{}-{}", t.host, t.session))
         .opacity(0.5)
         .on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
@@ -300,7 +312,7 @@ fn threads(s: &Lemur, host: &str, worktree: Option<&str>, sessions: &[Session], 
             SidebarRow::new(format!("Put away ({})", away.len()))
                 .depth(1)
                 .on_select(move |s: &mut Lemur, _| s.toggle_away_list(toggle.clone()))
-                .build(k)
+                .build(&named(k))
                 .key(format!("away-{host}-{}", worktree.unwrap_or_default()))
                 .opacity(0.7),
         );
@@ -379,7 +391,11 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
         .key(format!("plus-{}", w.path));
     let shows_counts = folded && !w.sessions.is_empty();
     let counts = shows_counts.then(|| counts(&w.sessions, k));
-    let mut r = SidebarRow::new(label.clone()).avatar(lead).trailing(row().gap(6.0).center_y().children(counts).child(plus));
+    // As the meters at the foot have it: down while open, turning to the right as it folds.
+    // With no threads to fold, the same space, so the + buttons line up.
+    let arrow = if w.sessions.is_empty() && w.gone.is_empty() { el().size(12.0, 12.0) } else { super::meter::chevron(folded, k) };
+    let trailing = row().gap(6.0).center_y().children(counts).child(plus).child(arrow.key("fold"));
+    let mut r = SidebarRow::new(label.clone()).avatar(lead).trailing(trailing);
     // The counts are icons, so the row says them in words.
     let mut said = None;
     if shows_counts {
@@ -401,7 +417,7 @@ fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> 
     let (host_m, path_m, label_m) = (host.to_string(), w.path.clone(), label.clone());
     let id = format!("wt-{}", w.path);
     let drag_path = w.path.clone();
-    let built = r.on_select(move |s: &mut Lemur, _| s.toggle_worktree(index, &path)).build(k);
+    let built = r.on_select(move |s: &mut Lemur, _| s.toggle_worktree(index, &path)).build(&named(k));
     let built = match said {
         Some(said) => built.description(said),
         None => built,
@@ -492,9 +508,10 @@ fn host_row(s: &Lemur, name: &str, home: &str, k: &Kit) -> El {
             })
             .build(k)
             .key(format!("host-plus-{name}"));
-        r = r.trailing(plus);
+        // Where a worktree has its arrow, so the + buttons line up.
+        r = r.trailing(row().gap(6.0).center_y().child(plus).child(el().size(12.0, 12.0)));
     }
-    r.build(k).key(format!("host-{name}"))
+    r.build(&named(k)).key(format!("host-{name}"))
 }
 
 /// The button that folds the sidebar away (`open`) or brings it back: Lucide's, as the
@@ -530,7 +547,7 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
         .child(toggle(true, k));
     let mut sb = Sidebar::new().label("Threads").row_gap(1.0);
     if !s.loaded {
-        sb = sb.child(SidebarRow::new("Loading sessions…").build(k).key("loading").opacity(0.6));
+        sb = sb.child(SidebarRow::new("Loading sessions…").build(&named(k)).key("loading").opacity(0.6));
     }
     // Projects first, in the config's order whatever their host; then each host's threads
     // outside them, or why it couldn't be reached.
@@ -548,12 +565,12 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
                 SidebarRow::new("New worktree")
                     .icon(&icons::PLUS)
                     .on_select(move |s: &mut Lemur, _| s.ask_name(Ask::NewWorktree { base: index, agent: Some(Agent::Claude) }))
-                    .build(k)
+                    .build(&named(k))
                     .key(format!("new-worktree-{index}")),
             );
         }
         if let Some(e) = &b.error {
-            rows.push(SidebarRow::new(e.clone()).icon(&icons::TRIANGLE_ALERT).build(k).key(format!("error-{index}")).opacity(0.7));
+            rows.push(SidebarRow::new(e.clone()).icon(&icons::TRIANGLE_ALERT).build(&named(k)).key(format!("error-{index}")).opacity(0.7));
         }
         let mut hidden = vec![];
         for w in &b.worktrees {
@@ -569,7 +586,7 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
                 SidebarRow::new("Hidden")
                     .trailing(super::meter::chevron(!base.hidden_open, k))
                     .on_select(move |s: &mut Lemur, _| s.toggle_hidden(index))
-                    .build(k)
+                    .build(&named(k))
                     .key(format!("hidden-{index}"))
                     .opacity(0.8),
             );
@@ -605,14 +622,14 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
     let mut other = vec![];
     for h in &s.snap.hosts {
         if let Some(e) = &h.error {
-            let mut rows = vec![SidebarRow::new(e.clone()).icon(&icons::TRIANGLE_ALERT).build(k).key(format!("host-error-{}", h.name)).opacity(0.7)];
+            let mut rows = vec![SidebarRow::new(e.clone()).icon(&icons::TRIANGLE_ALERT).build(&named(k)).key(format!("host-error-{}", h.name)).opacity(0.7)];
             // herdr-core needs you to add it: in a terminal, as Herdr's.
             if let Some(host) = s.cfg.host(&h.name).filter(|_| h.needs_you).cloned() {
                 rows.push(
                     SidebarRow::new(format!("Set up {}…", h.name))
                         .icon(&icons::SQUARE_TERMINAL)
                         .on_select(move |s: &mut Lemur, _| s.set_up_host(host.clone()))
-                        .build(k)
+                        .build(&named(k))
                         .key(format!("set-up-{}", h.name)),
                 );
             }

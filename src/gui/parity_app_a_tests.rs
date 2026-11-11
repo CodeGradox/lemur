@@ -1019,6 +1019,33 @@ fn a_threads_indicators_are_separated() {
     assert_eq!(q.matches('·').count(), 0, "{q}");
 }
 
+/// A click whose pointer moves a little before it lets go, as a hand's does, folds a worktree
+/// with its animation all the same: its threads fade out rather than vanish.
+#[test]
+fn a_worktree_folds_with_its_animation_though_the_pointer_moved() {
+    let server = HcServer::new("pa-foldanim");
+    let dir = TempDir::new("pa-foldanim");
+    let repo = repo(&dir, "api", "main", &[]);
+    let path = path_of(&repo);
+    let t = server.run(&path, &[], &["sleep", "600"]);
+    let mut cfg = server.config();
+    cfg.bases.push(Base::new("local", &path));
+    let mut rt = loaded_with(cfg);
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some()));
+    frames(&mut rt, 20);
+    let row = format!("row-local-{t}");
+    let (x, y) = rt.find(&format!("wt-{path}")).expect("the worktree");
+    rt.pointer_move(x, y);
+    frames(&mut rt, 2);
+    rt.pointer_down(x, y);
+    rt.pointer_move(x + 1.0, y + 1.0);
+    rt.pointer_up(x + 1.0, y + 1.0);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.cfg.bases[0].collapsed_worktrees.contains(&path), "it folded");
+    let fading = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(row.as_str()));
+    assert!(fading.is_some_and(|e| e.exiting), "its threads fade out");
+}
+
 /// v2 `clicking_a_worktree_folds_its_threads`: clicking a worktree folds its threads away
 /// and back, saying what runs in it while folded; its + starts a terminal there, or opens
 /// its notes, and leaves it open.
