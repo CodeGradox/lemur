@@ -93,10 +93,10 @@ impl Action {
         })
     }
 
-    /// The key that does it, as menus show it (`⌘T`).
-    pub fn key_label(self) -> Option<String> {
+    /// The key that does it, for a pop-up menu to show beside its item (⌘T).
+    pub fn key_equivalent(self) -> Option<rune::Shortcut> {
         let (_, _, _, key) = ACTIONS.iter().find(|(a, ..)| *a == self)?;
-        Some(Chord::parse((*key)?).ok()?.label())
+        (*key)?.replace("mod+", "cmd+").parse().ok()
     }
 }
 

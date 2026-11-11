@@ -388,7 +388,7 @@ impl Lemur {
 /// What can start in a folder, as a menu: a terminal or an agent at once, or one named in
 /// the spotlight, each with the key that does it for the thread on show.
 pub fn new_menu() -> PopupMenu {
-    let key = |a: super::Action| a.key_label().and_then(|k| k.parse().ok());
+    let key = |a: super::Action| a.key_equivalent();
     let mut terminal = PopupItem::new("new-terminal", "New terminal").symbol("apple.terminal");
     if let Some(k) = key(super::Action::NewTerminal) {
         terminal = terminal.key_equivalent(k);

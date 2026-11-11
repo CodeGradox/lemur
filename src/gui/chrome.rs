@@ -33,7 +33,7 @@ fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
     let mut menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…"));
     if s.place_of(key).is_some() {
         let mut new = PopupItem::new("new-terminal", "New terminal");
-        if let Some(k) = Action::NewTerminal.key_label().and_then(|k| k.parse().ok()) {
+        if let Some(k) = Action::NewTerminal.key_equivalent() {
             new = new.key_equivalent(k);
         }
         menu = menu.item(new);
@@ -43,7 +43,7 @@ fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
         menu = menu.item(PopupItem::new("silence", silence_label(t.silent)));
     }
     let mut close = PopupItem::new("close", "Close");
-    if let Some(k) = Action::CloseThread.key_label().and_then(|k| k.parse().ok()) {
+    if let Some(k) = Action::CloseThread.key_equivalent() {
         close = close.key_equivalent(k);
     }
     menu.item(PopupItem::new("put-away", "Put away")).item(close)

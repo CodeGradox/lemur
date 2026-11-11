@@ -984,3 +984,14 @@ fn a_working_tab_has_the_breathing_dot() {
     rt.window_focus(false);
     assert!(!breathes(&mut rt), "still, behind other apps");
 }
+
+/// The + menu shows the keys that do what it offers, as v2's did: ⌘T for a new terminal, ⌘J
+/// for one named. So do a tab's menu's New terminal and Close.
+#[test]
+fn the_new_menu_shows_its_keys() {
+    let key = |a: Action| format!("{:?}", a.key_equivalent().expect("a key"));
+    assert_eq!(key(Action::NewTerminal), format!("{:?}", "cmd+t".parse::<rune::Shortcut>().unwrap()));
+    let menu = format!("{:?}", super::prompt::new_menu());
+    assert!(menu.contains(&key(Action::NewTerminal)) && menu.contains(&key(Action::NewThreadHere)), "{menu}");
+    assert!(Action::CloseThread.key_equivalent().is_some());
+}
