@@ -1,16 +1,21 @@
 //! What the window knows of herdr-core: refreshes, the watch on its changes, the thread on
 //! show, and opening, closing and ordering threads.
 
-use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, key, move_item, sessions, watched, worktree_label};
+use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, Seen, key, move_item, sessions, watched, worktree_label};
 use crate::actions;
 use crate::attach::Active;
 use crate::config::{Agent, ThreadOrder};
 use crate::snapshot::{self, Activity, Session, Snapshot, Worktree};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Out of sight, the sidebar refreshes every this many REFRESH ticks.
 const AWAY: u32 = 5;
+
+/// How long a shell's command runs before its finishing is news: one done sooner, you
+/// likely saw.
+pub const COMMAND_NEWS: Duration = Duration::from_secs(10);
 
 impl Lemur {
     /// The ticks, the first of which refreshes, and the watch on herdr-core's changes.
@@ -197,26 +202,34 @@ impl Lemur {
         let before = std::mem::take(&mut self.seen);
         // Working -> idle is "finished"; anything -> waiting is "needs input".
         let mut news = vec![];
+        let mut seen = HashMap::new();
         for (k, s) in &now {
-            let was = before.get(k).copied().unwrap_or(Activity::Unknown);
-            let finished = was == Activity::Working && matches!(s.activity, Activity::Idle | Activity::Unknown);
+            let was = before.get(k);
+            let (doing, was_doing) = (s.doing(), was.map_or(Activity::Unknown, |w| w.doing));
+            let finished = was_doing == Activity::Working && matches!(doing, Activity::Idle | Activity::Unknown);
             if finished && self.active.as_ref() != Some(k) {
                 self.done.insert(k.clone());
                 // It ranks among the done now: Next Agent starts over.
                 self.agent_walk.clear();
             }
-            let asks = s.activity == Activity::NeedsInput && was != Activity::NeedsInput;
-            if (finished || asks) && !s.silent {
-                news.push((k.clone(), s.activity, s.waiting_for.clone()));
+            let asks = doing == Activity::NeedsInput && was_doing != Activity::NeedsInput;
+            // A shell's command is news once it's run a while; it says which it was.
+            let ran = was.and_then(|w| w.command.as_ref());
+            let told = ran.is_none_or(|(_, since)| since.elapsed() >= COMMAND_NEWS);
+            // Of what it ran: a Claude ended goes back to its shell.
+            let agent = if asks { s.agent() } else { was.and_then(|w| w.agent) };
+            if (finished && told || asks) && !s.silent && self.prefs.notifies(agent) {
+                let said = if asks { s.waiting_for.clone() } else { ran.map(|(command, _)| command.clone()) };
+                news.push((k.clone(), doing, said));
             }
+            // From when it started, whatever it ran after it.
+            let command = s.shell_runs().map(|c| (c.to_string(), ran.map_or_else(Instant::now, |(_, since)| *since)));
+            seen.insert(k.clone(), Seen { doing, agent: s.agent(), command });
         }
-        self.seen = before
-            .into_iter()
-            .filter(|(k, _)| unreached.contains(k.0.as_str()) && !now.contains_key(k))
-            .chain(now.iter().map(|(k, s)| (k.clone(), s.activity)))
-            .collect();
+        seen.extend(before.into_iter().filter(|(k, _)| unreached.contains(k.0.as_str()) && !now.contains_key(k)));
+        self.seen = seen;
         let kept = |k: &Key| unreached.contains(k.0.as_str()) && !now.contains_key(k);
-        self.done.retain(|k| kept(k) || now.get(k).is_some_and(|s| s.activity != Activity::Working));
+        self.done.retain(|k| kept(k) || now.get(k).is_some_and(|s| s.doing() != Activity::Working));
         let gone: Vec<Key> = self.popups().into_iter().filter(|k| !now.contains_key(k) && !kept(k)).collect();
         // Not one put away since: it stays away across restarts.
         let restore = self.restore.take().filter(|k| now.get(k).is_some_and(|s| !s.away) && self.active.is_none());

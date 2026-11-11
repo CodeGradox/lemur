@@ -10,6 +10,7 @@ mod agents;
 mod away;
 mod bg;
 mod card;
+mod carry;
 mod changes;
 mod changes_panel;
 mod chrome;
@@ -47,18 +48,19 @@ mod term_links;
 mod terminal;
 #[cfg(test)]
 mod tests;
+mod zoom;
 #[cfg(test)]
 mod parity_terminal_tests;
 #[cfg(test)]
 mod parity_differential_confirm;
 
 use crate::attach::Active;
-use crate::config::{Config, Host, Language, Terminal, ThemeChoice, ThreadOrder};
+use crate::config::{Agent, Config, Host, Language, Terminal, ThemeChoice, ThreadOrder};
 use crate::snapshot::{Activity, HostData, Session, Snapshot, Worktree};
 use bg::Bg;
-use rune::{AppSpec, Chrome, Cx, El, KeyEvent, Tx, Waker, el};
+use rune::{AppSpec, Cx, El, KeyEvent, Titlebar, Tx, Waker, el};
 use rune_kit::Kit;
-use rune_kit::shell::{PaneState, TabDragState};
+use rune_kit::shell::{PaneState, TOOLBAR_HEIGHT, TabDragState};
 use snackbar::Kind;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -98,6 +100,17 @@ pub enum Right {
 const SIDEBAR_WIDTH: f32 = 255.0;
 const NOTES_WIDTH: f32 = 360.0;
 
+/// What a thread was doing at a snapshot.
+#[derive(Clone, Debug)]
+struct Seen {
+    /// As its dot says (`Session::doing`).
+    doing: Activity,
+    /// The agent it ran; none for a shell.
+    agent: Option<Agent>,
+    /// The command its shell ran, the latest if it ran one after another, and since when.
+    command: Option<(String, Instant)>,
+}
+
 /// Lemur's settings, which Settings changes and the config file keeps.
 #[derive(Clone)]
 pub struct Prefs {
@@ -109,6 +122,12 @@ pub struct Prefs {
     pub codex_usage: bool,
     /// Milliseconds a notification shows before it goes by itself; 0 keeps it.
     pub notification_dismiss_ms: u32,
+    /// Which threads notify: Claude's, Codex's, and shells' as a command finishes.
+    pub claude_notifications: bool,
+    pub codex_notifications: bool,
+    pub shell_notifications: bool,
+    /// How large the window draws everything, 1 as it is.
+    pub zoom: f32,
     /// The config file that keeps changes; tests have none.
     file: Option<PathBuf>,
 }
@@ -123,7 +142,20 @@ impl Prefs {
             claude_usage: cfg.claude_usage,
             codex_usage: cfg.codex_usage,
             notification_dismiss_ms: cfg.notification_dismiss_ms,
+            claude_notifications: cfg.claude_notifications,
+            codex_notifications: cfg.codex_notifications,
+            shell_notifications: cfg.shell_notifications,
+            zoom: cfg.zoom.unwrap_or(1.0),
             file,
+        }
+    }
+
+    /// Whether threads running `agent`, or with none a shell, notify.
+    pub fn notifies(&self, agent: Option<Agent>) -> bool {
+        match agent {
+            Some(Agent::Claude) => self.claude_notifications,
+            Some(Agent::Codex) => self.codex_notifications,
+            None => self.shell_notifications,
         }
     }
 
@@ -171,7 +203,7 @@ pub struct Lemur {
     pub done: HashSet<Key>,
     /// What each thread was doing at the last snapshot, or before its host couldn't be
     /// reached.
-    seen: HashMap<Key, Activity>,
+    seen: HashMap<Key, Seen>,
     /// The agents in the order Next and Previous Agent go through them.
     agent_walk: Vec<Key>,
     /// Lists whose dragged order is being written to herdr-core, and the order dragged
@@ -235,6 +267,10 @@ pub struct Lemur {
     revealed: Option<(Key, f32)>,
     /// The tab the tab bar's ‹ or › last scrolled to (`chrome::scroll_arrows`).
     tab_aim: Option<String>,
+    /// macOS keeps the window's place and size, to open there next time.
+    frame_kept: bool,
+    /// Files to drag out to other apps, as far as they've got here.
+    carried: HashMap<carry::Carried, carry::Carry>,
     /// herdr-core tells of changes while this is set.
     watching: bool,
 }
@@ -364,6 +400,8 @@ impl Lemur {
             fitted: (sidebar_width, notes_width),
             revealed: None,
             tab_aim: None,
+            frame_kept: false,
+            carried: HashMap::new(),
             watching: false,
         }
     }
@@ -525,6 +563,9 @@ fn kit(s: &Lemur, cx: &Cx<Lemur>) -> (Kit, bool) {
 }
 
 fn view(s: &Lemur, cx: &mut Cx<Lemur>) -> El {
+    // Zoomed, the title bar's row is as much taller, and the traffic lights stay in its middle.
+    cx.zoom(s.prefs.zoom);
+    cx.titlebar_height(TOOLBAR_HEIGHT * s.prefs.zoom);
     let (k, dark) = kit(s, cx);
     let mut layer = Vec::new();
     let body = chrome::window(s, cx, &k, &mut layer);
@@ -610,6 +651,10 @@ fn poll(s: &mut Lemur, now: f64, tx: &mut Tx) -> bool {
     s.fit_panes();
     s.save_panel_widths();
     s.reveal_tab(tx);
+    // Once the window is there: it isn't in `setup`.
+    if !s.frame_kept && windowed() {
+        s.frame_kept = rune_mac::remember_frame("Lemur");
+    }
     changed |= s.expire_popups(now, tx);
     changed |= s.panels_poll(tx);
     changed
@@ -647,14 +692,34 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         min_size: Some((720.0, 480.0)),
         ..AppSpec::new("Lemur", (1280.0, 820.0), init, view)
     };
-    // No title bar, as in Herdr: the window's buttons sit in the sidebar's top row.
-    let chrome = Chrome { full_size_content: true, traffic_lights: Some((16.0, 17.0)), drag_regions: true };
+    // No title bar, as in Herdr: the window's buttons sit in the sidebar's top row, in its
+    // middle (`view` keeps the band as tall as the row, zoomed).
+    let titlebar = Titlebar::new(TOOLBAR_HEIGHT);
     CONFIG.set(cfg).ok();
-    let app = rune::App::new(spec).chrome(chrome).standard_menus().modifier_keys().on_ime(term_input::on_ime);
-    let mut app = actions::menus(app.on_modifiers(notes::modifiers));
-    notify::add_overlay(&mut app);
+    let app = rune::App::new(spec).titlebar(titlebar).standard_menus().modifier_keys().on_ime(term_input::on_ime);
+    let app = actions::menus(app.on_modifiers(notes::modifiers)).global_shortcut(SUMMON, summon);
+    let _ = WINDOWED.set(!rune::tooling::is_headless());
+    notify::start(&app);
     app.run();
     Ok(())
+}
+
+/// The key that brings Lemur forward to go to a thread, from any app.
+pub const SUMMON: &str = "ctrl+alt+mod+p";
+
+/// Lemur runs in a window of its own: not headless, nor in tests, which never call `run`.
+static WINDOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn windowed() -> bool {
+    WINDOWED.get().copied().unwrap_or(false)
+}
+
+/// `SUMMON`, from any app: Lemur comes forward, asking which thread to go to.
+fn summon(s: &mut Lemur, _: &mut Tx) {
+    if windowed() {
+        rune_mac::notify::bring_to_front();
+    }
+    s.find_thread();
 }
 
 /// The config `run` was given, for `init`, which Rune calls without arguments.

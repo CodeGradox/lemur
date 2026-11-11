@@ -20,6 +20,9 @@ const NUMBERED_TABS: usize = 9;
 const ARROW_GAP: f32 = 2.0;
 /// Points between the tabs and +, as the strip keeps before its own trailing action.
 const TAB_GAP: f32 = 6.0;
+/// A tab's width: its agent's icon and its number, as Herdr's tabs, since the sidebar and
+/// the terminal's header name the thread. Past 64 points the strip shows a tab's title.
+const TAB_WIDTH: f32 = 72.0;
 /// Points of window around the main pane, and between it and the sidebar: the sidebar's
 /// resize grip, as wide, so the gap shows where to drag.
 const FRAME: f32 = 6.0;
@@ -36,7 +39,7 @@ fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
         menu = menu.item(new);
     }
     menu = menu.separator();
-    if let Some(t) = s.session_of(key).filter(|t| t.agent().is_some()) {
+    if let Some(t) = s.session_of(key) {
         menu = menu.item(PopupItem::new("silence", silence_label(t.silent)));
     }
     let mut close = PopupItem::new("close", "Close");
@@ -79,7 +82,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
             let t = s.session_of(key)?;
             ids.push(key.1.clone());
             let shown = s.active.as_ref() == Some(key);
-            let status = match t.activity {
+            let status = match t.doing() {
                 Activity::NeedsInput => Some(TabItemStatus::Attention),
                 Activity::Working => Some(TabItemStatus::Busy),
                 _ if s.done.contains(key) => Some(TabItemStatus::Unread),
@@ -90,7 +93,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
             let menu = tab_menu(s, key);
             let menu_key = key.clone();
             let label = t.label.clone();
-            let mut item = TabItem::new(key.1.as_str(), t.label.as_str())
+            let mut item = TabItem::new(key.1.as_str(), (i + 1).to_string())
                 .avatar(agent_icon(t.agent(), k))
                 .status(status.filter(|st| !shown || *st == TabItemStatus::Busy));
             item = item.decorate(move |tab, _| {
@@ -103,7 +106,9 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
                         }
                     });
                 });
-                // Its name, its key and the issue pinned to it on hover; the tab stays narrow.
+                // Its name, its key and the issue pinned to it on hover, and its name to a
+                // screen reader: the tab shows its number.
+                let tab = tab.label(label_tip.clone());
                 let mut tip = label_tip;
                 if let Some(n) = number {
                     tip = format!("{tip}  ⌘{n}");
@@ -137,7 +142,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
         .label("Threads in this worktree")
         .tabs(items)
         .active(Some(active.1.as_str()))
-        .overflow(TabOverflow::ShrinkThenScroll { min_width: 44.0, max_width: 180.0, pinned_width: 36.0, fade_width: 24.0 })
+        .overflow(TabOverflow::ShrinkThenScroll { min_width: TAB_WIDTH, max_width: TAB_WIDTH, pinned_width: 36.0, fade_width: 24.0 })
         .drag_state(&s.tab_drag, |s: &mut Lemur| &mut s.tab_drag)
         .close_icon(&icons::X)
         .on_select(move |s: &mut Lemur, id, _| s.open(host.clone(), id.to_string()))
@@ -156,10 +161,14 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
             let (Some(from), Some(to)) = (at(&numbered[r.from]), at(&numbered[r.to])) else { return };
             s.reorder(list.clone(), from, to);
         });
-    // In the background a working tab's dot holds still, as the sidebar's does.
-    if !s.looking {
-        strip = strip.busy_indicator(|k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), false));
-    }
+    // A working tab has the sidebar's dot, not the kit's ring: breathing, and holding still
+    // in the background, as the sidebar's does.
+    let working: fn(&Kit) -> El = if s.looking {
+        |k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), true)
+    } else {
+        |k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), false)
+    };
+    strip = strip.busy_indicator(working);
     // + after the arrows, as the strip's own trailing action would sit inside them.
     Some(row().key("tab-row").shrink().min_w(0.0).gap(TAB_GAP).center_y().child(scroll_arrows(strip.build(k), &ids, s.tab_aim.as_deref(), k)).children(plus))
 }

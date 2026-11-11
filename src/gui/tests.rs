@@ -59,6 +59,7 @@ pub(super) fn session(name: &str, activity: Activity) -> Session {
         started: 0,
         claude: None,
         busy: false,
+        command: None,
         running: true,
         pid: None,
         shell: None,
@@ -893,4 +894,93 @@ fn projects_take_a_color_and_lines_part_them() {
     click(&mut rt, "project-menu-1");
     rt.resolve_popup(Some("color:gray")).unwrap();
     assert_eq!(rt.state.cfg.bases[1].color, None, "gray is no colour of its own");
+}
+
+/// The key that works from any app asks which thread to go to.
+#[test]
+fn the_key_from_any_app_asks_which_thread() {
+    let mut rt = window(toml::from_str("").unwrap());
+    rt.update(super::summon);
+    assert!(rt.state.prompt.as_ref().is_some_and(|p| p.what == super::prompt::Ask::Find), "Go to thread");
+    assert!(rune::Chord::parse(super::SUMMON).is_ok(), "the Shortcuts page shows it");
+}
+
+/// A file's path a terminal printed, held with ⌘, is got ready to drag to another app, and
+/// drawn again over the terminal for the pointer to lift; a click on it still previews it.
+#[test]
+fn a_printed_path_held_with_cmd_drags_out() {
+    let dir = crate::test_support::TempDir::new("dragout");
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "hi").unwrap();
+    let script = format!("printf '%s\\n' '{}'; exec sleep 600", file.display());
+    let (_server, mut rt, k) = printed("rdragout", &script, "notes.txt");
+    let row = row_of(&rt, &k, "notes.txt");
+    let (x, y) = cell_point(&rt, 3, row);
+    let cmd = Mods { cmd: true, logo: true, ..Mods::default() };
+    rt.physical_input(rune::PhysicalInput::Modifiers(cmd));
+    rt.pointer_move(x, y);
+    rt.frame(1.0 / 60.0);
+    let carried = (k.0.clone(), Some(k.1.clone()), file.display().to_string());
+    assert!(wait_for(&mut rt, 10.0, |s| s.drag_item(&carried, rune::Color::BLACK).is_some()), "ready to drag");
+    let item = rt.state.drag_item(&carried, rune::Color::BLACK).unwrap();
+    assert_eq!(item.paths(), [std::fs::canonicalize(&file).unwrap()], "the file itself, on this Mac");
+    let lifted = rt.elements().into_iter().find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("link-drag-")));
+    assert!(lifted.is_some(), "the path drawn over the terminal");
+}
+
+/// A shell thread's dot is green while it runs a command, saying which, as its tab's is, and
+/// blue once it's done out of sight.
+#[test]
+fn a_shell_running_a_command_has_the_working_dot() {
+    let server = HcServer::new("rshelldot");
+    let mut rt = window(server.config());
+    let put = |rt: &mut Runtime<Lemur>, command: Option<&str>| {
+        let mut snap = made_up(&[("a", Activity::Unknown), ("b", Activity::Unknown)]);
+        snap.hosts[0].other[1].command = command.map(String::from);
+        rt.update(|s, _| s.set_snapshot(snap));
+        rt.frame(1.0 / 60.0);
+    };
+    // What the dots say, in the sidebar's row for b and in its tab.
+    let says = |rt: &mut Runtime<Lemur>, of: &str| {
+        rt.frame(1.0 / 60.0);
+        let live = rt.elements().into_iter().filter(|e| !e.exiting);
+        live.filter(|e| e.path.contains(of)).filter_map(|e| e.help).collect::<Vec<_>>()
+    };
+    put(&mut rt, Some("sleep"));
+    open(&mut rt, "a");
+    let row = rt.elements().into_iter().find(|e| e.help.as_deref() == Some("Running sleep")).map(|e| e.path);
+    assert!(row.is_some_and(|p| !p.contains("t-b")), "the sidebar's dot says what runs");
+    assert!(says(&mut rt, "t-b").contains(&"Working".to_string()), "the tab's breathes");
+    put(&mut rt, None);
+    let all = says(&mut rt, "");
+    assert!(all.contains(&"Done".to_string()) && !all.contains(&"Running sleep".to_string()), "{all:?}");
+}
+
+/// A working thread's tab has the sidebar's dot, breathing while Lemur is in front and still
+/// behind other apps, not the kit's spinning ring.
+#[test]
+fn a_working_tab_has_the_breathing_dot() {
+    let server = HcServer::new("rtabdot");
+    let mut rt = window(server.config());
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Working)]);
+    open(&mut rt, "a");
+    // The dot's opacity a little apart, once it's settled: it changes while it breathes.
+    let breathes = |rt: &mut Runtime<Lemur>| {
+        let opacity = |rt: &mut Runtime<Lemur>| {
+            let tab = rt.elements().into_iter().filter(|e| e.path.contains("t-b") && !e.exiting).collect::<Vec<_>>();
+            tab.iter().find(|e| e.help.as_deref() == Some("Working")).map(|e| e.opacity).expect("the tab's dot")
+        };
+        for _ in 0..120 {
+            rt.frame(1.0 / 60.0);
+        }
+        let before = opacity(rt);
+        for _ in 0..25 {
+            rt.frame(1.0 / 60.0);
+        }
+        (opacity(rt) - before).abs() > 0.01
+    };
+    rt.window_focus(true);
+    assert!(breathes(&mut rt), "breathing");
+    rt.window_focus(false);
+    assert!(!breathes(&mut rt), "still, behind other apps");
 }

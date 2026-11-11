@@ -857,8 +857,26 @@ fn terminal(host: &Host, session: &str) -> Result<hc::Terminal> {
 /// relative path is from the session's current folder, as Claude prints
 /// them.
 pub fn download(host: &Host, session: &str, path: &str) -> Result<PathBuf> {
+    copy_here(host, &printed_path(host, session, path, true)?)
+}
+
+/// A file on `host` as a file on this Mac, to drag to another app: on this Mac, the file
+/// itself; on another host, a copy (as `download` makes). With `session`, the path is as it
+/// printed it; without, the whole path.
+pub fn file_here(host: &Host, session: Option<&str>, path: &str) -> Result<PathBuf> {
+    let local = Remote::new(host).is_local();
+    match session {
+        Some(session) if local => Ok(PathBuf::from(printed_path(host, session, path, true)?)),
+        Some(session) => download(host, session, path),
+        None if local => Ok(PathBuf::from(path)),
+        None => copy_here(host, path),
+    }
+}
+
+/// Copies the file at `remote` on `host` into a temporary folder that mirrors the host's,
+/// and returns where it went.
+fn copy_here(host: &Host, remote: &str) -> Result<PathBuf> {
     let r = Remote::new(host);
-    let remote = &printed_path(host, session, path, true)?;
     // Only the folders' names: `..` can't climb out.
     let mirrored: PathBuf = Path::new(remote)
         .components()

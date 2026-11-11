@@ -152,10 +152,11 @@ pub fn age(secs: u64) -> String {
 }
 
 impl Lemur {
-    /// A thread's dot: its colour, what it says, and whether it breathes (while working).
+    /// A thread's dot: its colour, what it says, and whether it breathes (while working, or
+    /// while its shell runs a command).
     pub fn activity(&self, key: &Key, s: &Session, k: &Kit) -> (Color, String, bool) {
         let c = &k.c;
-        match s.activity {
+        match s.doing() {
             Activity::NeedsInput => (
                 c.warning.icon,
                 match &s.waiting_for {
@@ -165,7 +166,10 @@ impl Lemur {
                 false,
             ),
             // Still while Lemur is in the background: breathing, it would draw every frame.
-            Activity::Working => (c.success.icon, "Working".into(), self.looking),
+            Activity::Working => {
+                let says = s.shell_runs().map_or_else(|| "Working".into(), |command| format!("Running {command}"));
+                (c.success.icon, says, self.looking)
+            }
             _ if self.done.contains(key) => (c.info.icon, "Done".into(), false),
             Activity::Idle => (c.text_muted.alpha(0.5), "Idle".into(), false),
             Activity::Unknown => (c.text_muted.alpha(0.5), "No Claude found".into(), false),
@@ -182,12 +186,11 @@ pub fn status_dot(color: Color, tip: String, breathes: bool) -> El {
 
 /// What a right click on a thread offers, and what it runs.
 fn thread_menu(s: &Session) -> PopupMenu {
-    let mut menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…")).item(PopupItem::new("peek", "Peek"));
-    // Only an agent has anything to notify of.
-    if s.agent().is_some() {
-        menu = menu.item(PopupItem::new("silence", silence_label(s.silent)));
-    }
-    menu.item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") })
+    PopupMenu::new()
+        .item(PopupItem::new("rename", "Rename…"))
+        .item(PopupItem::new("peek", "Peek"))
+        .item(PopupItem::new("silence", silence_label(s.silent)))
+        .item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") })
 }
 
 fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {

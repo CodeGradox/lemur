@@ -353,8 +353,8 @@ fn the_status_bar_says_how_many_need_you() {
     assert_eq!(info(&rt, "needs-you").and_then(|e| e.text).as_deref(), Some("1 needs you"), "one does");
 }
 
-/// A tab is as narrow with a long name as with a short one: hovered it says the name, and
-/// the terminal's header names the thread on show.
+/// A tab is as narrow with a long name as with a short one, and shows its number, as ⌘1 to
+/// ⌘9 take it: hovered it says the name, and the terminal's header names the thread on show.
 #[test]
 fn a_threads_name_is_on_hover_and_in_the_header() {
     let server = HcServer::new("pnames");
@@ -370,6 +370,8 @@ fn a_threads_name_is_on_hover_and_in_the_header() {
     let width = |rt: &Runtime<Lemur>, k: &str| rt.presented(k).unwrap_or_else(|| panic!("{k}")).0[2];
     let (short, wide) = (width(&rt, "t-a"), width(&rt, "t-b"));
     assert!((wide - short).abs() < 4.0, "{short} {wide}");
+    let shows = |rt: &Runtime<Lemur>, k: &str| rt.elements().into_iter().filter(|e| e.path.contains(k) && !e.exiting).filter_map(|e| e.text).collect::<Vec<_>>();
+    assert_eq!((shows(&rt, "t-a"), shows(&rt, "t-b")), (vec!["1".to_string()], vec!["2".to_string()]), "their numbers, not their names");
     let header = |rt: &Runtime<Lemur>| info(rt, "header-name").and_then(|e| e.text);
     assert_eq!(header(&rt).as_deref(), Some("ab"));
     let helps: Vec<String> = rt.elements().into_iter().filter(|e| !e.exiting).filter_map(|e| e.help).collect();
@@ -1464,7 +1466,8 @@ fn cmd_j_and_cmd_p_go_to_threads() {
 
 /// The Shortcuts page's keys for the window, the threads and dictation are bound: each does
 /// something, by an action's key or one the window takes itself, but for the app menu's
-/// (⌘H, ⌥⌘H, ⌘Q, which macOS's standard menus give) and Esc (which closes what's open).
+/// (⌘H, ⌥⌘H, ⌘Q, which macOS's standard menus give), Esc (which closes what's open) and
+/// the key from any app, which macOS hands Lemur (`the_key_from_any_app_asks_which_thread`).
 #[test]
 fn the_shortcuts_page_shows_bound_keys() {
     use super::settings::shortcuts_for_tests as shortcuts;
@@ -1477,7 +1480,7 @@ fn the_shortcuts_page_shows_bound_keys() {
             continue;
         }
         for chord in keys {
-            if ["escape", "mod+h", "alt+mod+h", "mod+q"].contains(&chord) {
+            if ["escape", "mod+h", "alt+mod+h", "mod+q", super::SUMMON].contains(&chord) {
                 continue;
             }
             let ev = match chord.strip_prefix("mod+") {

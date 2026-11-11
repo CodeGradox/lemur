@@ -608,6 +608,24 @@ fn row_el(id: &str, y: usize, row: &Row, m: Metrics) -> El {
     e
 }
 
+/// The text of `row` from column `start` up to `end`, run by run: where each part starts,
+/// it, and its run. A run of wide characters goes whole or not at all.
+fn span_runs(row: &Row, start: u16, end: u16) -> Vec<(u16, String, &super::grid::Run)> {
+    row.runs
+        .iter()
+        .filter(|r| r.col < end && r.col + r.cells > start)
+        .filter_map(|r| {
+            if r.text.chars().count() == usize::from(r.cells) {
+                let from = start.max(r.col);
+                let words: String = r.text.chars().skip(usize::from(from - r.col)).take(usize::from(end.min(r.col + r.cells) - from)).collect();
+                Some((from, words, r))
+            } else {
+                (r.col >= start).then(|| (r.col, r.text.clone(), r))
+            }
+        })
+        .collect()
+}
+
 /// The character in cell (`x`, `y`), and the run it's in.
 fn under_cursor(rows: &[Row], x: u16, y: u16) -> Option<(String, &super::grid::Run)> {
     let r = rows.get(usize::from(y))?.runs.iter().find(|r| (r.col..r.col + r.cells).contains(&x))?;
@@ -635,6 +653,25 @@ pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El
     for (i, &(row, start, end)) in view.hover.iter().flat_map(|link| &link.spans).enumerate() {
         let (x, w) = (f32::from(start) * m.cell_w, f32::from(end - start) * m.cell_w);
         rows = rows.child(el().key(format!("link-{id}-{i}")).absolute(x, f32::from(row + 1) * m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
+    }
+    // A file's path held with ⌘ drags to other apps, and a click on it previews it, as on the
+    // terminal under it: the path, drawn again over it, is what the pointer lifts.
+    for (i, &(row, start, end)) in view.hover.iter().filter(|link| link.file).flat_map(|link| &link.spans).enumerate() {
+        let Some(link) = &view.hover else { break };
+        let (x, y, w) = (f32::from(start) * m.cell_w, f32::from(row) * m.cell_h, f32::from(end - start) * m.cell_w);
+        let mut lifted = el().key(format!("link-drag-{id}-{i}")).absolute(x, y).size(w, m.cell_h).fill(grid.bg).cursor(rune::Cursor::Pointer);
+        for (col, words, r) in grid.rows.get(usize::from(row)).map(|r| span_runs(r, start, end)).unwrap_or_default() {
+            let style = if r.italic { m.style(r.bold).italic() } else { m.style(r.bold) };
+            lifted = lifted.child(text(words).font(style).color(r.fg).absolute(f32::from(col - start) * m.cell_w, 0.0));
+        }
+        let carried: super::carry::Carried = (view.host.name.clone(), Some(view.session.clone()), link.url.clone());
+        let (key, url, backing) = ((view.host.name.clone(), view.session.clone()), link.url.clone(), grid.bg);
+        rows = rows.child(
+            lifted
+                .child(el().absolute(0.0, m.cell_h - 2.0).size(w, 1.0).fill(grid.fg))
+                .drag_out(move |s: &Lemur| s.drag_item(&carried, backing))
+                .on_press(move |s: &mut Lemur| s.preview(key.clone(), url.clone())),
+        );
     }
     if let Some((x, y)) = grid.caret {
         let (cx, cy) = (f32::from(x) * m.cell_w, f32::from(y) * m.cell_h);

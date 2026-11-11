@@ -141,6 +141,11 @@ impl Lemur {
             && view.hover != link
         {
             view.hover = link;
+            // A file's path drags to other apps: it's got ready while the pointer is on it.
+            if let Some(url) = view.hover.as_ref().filter(|l| l.file).map(|l| l.url.clone()) {
+                let (host, session) = (view.host.clone(), view.session.clone());
+                self.ready_to_drag(&host, Some(session), url);
+            }
         }
     }
 
@@ -258,7 +263,7 @@ impl Lemur {
 
     /// Copies a file the session printed the path of from the host, then shows it with
     /// Quick Look.
-    fn preview(&mut self, key: Key, path: String) {
+    pub(super) fn preview(&mut self, key: Key, path: String) {
         let Some(view) = self.terminals.get_mut(&key) else { return };
         let (host, session) = (view.host.clone(), view.session.clone());
         view.status = Some((format!("downloading {path}…"), Kind::Progress));

@@ -46,6 +46,9 @@ pub struct Config {
     /// The notes panel's width in pixels, as last dragged.
     #[serde(default)]
     pub notes_width: Option<f32>,
+    /// How large the window draws everything, as ⌘+ and ⌘− set it: 1.25 is 125%. Unset is 100%.
+    #[serde(default)]
+    pub zoom: Option<f32>,
     #[serde(default)]
     pub terminal: Terminal,
     /// Whether the sidebar shows how much of Claude's plan is used; off
@@ -59,6 +62,14 @@ pub struct Config {
     /// it until it's dismissed.
     #[serde(default)]
     pub notification_dismiss_ms: u32,
+    /// Which threads notify: Claude's and Codex's when they finish or need input, and a
+    /// shell's when a command finishes. All do until turned off in Settings.
+    #[serde(default = "notifies")]
+    pub claude_notifications: bool,
+    #[serde(default = "notifies")]
+    pub codex_notifications: bool,
+    #[serde(default = "notifies")]
+    pub shell_notifications: bool,
     /// The sidebar's foot, minimized to one line each: Claude's usage, Codex's,
     /// and the hosts' load by host name.
     #[serde(default)]
@@ -336,6 +347,10 @@ fn default_claude() -> String {
 
 fn default_codex() -> String {
     "codex".into()
+}
+
+fn notifies() -> bool {
+    true
 }
 
 fn default_worktree_dir() -> String {
@@ -621,6 +636,35 @@ impl Config {
                 doc.remove("notification_dismiss_ms");
             } else {
                 doc["notification_dismiss_ms"] = toml_edit::value(i64::from(ms));
+            }
+            Ok(())
+        })
+    }
+
+    /// Saves the window's zoom to the config file at `path`, to the hundredth: 100% goes
+    /// without saying.
+    pub fn save_zoom(path: &Path, zoom: f32) -> Result<()> {
+        edit(path, |doc| {
+            let zoom = (f64::from(zoom) * 100.0).round() / 100.0;
+            if zoom == 1.0 {
+                doc.remove("zoom");
+            } else {
+                doc["zoom"] = toml_edit::value(zoom);
+            }
+            Ok(())
+        })
+    }
+
+    /// Saves which threads notify, Claude's, Codex's and shells', to the config file at
+    /// `path`. Notifying, the default, goes without saying.
+    pub fn save_notifications(path: &Path, claude: bool, codex: bool, shell: bool) -> Result<()> {
+        edit(path, |doc| {
+            for (key, on) in [("claude_notifications", claude), ("codex_notifications", codex), ("shell_notifications", shell)] {
+                if on {
+                    doc.remove(key);
+                } else {
+                    doc[key] = toml_edit::value(false);
+                }
             }
             Ok(())
         })
@@ -1062,6 +1106,44 @@ path = \"~/projects/api\"
         Config::save_notification_dismiss(&path, 0).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("notification_dismiss"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_the_zoom_keeps_it_to_the_hundredth() {
+        let path = std::env::temp_dir().join(format!("lemur-zoom-{}.toml", std::process::id()));
+        std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.zoom, None, "unset, 100%");
+        Config::save_zoom(&path, 1.1).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("zoom = 1.1\n"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.zoom, Some(1.1));
+        assert_eq!(cfg.hosts[0].name, "agent");
+        Config::save_zoom(&path, 1.0).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("zoom"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_which_threads_notify_keeps_only_those_turned_off() {
+        let path = std::env::temp_dir().join(format!("lemur-notify-{}.toml", std::process::id()));
+        std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let all = |cfg: &Config| (cfg.claude_notifications, cfg.codex_notifications, cfg.shell_notifications);
+        assert_eq!(all(&cfg), (true, true, true), "unset, all notify");
+        Config::save_notifications(&path, true, false, false).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("codex_notifications = false\nshell_notifications = false\n"), "{saved}");
+        assert!(!saved.contains("claude_notifications"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(all(&cfg), (true, false, false));
+        assert_eq!(cfg.hosts[0].name, "agent");
+
+        Config::save_notifications(&path, true, true, true).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("notifications"), "{saved}");
         let _ = std::fs::remove_file(path);
     }
 

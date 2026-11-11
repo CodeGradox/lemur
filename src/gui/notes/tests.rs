@@ -469,6 +469,7 @@ fn session(name: &str) -> Session {
         started: 0,
         claude: None,
         busy: false,
+        command: None,
         running: true,
         pid: None,
         shell: None,

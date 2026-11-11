@@ -762,3 +762,32 @@ fn a_commit_message_keeps_the_keyboard_only_in_its_worktree() {
     assert!(!rt.state.committing(), "the terminal took it");
     assert!(rt.state.keyboard_on_terminal());
 }
+
+/// A changed file drags to other apps once the pointer has been over its row; a deleted one,
+/// gone from the worktree, doesn't.
+#[test]
+fn a_changed_file_drags_out() {
+    let server = HcServer::new("changes-drag");
+    let host = server.config().hosts.remove(0);
+    let dir = TempDir::new("changes-drag");
+    let repo = dir.join("repo");
+    committed(&repo, &[("a.txt", "one\n"), ("b.txt", "one\n")]);
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    std::fs::remove_file(repo.join("b.txt")).unwrap();
+    let mut rt = window(server.config());
+    panel_on(&mut rt, &host, &repo);
+    assert!(wait_for(&mut rt, 10.0, |s| files(s).len() == 2), "{:?}", listed(&rt));
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    let carried = |name: &str| (host.name.clone(), None, format!("{}/{name}", repo.display()));
+    for row in ["change-0", "change-1"] {
+        let (x, y) = rt.find(row).unwrap_or_else(|| panic!("no {row}"));
+        rt.pointer_move(x, y);
+        rt.frame(1.0 / 60.0);
+    }
+    let (a, b) = (carried("a.txt"), carried("b.txt"));
+    assert!(wait_for(&mut rt, 10.0, |s| s.drag_item(&a, rune::Color::BLACK).is_some()), "a.txt ready");
+    assert_eq!(rt.state.drag_item(&a, rune::Color::BLACK).unwrap().paths(), [repo.join("a.txt")]);
+    assert!(rt.state.drag_item(&b, rune::Color::BLACK).is_none(), "b.txt is gone");
+}

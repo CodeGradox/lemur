@@ -10,6 +10,7 @@
 
 use super::palette::{Palette, Rgb, SLOTS, Slot, hex, rgb, set_color};
 use super::terminal::Metrics;
+use super::core::COMMAND_NEWS;
 use super::{Lemur, icons};
 use crate::config::{Agent, Config, FONT_SIZES, Language, SCROLLBACKS, ThemeChoice, ThreadOrder, parse_hex};
 use crate::core_update::{self, Versions};
@@ -142,6 +143,22 @@ impl Lemur {
     fn set_dismiss(&mut self, ms: u32) {
         self.prefs.notification_dismiss_ms = ms;
         let saved = self.prefs.config_file().map(|file| Config::save_notification_dismiss(file, ms));
+        self.panels.settings.error = match saved {
+            Some(Err(e)) => Some(format!("{e:#}")),
+            _ => None,
+        };
+    }
+
+    /// Whether threads running `agent`, or with none a shell, notify: a notification out
+    /// stays till it's answered.
+    fn set_notifies(&mut self, agent: Option<Agent>, on: bool) {
+        let p = &mut self.prefs;
+        match agent {
+            Some(Agent::Claude) => p.claude_notifications = on,
+            Some(Agent::Codex) => p.codex_notifications = on,
+            None => p.shell_notifications = on,
+        }
+        let saved = p.config_file().map(|file| Config::save_notifications(file, p.claude_notifications, p.codex_notifications, p.shell_notifications));
         self.panels.settings.error = match saved {
             Some(Err(e)) => Some(format!("{e:#}")),
             _ => None,
@@ -482,8 +499,36 @@ fn notifications(s: &Lemur, k: &Kit) -> Vec<El> {
     let st = &s.panels.settings;
     let ok = st.dismiss.text.trim().parse::<u32>().is_ok();
     let after = stepper("dismiss", &st.dismiss, |s| &mut s.panels.settings.dismiss, Lemur::dismiss_typed, Lemur::step_dismiss, !ok, k);
-    let help = "Milliseconds a notification shows before it goes by itself. 0 keeps it until you dismiss it. Silence a thread to have none from it.";
-    vec![group(None, None, vec![item("dismiss", "Dismiss after (ms)", after, Some(help.into()), k)], k)]
+    let help = "Milliseconds before Lemur takes a notification away, from Notification Center too. 0 leaves it until you clear it or open its thread. System Settings › Notifications › Lemur says whether it shows as a banner or an alert. Silence a thread to have none from it.";
+    let which = [Some(Agent::Claude), Some(Agent::Codex), None].map(|agent| notifies(s, agent, k)).into();
+    vec![
+        group(Some("Notify of"), None, which, k),
+        group(None, None, vec![item("dismiss", "Dismiss after (ms)", after, Some(help.into()), k)], k),
+    ]
+}
+
+/// Whether threads running `agent`, or with none a shell, notify.
+fn notifies(s: &Lemur, agent: Option<Agent>, k: &Kit) -> El {
+    let on = s.prefs.notifies(agent);
+    let (id, title, help) = match agent {
+        Some(Agent::Claude) => ("notify-claude", "Claude", "A Claude thread finishing or needing input.".to_string()),
+        Some(Agent::Codex) => ("notify-codex", "Codex", "A Codex thread finishing or needing input.".to_string()),
+        None => (
+            "notify-shell",
+            "Shell commands",
+            format!(
+                "A command finishing in a shell thread, once it has run {} seconds. Editors, pagers, ssh and the like wait on you, so they don't count.",
+                COMMAND_NEWS.as_secs()
+            ),
+        ),
+    };
+    let switch = Switch::new(on)
+        .label(title)
+        .hide_label()
+        .on_toggle(move |s: &mut Lemur| s.set_notifies(agent, !on))
+        .build(k)
+        .key(format!("settings-{id}"));
+    item(id, title, switch, Some(help), k)
 }
 
 fn terminal(s: &Lemur, k: &Kit) -> Vec<El> {

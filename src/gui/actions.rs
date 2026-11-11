@@ -29,6 +29,9 @@ pub enum Action {
     MoveTabRight,
     NextAgent,
     PreviousAgent,
+    ZoomIn,
+    ZoomOut,
+    ActualSize,
     UpdateCore,
     GoToTab(usize),
     /// ⌘⏎: what was dictated goes to the thread on show.
@@ -60,6 +63,9 @@ pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
     (Action::MoveTabRight, "Move Tab Right", "View", Some("mod+shift+right")),
     (Action::NextAgent, "Next Agent", "View", None),
     (Action::PreviousAgent, "Previous Agent", "View", None),
+    (Action::ZoomIn, "Zoom In", "View", Some("mod+=")),
+    (Action::ZoomOut, "Zoom Out", "View", Some("mod+-")),
+    (Action::ActualSize, "Actual Size", "View", Some("mod+0")),
 ];
 
 impl Action {
@@ -73,6 +79,10 @@ impl Action {
         }
         if Chord::parse("mod+,").is_ok_and(|c| c.matches_tx(ev, tx)) {
             return Some(Action::Settings);
+        }
+        // ⌘+ too, as a keyboard with a + key of its own (a Norwegian one) types it.
+        if Chord::parse("mod+plus").is_ok_and(|c| c.matches_tx(ev, tx)) {
+            return Some(Action::ZoomIn);
         }
         if Chord::parse("mod+enter").is_ok_and(|c| c.matches_tx(ev, tx)) {
             return Some(Action::PasteDictation);
@@ -120,6 +130,9 @@ pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
         Action::MoveTabRight => s.move_tab(false),
         Action::NextAgent => s.next_agent(false),
         Action::PreviousAgent => s.next_agent(true),
+        Action::ZoomIn => s.step_zoom(false),
+        Action::ZoomOut => s.step_zoom(true),
+        Action::ActualSize => s.set_zoom(1.0),
         Action::UpdateCore => s.update_core(),
         Action::GoToTab(i) => s.go_to_tab(i),
         Action::PasteDictation => s.paste_dictation(),
@@ -157,6 +170,9 @@ menu_fn! {
     m_tab_right => Action::MoveTabRight;
     m_next_agent => Action::NextAgent;
     m_previous_agent => Action::PreviousAgent;
+    m_zoom_in => Action::ZoomIn;
+    m_zoom_out => Action::ZoomOut;
+    m_actual_size => Action::ActualSize;
 }
 
 fn m_about(s: &mut Lemur, _: &mut Tx) {
@@ -203,6 +219,9 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
         (Action::MoveTabRight, m_tab_right),
         (Action::NextAgent, m_next_agent),
         (Action::PreviousAgent, m_previous_agent),
+        (Action::ZoomIn, m_zoom_in),
+        (Action::ZoomOut, m_zoom_out),
+        (Action::ActualSize, m_actual_size),
     ];
     let mut app = app
         .menu_item(MenuItem::new("About Lemur", m_about).id("about"))

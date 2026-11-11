@@ -355,8 +355,8 @@ impl Lemur {
 }
 
 /// A changed file's row: git's letter for the change, its folder and name, and its lines
-/// added and removed.
-fn file_row(i: usize, f: &Change, shown: bool, k: &Kit) -> El {
+/// added and removed. One still there, in worktree `root` on `host`, drags to other apps.
+fn file_row(i: usize, f: &Change, shown: bool, (host, root): (&Host, &str), k: &Kit) -> El {
     let c = &k.c;
     let color = match f.status {
         'A' | '?' => c.success.fg,
@@ -390,7 +390,19 @@ fn file_row(i: usize, f: &Change, shown: bool, k: &Kit) -> El {
         r = r.child(text(format!("-{n}")).font(k.ty.small).color(c.danger.fg));
     }
     let path = f.path.clone();
-    let r = k.interactive(r).on_press(move |s: &mut Lemur| s.toggle_file(path.clone()));
+    let mut r = k.interactive(r).on_press(move |s: &mut Lemur| s.toggle_file(path.clone()));
+    if f.status != 'D' {
+        let file = format!("{}/{}", root.trim_end_matches('/'), f.path);
+        let carried: super::carry::Carried = (host.name.clone(), None, file.clone());
+        let (host, backing) = (host.clone(), c.bg_base);
+        r = r
+            .on_hover_change(move |s: &mut Lemur, inside, _| {
+                if inside {
+                    s.ready_to_drag(&host, None, file.clone());
+                }
+            })
+            .drag_out(move |s: &Lemur| s.drag_item(&carried, backing));
+    }
     if shown { r.fill(c.pressed) } else { r }
 }
 
@@ -406,7 +418,10 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
         _ if p.files.is_empty() => Some("No changes since the last commit.".into()),
         _ => None,
     };
-    let rows = p.files.iter().enumerate().map(|(i, f)| file_row(i, f, p.open.as_deref() == Some(&f.path), k));
+    let rows = p.files.iter().enumerate().filter_map(|(i, f)| {
+        let (host, root, _) = p.place.as_ref()?;
+        Some(file_row(i, f, p.open.as_deref() == Some(&f.path), (host, root), k))
+    });
     let mut list = col().key("changes-files").w_full().px(8.0).pb(4.0).gap(2.0).children(rows);
     if let Some(e) = empty {
         list = list.child(text(e).font(k.ty.small).color(c.text_muted).wrap().px(4.0).py(4.0));
