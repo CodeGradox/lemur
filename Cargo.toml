@@ -23,10 +23,10 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDictionary", "NSString", "NSUserDefaults", "NSValue"] }
 png = "0.18.1"
 # The window: Rune draws it, rune-kit has its controls. Rune is pre-release: a rev of `dev`.
-rune = { git = "https://github.com/anomalyco/rune", rev = "c382cb17886e0ad862e2c788ab64ead60e466a73", features = ["native-file-dialog"] }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "c382cb17886e0ad862e2c788ab64ead60e466a73", features = ["markdown"] }
+rune = { git = "https://github.com/anomalyco/rune", rev = "24bd7bbb60db77a4149e64318a3df6fccbee54d1", features = ["native-file-dialog"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "24bd7bbb60db77a4149e64318a3df6fccbee54d1", features = ["markdown"] }
 # The window's place kept across launches, and macOS's notifications.
-rune-mac = { git = "https://github.com/anomalyco/rune", rev = "c382cb17886e0ad862e2c788ab64ead60e466a73" }
+rune-mac = { git = "https://github.com/anomalyco/rune", rev = "24bd7bbb60db77a4149e64318a3df6fccbee54d1" }
 # The Keychain, so only Lemur can read its Linear sign-in.
 security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }

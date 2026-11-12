@@ -370,7 +370,10 @@ fn a_threads_name_is_on_hover_and_in_the_header() {
     let width = |rt: &Runtime<Lemur>, k: &str| rt.presented(k).unwrap_or_else(|| panic!("{k}")).0[2];
     let (short, wide) = (width(&rt, "t-a"), width(&rt, "t-b"));
     assert!((wide - short).abs() < 4.0, "{short} {wide}");
-    let shows = |rt: &Runtime<Lemur>, k: &str| rt.elements().into_iter().filter(|e| e.path.contains(k) && !e.exiting).filter_map(|e| e.text).collect::<Vec<_>>();
+    // The tab keeps its title under the pointer too, faded out until it's there.
+    let shows = |rt: &Runtime<Lemur>, k: &str| {
+        rt.elements().into_iter().filter(|e| e.path.contains(k) && !e.exiting && e.opacity > 0.0).filter_map(|e| e.text).collect::<Vec<_>>()
+    };
     assert_eq!((shows(&rt, "t-a"), shows(&rt, "t-b")), (vec!["1".to_string()], vec!["2".to_string()]), "their numbers, not their names");
     let header = |rt: &Runtime<Lemur>| info(rt, "header-name").and_then(|e| e.text);
     assert_eq!(header(&rt).as_deref(), Some("ab"));

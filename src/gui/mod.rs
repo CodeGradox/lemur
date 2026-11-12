@@ -490,7 +490,7 @@ impl Lemur {
         if self.window_w > 0.0 {
             let fit = |pane: &PaneState, wanted: f32, other: f32, (min, max): (f32, f32)| {
                 let most = (self.window_w - other - MIN_TERMINAL).clamp(min, max);
-                let mut fitted = if most == pane.max_width() { pane.clone() } else { pane.clone().range(min, most) };
+                let mut fitted = if most == pane.max_width() { *pane } else { pane.range(min, most) };
                 fitted.set_width(wanted);
                 fitted
             };
