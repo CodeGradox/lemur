@@ -2,7 +2,7 @@
 
 Lemur ships as `Lemur.app` in a disk image: open it, drag Lemur onto the
 Applications shortcut, eject it. Releases are Apple Silicon (arm64) only and
-need macOS 11 or newer. The version lives in one place, `Cargo.toml`; the app
+need macOS 13 or newer. The version lives in one place, `Cargo.toml`; the app
 build writes it into `Info.plist`.
 
 ## Local builds

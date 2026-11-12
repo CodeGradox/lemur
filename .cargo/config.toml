@@ -1,0 +1,3 @@
+# Ghostty's terminal core is built for macOS 13 and linked in, so Lemur is built for it too.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"

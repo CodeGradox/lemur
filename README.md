@@ -8,7 +8,7 @@ A macOS app for Claude Code and Codex sessions that live on a remote host: a sid
 
 ## Install
 
-Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag Lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 11 or newer (dictation, macOS 26).
+Download `lemur-macos-arm64.dmg` from the [latest release](https://github.com/CodeGradox/lemur/releases/latest), open it and drag Lemur into Applications. It's signed and notarized, and needs Apple Silicon and macOS 13 or newer (dictation, macOS 26).
 
 Lemur was called lemen up to 1.0.0. Coming from lemen, move `~/.config/lemen` to `~/.config/lemur` (without it, Lemur starts with no hosts or projects) and `~/.lemen` to `~/.lemur` (your notes). `lemen.app` can go once Lemur runs.
 
