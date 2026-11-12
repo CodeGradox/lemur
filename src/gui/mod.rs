@@ -43,6 +43,9 @@ mod settings;
 mod sidebar;
 mod silence;
 mod snackbar;
+mod term_bar;
+#[cfg(test)]
+mod term_bar_tests;
 mod term_input;
 mod term_links;
 mod terminal;

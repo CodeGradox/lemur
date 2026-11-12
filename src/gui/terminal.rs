@@ -112,6 +112,10 @@ pub struct TermView {
     pub marked: Option<String>,
     /// Shown in the window's snackbars while this terminal is.
     pub status: Option<(String, Kind)>,
+    /// The pointer is over its scroll bar.
+    pub bar_hover: bool,
+    /// Its scroll bar's thumb is dragged, from the row it showed first at the press.
+    pub bar_drag: Option<usize>,
     /// The cells it's shown at, and what the core was last told: the colours and cell size
     /// it's shown in, and whether it has the keyboard.
     pub size: Size,
@@ -150,6 +154,8 @@ impl TermView {
             hover: None,
             marked: None,
             status: None,
+            bar_hover: false,
+            bar_drag: None,
             size,
             told_display: None,
             told_focus: None,
@@ -708,8 +714,10 @@ pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El
                 .child(el().absolute(cx, cy + m.cell_h - 2.0).size(w, 1.0).fill(grid.fg));
         }
     }
+    // The window's terminal has a scroll bar; a peek at one doesn't.
+    let bar = (id == "main").then(|| super::term_bar::bar(view, grid.fg)).flatten();
     // A terminal's screen changes in place: no springs, fades or exits.
-    col().key(format!("screen-{id}")).w_full().h_full().padding(PAD).fill(grid.bg).child(rows.instant_changes())
+    col().key(format!("screen-{id}")).w_full().h_full().padding(PAD).fill(grid.bg).child(rows.instant_changes()).children(bar)
 }
 
 #[cfg(test)]

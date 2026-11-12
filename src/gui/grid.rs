@@ -352,6 +352,19 @@ impl Grid {
         self.stale = true;
     }
 
+    /// Shows the rows from `row` on, counting from the top of the scrollback.
+    pub fn scroll_to_row(&mut self, row: usize) {
+        self.terminal.scroll_viewport(ScrollViewport::Row(row));
+        self.stale = true;
+    }
+
+    /// Where the view is: how many rows there are with the scrollback, the first one shown,
+    /// and how many show. A program on the alternate screen has no scrollback.
+    pub fn scrollbar(&self) -> Option<(usize, usize, usize)> {
+        let bar = self.terminal.scrollbar().ok()?;
+        Some((bar.total as usize, bar.offset as usize, bar.len as usize))
+    }
+
     #[cfg(test)]
     pub fn scrollback_rows(&self) -> usize {
         self.terminal.scrollback_rows().unwrap_or(0)
