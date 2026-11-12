@@ -1,239 +1,239 @@
-//! The command palette (⌘⇧P), as Herdr's: every command by name, with its
-//! key. What's typed narrows them down; ↑↓ picks one and ⏎ runs it.
+//! Terminal colours for one appearance: One Half Dark and Light, with what Settings changes
+//! over them. Programs can still set any entry (OSC 4/10/11); Ghostty keeps those.
 
-use super::prompt::{Down, Up};
-use super::{
-    AddProject, CloseThread, Dictate, GoToThread, Lemur, MoveTabLeft, MoveTabRight, NewTerminal,
-    NewThreadHere, NextAgent, NextThread, OpenSettings, PreviousAgent, PreviousThread, PutAway,
-    Quit, Refresh, ToggleAgents, ToggleChanges, ToggleLinear, ToggleLinks, ToggleNotes,
-    ToggleRightPanel, ToggleSidebar, UpdateCore, spotlight,
+use crate::config::{Terminal, TerminalColors, parse_hex};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Palette {
+    pub ansi: [Rgb; 16],
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Rgb,
+}
+
+/// One color a palette sets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Slot {
+    Foreground,
+    Background,
+    Cursor,
+    /// 0-7 normal, 8-15 bright: black, red, green, yellow, blue, magenta, cyan, white.
+    Ansi(usize),
+}
+
+/// Every slot with its name, as Settings lists them.
+pub const SLOTS: [(Slot, &str); 19] = [
+    (Slot::Background, "Background"),
+    (Slot::Foreground, "Foreground"),
+    (Slot::Cursor, "Cursor"),
+    (Slot::Ansi(0), "Black"),
+    (Slot::Ansi(1), "Red"),
+    (Slot::Ansi(2), "Green"),
+    (Slot::Ansi(3), "Yellow"),
+    (Slot::Ansi(4), "Blue"),
+    (Slot::Ansi(5), "Magenta"),
+    (Slot::Ansi(6), "Cyan"),
+    (Slot::Ansi(7), "White"),
+    (Slot::Ansi(8), "Bright black"),
+    (Slot::Ansi(9), "Bright red"),
+    (Slot::Ansi(10), "Bright green"),
+    (Slot::Ansi(11), "Bright yellow"),
+    (Slot::Ansi(12), "Bright blue"),
+    (Slot::Ansi(13), "Bright magenta"),
+    (Slot::Ansi(14), "Bright cyan"),
+    (Slot::Ansi(15), "Bright white"),
+];
+
+pub const fn rgb(hex: u32) -> Rgb {
+    Rgb { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8 }
+}
+
+/// One Half Dark, as the WezTerm scheme of that name.
+pub const DARK: Palette = Palette {
+    ansi: [
+        rgb(0x282c34),
+        rgb(0xe17079),
+        rgb(0x98c379),
+        rgb(0xe5c07b),
+        rgb(0x61afef),
+        rgb(0xc678dd),
+        rgb(0x56b6c2),
+        rgb(0xdcdfe4),
+        rgb(0x8c939f),
+        rgb(0xe17079),
+        rgb(0x98c379),
+        rgb(0xe5c07b),
+        rgb(0x61afef),
+        rgb(0xc678dd),
+        rgb(0x56b6c2),
+        rgb(0xffffff),
+    ],
+    foreground: rgb(0xdcdfe4),
+    background: rgb(0x282c34),
+    cursor: rgb(0x979db4),
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::{ActiveTheme, IconName, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
 
-/// Key context of the palette, for its ↑↓.
-const PALETTE: &str = "Palette";
+/// One Half Light, as the WezTerm scheme of that name.
+pub const LIGHT: Palette = Palette {
+    ansi: [
+        rgb(0x383a42),
+        rgb(0xce4136),
+        rgb(0x318332),
+        rgb(0x986801),
+        rgb(0x356ce5),
+        rgb(0xa626a4),
+        rgb(0x007ab2),
+        rgb(0xa0a1a7),
+        rgb(0x696c77),
+        rgb(0xce4136),
+        rgb(0x318332),
+        rgb(0x986801),
+        rgb(0x356ce5),
+        rgb(0xa626a4),
+        rgb(0x007ab2),
+        rgb(0xfafafa),
+    ],
+    foreground: rgb(0x383a42),
+    background: rgb(0xfafafa),
+    cursor: rgb(0x4f525e),
+};
 
-/// How many commands it lists at most.
-const SHOWN: usize = 10;
-
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", Up, Some(PALETTE)),
-        KeyBinding::new("down", Down, Some(PALETTE)),
-    ]);
+/// Sets one color of the dark or light palette, or with `None` puts lemur's own back; the
+/// config keeps only what differs from lemur's own.
+pub fn set_color(terminal: &mut Terminal, dark: bool, slot: Slot, color: Option<Rgb>) {
+    let defaults = Palette::default_for(dark);
+    let mut palette = Palette::themed(dark, terminal);
+    palette.set(slot, color.unwrap_or(defaults.get(slot)));
+    let colors = palette.overrides(defaults);
+    if dark {
+        terminal.dark = colors;
+    } else {
+        terminal.light = colors;
+    }
 }
 
-pub(super) struct Palette {
-    input: Entity<InputState>,
-    /// The command picked among those listed.
-    picked: usize,
-    _events: Subscription,
+/// `#rrggbb`.
+pub fn hex(c: Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
 }
 
-/// Every command, by name: what the menus have.
-fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
-    vec![
-        ("Go to Thread…", Box::new(GoToThread)),
-        ("New Thread in Worktree…", Box::new(NewThreadHere)),
-        ("New Terminal", Box::new(NewTerminal)),
-        ("Close Thread", Box::new(CloseThread)),
-        ("Put Thread Away", Box::new(PutAway)),
-        ("Next Agent", Box::new(NextAgent)),
-        ("Previous Agent", Box::new(PreviousAgent)),
-        ("Next Thread in Worktree", Box::new(NextThread)),
-        ("Previous Thread in Worktree", Box::new(PreviousThread)),
-        ("Move Tab Left", Box::new(MoveTabLeft)),
-        ("Move Tab Right", Box::new(MoveTabRight)),
-        ("Toggle Sidebar", Box::new(ToggleSidebar)),
-        ("Toggle Right Panel", Box::new(ToggleRightPanel)),
-        ("Toggle Notes", Box::new(ToggleNotes)),
-        ("Toggle Linear", Box::new(ToggleLinear)),
-        ("Toggle Changes", Box::new(ToggleChanges)),
-        ("Toggle Links", Box::new(ToggleLinks)),
-        ("Toggle Agents", Box::new(ToggleAgents)),
-        ("Add Project…", Box::new(AddProject)),
-        ("Dictate", Box::new(Dictate)),
-        ("Refresh", Box::new(Refresh)),
-        ("Settings…", Box::new(OpenSettings)),
-        ("Update herdr-core", Box::new(UpdateCore)),
-        ("Quit Lemur", Box::new(Quit)),
-    ]
-}
+impl Palette {
+    /// lemur's own colors for dark or light.
+    pub fn default_for(dark: bool) -> &'static Palette {
+        if dark { &DARK } else { &LIGHT }
+    }
 
-/// The commands whose name has every word typed, in the palette's order.
-fn matching(typed: &str) -> Vec<(&'static str, Box<dyn Action>)> {
-    let typed = typed.to_lowercase();
-    let words: Vec<&str> = typed.split_whitespace().collect();
-    commands()
-        .into_iter()
-        .filter(|(name, _)| {
-            let name = name.to_lowercase();
-            words.iter().all(|w| name.contains(w))
-        })
-        .collect()
-}
-
-impl Lemur {
-    /// ⌘⇧P: opens the palette, over the window.
-    pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlaid() {
-            return;
+    /// The colors for dark or light: Settings' over lemur's own.
+    pub fn themed(dark: bool, terminal: &Terminal) -> Palette {
+        let mut palette = *Palette::default_for(dark);
+        let colors = if dark { &terminal.dark } else { &terminal.light };
+        let parse = |hex: &Option<String>| hex.as_deref().and_then(parse_hex).map(rgb);
+        let slots = [
+            (Slot::Foreground, &colors.foreground),
+            (Slot::Background, &colors.background),
+            (Slot::Cursor, &colors.cursor),
+        ];
+        for (slot, hex) in slots {
+            if let Some(c) = parse(hex) {
+                palette.set(slot, c);
+            }
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Run a command…"));
-        let events =
-            cx.subscribe_in(
-                &input,
-                window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { .. } => this.run_picked(window, cx),
-                    InputEvent::Change => {
-                        if let Some(palette) = &mut this.palette {
-                            palette.picked = 0;
-                        }
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            );
-        input.update(cx, |i, cx| i.focus(window, cx));
-        self.palette = Some(Palette {
-            input,
-            picked: 0,
-            _events: events,
-        });
-        cx.notify();
-    }
-
-    pub(super) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
-        self.focus_terminal(window, cx);
-        cx.notify();
-    }
-
-    fn palette_matches(&self, cx: &App) -> Vec<(&'static str, Box<dyn Action>)> {
-        let Some(palette) = &self.palette else {
-            return vec![];
-        };
-        matching(&palette.input.read(cx).value())
-    }
-
-    /// Moves the pick one down, or with `back` up, round the list.
-    fn step_palette(&mut self, back: bool, cx: &mut Context<Self>) {
-        let count = self.palette_matches(cx).len().min(SHOWN);
-        let Some(palette) = &mut self.palette else {
-            return;
-        };
-        if count > 0 {
-            palette.picked = if back {
-                (palette.picked + count - 1) % count
-            } else {
-                (palette.picked + 1) % count
-            };
+        for (offset, list) in [(0, &colors.ansi), (8, &colors.brights)] {
+            for (i, hex) in list.iter().flatten().take(8).enumerate() {
+                if let Some(c) = parse_hex(hex).map(rgb) {
+                    palette.set(Slot::Ansi(offset + i), c);
+                }
+            }
         }
-        cx.notify();
+        palette
     }
 
-    /// Runs the command picked, as its key or menu item would, once the
-    /// palette is gone and the terminal on show has the keyboard back.
-    fn run_picked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(picked) = self.palette.as_ref().map(|p| p.picked) else {
-            return;
-        };
-        let action = self.palette_matches(cx).into_iter().nth(picked);
-        self.close_palette(window, cx);
-        if let Some((_, action)) = action {
-            window.dispatch_action(action, cx);
+    pub fn get(&self, slot: Slot) -> Rgb {
+        match slot {
+            Slot::Foreground => self.foreground,
+            Slot::Background => self.background,
+            Slot::Cursor => self.cursor,
+            Slot::Ansi(i) => self.ansi[i],
         }
     }
 
-    pub(super) fn palette_card(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
-        let palette = self.palette.as_ref()?;
-        let theme = cx.theme();
-        let (muted, accent) = (theme.muted_foreground, theme.accent);
-        let rows: Vec<Stateful<Div>> = self
-            .palette_matches(cx)
-            .into_iter()
-            .take(SHOWN)
-            .enumerate()
-            .map(|(i, (name, action))| {
-                // Its key as bound, not as written here.
-                let keys = window
-                    .highest_precedence_binding_for_action(action.as_ref())
-                    .map(|b| {
-                        h_flex()
-                            .gap_1()
-                            .children(b.keystrokes().iter().map(|k| Kbd::new(k.inner().clone())))
-                    });
-                h_flex()
-                    .id(SharedString::from(format!("command-{i}")))
-                    .debug_selector(move || format!("command {i}"))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .rounded(theme.radius)
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(palette.picked == i, |row| row.bg(accent))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(palette) = &mut this.palette {
-                            palette.picked = i;
-                        }
-                        this.run_picked(window, cx);
-                    }))
-                    .child(div().flex_1().child(name))
-                    .children(keys)
-            })
-            .collect();
-        let empty = rows.is_empty();
-        Some(
-            spotlight::card(cx)
-                .key_context(PALETTE)
-                .on_action(cx.listener(|this, _: &Up, _, cx| this.step_palette(true, cx)))
-                .on_action(cx.listener(|this, _: &Down, _, cx| this.step_palette(false, cx)))
-                .child(spotlight::title(IconName::Search, "Commands", cx))
-                .child(
-                    div()
-                        .p_1()
-                        .child(Input::new(&palette.input).appearance(false)),
-                )
-                .child(v_flex().p_1().gap_0p5().children(rows).when(empty, |list| {
-                    list.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("No command by that name"),
-                    )
-                }))
-                .child(spotlight::footer("↑↓ pick · ⏎ run · esc cancel", false, cx)),
-        )
+    pub fn set(&mut self, slot: Slot, color: Rgb) {
+        match slot {
+            Slot::Foreground => self.foreground = color,
+            Slot::Background => self.background = color,
+            Slot::Cursor => self.cursor = color,
+            Slot::Ansi(i) => self.ansi[i] = color,
+        }
+    }
+
+    /// What differs from `defaults`, as the config writes it.
+    fn overrides(&self, defaults: &Palette) -> TerminalColors {
+        let differs = |slot| (self.get(slot) != defaults.get(slot)).then(|| hex(self.get(slot)));
+        let eight = |offset: usize| {
+            (offset..offset + 8)
+                .any(|i| self.ansi[i] != defaults.ansi[i])
+                .then(|| self.ansi[offset..offset + 8].iter().map(|c| hex(*c)).collect())
+        };
+        TerminalColors {
+            foreground: differs(Slot::Foreground),
+            background: differs(Slot::Background),
+            cursor: differs(Slot::Cursor),
+            ansi: eight(0),
+            brights: eight(8),
+        }
+    }
+
+    /// Behind selected text: a quarter of the way toward the foreground.
+    pub fn selection(&self) -> Rgb {
+        let mix = |a: u8, b: u8| ((a as u16 + b as u16 * 3) / 4) as u8;
+        let (fg, bg) = (self.foreground, self.background);
+        Rgb { r: mix(fg.r, bg.r), g: mix(fg.g, bg.g), b: mix(fg.b, bg.b) }
+    }
+
+    /// xterm's 256 colours, the first 16 this palette's.
+    pub fn indexed(&self, i: usize) -> Rgb {
+        const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        match i {
+            0..16 => self.ansi[i],
+            16..232 => {
+                let i = i - 16;
+                Rgb { r: LEVELS[i / 36], g: LEVELS[(i / 6) % 6], b: LEVELS[i % 6] }
+            }
+            _ => {
+                let v = 8 + 10 * (i.min(255) - 232) as u8;
+                Rgb { r: v, g: v, b: v }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Not `super::*`: gpui's `test` would stand in for the plain one.
-    use super::matching;
+    use super::*;
 
     #[test]
-    fn every_word_typed_narrows_the_commands() {
-        let names = |typed: &str| {
-            matching(typed)
-                .into_iter()
-                .map(|(n, _)| n)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names("toggle ag"), ["Toggle Agents"]);
-        assert_eq!(
-            names("AGENT"),
-            ["Next Agent", "Previous Agent", "Toggle Agents"]
-        );
-        assert!(names("").len() > 10, "all of them");
-        assert!(names("nothing like it").is_empty());
+    fn settings_colors_go_over_lemurs_own_and_back() {
+        let mut terminal = Terminal::default();
+        set_color(&mut terminal, true, Slot::Ansi(1), Some(rgb(0x112233)));
+        assert_eq!(terminal.dark.ansi.as_ref().unwrap()[1], "#112233");
+        assert_eq!(Palette::themed(true, &terminal).get(Slot::Ansi(1)), rgb(0x112233));
+        set_color(&mut terminal, true, Slot::Ansi(1), None);
+        assert_eq!(terminal.dark, TerminalColors::default());
+        assert_eq!(Palette::themed(true, &terminal), DARK);
+    }
+
+    #[test]
+    fn the_256_colours_follow_xterm() {
+        assert_eq!(DARK.indexed(16), rgb(0x000000));
+        assert_eq!(DARK.indexed(231), rgb(0xffffff));
+        assert_eq!(DARK.indexed(232), rgb(0x080808));
+        assert_eq!(DARK.indexed(1), DARK.ansi[1]);
     }
 }

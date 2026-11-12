@@ -3,48 +3,22 @@
 //! order whatever they're doing, each with what it runs to help it under it, as
 //! Herdr's agents list. A click opens one.
 
-use super::sidebar::{claude_icon, status_dot, thread_icon};
+use super::prompt::agent_icon;
+use super::sidebar::status_dot;
 use super::silence::silence_label;
-use super::{Key, Lemur, key, sessions, worktree_label};
+use super::{Key, Lemur, icons, key, sessions, worktree_label};
 use crate::snapshot::{Activity, Helper, Session};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
-
-/// Renders `Lemur::agents_panel`. As a cached view, its working dots'
-/// animation doesn't redraw the rest of the window.
-pub(super) struct AgentsView {
-    lemur: WeakEntity<Lemur>,
-}
-
-impl AgentsView {
-    pub(super) fn new(lemur: WeakEntity<Lemur>) -> Self {
-        AgentsView { lemur }
-    }
-}
-
-impl Render for AgentsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.lemur.upgrade() {
-            Some(lemur) => lemur.update(cx, |lemur, cx| lemur.agents_panel(cx).into_any_element()),
-            None => div().into_any_element(),
-        }
-    }
-}
+use rune::{El, ScrollSpec, col, row, text};
+use rune_kit::shell::{RowStatus, SidebarRow};
+use rune_kit::Kit;
 
 impl Lemur {
     /// The agents' threads, and threads running helpers, as the panel lists
     /// them: in the sidebar's order, projects first, so what they're doing doesn't
     /// move them.
     pub(super) fn agents(&self) -> Vec<(&str, &Session)> {
-        let mut agents: Vec<(&str, &Session)> = sessions(&self.snap)
-            .filter(|(_, s)| s.agent().is_some() || !s.helpers.is_empty())
-            .collect();
-        agents.sort_by_key(|(h, s)| {
-            self.project_of(h, &s.name)
-                .map_or(usize::MAX, |(base, _)| base)
-        });
+        let mut agents: Vec<(&str, &Session)> = sessions(&self.snap).filter(|(_, s)| s.agent().is_some() || !s.helpers.is_empty()).collect();
+        agents.sort_by_key(|(h, s)| self.project_of(h, &s.name).map_or(usize::MAX, |(base, _)| base));
         agents
     }
 
@@ -64,291 +38,161 @@ impl Lemur {
         agents
     }
 
-    /// Shows the next agent, or the one before, the ones needing you first, as
-    /// Herdr's ⌘] and ⌘[ do: from the thread on show, or the first.
-    pub(super) fn next_agent(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Next Agent, or with `back` Previous Agent: the ones that need you first, then the
+    /// ones done while you looked away, then the ones working, as Herdr's ⌘] and ⌘[ do:
+    /// from the thread on show, or the first.
+    pub(super) fn next_agent(&mut self, back: bool) {
         if self.overlaid() {
             return;
         }
         // Not one put away: showing it would bring it back for good.
-        let now: Vec<Key> = self
-            .agents_by_urgency()
-            .into_iter()
-            .filter(|(_, s)| !s.away)
-            .map(|(h, s)| key(h, s))
-            .collect();
-        // Next after next keeps to the order it started from: an agent done
-        // while you looked away leaves that rank once opened, which would
-        // skip the next one. A new agent, or one that ends, starts over.
+        let now: Vec<Key> = self.agents_by_urgency().into_iter().filter(|(_, s)| !s.away).map(|(h, s)| key(h, s)).collect();
+        // Next after next keeps to the order it started from: an agent done while you
+        // looked away leaves that rank once opened, which would skip the next one. A new
+        // agent, or one that ends, starts over.
         let same = |walk: &[Key]| walk.len() == now.len() && now.iter().all(|k| walk.contains(k));
-        let agents = if self
-            .active
-            .as_ref()
-            .is_some_and(|a| self.agent_walk.contains(a))
-            && same(&self.agent_walk)
-        {
+        let agents = if self.active.as_ref().is_some_and(|a| self.agent_walk.contains(a)) && same(&self.agent_walk) {
             self.agent_walk.clone()
         } else {
             now
         };
         self.agent_walk = agents.clone();
         if agents.is_empty() {
-            self.note("No agents' threads".into(), cx);
+            self.note("No agents' threads".into());
             return;
         }
-        let at = self
-            .active
-            .as_ref()
-            .and_then(|a| agents.iter().position(|k| k == a));
-        let n = agents.len();
-        let next = match (at, back) {
-            (Some(i), false) => (i + 1) % n,
-            (Some(i), true) => (i + n - 1) % n,
-            (None, _) => 0,
-        };
+        let at = self.active.as_ref().and_then(|a| agents.iter().position(|k| k == a));
+        let next = at.map_or(0, |i| super::card::step(i, agents.len(), back));
         let (host, session) = agents[next].clone();
-        self.open(host, session, window, cx);
-    }
-
-    fn agents_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let agents = self.agents();
-        let rows: Vec<AnyElement> = agents
-            .iter()
-            .enumerate()
-            .flat_map(|(i, (host, s))| {
-                let mut rows = vec![self.agent_row(i, host, s, cx)];
-                rows.extend(
-                    s.helpers
-                        .iter()
-                        .enumerate()
-                        .map(|(j, h)| self.helper_row(i, j, host, s, h, cx)),
-                );
-                rows
-            })
-            .collect();
-        let body = if rows.is_empty() {
-            div()
-                .p_3()
-                .text_sm()
-                .text_color(muted)
-                .child("No agents' threads. Claude's subagents show here too while they work.")
-                .into_any_element()
-        } else {
-            v_flex()
-                .id("agents-list")
-                .flex_1()
-                .min_h_0()
-                .p_2()
-                .gap_0p5()
-                .overflow_y_scroll()
-                .children(rows)
-                .into_any_element()
-        };
-        // No title: the Agents button over it says what it is.
-        v_flex().size_full().child(body)
-    }
-
-    /// An agent's thread: its name, where it runs, and what it's doing, in words
-    /// too when that's for you to see to.
-    fn agent_row(&self, i: usize, host: &str, s: &Session, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let k = key(host, s);
-        let shown = self.active.as_ref() == Some(&k);
-        let (color, tip) = self.activity(&k, s, cx);
-        let says = match s.activity {
-            Activity::NeedsInput => Some("Needs attention"),
-            Activity::Working => None,
-            _ if self.done.contains(&k) => Some("Done"),
-            _ => None,
-        };
-        let mut place = match self.project_of(host, &s.name) {
-            Some((base, w)) => format!("{} · {}", self.cfg.bases[base].name(), worktree_label(w)),
-            None => host.to_string(),
-        };
-        if let Some(issue) = &s.issue {
-            place = format!("{place} · {issue}");
-        }
-        let open = {
-            let (host, name) = (host.to_string(), s.name.clone());
-            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open(host.clone(), name.clone(), window, cx)
-            })
-        };
-        let peek = {
-            let k = k.clone();
-            Button::new(SharedString::from(format!("peek-{i}")))
-                .icon(IconName::Eye)
-                .ghost()
-                .xsmall()
-                .tooltip("Peek at it")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.peek(k.clone(), window, cx);
-                }))
-        };
-        let group = SharedString::from(format!("agent-row-{i}"));
-        // On hover, and always once silenced: that's worth seeing.
-        let silence = s.agent().map(|_| {
-            let (k, silent) = (k.clone(), s.silent);
-            let icon = if silent {
-                super::icons::bell_off()
-            } else {
-                super::icons::bell()
-            };
-            let selector = format!("silence {i}");
-            div()
-                .debug_selector(move || selector)
-                .when(!silent, |this| {
-                    this.invisible()
-                        .group_hover(group.clone(), |style| style.visible())
-                })
-                .child(
-                    Button::new(SharedString::from(format!("silence-{i}")))
-                        .icon(icon)
-                        .ghost()
-                        .xsmall()
-                        .tooltip(silence_label(silent))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.set_silent(k.clone(), !silent, cx);
-                        })),
-                )
-        });
-        h_flex()
-            .id(SharedString::from(format!("agent-{i}")))
-            .debug_selector(move || format!("agent-{i}"))
-            .group(group.clone())
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .map(|row| {
-                if shown {
-                    row.bg(theme.tokens.sidebar_accent)
-                } else {
-                    row.hover(|row| row.bg(theme.sidebar_accent.opacity(0.5)))
-                }
-            })
-            .on_click(open)
-            // Put away: still an agent, but out of the way.
-            .when(s.away, |row| row.opacity(0.6))
-            .child(thread_icon(s).small())
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_sm().truncate().child(s.label.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .truncate()
-                            .text_color(theme.muted_foreground)
-                            .child(place),
-                    ),
-            )
-            .when(!shown, |row| {
-                row.child(
-                    div()
-                        .invisible()
-                        .group_hover(group, |style| style.visible())
-                        .child(peek),
-                )
-            })
-            .children(silence)
-            .when_some(says, |row, says| {
-                row.child(
-                    div()
-                        .debug_selector(move || format!("agent-{i} says {says}"))
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(color)
-                        .child(says),
-                )
-            })
-            .child(status_dot(&k, color, self.breathes(s.activity), tip))
-            .into_any_element()
-    }
-
-    /// What agent `i` runs, under it: one of Claude's subagents, a click on
-    /// which shows its thread, or a terminal its agent started, which a
-    /// click opens.
-    fn helper_row(
-        &self,
-        i: usize,
-        j: usize,
-        host: &str,
-        s: &Session,
-        h: &Helper,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        // A subagent has no terminal of its own: it opens its thread.
-        let opens = if h.terminal {
-            h.id.clone()
-        } else {
-            s.name.clone()
-        };
-        let shown = h.terminal && self.active.as_ref() == Some(&(host.to_string(), h.id.clone()));
-        let (color, what) = match h.activity {
-            Activity::NeedsInput => (theme.warning, "Needs input"),
-            Activity::Working => (theme.success, "Working"),
-            Activity::Idle => (theme.muted_foreground.opacity(0.5), "Idle"),
-            Activity::Unknown => (theme.muted_foreground.opacity(0.5), "Running"),
-        };
-        let tip: SharedString = if h.terminal {
-            format!("{what} · a terminal its agent started")
-        } else {
-            format!("{what} · Claude's subagent")
-        }
-        .into();
-        let dot_key: Key = (host.to_string(), format!("{}/{}", s.name, h.id));
-        // A terminal of its own is peeked at, as Herdr does: what the
-        // thread's agent started, over the one on show.
-        let terminal = h.terminal;
-        let open = {
-            let host = host.to_string();
-            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                if terminal {
-                    this.peek((host.clone(), opens.clone()), window, cx);
-                } else {
-                    this.open(host.clone(), opens.clone(), window, cx);
-                }
-            })
-        };
-        let icon = if h.terminal {
-            Icon::new(IconName::SquareTerminal)
-        } else {
-            claude_icon()
-        };
-        let label = SharedString::from(h.label.clone());
-        h_flex()
-            .id(SharedString::from(format!("agent-{i}-{j}")))
-            .debug_selector(move || format!("agent-{i}-{j}"))
-            .w_full()
-            .pl(px(28.0 + 14.0 * h.depth as f32))
-            .pr_2()
-            .py_0p5()
-            .gap_2()
-            .items_center()
-            .rounded(theme.radius)
-            .text_xs()
-            .cursor_pointer()
-            .map(|row| {
-                if shown {
-                    row.bg(theme.tokens.sidebar_accent)
-                } else {
-                    row.hover(|row| row.bg(theme.sidebar_accent.opacity(0.5)))
-                }
-            })
-            .on_click(open)
-            .child(icon.xsmall())
-            .child(div().flex_1().min_w_0().truncate().child(label))
-            .child(status_dot(&dot_key, color, self.breathes(h.activity), tip))
-            .into_any_element()
+        self.open(host, session);
     }
 }
+
+pub fn view(s: &Lemur, k: &Kit) -> El {
+    let agents = s.agents();
+    let rows: Vec<El> = agents
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (host, t))| {
+            let mut rows = vec![agent_row(s, i, host, t, k)];
+            rows.extend(t.helpers.iter().enumerate().map(|(j, h)| helper_row(s, (i, j), host, t, h, k)));
+            rows
+        })
+        .collect();
+    let body = if rows.is_empty() {
+        col().key("agents-none").w_full().padding(12.0).child(
+            text("No agents' threads. Claude's subagents show here too while they work.").font(k.ty.ui).color(k.c.text_muted).wrap(),
+        )
+    } else {
+        col()
+            .key("agents-list")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .padding(8.0)
+            .gap(2.0)
+            .scroll(ScrollSpec { stick_bottom: false })
+            .children(rows)
+    };
+    // No title: the Agents button over it says what it is.
+    col().key("agents-panel").w_full().h_full().min_h(0.0).child(body)
+}
+
+
+/// An agent's thread: its name, where it runs, and what it's doing, in words
+/// too when that's for you to see to.
+fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
+    let key = key(host, t);
+    let shown = s.active.as_ref() == Some(&key);
+    let (color, tip, breathes) = s.activity(&key, t, k);
+    let says = match t.activity {
+        Activity::NeedsInput => Some("Needs attention"),
+        Activity::Working => None,
+        _ if s.done.contains(&key) => Some("Done"),
+        _ => None,
+    };
+    let mut place = match s.project_of(host, &t.name) {
+        Some((base, w)) => format!("{} · {}", s.cfg.bases[base].name(), worktree_label(w)),
+        None => host.to_string(),
+    };
+    if let Some(issue) = &t.issue {
+        place = format!("{place} · {issue}");
+    }
+    let mut trailing = row().gap(2.0).center_y();
+    // On hover; not the one on show, which there's no peeking at.
+    if !shown {
+        let peek = key.clone();
+        trailing = trailing.child(
+            icons::button(&icons::EYE, "Peek at it")
+                .on_press(move |s: &mut Lemur| s.peek(peek.clone()))
+                .build(k)
+                .key(format!("agent-{i}-peek"))
+                .group_opacity(0.0, 1.0),
+        );
+    }
+    // On hover, and always once silenced: that's worth seeing.
+    if t.agent().is_some() {
+        let (silence, silent) = (key.clone(), t.silent);
+        let bell = icons::button(if silent { &icons::BELL_OFF } else { &icons::BELL }, silence_label(silent))
+            .on_press(move |s: &mut Lemur| s.set_silent(silence.clone(), !silent))
+            .build(k)
+            .key(format!("agent-{i}-silence"));
+        trailing = trailing.child(if silent { bell } else { bell.group_opacity(0.0, 1.0) });
+    }
+    if let Some(says) = says {
+        trailing = trailing.child(text(says).key(format!("agent-{i}-says")).font(k.ty.small).color(color));
+    }
+    let open = key.clone();
+    SidebarRow::new(t.label.clone())
+        .avatar(agent_icon(t.agent(), k))
+        .subtitle(place)
+        .trailing(trailing)
+        .status(RowStatus::Other(status_dot(color, tip, breathes)))
+        .selected(shown)
+        .on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
+        .build(k)
+        .key(format!("agent-{i}"))
+        // Put away: still an agent, but out of the way.
+        .opacity(if t.away { 0.6 } else { 1.0 })
+}
+
+/// What agent `i` runs, under it (`j`th): one of Claude's subagents, a click on
+/// which shows its thread, or a terminal its agent started, which a click peeks
+/// at.
+fn helper_row(s: &Lemur, (i, j): (usize, usize), host: &str, t: &Session, h: &Helper, k: &Kit) -> El {
+    let c = &k.c;
+    // A subagent has no terminal of its own: it opens its thread.
+    let opens: Key = (host.to_string(), if h.terminal { h.id.clone() } else { t.name.clone() });
+    let shown = h.terminal && s.active.as_ref() == Some(&opens);
+    let (color, what) = match h.activity {
+        Activity::NeedsInput => (c.warning.icon, "Needs input"),
+        Activity::Working => (c.success.icon, "Working"),
+        Activity::Idle => (c.text_muted.alpha(0.5), "Idle"),
+        Activity::Unknown => (c.text_muted.alpha(0.5), "Running"),
+    };
+    let tip = if h.terminal { format!("{what} · a terminal its agent started") } else { format!("{what} · Claude's subagent") };
+    let agent = if h.terminal { None } else { Some(crate::config::Agent::Claude) };
+    // A terminal of its own is peeked at, as Herdr does: what the thread's agent
+    // started, over the one on show.
+    let terminal = h.terminal;
+    SidebarRow::new(h.label.clone())
+        .avatar(agent_icon(agent, k))
+        .depth(1 + h.depth.min(8) as u8)
+        .height(24.0)
+        .title_style(k.ty.small)
+        .status(RowStatus::Other(status_dot(color, tip, h.activity == Activity::Working)))
+        .selected(shown)
+        .on_select(move |s: &mut Lemur, _| {
+            if terminal {
+                s.peek(opens.clone());
+            } else {
+                s.open(opens.0.clone(), opens.1.clone());
+            }
+        })
+        .build(k)
+        .key(format!("agent-{i}-{j}"))
+}
+
+#[cfg(test)]
+#[path = "agents_tests.rs"]
+pub(super) mod tests;

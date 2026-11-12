@@ -46,6 +46,9 @@ pub struct Config {
     /// The notes panel's width in pixels, as last dragged.
     #[serde(default)]
     pub notes_width: Option<f32>,
+    /// How large the window draws everything, as ⌘+ and ⌘− set it: 1.25 is 125%. Unset is 100%.
+    #[serde(default)]
+    pub zoom: Option<f32>,
     #[serde(default)]
     pub terminal: Terminal,
     /// Whether the sidebar shows how much of Claude's plan is used; off
@@ -55,6 +58,18 @@ pub struct Config {
     /// The same of Codex's.
     #[serde(default)]
     pub codex_usage: bool,
+    /// Milliseconds a notification shows before it goes by itself; 0, the default, keeps
+    /// it until it's dismissed.
+    #[serde(default)]
+    pub notification_dismiss_ms: u32,
+    /// Which threads notify: Claude's and Codex's when they finish or need input, and a
+    /// shell's when a command finishes. All do until turned off in Settings.
+    #[serde(default = "notifies")]
+    pub claude_notifications: bool,
+    #[serde(default = "notifies")]
+    pub codex_notifications: bool,
+    #[serde(default = "notifies")]
+    pub shell_notifications: bool,
     /// The sidebar's foot, minimized to one line each: Claude's usage, Codex's,
     /// and the hosts' load by host name.
     #[serde(default)]
@@ -270,6 +285,9 @@ pub struct Base {
     /// Folded away in the sidebar.
     #[serde(default)]
     pub collapsed: bool,
+    /// The colour of its mark in the sidebar, one of `COLORS`; gray unset.
+    #[serde(default)]
+    pub color: Option<String>,
     /// Its worktrees' paths in the order they were dragged into; others
     /// follow in git's order.
     #[serde(default)]
@@ -331,6 +349,10 @@ fn default_codex() -> String {
     "codex".into()
 }
 
+fn notifies() -> bool {
+    true
+}
+
 fn default_worktree_dir() -> String {
     CLAUDE_WORKTREES.into()
 }
@@ -367,6 +389,7 @@ impl Base {
             name: None,
             worktree_dir: default_worktree_dir(),
             collapsed: false,
+            color: None,
             worktree_order: vec![],
             worktree_colors: BTreeMap::new(),
             hidden_worktrees: vec![],
@@ -549,6 +572,10 @@ impl Config {
             } else {
                 table.remove("collapsed");
             }
+            match &base.color {
+                Some(color) => table.insert("color", toml_edit::value(color)),
+                None => table.remove("color"),
+            };
             if base.worktree_order.is_empty() {
                 table.remove("worktree_order");
             } else {
@@ -595,6 +622,48 @@ impl Config {
                     None => {
                         doc.remove(key);
                     }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Saves how long a notification shows before it goes by itself, in milliseconds, to
+    /// the config file at `path`. 0, which keeps it till it's dismissed, goes without saying.
+    pub fn save_notification_dismiss(path: &Path, ms: u32) -> Result<()> {
+        edit(path, |doc| {
+            if ms == 0 {
+                doc.remove("notification_dismiss_ms");
+            } else {
+                doc["notification_dismiss_ms"] = toml_edit::value(i64::from(ms));
+            }
+            Ok(())
+        })
+    }
+
+    /// Saves the window's zoom to the config file at `path`, to the hundredth: 100% goes
+    /// without saying.
+    pub fn save_zoom(path: &Path, zoom: f32) -> Result<()> {
+        edit(path, |doc| {
+            let zoom = (f64::from(zoom) * 100.0).round() / 100.0;
+            if zoom == 1.0 {
+                doc.remove("zoom");
+            } else {
+                doc["zoom"] = toml_edit::value(zoom);
+            }
+            Ok(())
+        })
+    }
+
+    /// Saves which threads notify, Claude's, Codex's and shells', to the config file at
+    /// `path`. Notifying, the default, goes without saying.
+    pub fn save_notifications(path: &Path, claude: bool, codex: bool, shell: bool) -> Result<()> {
+        edit(path, |doc| {
+            for (key, on) in [("claude_notifications", claude), ("codex_notifications", codex), ("shell_notifications", shell)] {
+                if on {
+                    doc.remove(key);
+                } else {
+                    doc[key] = toml_edit::value(false);
                 }
             }
             Ok(())
@@ -1021,6 +1090,64 @@ path = \"~/projects/api\"
     }
 
     #[test]
+    fn saving_the_notification_dismiss_keeps_it_before_the_tables() {
+        let path = std::env::temp_dir().join(format!("lemur-dismiss-{}.toml", std::process::id()));
+        std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.notification_dismiss_ms, 0, "unset, notifications stay");
+        Config::save_notification_dismiss(&path, 4500).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("notification_dismiss_ms = 4500\n"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.notification_dismiss_ms, 4500);
+        assert_eq!(cfg.hosts[0].name, "agent");
+
+        // 0 is the default, and leaves the file.
+        Config::save_notification_dismiss(&path, 0).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("notification_dismiss"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_the_zoom_keeps_it_to_the_hundredth() {
+        let path = std::env::temp_dir().join(format!("lemur-zoom-{}.toml", std::process::id()));
+        std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.zoom, None, "unset, 100%");
+        Config::save_zoom(&path, 1.1).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("zoom = 1.1\n"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.zoom, Some(1.1));
+        assert_eq!(cfg.hosts[0].name, "agent");
+        Config::save_zoom(&path, 1.0).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("zoom"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_which_threads_notify_keeps_only_those_turned_off() {
+        let path = std::env::temp_dir().join(format!("lemur-notify-{}.toml", std::process::id()));
+        std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let all = |cfg: &Config| (cfg.claude_notifications, cfg.codex_notifications, cfg.shell_notifications);
+        assert_eq!(all(&cfg), (true, true, true), "unset, all notify");
+        Config::save_notifications(&path, true, false, false).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("codex_notifications = false\nshell_notifications = false\n"), "{saved}");
+        assert!(!saved.contains("claude_notifications"), "{saved}");
+        let cfg: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(all(&cfg), (true, false, false));
+        assert_eq!(cfg.hosts[0].name, "agent");
+
+        Config::save_notifications(&path, true, true, true).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("notifications"), "{saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn saving_the_project_order_moves_entries_with_their_comments() {
         let path = std::env::temp_dir().join(format!("lemur-order-{}.toml", std::process::id()));
         let original = "\
@@ -1156,6 +1283,7 @@ path = \"~/projects/api\"
         // A project's look goes in its entry, and its defaults come out.
         let mut site = cfg.bases[1].clone();
         site.collapsed = true;
+        site.color = Some("teal".into());
         site.worktree_colors
             .insert("/srv/site/.worktrees/b".into(), "blue".into());
         site.worktree_order = vec!["/srv/site/.worktrees/b".into(), "/srv/site".into()];
@@ -1166,6 +1294,7 @@ path = \"~/projects/api\"
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
         assert!(cfg.bases[1].collapsed);
+        assert_eq!(cfg.bases[1].color.as_deref(), Some("teal"));
         assert_eq!(cfg.bases[1].worktree_order, site.worktree_order);
         assert_eq!(cfg.bases[1].hidden_worktrees, site.hidden_worktrees);
         assert_eq!(cfg.bases[1].collapsed_worktrees, site.collapsed_worktrees);
@@ -1173,6 +1302,7 @@ path = \"~/projects/api\"
         assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
         assert!(cfg.bases[0].hidden_worktrees.is_empty());
         site.worktree_colors.clear();
+        site.color = None;
         site.collapsed = false;
         site.worktree_order.clear();
         site.hidden_worktrees.clear();

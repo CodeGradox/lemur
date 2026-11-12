@@ -2,23 +2,20 @@
 //! resumed once their terminal is gone, as after the host restarted.
 //! Each starts with an ID of lemur's, and refreshes keep it current.
 
-use super::settings::Prefs;
-use super::snackbar::Kind;
 use super::{Lemur, sessions};
 use crate::actions;
 use crate::config::{ClaudeThread, Config};
-use gpui_kit::*;
 
 impl Lemur {
     /// Keeps `thread` to resume, in place of its session's entry.
-    pub(super) fn keep_thread(&mut self, thread: ClaudeThread, cx: &mut Context<Self>) {
+    pub(super) fn keep_thread(&mut self, thread: ClaudeThread) {
         if self.cfg.threads.contains(&thread) {
             return;
         }
-        if let Some(file) = Prefs::get(cx).config_file()
+        if let Some(file) = self.prefs.config_file()
             && let Err(e) = Config::save_thread(file, &thread)
         {
-            self.fail(e, cx);
+            self.fail(e);
         }
         self.cfg
             .threads
@@ -32,7 +29,6 @@ impl Lemur {
         &mut self,
         host: &str,
         sessions: &[String],
-        cx: &mut Context<Self>,
     ) {
         let kept = self.cfg.threads.len();
         self.cfg
@@ -41,21 +37,20 @@ impl Lemur {
         if self.cfg.threads.len() == kept {
             return;
         }
-        if let Some(file) = Prefs::get(cx).config_file()
+        if let Some(file) = self.prefs.config_file()
             && let Err(e) = Config::remove_threads(file, host, sessions)
         {
-            self.fail(e, cx);
+            self.fail(e);
         }
         let threads = &self.cfg.threads;
         self.snap.retain_gone(|t| threads.contains(t));
         // A snapshot fetched before would bring them back.
         self.changes += 1;
-        cx.notify();
-    }
+            }
 
     /// Notes the shell each Claude thread runs in, so that one whose host
     /// restarted, back at its address as a fresh shell, is known to be.
-    pub(super) fn note_shells(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn note_shells(&mut self) {
         let notes: Vec<(String, String, u32)> = sessions(&self.snap)
             .filter_map(|(host, s)| Some((host.to_string(), s.name.clone(), s.shell_to_note()?)))
             .collect();
@@ -64,22 +59,21 @@ impl Lemur {
         }
         let cfg = self.cfg.clone();
         self.in_background(
-            cx,
             move || {
                 for (host, session, pid) in notes {
                     // Noted at the next snapshot if it can't be now.
                     let _ = actions::note_shell(&cfg, &host, &session, pid);
                 }
             },
-            |_, _, _, _| {},
+            |_, _| {},
         )
-        .detach();
+        ;
     }
 
     /// Keeps each running Claude's session ID as `claude agents` reports
     /// it: a thread lemur didn't start gets one, and one whose Claude
     /// started over (`/clear`) gets the new one.
-    pub(super) fn keep_claude_ids(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn keep_claude_ids(&mut self) {
         let running: Vec<ClaudeThread> = sessions(&self.snap)
             .filter_map(|(host, s)| {
                 let run = s.claude.as_ref().filter(|r| actions::is_uuid(&r.id))?;
@@ -107,14 +101,14 @@ impl Lemur {
                 })
                 .map(|t| t.session.clone())
                 .collect();
-            self.forget_threads(&thread.host, &moved, cx);
-            self.keep_thread(thread, cx);
+            self.forget_threads(&thread.host, &moved);
+            self.keep_thread(thread);
         }
     }
 
     /// Starts gone threads' sessions again, each resuming its Claude
     /// conversation; one alone opens.
-    pub(super) fn resume(&mut self, threads: Vec<ClaudeThread>, cx: &mut Context<Self>) {
+    pub(super) fn resume(&mut self, threads: Vec<ClaudeThread>) {
         // Not one being resumed, as with a double click, or ▶ then Resume
         // all: two Claudes would work on one conversation.
         let threads: Vec<ClaudeThread> = threads
@@ -126,11 +120,9 @@ impl Lemur {
             [one] => one.shown(),
             many => format!("{} threads", many.len()),
         };
-        self.status = Some((format!("resuming {what}…"), Kind::Progress));
-        cx.notify();
+        let said = self.busy(format!("resuming {what}…"));
         let cfg = self.cfg.clone();
         self.in_background(
-            cx,
             move || {
                 threads
                     .into_iter()
@@ -140,8 +132,8 @@ impl Lemur {
                     })
                     .collect::<Vec<_>>()
             },
-            |this, results, window, cx| {
-                this.status = None;
+            move |this, results| {
+                this.done(&said);
                 let mut resumed = vec![];
                 for (thread, result) in results {
                     this.resuming
@@ -152,25 +144,23 @@ impl Lemur {
                             this.forget_threads(
                                 &thread.host,
                                 std::slice::from_ref(&thread.session),
-                                cx,
-                            );
+                                                );
                             let again = ClaudeThread { session, ..thread };
-                            this.keep_thread(again.clone(), cx);
+                            this.keep_thread(again.clone());
                             resumed.push(again);
                         }
-                        Err(e) => this.fail(e.context(format!("resuming {}", thread.shown())), cx),
+                        Err(e) => this.fail(e.context(format!("resuming {}", thread.shown()))),
                     }
                 }
                 // Refreshes that started before it was back are stale.
                 this.changes += 1;
                 if let [one] = resumed.as_slice() {
-                    this.open_fresh(one.host.clone(), one.session.clone(), window, cx);
+                    this.open_fresh(one.host.clone(), one.session.clone());
                 }
-                this.refresh(cx).detach();
-                cx.notify();
-            },
+                this.refresh();
+                            },
         )
-        .detach();
+        ;
     }
 
     /// The gone threads of project `index`, to resume all at once.

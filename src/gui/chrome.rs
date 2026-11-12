@@ -1,772 +1,534 @@
-//! What frames the terminal: the tabs of the worktree on show, the
-//! terminal's own header, the status bar under it, and each host's load at
-//! the foot of the sidebar.
+//! The window's frame: the sidebar beside the main pane, the tabs and the panels' buttons
+//! in the toolbar, the terminal in its frame with its header, the status bar under it, and
+//! what shows over the window (the spotlight, a dialog, a peek, snackbars).
 
-use super::settings::Prefs;
-use super::sidebar::thread_icon;
-use super::silence::silence_item;
-use super::terminal::Palette;
-use super::{
-    Ask, CloseThread, Key, Lemur, List, NUMBERED_TABS, NewTerminal, icons, rows, sessions,
-};
+use super::card;
+use super::prompt::{Ask, agent_icon, new_menu, new_picked};
+use super::silence::silence_label;
+use super::snackbar;
+use super::{Action, Key, Lemur, Right, icons, panels, peek, prompt, sessions, sidebar, terminal};
 use crate::config::Agent;
-use crate::machine::{self, Load};
-use crate::snapshot::{Activity, Session, Worktree};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
-use std::rc::Rc;
+use crate::machine;
+use crate::snapshot::Activity;
+use rune::{Cx, El, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
+use rune_kit::shell::{SplitView, TabItem, TabItemStatus, TabOrientation, TabOverflow, TabReorder, TabStrip, Toolbar};
+use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, Kit};
 
-/// The status bar's height, and the terminal header's.
-const STATUS_HEIGHT: Pixels = px(28.0);
-const HEADER_HEIGHT: Pixels = px(30.0);
+/// How many tabs have a key (⌘1 to ⌘9).
+const NUMBERED_TABS: usize = 9;
+/// Points between the tab bar's scroll arrows and its tabs.
+const ARROW_GAP: f32 = 2.0;
+/// Points between the tabs and +, as the strip keeps before its own trailing action.
+const TAB_GAP: f32 = 6.0;
+/// A tab's width: its agent's icon and its number, as Herdr's tabs, since the sidebar and
+/// the terminal's header name the thread. Past 64 points the strip shows a tab's title.
+const TAB_WIDTH: f32 = 72.0;
+/// Points of window around the main pane, and between it and the sidebar: the sidebar's
+/// resize grip, as wide, so the gap shows where to drag.
+const FRAME: f32 = 6.0;
 
-/// The number on the tab at `i`, which with ⌘ shows that tab; tabs past
-/// those with a key have none.
-pub(super) fn tab_number(i: usize) -> Option<String> {
-    (i < NUMBERED_TABS).then(|| (i + 1).to_string())
+/// A tab's right-click menu, as Herdr's: rename it, start a terminal beside it, put it away,
+/// close it.
+fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
+    let mut menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…"));
+    if s.place_of(key).is_some() {
+        let mut new = PopupItem::new("new-terminal", "New terminal");
+        if let Some(k) = Action::NewTerminal.key_equivalent() {
+            new = new.key_equivalent(k);
+        }
+        menu = menu.item(new);
+    }
+    menu = menu.separator();
+    if let Some(t) = s.session_of(key) {
+        menu = menu.item(PopupItem::new("silence", silence_label(t.silent)));
+    }
+    let mut close = PopupItem::new("close", "Close");
+    if let Some(k) = Action::CloseThread.key_equivalent() {
+        close = close.key_equivalent(k);
+    }
+    menu.item(PopupItem::new("put-away", "Put away")).item(close)
 }
 
-/// The window has no title bar: its buttons sit at the left of the top
-/// row, at `WINDOW_BUTTONS_AT`, which leaves this much room for them.
-pub(super) const WINDOW_BUTTONS: Pixels = px(80.0);
-pub(super) const WINDOW_BUTTONS_AT: Point<Pixels> = point(px(12.0), px(12.0));
-
-/// A top row that does a title bar's work: a drag that starts where no
-/// button or tab takes the press moves the window, and a double click
-/// zooms it (or does what System Settings says a title bar's does).
-pub(super) fn title_bar(id: &'static str, window: &mut Window, cx: &mut App) -> Stateful<Div> {
-    // Whether the left button went down on the row itself.
-    let pressed =
-        window.use_keyed_state(SharedString::from(format!("{id} pressed")), cx, |_, _| {
-            false
-        });
-    let (down, out) = (pressed.clone(), pressed.clone());
-    h_flex()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
-            // Buttons and tabs take their presses before the row sees them.
-            let own = !window.default_prevented();
-            if own && e.click_count == 2 {
-                window.titlebar_double_click();
+fn tab_picked(s: &mut Lemur, picked: &str, key: Key) {
+    match picked {
+        "rename" => s.ask_name(Ask::Rename { host: key.0, session: key.1 }),
+        "new-terminal" => {
+            if let Some((dir, _)) = s.place_of(&key) {
+                s.start_now(key.0, dir, None);
             }
-            down.update(cx, |p, _| *p = own && e.click_count == 1);
-        })
-        .on_mouse_down_out(move |_, _, cx| out.update(cx, |p, _| *p = false))
-        .on_mouse_move(move |e: &MouseMoveEvent, window, cx| {
-            if pressed.update(cx, |p, _| std::mem::take(p))
-                && e.pressed_button == Some(MouseButton::Left)
-            {
-                window.start_window_move();
-            }
-        })
+        }
+        "silence" => {
+            let silent = s.session_of(&key).is_some_and(|t| t.silent);
+            s.set_silent(key, !silent);
+        }
+        "put-away" => s.put_away(key),
+        "close" => s.confirm_close_of(key),
+        _ => {}
+    }
 }
 
-impl Lemur {
-    /// The thread behind `key`, if a snapshot lists it.
-    pub(super) fn session_of(&self, key: &Key) -> Option<&Session> {
-        sessions(&self.snap)
-            .find(|(h, s)| *h == key.0 && s.name == key.1)
-            .map(|(_, s)| s)
-    }
-
-    /// The worktree the thread on show runs in, and the host it's on.
-    pub(super) fn active_worktree(&self) -> Option<(&str, &Worktree)> {
-        let (host, session) = self.active.as_ref()?;
-        let (_, w) = self.project_of(host, session)?;
-        Some((host, w))
-    }
-
-    /// Where a thread runs, for what starts beside it: its worktree and the
-    /// project it's in, or its folder outside every worktree.
-    pub(super) fn place_of(&self, key: &Key) -> Option<(String, Option<usize>)> {
-        match self.project_of(&key.0, &key.1) {
-            Some((base, w)) => Some((w.path.clone(), Some(base))),
-            None => Some((self.session_of(key)?.path.clone(), None)),
-        }
-    }
-
-    /// The tabs of the threads where the one on show runs: its worktree's,
-    /// or its host's outside every worktree. + offers what starts there.
-    /// Dragged, they move in the sidebar too: it's one order.
-    pub(super) fn tabs(&self, cx: &mut Context<Self>) -> Div {
-        let Some(active) = self.active.clone() else {
-            return h_flex().flex_1();
-        };
-        let list: List = (
-            active.0.clone(),
-            self.project_of(&active.0, &active.1)
-                .map(|(_, w)| w.path.clone()),
-        );
-        let drag: SharedString = format!(
-            "tabs\n{}\n{}",
-            list.0,
-            list.1.as_deref().unwrap_or_default()
-        )
-        .into();
-        let reorder: rows::Reorder = {
-            let this = cx.entity().downgrade();
-            Rc::new(move |from, to, _, cx| {
-                this.update(cx, |this, cx| this.reorder(list.clone(), from, to, cx))
-                    .ok();
-            })
-        };
-        let siblings = self.siblings(&active);
-        // The dots of tabs no longer shown go with them.
-        self.dots
-            .borrow_mut()
-            .retain(|(place, key), _| *place != "tab" || siblings.contains(key));
-        // Asked each time, so a new tab or a narrower window keeps it in view
-        // too; it only scrolls if the tab is out of view.
-        if self.tab_follows
-            && let Some(i) = siblings.iter().position(|key| *key == active)
-        {
-            self.tab_scroll.scroll_to_item(i);
-        }
-        // That goes by the bar's width a frame ago: one more if this frame
-        // changes it, as a narrower window or the sidebar coming back do.
-        let width = self.tab_scroll.bounds().size.width;
-        let this = cx.entity().downgrade();
-        cx.defer(move |cx| {
-            this.update(cx, |this, cx| {
-                if this.tab_follows && this.tab_scroll.bounds().size.width != width {
-                    cx.notify();
+/// The tabs of the threads where the one on show runs: its worktree's, or its host's
+/// outside every worktree. + offers what starts there. Dragged, they move in the sidebar
+/// too: it's one order.
+fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
+    let active = s.active.clone()?;
+    let siblings = s.siblings(&active);
+    let numbered: Vec<String> = siblings.iter().map(|(_, n)| n.clone()).collect();
+    let mut ids: Vec<String> = Vec::new();
+    let items: Vec<TabItem<'_, Lemur>> = siblings
+        .iter()
+        .enumerate()
+        .filter_map(|(i, key)| {
+            let t = s.session_of(key)?;
+            ids.push(key.1.clone());
+            let shown = s.active.as_ref() == Some(key);
+            let status = match t.doing() {
+                Activity::NeedsInput => Some(TabItemStatus::Attention),
+                Activity::Working => Some(TabItemStatus::Busy),
+                _ if s.done.contains(key) => Some(TabItemStatus::Unread),
+                _ => None,
+            };
+            let number = (i < NUMBERED_TABS).then(|| format!("{}", i + 1));
+            let issue = t.issue.clone();
+            let menu = tab_menu(s, key);
+            let menu_key = key.clone();
+            let label = t.label.clone();
+            let mut item = TabItem::new(key.1.as_str(), (i + 1).to_string())
+                .avatar(agent_icon(t.agent(), k))
+                .status(status.filter(|st| !shown || *st == TabItemStatus::Busy));
+            item = item.decorate(move |tab, _| {
+                let label_tip = label;
+                let tab = tab.on_secondary_press(move |_: &mut Lemur, press, tx: &mut Tx| {
+                    let key = menu_key.clone();
+                    tx.popup_menu(menu.clone(), press, move |s: &mut Lemur, picked, _| {
+                        if let Some(p) = picked {
+                            tab_picked(s, p, key);
+                        }
+                    });
+                });
+                // Its name, its key and the issue pinned to it on hover, and its name to a
+                // screen reader: the tab shows its number.
+                let tab = tab.label(label_tip.clone());
+                let mut tip = label_tip;
+                if let Some(n) = number {
+                    tip = format!("{tip}  ⌘{n}");
                 }
-            })
-            .ok();
-        });
-        let tabs: Vec<AnyElement> = siblings
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                let s = self.session_of(&key)?.clone();
-                Some(self.tab(i, key, &s, (drag.clone(), reorder.clone()), cx))
-            })
-            .collect();
-        let add = self.place_of(&active).map(|(dir, base)| {
-            let new = self.new_menu(&active.0, &dir, base, cx);
-            Button::new("new-tab")
-                .icon(IconName::Plus)
-                .ghost()
-                .xsmall()
-                .tooltip("New terminal or Claude here")
-                .dropdown_menu(move |m, window, cx| new(m, window, cx))
-        });
-        h_flex()
-            .flex_1()
-            .min_w_0()
-            .gap_1()
-            .child(
-                h_flex()
-                    .id("tabs")
-                    .min_w_0()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.tab_scroll)
-                    .on_scroll_wheel(cx.listener(|this, _, _, _| this.tab_follows = false))
-                    // A press here is the tabs', to click or drag, not the
-                    // title bar's (see `title_bar`).
-                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .children(tabs),
-            )
-            .children(add)
-    }
-
-    /// ⌘1 to ⌘9: shows the tab at `i` of the tab bar, if it has one.
-    pub(super) fn go_to_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overlaid() {
-            return;
-        }
-        let Some(active) = &self.active else {
-            return;
-        };
-        if let Some((host, session)) = self.siblings(active).into_iter().nth(i) {
-            self.open(host, session, window, cx);
-        }
-    }
-
-    /// The tab at `i` of the tab bar `drag`, which a drop reorders.
-    fn tab(
-        &self,
-        i: usize,
-        key: Key,
-        s: &Session,
-        (drag, reorder): (SharedString, rows::Reorder),
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let menu = self.tab_menu(&key, cx);
-        let theme = cx.theme();
-        let shown = self.active.as_ref() == Some(&key);
-        let (dot, tip) = self.activity(&key, s, cx);
-        let breathes = self.breathes(s.activity);
-        let open = {
-            let key = key.clone();
-            cx.listener(move |this, event: &ClickEvent, window, cx| {
-                let (host, session) = key.clone();
-                if event.click_count() >= 2 {
-                    this.ask_name(Ask::Rename { host, session }, window, cx);
-                } else {
-                    this.open(host, session, window, cx);
+                if let Some(issue) = issue {
+                    tip = format!("{tip}  · {issue}");
                 }
-            })
-        };
-        let close = Button::new(SharedString::from(format!("close-tab-{i}")))
-            .ghost()
-            .xsmall()
-            .icon(IconName::Close)
-            .tooltip("Close thread")
-            .on_click(cx.listener({
-                let key = key.clone();
-                move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.confirm_close_of(key.clone(), window, cx);
-                }
-            }));
-        let tab = h_flex()
-            .id(SharedString::from(format!("tab-{i}")))
-            .debug_selector(move || format!("tab-{i}"))
-            .flex_shrink_0()
-            .h_7()
-            .pl_2()
-            .pr_1()
-            .gap_1p5()
-            .items_center()
-            .rounded_md()
-            .border_1()
-            .text_sm()
-            .cursor_pointer()
-            // Filled as the thread on show is in the sidebar, as Herdr's;
-            // hovered ones fainter, so they don't pass for it.
-            .map(|tab| {
-                if shown {
-                    tab.bg(theme.tokens.sidebar_accent)
-                        .border_color(theme.border)
-                        .text_color(theme.tab_active_foreground)
-                } else {
-                    tab.border_color(transparent_black())
-                        .text_color(theme.muted_foreground)
-                        .hover(|tab| tab.bg(theme.sidebar_accent.opacity(0.5)))
-                }
-            })
-            .on_click(open)
-            // No title, to keep it narrow: the name shows on hover, and in
-            // the terminal's header on show.
-            .tooltip({
-                let name = s.label.clone();
-                move |window, cx| {
-                    let name = name.clone();
-                    Tooltip::element(move |_, _| {
-                        let selector = format!("tab-name {name}");
-                        div().debug_selector(move || selector).child(name.clone())
-                    })
-                    .build(window, cx)
-                }
-            })
-            .children(tab_number(i).map(|number| {
-                div()
-                    .debug_selector(move || format!("tab-number-{i}"))
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(number)
-            }))
-            .child(thread_icon(s).small())
-            .children(s.issue.clone().map(|issue| {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(issue)
-            }))
-            .child(self.dot_view("tab", &key, dot, breathes, tip, cx))
-            .child(close);
-        rows::draggable_tab(tab, drag, i, s.label.clone().into(), reorder, cx)
-            .context_menu(move |m, window, cx| menu(m, window, cx))
-            .into_any_element()
-    }
-
-    /// A tab's right-click menu, as Herdr's: rename it, start a terminal
-    /// beside it, close it; with the keys that do so for the one on show.
-    fn tab_menu(&self, key: &Key, cx: &mut Context<Self>) -> rows::MenuBuilder {
-        let this = cx.entity().downgrade();
-        let key = key.clone();
-        let dir = self.place_of(&key).map(|(dir, _)| dir);
-        // Only an agent has anything to notify of.
-        let silences = self
-            .session_of(&key)
-            .and_then(|s| s.agent().map(|_| s.silent));
-        Rc::new(
-            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-                let rename = {
-                    let (this, (host, session)) = (this.clone(), key.clone());
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        let ask = Ask::Rename {
-                            host: host.clone(),
-                            session: session.clone(),
-                        };
-                        this.update(cx, |this, cx| this.ask_name(ask, window, cx))
-                            .ok();
-                    }
-                };
-                let close = {
-                    let (this, key) = (this.clone(), key.clone());
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        this.update(cx, |this, cx| {
-                            this.confirm_close_of(key.clone(), window, cx)
-                        })
-                        .ok();
-                    }
-                };
-                let menu = menu.item(PopupMenuItem::new("Rename…").on_click(rename));
-                let menu = match &dir {
-                    Some(dir) => {
-                        let (this, host, dir) = (this.clone(), key.0.clone(), dir.clone());
-                        menu.item(
-                            PopupMenuItem::new("New terminal")
-                                .action(Box::new(NewTerminal))
-                                .on_click(move |_, _, cx| {
-                                    this.update(cx, |this, cx| {
-                                        this.start_now(host.clone(), dir.clone(), None, cx)
-                                    })
-                                    .ok();
-                                }),
-                        )
-                    }
-                    None => menu,
-                };
-                let away = {
-                    let (this, key) = (this.clone(), key.clone());
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        this.update(cx, |this, cx| this.put_away(key.clone(), window, cx))
-                            .ok();
-                    }
-                };
-                let menu = menu.separator();
-                let menu = match silences {
-                    Some(silent) => menu.item(silence_item(&this, &key, silent)),
-                    None => menu,
-                };
-                menu.item(PopupMenuItem::new("Put away").on_click(away))
-                    .item(
-                        PopupMenuItem::new("Close")
-                            .action(Box::new(CloseThread))
-                            .on_click(close),
-                    )
-            },
-        )
-    }
-
-    /// Over the terminal: what runs in it, its name, and where.
-    pub(super) fn pane_header(&self, cx: &App) -> Option<Div> {
-        let s = self.session_of(self.active.as_ref()?)?;
-        let what = s.agent().map_or("Shell", Agent::name);
-        Some(
-            h_flex()
-                .h(HEADER_HEIGHT)
-                .flex_shrink_0()
-                .px_3()
-                .gap_2()
-                .items_center()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .text_sm()
-                .child(thread_icon(s).small())
-                .child(div().flex_shrink_0().child(what))
-                .child(
-                    div()
-                        .debug_selector(|| format!("header-name {}", s.label))
-                        .min_w_0()
-                        .truncate()
-                        .font_semibold()
-                        .child(s.label.clone()),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(s.path.clone()),
-                ),
-        )
-    }
-
-    /// The terminal on show in a rounded frame, with its header; the ring
-    /// says it has the keyboard.
-    pub(super) fn framed(&self, terminal: AnyElement, focused: bool, cx: &App) -> Div {
-        let palette = Palette::themed(cx.theme().is_dark(), &Prefs::get(cx).terminal);
-        let bg = palette.background;
-        let bg = rgb(((bg.r as u32) << 16) | ((bg.g as u32) << 8) | bg.b as u32);
-        let ring = if focused {
-            cx.theme().ring
-        } else {
-            cx.theme().border
-        };
-        div().size_full().p_2().child(
-            v_flex()
-                .size_full()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(ring)
-                .overflow_hidden()
-                .bg(bg)
-                .children(self.pane_header(cx))
-                .child(div().flex_1().min_h_0().child(terminal)),
-        )
-    }
-
-    /// Under the terminal: where the thread on show runs (its host, and its
-    /// worktree's branch, its lines added and removed, and its servers),
-    /// and how many agents need you.
-    pub(super) fn status_bar(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme().clone();
-        let item = |icon: Icon, text: SharedString| {
-            h_flex()
-                .gap_1p5()
-                .items_center()
-                .child(icon.xsmall())
-                .child(text)
-        };
-        let mut bar = h_flex()
-            .h(STATUS_HEIGHT)
-            .flex_shrink_0()
-            .px_3()
-            .gap_4()
-            .items_center()
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.status_bar)
-            .text_xs()
-            .text_color(theme.muted_foreground);
-        if let Some((host, _)) = &self.active
-            && let Some(h) = self.cfg.host(host)
-        {
-            bar = bar.child(if h.ssh == "local" {
-                item(icons::monitor(), "This Mac".into())
-            } else {
-                item(icons::server(), h.name.clone().into())
+                tab.help(tip)
             });
-        }
-        if let Some((host, w)) = self.active_worktree() {
-            let branch = match (&w.branch, &w.head) {
-                (Some(branch), _) => branch.clone(),
-                (None, Some(head)) => format!("detached at {}", &head[..head.len().min(8)]),
-                (None, None) => crate::config::leaf(&w.path).to_string(),
-            };
-            bar = bar
-                .child(item(icons::git_branch(), branch.into()))
-                .children(self.changes_item(host, &w.path, cx));
-            let links = self.links(host, w, cx);
-            if !links.is_empty() {
-                bar = bar.child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(Icon::new(IconName::Globe).xsmall().mr_1())
-                        .children(links),
-                );
-            }
-        }
-        let needs = sessions(&self.snap)
-            .filter(|(_, s)| s.agent().is_some() && s.activity == Activity::NeedsInput)
-            .count();
-        bar.when(needs > 0, |bar| {
-            bar.child(
-                div()
-                    .debug_selector(|| "needs-you".into())
-                    .text_color(theme.warning)
-                    .child(format!(
-                        "{needs} need{} you",
-                        if needs == 1 { "s" } else { "" }
-                    )),
-            )
+            Some(item)
         })
-    }
-
-    /// The worktree's servers, by port: a link to each one that can be
-    /// reached from here. Another host's is reached by its tailnet name.
-    fn links(&self, host: &str, w: &Worktree, cx: &App) -> Vec<AnyElement> {
-        let Some(view) = self.snap.hosts.iter().find(|h| h.name == host) else {
-            return vec![];
-        };
-        let Some(h) = self.cfg.host(host) else {
-            return vec![];
-        };
-        // A worktree inside this one keeps its own servers.
-        let deeper: Vec<&str> = view
-            .bases
-            .iter()
-            .flat_map(|b| b.worktrees.iter())
-            .map(|o| o.path.as_str())
-            .filter(|p| *p != w.path && p.starts_with(&format!("{}/", w.path)))
-            .collect();
-        let local = h.ssh == "local";
-        let name = match &view.machine.tailnet {
-            _ if local => "localhost".to_string(),
-            Some(tailnet) => tailnet.clone(),
-            None => h.name.clone(),
-        };
-        let theme = cx.theme().clone();
-        machine::servers_in(&view.machine.servers, &w.path, &deeper)
-            .into_iter()
-            .map(|s| {
-                let url = format!("http://{name}:{}", s.port);
-                let reachable = local || !s.local_only();
-                let tip: SharedString = if reachable {
-                    format!("{url} · {}", s.name).into()
-                } else {
-                    format!(
-                        "{} on :{} listens only on {}'s own localhost",
-                        s.name, s.port, h.name
-                    )
-                    .into()
-                };
-                let port = s.port;
-                div()
-                    .id(SharedString::from(format!("port-{port}")))
-                    .debug_selector(move || format!("port {port}"))
-                    .px_1()
-                    .rounded_sm()
-                    .text_color(if reachable {
-                        theme.link
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                    .when(reachable, |link| {
-                        link.cursor_pointer()
-                            .hover(|link| link.bg(theme.secondary_hover))
-                            .on_click(move |_, _, cx| cx.open_url(&url))
-                    })
-                    .child(format!(":{}", s.port))
-                    .into_any_element()
+        .collect();
+    let host = active.0.clone();
+    let place = s.place_of(&active);
+    let plus = place.map(|(dir, base)| {
+        let (host, dir) = (host.clone(), dir);
+        icons::button(&icons::PLUS, "New terminal or Claude here")
+            .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
+                let (host, dir) = (host.clone(), dir.clone());
+                tx.popup_menu(new_menu(), "new-tab", move |s: &mut Lemur, picked, _| {
+                    if let Some(p) = picked {
+                        new_picked(s, p, &host, &dir, base);
+                    }
+                });
             })
-            .collect()
-    }
-
-    /// Follows each host's load: the CPU share is the busy time between two
-    /// readings.
-    pub(super) fn follow_loads(&mut self) {
-        for h in &self.snap.hosts {
-            let Some(load) = &h.machine.load else {
-                continue;
-            };
-            let cpu = match self.loads.get(&h.name) {
-                Some((before, cpu)) if before.total == load.total => *cpu,
-                Some((before, _)) => load.cpu_since(before),
-                None => None,
-            };
-            self.loads.insert(h.name.clone(), (load.clone(), cpu));
-        }
-        // One that can't be reached shows no load, rather than its last.
-        self.loads.retain(|name, _| {
-            self.snap
-                .hosts
-                .iter()
-                .any(|h| h.name == *name && h.error.is_none())
+            .build(k)
+            .key("new-tab")
+    });
+    let list = s.list_of(&active);
+    let mut strip = TabStrip::new("tabs", TabOrientation::Horizontal)
+        .label("Threads in this worktree")
+        .tabs(items)
+        .active(Some(active.1.as_str()))
+        .overflow(TabOverflow::ShrinkThenScroll { min_width: TAB_WIDTH, max_width: TAB_WIDTH, pinned_width: 36.0, fade_width: 24.0 })
+        .drag_state(&s.tab_drag, |s: &mut Lemur| &mut s.tab_drag)
+        .close_icon(&icons::X)
+        .on_select(move |s: &mut Lemur, id, _| s.open(host.clone(), id.to_string()))
+        .on_close({
+            let host = active.0.clone();
+            move |s: &mut Lemur, id, _| s.confirm_close_of((host.clone(), id.to_string()))
+        })
+        .on_double_click({
+            let host = active.0.clone();
+            move |s: &mut Lemur, id, _| s.ask_name(Ask::Rename { host: host.clone(), session: id.to_string() })
+        })
+        .on_reorder(move |s: &mut Lemur, r: TabReorder, _| {
+            // The tabs leave out what's put away; the list has it, at its end.
+            let Some(sessions) = s.list_mut(&list) else { return };
+            let at = |name: &str| sessions.iter().position(|t| t.name == name);
+            let (Some(from), Some(to)) = (at(&numbered[r.from]), at(&numbered[r.to])) else { return };
+            s.reorder(list.clone(), from, to);
         });
-    }
-
-    /// Each host's CPU and memory, as bars at the foot of the sidebar; none
-    /// for hosts without /proc to read them from. A click on a host's name
-    /// minimizes it to that line.
-    pub(super) fn machines(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let mut hosts: Vec<(&String, &(Load, Option<f32>))> = self.loads.iter().collect();
-        if hosts.is_empty() {
-            return None;
-        }
-        hosts.sort_by_key(|(name, _)| {
-            self.cfg
-                .hosts
-                .iter()
-                .position(|h| h.name == **name)
-                .unwrap_or(usize::MAX)
-        });
-        let theme = cx.theme();
-        let gib = |kb: u64| format!("{:.1}", kb as f64 / 1_048_576.0);
-        let rows = hosts.into_iter().map(|(name, (load, cpu))| {
-            let tip: SharedString = format!(
-                "{name}: CPU {}{} · load {} · memory {} of {} GiB{}",
-                cpu.map_or("…".into(), |c| format!("{c:.0}%")),
-                load.cores
-                    .map_or(String::new(), |n| format!(" of {n} cores")),
-                load.load.join(" "),
-                gib(load.mem_used_kb),
-                gib(load.mem_total_kb),
-                if load.swap_total_kb > 0 {
-                    format!(
-                        " · swap {} of {} GiB",
-                        gib(load.swap_used_kb),
-                        gib(load.swap_total_kb)
-                    )
-                } else {
-                    String::new()
-                },
-            )
-            .into();
-            let cpu_text = cpu.map_or("…".to_string(), |c| format!("{c:.0}%"));
-            let ram_text = format!("{} / {} GiB", gib(load.mem_used_kb), gib(load.mem_total_kb));
-            let selector = format!("load {name}");
-            let minimized = self.cfg.minimized_hosts.contains(name);
-            // Minimized, the bars' numbers take the load's place.
-            let right = if minimized {
-                let ram = load
-                    .memory()
-                    .map_or("…".to_string(), |m| format!("{m:.0}%"));
-                Some(format!("CPU {cpu_text} · RAM {ram}"))
-            } else {
-                load.load.first().map(|l| format!("load {l}"))
-            };
-            let toggle = {
-                let name = (*name).clone();
-                cx.listener(move |this, _, _, cx| this.toggle_host_minimized(&name, cx))
-            };
-            v_flex()
-                .id(SharedString::from(format!("load-{name}")))
-                .debug_selector(move || selector)
-                .gap_0p5()
-                .py_1()
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                .child(
-                    minimizable_header(
-                        SharedString::from(format!("load-header-{name}")),
-                        minimized,
-                        cx,
-                    )
-                    .on_mouse_down(MouseButton::Left, toggle)
-                    .child(icons::server().xsmall().text_color(theme.muted_foreground))
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                    .children(right.map(|right| {
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(right)
-                    }))
-                    .child(chevron(minimized)),
-                )
-                .when(!minimized, |this| {
-                    this.child(bar("CPU", *cpu, cpu_text, cx)).child(bar(
-                        "RAM",
-                        load.memory(),
-                        ram_text,
-                        cx,
-                    ))
-                })
-        });
-        Some(
-            v_flex()
-                .w_full()
-                .px_2()
-                .py_1()
-                .gap_1()
-                .border_t_1()
-                .border_color(theme.sidebar_border)
-                .children(rows),
-        )
-    }
+    // A working tab has the sidebar's dot, not the kit's ring: breathing, and holding still
+    // in the background, as the sidebar's does.
+    let working: fn(&Kit) -> El = if s.looking {
+        |k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), true)
+    } else {
+        |k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), false)
+    };
+    strip = strip.busy_indicator(working);
+    // + after the arrows, as the strip's own trailing action would sit inside them.
+    Some(row().key("tab-row").shrink().min_w(0.0).gap(TAB_GAP).center_y().child(scroll_arrows(strip.build(k), &ids, s.tab_aim.as_deref(), k)).children(plus))
 }
 
-/// The first line of a block at the sidebar's foot, which a press minimizes
-/// to that line, or opens again: on the press, not the release, so it's
-/// done before the button comes up.
-pub(super) fn minimizable_header(id: SharedString, minimized: bool, cx: &App) -> Stateful<Div> {
-    let selector = format!("{id}{}", if minimized { " minimized" } else { "" });
-    h_flex()
-        .id(id)
-        .debug_selector(move || selector)
-        .gap_2()
-        .items_center()
-        .text_sm()
-        .cursor_pointer()
-        .rounded(cx.theme().radius)
+/// Where a tab is in the tab bar's view: cut off at its start or end, by more than half or
+/// less, or wholly in it.
+#[derive(Clone, Copy, PartialEq)]
+enum InView {
+    Before,
+    PartBefore,
+    In,
+    PartAfter,
+    After,
 }
 
-/// The caret at a minimizable line's end, as a project's: down while open.
-/// A click on it reaches the line, which minimizes.
-pub(super) fn chevron(minimized: bool) -> Button {
-    Button::new("minimize").xsmall().ghost().icon(
-        Icon::new(IconName::ChevronRight)
-            .size_4()
-            .when(!minimized, |this| this.rotate(percentage(90. / 360.))),
+/// The tab bar between ‹ and ›, while its tabs (`ids`) don't all fit: each scrolls it a tab
+/// that way, and dims with none left there. Shortcuts go through the tabs; these show there
+/// are more. `aim` is the tab an arrow last scrolled to: pressed again before it's there, an
+/// arrow goes on from it.
+fn scroll_arrows(strip: El, ids: &[String], aim: Option<&str>, k: &Kit) -> El {
+    use rune::memo::{layout_size, window_layout, window_layout_with};
+    let width = |key: &str| layout_size(key).map_or(0.0, |[w, _]| w);
+    let (list, view) = (width("tabs-list"), width("tabs-scroll"));
+    // Judged as if there were none: the arrows take their room from the view, and mustn't
+    // be what makes the tabs not fit.
+    let arrows = match (layout_size("tabs-back"), layout_size("tabs-forward")) {
+        (Some([back, _]), Some([forward, _])) => back + forward + 2.0 * ARROW_GAP,
+        _ => 0.0,
+    };
+    let bar = row().key("tab-bar").shrink().min_w(0.0).gap(ARROW_GAP).center_y();
+    if list <= view + arrows + 0.5 {
+        return bar.child(strip);
+    }
+    let [sx, _, sw, _] = window_layout("tabs-scroll").unwrap_or_default();
+    let places: Vec<(&String, InView)> = ids
+        .iter()
+        .filter_map(|id| {
+            let at = window_layout_with(&format!("t-{id}"), move |[x, _, w, _]| match () {
+                _ if x + w / 2.0 < sx => InView::Before,
+                _ if x < sx - 0.5 => InView::PartBefore,
+                _ if x + w / 2.0 > sx + sw => InView::After,
+                _ if x + w > sx + sw + 0.5 => InView::PartAfter,
+                _ => InView::In,
+            })?;
+            Some((id, at))
+        })
+        .collect();
+    // A tab that way: the first mostly out of view, as one nearly in would scroll the bar a
+    // point or two; else one a little out.
+    let first = |tabs: &mut dyn Iterator<Item = &(&String, InView)>, most: InView, part: InView| {
+        let tabs: Vec<_> = tabs.filter(|(_, at)| *at == most || *at == part).collect();
+        tabs.iter().find(|(_, at)| *at == most).or(tabs.first()).map(|(id, _)| (*id).clone())
+    };
+    let arriving = places.iter().position(|(id, _)| Some(id.as_str()) == aim).map(|i| (i, places[i].1));
+    let back = match arriving {
+        Some((i, InView::Before | InView::PartBefore)) => i.checked_sub(1).map(|i| places[i].0.clone()),
+        _ => first(&mut places.iter().rev(), InView::Before, InView::PartBefore),
+    };
+    let forward = match arriving {
+        Some((i, InView::After | InView::PartAfter)) => places.get(i + 1).map(|(id, _)| (*id).clone()),
+        _ => first(&mut places.iter(), InView::After, InView::PartAfter),
+    };
+    let arrow = |key: &'static str, glyph: &'static rune::Icon, label: &str, to: Option<String>| {
+        icons::button(glyph, label)
+            .disabled(to.is_none())
+            .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| {
+                if let Some(id) = &to {
+                    tx.scroll_into_view_in("tabs-scroll", format!("t-{id}"));
+                    s.tab_aim = Some(id.clone());
+                }
+            })
+            .build(k)
+            .key(key)
+    };
+    bar.child(arrow("tabs-back", &icons::CHEVRON_LEFT, "Scroll the tabs back", back))
+        .child(strip)
+        .child(arrow("tabs-forward", &icons::CHEVRON_RIGHT, "Scroll the tabs on", forward))
+}
+
+/// The panels' buttons, at the toolbar's end: each shows its panel, or hides it.
+fn panel_buttons(s: &Lemur, k: &Kit) -> Vec<El> {
+    let panel = |which: Right, glyph: &'static rune::Icon, name: &'static str, tip: &'static str| {
+        let on = s.right() == Some(which);
+        Button::new(name)
+            .variant(if on { ButtonVariant::Outline } else { ButtonVariant::Ghost })
+            .control_size(ControlSize::Small)
+            .icon(glyph)
+            .help(tip)
+            .on_press(move |s: &mut Lemur| s.toggle_right(which))
+            .build(k)
+            .key(format!("toggle-{}", name.to_lowercase()))
+    };
+    vec![
+        panel(Right::Notes, &icons::FILE_TEXT, "Notes", "Toggle notes"),
+        panel(Right::Linear, &icons::TICKET, "Linear", "Toggle Linear"),
+        panel(Right::Changes, &icons::FILE_DIFF, "Changes", "Toggle changes"),
+        panel(Right::Links, &icons::LINK, "Links", "Toggle links"),
+        panel(Right::Agents, &icons::BOT, "Agents", "Toggle agents (⌘⇧A)"),
+    ]
+}
+
+/// Over the terminal: what runs in it, its name, and where.
+fn pane_header(s: &Lemur, key: &Key, k: &Kit) -> Option<El> {
+    let c = &k.c;
+    let t = s.session_of(key)?;
+    let what = t.agent().map_or("Shell", Agent::name);
+    Some(
+        row()
+            .key("term-header")
+            .w_full()
+            .h(32.0)
+            .px(12.0)
+            .gap(8.0)
+            .center_y()
+            .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
+            // On the terminal's own background, as if part of it.
+            .fill(rune::color::hex(&super::palette::hex(s.palette().background)).unwrap_or(c.bg_base))
+            .child(agent_icon(t.agent(), k))
+            .child(text(what).font(k.ty.ui).color(c.text_muted))
+            .child(text(t.label.clone()).key("header-name").font(k.ty.ui_medium).color(c.text_base).truncate())
+            .child(text(t.path.clone()).font(k.ty.small).color(c.text_faint).truncate_head().grow(1.0)),
     )
 }
 
-impl Lemur {
-    /// Minimizes a host's load to its one line, or opens it again.
-    pub(super) fn toggle_host_minimized(&mut self, host: &str, cx: &mut Context<Self>) {
-        let hosts = &mut self.cfg.minimized_hosts;
-        match hosts.iter().position(|h| h == host) {
-            Some(i) => {
-                hosts.remove(i);
-            }
-            None => hosts.push(host.to_string()),
-        }
-        self.save_minimized(cx);
-    }
-
-    /// Keeps what's minimized at the sidebar's foot in the config.
-    pub(super) fn save_minimized(&mut self, cx: &mut Context<Self>) {
-        if let Some(file) = Prefs::get(cx).config_file()
-            && let Err(e) = crate::config::Config::save_minimized(
-                file,
-                self.cfg.minimized_usage,
-                self.cfg.minimized_codex_usage,
-                &self.cfg.minimized_hosts,
-            )
-        {
-            self.fail(e, cx);
-        }
-        cx.notify();
-    }
-}
-
-/// One measure of a host, as a bar: its name, how full, and the number.
-/// Nearly full turns it to a warning, then to danger.
-fn bar(name: &'static str, percent: Option<f32>, text: String, cx: &App) -> Div {
-    bar_sized(name.into(), (px(28.0), px(92.0)), percent, text, cx)
-}
-
-/// A bar whose name and number take these widths.
-pub(super) fn bar_sized(
-    name: SharedString,
-    (name_width, text_width): (Pixels, Pixels),
-    percent: Option<f32>,
-    text: String,
-    cx: &App,
-) -> Div {
-    let theme = cx.theme();
-    let fill = percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let color = match fill {
-        90.0.. => theme.danger,
-        75.0.. => theme.warning,
-        _ => theme.primary,
-    };
-    h_flex()
-        .gap_2()
-        .items_center()
-        .text_xs()
-        .child(
-            div()
-                .w(name_width)
-                .flex_shrink_0()
-                .truncate()
-                .text_color(theme.muted_foreground)
-                .child(name),
-        )
-        .child(
-            div()
-                .flex_1()
-                .h_1p5()
-                .rounded_full()
-                .bg(theme.border)
+/// The terminal on show in its frame, with its header, or a hint with none. The pane
+/// reports its size, which the terminals fit.
+fn main_pane(s: &Lemur, k: &Kit) -> El {
+    let c = &k.c;
+    let body = match s.active.as_ref().and_then(|key| s.terminals.get(key).map(|v| (key, v))) {
+        Some((key, view)) => {
+            let focused = s.keyboard_on_terminal() && s.peek.is_none();
+            col()
+                .key("terminal")
+                .w_full()
+                .h_full()
+                .children(pane_header(s, key, k))
                 .child(
-                    div()
-                        .h_full()
-                        .rounded_full()
-                        .bg(color)
-                        .w(relative(fill / 100.0)),
-                ),
-        )
-        .child(div().w(text_width).flex_shrink_0().text_right().child(text))
+                    col()
+                        .key("term-area")
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .on_layout(|s: &mut Lemur, [_, _, w, h]| s.set_term_area(w, h))
+                        .on_wheel(|s: &mut Lemur, e, tx| s.term_wheel(&e, tx))
+                        .on_drag(|s: &mut Lemur, d, tx| s.term_drag(d, tx))
+                        .on_secondary_press_local(|s: &mut Lemur, e, tx| s.term_secondary(e, tx))
+                        .on_pointer_move_local(|s: &mut Lemur, e, tx| s.term_hover(e, tx))
+                        .on_drop_files(|s: &mut Lemur, files, _| s.drop_files(files))
+                        .cursor(rune::Cursor::Text)
+                        .child(terminal::screen(view, s.metrics, focused, "main"))
+                        .children(super::term_find::bar(view, key, k)),
+                )
+        }
+        None => col()
+            .key("empty")
+            .w_full()
+            .h_full()
+            .center()
+            .on_layout(|s: &mut Lemur, [_, _, w, h]| s.set_term_area(w, h.max(200.0) - 32.0))
+            .child(
+                text(if s.loaded { "Pick a session, or start one with +" } else { "Loading sessions…" })
+                    .font(k.ty.body)
+                    .color(c.text_faint),
+            ),
+    };
+    let mut snacks = vec![];
+    if let Some((message, kind)) = &s.status {
+        snacks.push(snackbar::snackbar("status", message, *kind, |s: &mut Lemur| s.status = None, k));
+    }
+    if let Some((message, kind)) = s.active.as_ref().and_then(|key| s.terminals.get(key)).and_then(|v| v.status.as_ref()) {
+        snacks.push(snackbar::snackbar(
+            "terminal-status",
+            message,
+            *kind,
+            |s: &mut Lemur| {
+                if let Some(v) = s.active.clone().and_then(|key| s.terminals.get_mut(&key)) {
+                    v.status = None;
+                }
+            },
+            k,
+        ));
+    }
+    let frame = col().key("frame").w_full().grow(1.0).min_h(0.0).child(body).child(snackbar::stack(snacks));
+    col().key("pane").w_full().h_full().child(frame).children(panels::under_terminal(s, k)).child(status_bar(s, k))
 }
+
+/// Under the terminal: where the thread on show runs (its host, and its worktree's branch,
+/// its lines added and removed, and its servers), and how many agents need you.
+fn status_bar(s: &Lemur, k: &Kit) -> El {
+    let c = &k.c;
+    let item = |glyph: &'static rune::Icon, label: String| {
+        row().gap(5.0).center_y().child(icon(glyph, 13.0).color(c.icon_muted)).child(text(label).font(k.ty.small).color(c.text_muted))
+    };
+    let mut bar = row()
+        .key("status-bar")
+        .w_full()
+        .h(26.0)
+        .px(12.0)
+        .gap(14.0)
+        .center_y()
+        .fill(super::look::status_bar(k.dark))
+        .border_sides([1.0, 0.0, 0.0, 0.0], c.border_weak);
+    if let Some((host, _)) = &s.active
+        && let Some(h) = s.cfg.host(host)
+    {
+        bar = bar.child(item(super::picker::host_icon(h), super::picker::host_label(h)));
+    }
+    if let Some((host, w)) = s.active_worktree() {
+        let branch = match (&w.branch, &w.head) {
+            (Some(branch), _) => branch.clone(),
+            (None, Some(head)) => format!("detached at {}", &head[..head.len().min(8)]),
+            (None, None) => crate::config::leaf(&w.path).to_string(),
+        };
+        bar = bar.child(item(&icons::GIT_BRANCH, branch)).children(s.changes_item(host, &w.path, k));
+        let links = servers(s, host, w, k);
+        if !links.is_empty() {
+            bar = bar.child(row().key("servers").gap(4.0).center_y().children(links));
+        }
+    }
+    bar = bar.child(el().grow(1.0));
+    let needs = sessions(&s.snap).filter(|(_, t)| t.agent().is_some() && t.activity == Activity::NeedsInput).count();
+    if needs > 0 {
+        bar = bar.child(
+            text(format!("{needs} need{} you", if needs == 1 { "s" } else { "" }))
+                .key("needs-you")
+                .font(k.ty.small_medium)
+                .color(c.warning.fg),
+        );
+    }
+    bar
+}
+
+/// The worktree's servers, by port: a link to each one that can be reached from here.
+/// Another host's is reached by its tailnet name.
+fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec<El> {
+    let c = &k.c;
+    let Some(view) = s.snap.hosts.iter().find(|h| h.name == host) else { return vec![] };
+    let Some(h) = s.cfg.host(host) else { return vec![] };
+    // A worktree inside this one keeps its own servers.
+    let deeper: Vec<&str> = view
+        .bases
+        .iter()
+        .flat_map(|b| b.worktrees.iter())
+        .map(|o| o.path.as_str())
+        .filter(|p| *p != w.path && p.starts_with(&format!("{}/", w.path)))
+        .collect();
+    let local = h.ssh == "local";
+    let name = match &view.machine.tailnet {
+        _ if local => "localhost".to_string(),
+        Some(tailnet) => tailnet.clone(),
+        None => h.name.clone(),
+    };
+    machine::servers_in(&view.machine.servers, &w.path, &deeper)
+        .into_iter()
+        .map(|server| {
+            let url = format!("http://{name}:{}", server.port);
+            let reachable = local || !server.local_only();
+            let tip = if reachable {
+                format!("{url} · {}", server.name)
+            } else {
+                format!("{} on :{} listens only on {}'s own localhost", server.name, server.port, h.name)
+            };
+            let port = text(format!(":{}", server.port))
+                .key(format!("port-{}", server.port))
+                .font(k.ty.small)
+                .color(if reachable { c.text_accent } else { c.text_faint })
+                .help(tip);
+            if reachable {
+                port.cursor(rune::Cursor::Pointer).on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
+                    let _ = tx.open_url(&url);
+                })
+            } else {
+                port
+            }
+        })
+        .collect()
+}
+
+/// A question over the window, as an alert.
+fn dialog(d: &super::Dialog, k: &Kit, layer: &mut Vec<El>) {
+    let c = &k.c;
+    let mut body = col().gap(10.0).child(text(d.title.clone()).font(k.ty.body_medium).color(c.text_base).wrap()).child(
+        text(d.description.clone()).font(k.ty.ui).color(c.text_muted).wrap(),
+    );
+    if let Some((label, checked)) = &d.check {
+        let checked = *checked;
+        body = body.child(
+            Checkbox::new(checked)
+                .label(label.clone())
+                .on_toggle(|s: &mut Lemur| {
+                    if let Some((_, c)) = s.dialog.as_mut().and_then(|d| d.check.as_mut()) {
+                        *c = !*c;
+                    }
+                })
+                .build(k)
+                .key("dialog-check"),
+        );
+    }
+    let cancel = Button::new("Cancel")
+        .variant(ButtonVariant::Outline)
+        .on_press(|s: &mut Lemur| s.dialog = None)
+        .build(k)
+        .key("dialog-cancel");
+    let ok = Button::new(d.ok)
+        .variant(ButtonVariant::Contrast)
+        .on_press(|s: &mut Lemur| {
+            if let Some(d) = s.dialog.take() {
+                let checked = d.check.as_ref().is_some_and(|(_, c)| *c);
+                (d.on_ok)(s, checked);
+            }
+        })
+        .build(k)
+        .key("dialog-ok")
+        // Return agrees, as in a Mac's alerts.
+        .default_button();
+    let buttons = if d.ok == "OK" {
+        row().gap(8.0).justify_end().child(ok)
+    } else {
+        row().gap(8.0).justify_end().child(cancel).child(ok)
+    };
+    let card = card::surface("dialog", 420.0, k).child(col().padding(20.0).gap(16.0).child(body).child(buttons));
+    card::over_window("dialog", card, |s: &mut Lemur| s.dialog = None, k, layer);
+}
+
+/// The whole window.
+pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El {
+    let mut toolbar = Toolbar::new();
+    // Past the traffic lights while the sidebar, which has it otherwise, is away.
+    if !s.sidebar.is_open() {
+        toolbar = toolbar.leading(sidebar::toggle(false, k));
+    }
+    if let Some(tabs) = tabs(s, k) {
+        toolbar = toolbar.leading(tabs);
+    }
+    for b in panel_buttons(s, k) {
+        toolbar = toolbar.trailing(b);
+    }
+    let split = SplitView::new(main_pane(s, k))
+        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k, cx.titlebar_inset()))
+        .inspector(&s.inspector, |s: &mut Lemur| &mut s.inspector, panels::right(s, k))
+        .toolbar(toolbar)
+        .titlebar_inset(cx.titlebar_inset())
+        .frame_inset(FRAME)
+        .sidebar_padding(0.0, FRAME)
+        .hide_sidebar_toggle()
+        .reduced_motion(cx.is_reduced_motion())
+        .build(k);
+    let mut root = el().key("window").w_full().h_full().child(split);
+    if let Some(card) = peek::card(s, k) {
+        root = root.child(card);
+    }
+    for over in panels::overlays(s, k, layer) {
+        root = root.child(over);
+    }
+    if let Some(p) = &s.prompt {
+        card::over_window("spotlight", prompt::card(s, p, k), |s: &mut Lemur| s.close_prompt(), k, layer);
+    }
+    if let Some(d) = &s.dialog {
+        dialog(d, k, layer);
+    }
+    root
+}
+

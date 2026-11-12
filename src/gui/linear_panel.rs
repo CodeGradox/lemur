@@ -2,21 +2,19 @@
 //! are: the Linear issue pinned to the thread on show, to open in Linear or
 //! paste at its agent's prompt, and a search for issues to pin. Lemur signs
 //! in with its own Linear app (`crate::linear`); Settings → Linear signs
-//! out. It asks Linear only while it shows (as it's drawn, and as the
-//! window points it at the thread on show), at most every `FRESH` for the
+//! out. It asks Linear only while it shows (as the window points it at the
+//! thread on show, and with each snapshot), at most every `FRESH` for the
 //! same issues.
 
-use super::Key;
+use super::{Key, Lemur, Right, icons};
+use crate::actions;
+use crate::config::ClaudeThread;
 use crate::linear::{self, Issue, Linear};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
+use rune::{El, Key as K, ScrollSpec, TextEdit, Tx, col, el, row, text};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Markdown, TextInput};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 /// How long what Linear said of an issue, or of yours, is shown before
@@ -25,18 +23,9 @@ const FRESH: Duration = Duration::from_secs(120);
 /// How long typing pauses before a search: Linear allows 30 a minute.
 const TYPING: Duration = Duration::from_millis(350);
 
-/// Lemur's Linear, and whether it's signed in. The panel and Settings
-/// follow it.
+/// Whether Lemur is signed in to Linear. The panel and Settings follow it.
 #[derive(Clone)]
-pub(super) struct LinearAccount {
-    pub(super) linear: Linear,
-    pub(super) state: Account,
-}
-
-impl Global for LinearAccount {}
-
-#[derive(Clone)]
-pub(super) enum Account {
+pub enum Account {
     /// Asking Linear whether the sign-in kept still works.
     Checking,
     /// With why the last sign-in failed, if it did.
@@ -47,785 +36,596 @@ pub(super) enum Account {
     SignedIn(Option<linear::Account>),
 }
 
-impl LinearAccount {
-    pub(super) fn get(cx: &App) -> &LinearAccount {
-        static DEFAULT: LazyLock<LinearAccount> = LazyLock::new(|| LinearAccount {
-            linear: Linear::new(),
-            state: Account::SignedOut(None),
-        });
-        cx.try_global().unwrap_or(&DEFAULT)
-    }
-
-    fn signed_in(cx: &App) -> bool {
-        matches!(LinearAccount::get(cx).state, Account::SignedIn(_))
-    }
-}
-
-fn set_account(state: Account, cx: &mut App) {
-    let linear = LinearAccount::get(cx).linear.clone();
-    cx.set_global(LinearAccount { linear, state });
-}
-
-/// Starts following `linear`: whether its sign-in is kept, and still
-/// works.
-pub(super) fn init(linear: Linear, cx: &mut App) {
-    cx.set_global(LinearAccount {
-        linear: linear.clone(),
-        state: Account::Checking,
-    });
-    cx.spawn(async move |cx| {
-        let state = cx
-            .background_spawn(async move {
-                match linear.signed_in() {
-                    Ok(false) => Account::SignedOut(None),
-                    Err(e) => Account::SignedOut(Some(format!("{e:#}"))),
-                    Ok(true) => match linear.account() {
-                        Ok(account) => Account::SignedIn(Some(account)),
-                        Err(e) if linear::is_signed_out(&e) => Account::SignedOut(None),
-                        // Linear can't be reached: the sign-in is kept.
-                        Err(_) => Account::SignedIn(None),
-                    },
-                }
-            })
-            .await;
-        cx.update(|cx| checked(state, cx));
-    })
-    .detach();
-}
-
-/// Takes what checking the kept sign-in found, unless a sign-in started
-/// meanwhile: its Cancel would go, and its answer would be lost.
-fn checked(state: Account, cx: &mut App) {
-    if matches!(LinearAccount::get(cx).state, Account::Checking) {
-        set_account(state, cx);
-    }
-}
-
-/// Opens Linear's page asking you to approve Lemur, and waits for the
-/// browser to come back with the answer.
-pub(super) fn sign_in(cx: &mut App) {
-    let account = LinearAccount::get(cx);
-    if matches!(account.state, Account::SigningIn(_)) {
-        return;
-    }
-    let linear = account.linear.clone();
-    let sign_in = match linear.start_sign_in() {
-        Ok(sign_in) => sign_in,
-        Err(e) => return set_account(Account::SignedOut(Some(format!("{e:#}"))), cx),
-    };
-    cx.open_url(&sign_in.url());
-    let cancelled = Arc::new(AtomicBool::new(false));
-    set_account(Account::SigningIn(cancelled.clone()), cx);
-    cx.spawn(async move |cx| {
-        let done = cx
-            .background_spawn(async move { linear.finish_sign_in(sign_in, &cancelled) })
-            .await;
-        cx.update(|cx| {
-            let state = match done {
-                Ok(account) => {
-                    // Back from the browser.
-                    cx.activate(true);
-                    Account::SignedIn(Some(account))
-                }
-                Err(e) if linear::is_cancelled(&e) => Account::SignedOut(None),
-                Err(e) => Account::SignedOut(Some(format!("{e:#}"))),
-            };
-            set_account(state, cx);
-        });
-    })
-    .detach();
-}
-
-pub(super) fn cancel_sign_in(cx: &mut App) {
-    if let Account::SigningIn(cancelled) = &LinearAccount::get(cx).state {
-        cancelled.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Forgets the sign-in, and tells Linear so.
-pub(super) fn sign_out(cx: &mut App) {
-    let linear = LinearAccount::get(cx).linear.clone();
-    set_account(Account::SignedOut(None), cx);
-    cx.background_spawn(async move { linear.sign_out() })
-        .detach();
-}
-
-/// What the panel asks the window to do for the thread on show.
-pub(super) enum LinearEvent {
-    /// Pin this issue to the thread, by its key, or with `None` unpin it.
-    Pin(Key, Option<String>),
-    /// Paste this link at the thread's prompt.
-    Send(Key, String),
-}
-
-impl EventEmitter<LinearEvent> for LinearPanel {}
-
 /// The thread on show: its key, its name, and the issue pinned to it.
-pub(super) type Thread = (Key, String, Option<String>);
+pub type Thread = (Key, String, Option<String>);
 
-pub(super) struct LinearPanel {
+pub struct LinearPanel {
+    /// Lemur's Linear; tests have a stand-in.
+    linear: Linear,
+    account: Account,
+    /// Whether the sign-in kept was looked at yet: once, as Lemur starts.
+    checked: bool,
     thread: Option<Thread>,
-    query: Entity<InputState>,
+    query: TextEdit,
     /// What was searched for, and what Linear found.
     found: Option<(String, Result<Vec<Issue>, String>)>,
     searching: bool,
+    /// Counts the searches started and given up: only the latest's answer shows.
+    search: u64,
     /// The issues assigned to you, and when Linear said.
     mine: Option<(Instant, Result<Vec<Issue>, String>)>,
     /// Pinned issues, by key, as Linear last said, and when.
     issues: HashMap<String, (Instant, Result<Issue, String>)>,
-    _query: Subscription,
-    _account: Subscription,
-    _search: Option<Task<()>>,
-    _mine: Option<Task<()>>,
-    _issue: Option<Task<()>>,
+    /// Linear is being asked for yours, or for a pinned issue.
+    asking_mine: bool,
+    asking_issue: bool,
+    /// Linear's page asking you to approve Lemur, opened in the browser before the next
+    /// frame: Settings' button has no `Tx` to open it with.
+    approve: Option<String>,
+}
+
+impl Default for LinearPanel {
+    fn default() -> Self {
+        LinearPanel {
+            linear: Linear::new(),
+            account: Account::Checking,
+            checked: false,
+            thread: None,
+            query: TextEdit::new(""),
+            found: None,
+            searching: false,
+            search: 0,
+            mine: None,
+            issues: HashMap::new(),
+            asking_mine: false,
+            asking_issue: false,
+            approve: None,
+        }
+    }
 }
 
 impl LinearPanel {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search issues, or paste a key or a link")
-        });
-        let typed = cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
-            if let InputEvent::Change = event {
-                this.search(cx);
-            }
-        });
-        // What Linear said was another sign-in's, or an error it no longer
-        // has: asked again, as it's drawn.
-        let account = cx.observe_global::<LinearAccount>(|this, cx| {
-            this.mine = None;
-            this.issues.clear();
-            this.found = None;
-            if LinearAccount::signed_in(cx) {
-                this.search(cx);
-            }
-            cx.notify();
-        });
-        LinearPanel {
-            thread: None,
-            query,
-            found: None,
-            searching: false,
-            mine: None,
-            issues: HashMap::new(),
-            _query: typed,
-            _account: account,
-            _search: None,
-            _mine: None,
-            _issue: None,
-        }
-    }
-
-    /// Shows `thread`'s issue, or yours when none is pinned to it; asked
-    /// again once they're no longer fresh. The window calls it while the
-    /// panel shows.
-    pub(super) fn show(&mut self, thread: Option<Thread>, cx: &mut Context<Self>) {
-        if self.thread != thread {
-            self.thread = thread;
-            cx.notify();
-        }
-        self.fetch(cx);
+    fn signed_in(&self) -> bool {
+        matches!(self.account, Account::SignedIn(_))
     }
 
     #[cfg(test)]
     pub(super) fn shown(&self) -> Option<&Thread> {
         self.thread.as_ref()
     }
+}
+
+impl Lemur {
+    /// Points the Linear panel at the thread on show, while it shows. The first time, as
+    /// the first snapshot comes in, it asks whether the sign-in kept still works.
+    pub(super) fn follow_linear(&mut self) {
+        self.check_linear();
+        if self.right() != Some(Right::Linear) {
+            return;
+        }
+        let thread = self.active.clone().map(|key| {
+            let (label, issue) = match self.session_of(&key) {
+                Some(s) => (s.label.clone(), s.issue.clone()),
+                None => (self.label_of(&key.0, &key.1), None),
+            };
+            (key, label, issue)
+        });
+        self.panels.linear.thread = thread;
+        self.fetch_linear();
+    }
+
+    /// Starts following Linear: whether its sign-in is kept, and still works.
+    fn check_linear(&mut self) {
+        let p = &mut self.panels.linear;
+        if p.checked {
+            return;
+        }
+        p.checked = true;
+        // A headless run (a snapshot, a script) leaves the Keychain alone: reading it may
+        // ask you, on the screen you're using.
+        if rune::tooling::headless_run().is_some() {
+            return self.linear_checked(Account::SignedOut(None));
+        }
+        let linear = p.linear.clone();
+        self.in_background(
+            move || match linear.signed_in() {
+                Ok(false) => Account::SignedOut(None),
+                Err(e) => Account::SignedOut(Some(format!("{e:#}"))),
+                Ok(true) => match linear.account() {
+                    Ok(account) => Account::SignedIn(Some(account)),
+                    Err(e) if linear::is_signed_out(&e) => Account::SignedOut(None),
+                    // Linear can't be reached: the sign-in is kept.
+                    Err(_) => Account::SignedIn(None),
+                },
+            },
+            |s, state| s.linear_checked(state),
+        );
+    }
+
+    /// Takes what checking the kept sign-in found, unless a sign-in started
+    /// meanwhile: its Cancel would go, and its answer would be lost.
+    fn linear_checked(&mut self, state: Account) {
+        if matches!(self.panels.linear.account, Account::Checking) {
+            self.set_linear_account(state);
+        }
+    }
+
+    /// The sign-in changed: what Linear said was another sign-in's, or an error it no
+    /// longer has, so it's asked again.
+    fn set_linear_account(&mut self, state: Account) {
+        let p = &mut self.panels.linear;
+        p.account = state;
+        p.mine = None;
+        p.issues.clear();
+        p.found = None;
+        if p.signed_in() {
+            self.linear_search();
+        }
+        self.follow_linear();
+    }
+
+    /// Opens Linear's page asking you to approve Lemur, and waits for the
+    /// browser to come back with the answer.
+    fn sign_in_linear(&mut self) {
+        let p = &self.panels.linear;
+        if matches!(p.account, Account::SigningIn(_)) {
+            return;
+        }
+        let linear = p.linear.clone();
+        let sign_in = match linear.start_sign_in() {
+            Ok(sign_in) => sign_in,
+            Err(e) => return self.set_linear_account(Account::SignedOut(Some(format!("{e:#}")))),
+        };
+        self.panels.linear.approve = Some(sign_in.url());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.set_linear_account(Account::SigningIn(cancelled.clone()));
+        self.in_background(
+            move || linear.finish_sign_in(sign_in, &cancelled),
+            |s, done| {
+                let state = match done {
+                    Ok(account) => Account::SignedIn(Some(account)),
+                    Err(e) if linear::is_cancelled(&e) => Account::SignedOut(None),
+                    Err(e) => Account::SignedOut(Some(format!("{e:#}"))),
+                };
+                s.set_linear_account(state);
+            },
+        );
+    }
+
+    fn cancel_linear_sign_in(&mut self) {
+        if let Account::SigningIn(cancelled) = &self.panels.linear.account {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Forgets the sign-in, and tells Linear so.
+    fn sign_out_linear(&mut self) {
+        let linear = self.panels.linear.linear.clone();
+        self.set_linear_account(Account::SignedOut(None));
+        self.in_background(move || linear.sign_out(), |_, _| {});
+    }
+
+    /// What Settings says of Lemur's Linear sign-in, and why the last went wrong, if it did.
+    pub(super) fn linear_account_status(&self) -> (String, Option<String>) {
+        match &self.panels.linear.account {
+            Account::Checking => ("Checking…".into(), None),
+            Account::SignedOut(error) => ("Not signed in".into(), error.clone()),
+            Account::SigningIn(_) => ("Waiting for you in the browser…".into(), None),
+            Account::SignedIn(Some(a)) => (format!("{} · {}", a.name, a.workspace), None),
+            Account::SignedIn(None) => ("Signed in · Linear can't be reached".into(), None),
+        }
+    }
+
+    /// What Settings offers for the sign-in, and what that runs: Sign out signed in, Cancel
+    /// signing in, else Sign in.
+    pub(super) fn linear_account_action(&self) -> (&'static str, fn(&mut Lemur)) {
+        match &self.panels.linear.account {
+            Account::SignedIn(_) => ("Sign out", Lemur::sign_out_linear),
+            Account::SigningIn(_) => ("Cancel", Lemur::cancel_linear_sign_in),
+            _ => ("Sign in with Linear", Lemur::sign_in_linear),
+        }
+    }
+
+    /// What Linear said, or why it couldn't; a sign-in Linear turned down
+    /// signs Lemur out.
+    fn linear_said<T>(&mut self, answer: anyhow::Result<T>) -> Result<T, String> {
+        answer.map_err(|e| {
+            if linear::is_signed_out(&e) {
+                self.set_linear_account(Account::SignedOut(None));
+            }
+            format!("{e:#}")
+        })
+    }
 
     /// Asks Linear for what shows, unless it said so lately.
-    fn fetch(&mut self, cx: &mut Context<Self>) {
-        if !LinearAccount::signed_in(cx) {
+    fn fetch_linear(&mut self) {
+        let p = &mut self.panels.linear;
+        if !p.signed_in() {
             return;
         }
         let stale = |at: Option<Instant>| at.is_none_or(|at| at.elapsed() >= FRESH);
-        let linear = LinearAccount::get(cx).linear.clone();
-        let pinned = self.thread.as_ref().and_then(|(_, _, issue)| issue.clone());
-        match pinned {
+        let linear = p.linear.clone();
+        match p.thread.as_ref().and_then(|(_, _, issue)| issue.clone()) {
             Some(key) => {
-                if self._issue.is_some() || !stale(self.issues.get(&key).map(|(at, _)| *at)) {
+                if p.asking_issue || !stale(p.issues.get(&key).map(|(at, _)| *at)) {
                     return;
                 }
-                self._issue = Some(cx.spawn(async move |this, cx| {
-                    let asked = key.clone();
-                    let issue = cx
-                        .background_spawn(async move { linear.issue(&asked) })
-                        .await;
-                    this.update(cx, |this, cx| {
-                        this._issue = None;
-                        let issue = said(issue, cx);
-                        this.issues.insert(key, (Instant::now(), issue));
-                        // Drawn again, it asks for one pinned meanwhile.
-                        cx.notify();
-                    })
-                    .ok();
-                }));
+                p.asking_issue = true;
+                let asked = key.clone();
+                self.in_background(
+                    move || linear.issue(&asked),
+                    |s, issue| {
+                        s.panels.linear.asking_issue = false;
+                        let issue = s.linear_said(issue);
+                        s.panels.linear.issues.insert(key, (Instant::now(), issue));
+                        // It asks for one pinned meanwhile.
+                        s.follow_linear();
+                    },
+                );
             }
             None => {
-                if self._mine.is_some() || !stale(self.mine.as_ref().map(|(at, _)| *at)) {
+                if p.asking_mine || !stale(p.mine.as_ref().map(|(at, _)| *at)) {
                     return;
                 }
-                self._mine = Some(cx.spawn(async move |this, cx| {
-                    let mine = cx.background_spawn(async move { linear.mine() }).await;
-                    this.update(cx, |this, cx| {
-                        this._mine = None;
-                        this.mine = Some((Instant::now(), said(mine, cx)));
-                        cx.notify();
-                    })
-                    .ok();
-                }));
+                p.asking_mine = true;
+                self.in_background(
+                    move || linear.mine(),
+                    |s, mine| {
+                        s.panels.linear.asking_mine = false;
+                        let mine = s.linear_said(mine);
+                        s.panels.linear.mine = Some((Instant::now(), mine));
+                    },
+                );
             }
         }
     }
 
     /// Searches for what's typed, once typing pauses.
-    fn search(&mut self, cx: &mut Context<Self>) {
-        let term = self.query.read(cx).value().trim().to_string();
+    fn linear_search(&mut self) {
+        let p = &mut self.panels.linear;
+        let term = p.query.text.trim().to_string();
+        p.search += 1;
         if term.is_empty() {
-            self.found = None;
-            self.searching = false;
-            self._search = None;
-            cx.notify();
+            p.found = None;
+            p.searching = false;
             return;
         }
         // Back to what was found: a search for what was typed meanwhile
         // would answer for a term no longer in the box.
-        if self.found.as_ref().is_some_and(|(t, _)| *t == term) {
-            self.searching = false;
-            self._search = None;
-            cx.notify();
+        if p.found.as_ref().is_some_and(|(t, _)| *t == term) {
+            p.searching = false;
             return;
         }
-        let linear = LinearAccount::get(cx).linear.clone();
-        self.searching = true;
-        cx.notify();
-        self._search = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TYPING).await;
+        p.searching = true;
+        let (linear, search) = (p.linear.clone(), p.search);
+        self.bg.after(TYPING, move |s| {
+            if s.panels.linear.search != search {
+                return;
+            }
             let asked = term.clone();
-            let found = cx
-                .background_spawn(async move { linear.search(&asked) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.searching = false;
-                this.found = Some((term, said(found, cx)));
-                cx.notify();
-            })
-            .ok();
-        }));
+            s.in_background(
+                move || linear.search(&asked),
+                move |s, found| {
+                    if s.panels.linear.search != search {
+                        return;
+                    }
+                    let found = s.linear_said(found);
+                    let p = &mut s.panels.linear;
+                    p.searching = false;
+                    p.found = Some((term, found));
+                },
+            );
+        });
     }
 
     /// Pins `issue` to the thread on show, or opens it in Linear with no
     /// thread on show.
-    fn pick(&mut self, issue: &Issue, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((key, _, _)) = &self.thread else {
-            cx.open_url(&issue.url);
+    fn pick_issue(&mut self, issue: &Issue, tx: &mut Tx) {
+        let p = &mut self.panels.linear;
+        let Some((key, _, _)) = p.thread.clone() else {
+            let _ = tx.open_url(&issue.url);
             return;
         };
         // Found by its key, it came with its description; otherwise that's
         // asked for once it's pinned.
         if issue.description.is_some() {
-            let shown = (Instant::now(), Ok(issue.clone()));
-            self.issues.insert(issue.identifier.clone(), shown);
+            p.issues.insert(issue.identifier.clone(), (Instant::now(), Ok(issue.clone())));
         } else {
-            self.issues.remove(&issue.identifier);
+            p.issues.remove(&issue.identifier);
         }
-        cx.emit(LinearEvent::Pin(
-            key.clone(),
-            Some(issue.identifier.clone()),
-        ));
-        self.query.update(cx, |q, cx| q.set_value("", window, cx));
-        self.found = None;
-        cx.notify();
+        p.query.clear();
+        p.found = None;
+        p.searching = false;
+        p.search += 1;
+        self.pin_issue(key, Some(issue.identifier.clone()));
     }
 
-    fn issue_rows(&self, issues: &[Issue], cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let theme = cx.theme().clone();
-        issues
-            .iter()
-            .enumerate()
-            .map(|(i, issue)| {
-                let picked = issue.clone();
-                let pinned = self.thread.as_ref().and_then(|(_, _, p)| p.as_deref())
-                    == Some(issue.identifier.as_str());
-                h_flex()
-                    .id(SharedString::from(format!("issue-{i}")))
-                    .debug_selector(move || format!("issue {i}"))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .items_center()
-                    .rounded(theme.radius)
-                    .text_sm()
-                    .cursor_pointer()
-                    .map(|row| {
-                        if pinned {
-                            row.bg(theme.tokens.sidebar_accent)
-                        } else {
-                            row.hover(|row| row.bg(theme.sidebar_accent.opacity(0.5)))
-                        }
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.pick(&picked, window, cx)),
-                    )
-                    .child(state_dot(issue, theme.muted_foreground))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(issue.identifier.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(issue.title.clone()),
-                    )
-                    .into_any_element()
-            })
-            .collect()
-    }
-
-    /// The issue pinned to the thread on show: what it is, where it's at,
-    /// and what to do with it.
-    fn card(&self, key: &Key, pinned: &str, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
-        let issue = match self.issues.get(pinned) {
-            Some((_, Ok(issue))) => issue.clone(),
-            other => {
-                let note = match other {
-                    Some((_, Err(e))) => e.clone(),
-                    _ => "Asking Linear…".into(),
-                };
-                let unpin = key.clone();
-                return v_flex()
-                    .p_3()
-                    .gap_2()
-                    .child(div().text_sm().font_semibold().child(pinned.to_string()))
-                    .child(div().text_sm().text_color(muted).child(note))
-                    .child(
-                        h_flex().child(Button::new("unpin").small().label("Unpin").on_click(
-                            cx.listener(move |_, _, _, cx| {
-                                cx.emit(LinearEvent::Pin(unpin.clone(), None))
-                            }),
-                        )),
-                    )
-                    .into_any_element();
-            }
-        };
-        let meta: Vec<String> = [
-            issue.assignee.as_ref().map(|a| a.name.clone()),
-            Some(issue.priority_label.clone()).filter(|p| p != "No priority"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let (open, send, unpin) = (issue.url.clone(), issue.url.clone(), key.clone());
-        let send_to = key.clone();
-        let description = issue.description.clone().unwrap_or_default();
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(
-                v_flex()
-                    .flex_shrink_0()
-                    .px_3()
-                    .pb_3()
-                    .gap_1p5()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .text_xs()
-                            .child(div().text_color(muted).child(issue.identifier.clone()))
-                            .child(state_dot(&issue, muted))
-                            .child(issue.state.name.clone()),
-                    )
-                    .child(div().text_sm().font_semibold().child(issue.title.clone()))
-                    .when(!meta.is_empty(), |card| {
-                        card.child(div().text_xs().text_color(muted).child(meta.join(" · ")))
-                    })
-                    .child(
-                        h_flex()
-                            .pt_1()
-                            .gap_2()
-                            .child(
-                                div().debug_selector(|| "send to agent".into()).child(
-                                    Button::new("send")
-                                        .small()
-                                        .primary()
-                                        .label("Send to agent")
-                                        .tooltip("Pastes its link at the thread's prompt")
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(LinearEvent::Send(
-                                                send_to.clone(),
-                                                send.clone(),
-                                            ))
-                                        })),
-                                ),
-                            )
-                            .child(
-                                Button::new("open")
-                                    .small()
-                                    .label("Open in Linear")
-                                    .on_click(move |_, _, cx| cx.open_url(&open)),
-                            )
-                            .child(
-                                div().debug_selector(|| "unpin".into()).child(
-                                    Button::new("unpin")
-                                        .small()
-                                        .ghost()
-                                        .label("Unpin")
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(LinearEvent::Pin(unpin.clone(), None))
-                                        })),
-                                ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("issue-description")
-                    .flex_1()
-                    .min_h_0()
-                    .p_3()
-                    .overflow_y_scroll()
-                    .text_sm()
-                    .child(if description.trim().is_empty() {
-                        div()
-                            .text_color(muted)
-                            .child("No description.")
-                            .into_any_element()
-                    } else {
-                        TextView::markdown("issue-markdown", description)
-                            .selectable(true)
-                            .into_any_element()
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// Asks you to sign in, or says it's under way.
-    fn signed_out(&self, state: &Account, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let danger = cx.theme().danger;
-        let body = v_flex().p_3().gap_3().text_sm();
-        match state {
-            Account::Checking => body.text_color(muted).child("Checking Linear…"),
-            Account::SigningIn(_) => body
-                .child(
-                    div().text_color(muted).child(
-                        "Approve Lemur in the browser window that opened, then come back here.",
-                    ),
-                )
-                .child(
-                    h_flex().child(
-                        Button::new("cancel-sign-in")
-                            .small()
-                            .label("Cancel")
-                            .on_click(|_, _, cx| cancel_sign_in(cx)),
-                    ),
-                ),
-            Account::SignedOut(error) => body
-                .child(div().text_color(muted).child(
-                    "Sign in to Linear to search its issues and pin them to threads. \
-                     Lemur only reads.",
-                ))
-                .child(
-                    h_flex().child(
-                        Button::new("sign-in")
-                            .small()
-                            .primary()
-                            .label("Sign in with Linear")
-                            .on_click(|_, _, cx| sign_in(cx)),
-                    ),
-                )
-                .children(
-                    error
-                        .clone()
-                        .map(|e| div().text_xs().text_color(danger).child(e)),
-                ),
-            Account::SignedIn(_) => body,
+    /// Pins the Linear issue `issue` (its key) to thread `key`, or with `None` unpins its
+    /// issue: shown at once, and herdr-core keeps it.
+    pub(super) fn pin_issue(&mut self, key: Key, issue: Option<String>) {
+        if let Some(s) = self.session_mut(&key) {
+            s.issue = issue.clone();
         }
-        .into_any_element()
-    }
-}
-
-/// What Linear said, or why it couldn't; a sign-in Linear turned down
-/// signs Lemur out.
-fn said<T>(answer: anyhow::Result<T>, cx: &mut App) -> Result<T, String> {
-    answer.map_err(|e| {
-        if linear::is_signed_out(&e) {
-            set_account(Account::SignedOut(None), cx);
+        // Kept to resume it, it's pinned again then: whether or not its
+        // Claude runs, which keeps the entry current otherwise.
+        let kept = self.cfg.threads.iter().find(|t| t.host == key.0 && t.session == key.1).cloned();
+        if let Some(thread) = kept {
+            self.keep_thread(ClaudeThread { issue: issue.clone(), ..thread });
         }
-        format!("{e:#}")
-    })
+        self.follow_linear();
+        self.write_core(move |cfg| actions::set_issue(cfg, &key.0, &key.1, issue.as_deref()));
+    }
+
+    /// A link to a Linear issue pasted into a thread pins that issue to it, unless it has
+    /// one.
+    pub(super) fn pasted(&mut self, key: &Key, text: &str) {
+        let Some(issue) = linear::issue_in(text) else { return };
+        if self.session_of(key).is_some_and(|s| s.issue.is_none()) {
+            self.pin_issue(key.clone(), Some(issue));
+        }
+    }
+
+    /// Pastes `text` at thread `key`'s prompt, as if typed there, and gives it the
+    /// keyboard; Enter is left to you.
+    fn paste_into(&mut self, key: &Key, text: &str, tx: &mut Tx) {
+        let Some(view) = self.terminals.get_mut(key) else { return };
+        view.paste_text(text);
+        self.panels.linear.query.focused = false;
+        tx.blur();
+    }
+
+    /// The search field has the keyboard.
+    pub(super) fn linear_editing(&self) -> bool {
+        self.right() == Some(Right::Linear) && self.panels.linear.query.focused
+    }
+
+    /// Before each frame: Linear's page to approve Lemur opens in the browser, and the
+    /// search field, hidden, lets go of the keyboard, so it doesn't take it back as it
+    /// shows again. True if that changed anything.
+    pub(super) fn linear_poll(&mut self, tx: &mut Tx) -> bool {
+        let shown = self.right() == Some(Right::Linear);
+        let p = &mut self.panels.linear;
+        if let Some(url) = p.approve.take() {
+            let _ = tx.open_url(&url);
+        }
+        if shown || !p.query.focused {
+            return false;
+        }
+        p.query.focused = false;
+        true
+    }
 }
 
 /// A dot in the color of the issue's state.
-fn state_dot(issue: &Issue, fallback: Hsla) -> Div {
-    let color = u32::from_str_radix(issue.state.color.trim_start_matches('#'), 16)
-        .map(|c| Hsla::from(rgb(c)))
-        .unwrap_or(fallback);
-    div().flex_shrink_0().size_2().rounded_full().bg(color)
+fn state_dot(issue: &Issue, k: &Kit) -> El {
+    let color = rune::color::hex(&issue.state.color).unwrap_or(k.c.text_muted);
+    el().size(8.0, 8.0).radius(4.0).fill(color)
 }
 
-impl Render for LinearPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Only drawn while it shows.
-        self.fetch(cx);
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
-        let title = match &self.thread {
-            Some((_, label, _)) => format!("Linear · {label}"),
-            None => "Linear".to_string(),
-        };
-        let header = h_flex().h_10().flex_shrink_0().px_3().items_center().child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_sm()
-                .font_semibold()
-                .child(title),
-        );
-        let state = LinearAccount::get(cx).state.clone();
-        if !matches!(state, Account::SignedIn(_)) {
-            return v_flex()
-                .size_full()
-                .child(header)
-                .child(self.signed_out(&state, cx));
-        }
-        let search = div().px_3().pb_2().flex_shrink_0().child(
-            Input::new(&self.query)
-                .small()
-                .prefix(Icon::new(IconName::Search).small().text_color(muted))
-                .cleanable(true),
-        );
-        let note = |text: String| div().px_3().py_1().text_sm().text_color(muted).child(text);
-        let list = |rows: Vec<AnyElement>| {
-            v_flex()
-                .id("linear-issues")
-                .flex_1()
-                .min_h_0()
-                .px_1()
-                .gap_0p5()
-                .overflow_y_scroll()
-                .children(rows)
-                .into_any_element()
-        };
-        let typed = !self.query.read(cx).value().trim().is_empty();
-        let pinned = self
-            .thread
-            .as_ref()
-            .and_then(|(key, _, issue)| Some((key.clone(), issue.clone()?)));
-        let body = if typed {
-            match &self.found {
-                _ if self.searching => note("Searching…".into()).into_any_element(),
-                Some((_, Ok(found))) if found.is_empty() => {
-                    note("No issues match.".into()).into_any_element()
-                }
-                Some((_, Ok(found))) => list(self.issue_rows(found, cx)),
-                Some((_, Err(e))) => note(e.clone()).into_any_element(),
-                None => note("Searching…".into()).into_any_element(),
-            }
-        } else if let Some((key, issue)) = pinned {
-            self.card(&key, &issue, cx)
-        } else {
-            let mine = match &self.mine {
-                None => vec![note("Asking Linear…".into()).into_any_element()],
-                Some((_, Err(e))) => vec![note(e.clone()).into_any_element()],
-                Some((_, Ok(mine))) if mine.is_empty() => {
-                    vec![note("Nothing is assigned to you.".into()).into_any_element()]
-                }
-                Some((_, Ok(mine))) => self.issue_rows(mine, cx),
+/// A line of muted text, for what's under way or went wrong.
+fn note(key: &str, said: String, k: &Kit) -> El {
+    text(said).key(key.to_string()).font(k.ty.ui).color(k.c.text_muted).wrap().px(12.0).py(4.0)
+}
+
+/// Issues to pin, as rows; the one pinned to the thread on show stands out.
+fn issue_rows(p: &LinearPanel, issues: &[Issue], k: &Kit) -> El {
+    let c = &k.c;
+    let pinned = p.thread.as_ref().and_then(|(_, _, i)| i.as_deref());
+    let rows = issues.iter().enumerate().map(|(i, issue)| {
+        let picked = issue.clone();
+        let r = row()
+            .key(format!("linear-issue-{i}"))
+            .w_full()
+            .h(28.0)
+            .px(8.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.md)
+            .cursor(rune::Cursor::Pointer)
+            .help(issue.url.clone())
+            .child(state_dot(issue, k))
+            .child(text(issue.identifier.clone()).font(k.ty.small).color(c.text_faint))
+            .child(text(issue.title.clone()).font(k.ty.ui).color(c.text_base).truncate().grow(1.0).shrink())
+            .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| s.pick_issue(&picked, tx));
+        if pinned == Some(issue.identifier.as_str()) { r.fill(c.pressed) } else { k.interactive(r) }
+    });
+    col().key("linear-issues").w_full().grow(1.0).min_h(0.0).px(4.0).pb(8.0).gap(1.0).scroll(ScrollSpec { stick_bottom: false }).children(rows)
+}
+
+/// The issue pinned to the thread on show: what it is, where it's at,
+/// and what to do with it.
+fn card(p: &LinearPanel, key: &Key, pinned: &str, k: &Kit) -> El {
+    let c = &k.c;
+    let unpin = key.clone();
+    let unpin_button = |variant| {
+        Button::new("Unpin")
+            .variant(variant)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut Lemur| s.pin_issue(unpin.clone(), None))
+            .build(k)
+            .key("linear-unpin")
+    };
+    let issue = match p.issues.get(pinned) {
+        Some((_, Ok(issue))) => issue,
+        other => {
+            let said = match other {
+                Some((_, Err(e))) => e.clone(),
+                _ => "Asking Linear…".into(),
             };
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(muted)
-                        .child(if self.thread.is_some() {
-                            "Assigned to you · click one to pin it to this thread"
-                        } else {
-                            "Assigned to you · open a thread to pin one to it"
-                        }),
-                )
-                .child(list(mine))
-                .into_any_element()
+            return col()
+                .key("linear-card")
+                .w_full()
+                .px(12.0)
+                .pb(12.0)
+                .gap(8.0)
+                .child(text(pinned.to_string()).font(k.ty.ui_medium).color(c.text_base))
+                .child(text(said).font(k.ty.ui).color(c.text_muted).wrap())
+                .child(row().child(unpin_button(ButtonVariant::Outline)));
+        }
+    };
+    let meta: Vec<String> =
+        [issue.assignee.as_ref().map(|a| a.name.clone()), Some(issue.priority_label.clone()).filter(|p| p != "No priority")]
+            .into_iter()
+            .flatten()
+            .collect();
+    let (open, send, send_to) = (issue.url.clone(), issue.url.clone(), key.clone());
+    let mut head = col()
+        .key("linear-card")
+        .w_full()
+        .px(12.0)
+        .pb(12.0)
+        .gap(6.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
+        .child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(text(issue.identifier.clone()).font(k.ty.small).color(c.text_muted))
+                .child(state_dot(issue, k))
+                .child(text(issue.state.name.clone()).font(k.ty.small).color(c.text_base)),
+        )
+        .child(text(issue.title.clone()).font(k.ty.ui_medium).color(c.text_base).wrap());
+    if !meta.is_empty() {
+        head = head.child(text(meta.join(" · ")).font(k.ty.small).color(c.text_muted));
+    }
+    let buttons = row()
+        .pt(4.0)
+        .gap(8.0)
+        .child(
+            Button::new("Send to agent")
+                .variant(ButtonVariant::Contrast)
+                .control_size(ControlSize::Small)
+                .help("Pastes its link at the thread's prompt")
+                .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| s.paste_into(&send_to, &send, tx))
+                .build(k)
+                .key("linear-send"),
+        )
+        .child(
+            Button::new("Open in Linear")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
+                    let _ = tx.open_url(&open);
+                })
+                .build(k)
+                .key("linear-open"),
+        )
+        .child(unpin_button(ButtonVariant::Ghost));
+    let description = issue.description.clone().unwrap_or_default();
+    let body = if description.trim().is_empty() {
+        text("No description.").font(k.ty.ui).color(c.text_muted)
+    } else {
+        Markdown::new(description).selectable(true).build(k)
+    };
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(head.child(buttons))
+        .child(col().key("linear-description").w_full().grow(1.0).min_h(0.0).padding(12.0).scroll(ScrollSpec { stick_bottom: false }).child(body))
+}
+
+/// Asks you to sign in, or says it's under way.
+fn signed_out(state: &Account, k: &Kit) -> El {
+    let c = &k.c;
+    let body = col().key("linear-sign-in").w_full().px(12.0).py(4.0).gap(12.0);
+    let said = |words: &str| text(words.to_string()).font(k.ty.ui).color(c.text_muted).wrap();
+    match state {
+        Account::Checking => body.child(said("Checking Linear…")),
+        Account::SigningIn(_) => body.child(said("Approve Lemur in the browser window that opened, then come back here.")).child(
+            row().child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .on_press(Lemur::cancel_linear_sign_in)
+                    .build(k)
+                    .key("linear-cancel-sign-in"),
+            ),
+        ),
+        Account::SignedOut(error) => {
+            let body = body.child(said("Sign in to Linear to search its issues and pin them to threads. Lemur only reads.")).child(
+                row().child(
+                    Button::new("Sign in with Linear")
+                        .variant(ButtonVariant::Contrast)
+                        .control_size(ControlSize::Small)
+                        .on_press(Lemur::sign_in_linear)
+                        .build(k)
+                        .key("linear-sign-in-button"),
+                ),
+            );
+            match error {
+                Some(e) => body.child(text(e.clone()).font(k.ty.small).color(c.danger.fg).wrap()),
+                None => body,
+            }
+        }
+        Account::SignedIn(_) => body,
+    }
+}
+
+pub fn view(s: &Lemur, k: &Kit) -> El {
+    let p = &s.panels.linear;
+    let c = &k.c;
+    let header = super::panels::header("linear-head", None, "Linear", p.thread.as_ref().map(|(_, l, _)| l.as_str()), 0, k);
+    let panel = col().key("linear-panel").w_full().h_full().min_h(0.0).child(header);
+    if !p.signed_in() {
+        return panel.child(signed_out(&p.account, k));
+    }
+    let typed = !p.query.text.trim().is_empty();
+    let mut search = TextInput::new(&p.query)
+        .placeholder("Search issues, or paste a key or a link")
+        .leading_icon(&icons::SEARCH)
+        .width(None)
+        .on_edit(|s: &mut Lemur| &mut s.panels.linear.query)
+        .on_change(|s: &mut Lemur, _| s.linear_search())
+        .on_key(|s: &mut Lemur, ev, tx| {
+            // Esc gives the keyboard back to the thread on show.
+            if ev.key == K::Escape {
+                s.panels.linear.query.focused = false;
+                tx.blur();
+                return true;
+            }
+            false
+        });
+    if typed {
+        search = search.clear_button().on_action(|s: &mut Lemur, _| {
+            s.panels.linear.query.clear();
+            s.linear_search();
+        });
+    }
+    let search = row().w_full().px(12.0).pb(8.0).child(search.build(k).key("linear-search"));
+    let pinned = p.thread.as_ref().and_then(|(key, _, issue)| Some((key, issue.as_deref()?)));
+    let body = if typed {
+        match &p.found {
+            _ if p.searching => note("linear-searching", "Searching…".into(), k),
+            Some((_, Ok(found))) if found.is_empty() => note("linear-no-match", "No issues match.".into(), k),
+            Some((_, Ok(found))) => issue_rows(p, found, k),
+            Some((_, Err(e))) => note("linear-error", e.clone(), k),
+            None => note("linear-searching", "Searching…".into(), k),
+        }
+    } else if let Some((key, issue)) = pinned {
+        card(p, key, issue, k)
+    } else {
+        let mine = match &p.mine {
+            None => note("linear-asking", "Asking Linear…".into(), k),
+            Some((_, Err(e))) => note("linear-error", e.clone(), k),
+            Some((_, Ok(mine))) if mine.is_empty() => note("linear-none", "Nothing is assigned to you.".into(), k),
+            Some((_, Ok(mine))) => issue_rows(p, mine, k),
         };
-        v_flex().size_full().child(header).child(search).child(body)
-    }
-}
-
-/// Settings' Linear page: who Lemur is signed in as, and signing in or out.
-pub(super) fn settings_status(cx: &App) -> (String, Option<String>) {
-    match &LinearAccount::get(cx).state {
-        Account::Checking => ("Checking…".into(), None),
-        Account::SignedOut(error) => ("Not signed in".into(), error.clone()),
-        Account::SigningIn(_) => ("Waiting for you in the browser…".into(), None),
-        Account::SignedIn(Some(a)) => (format!("{} · {}", a.name, a.workspace), None),
-        Account::SignedIn(None) => ("Signed in · Linear can't be reached".into(), None),
-    }
-}
-
-/// Whether Settings offers Sign out (signed in), Cancel (signing in) or
-/// Sign in.
-pub(super) fn settings_action(cx: &App) -> (&'static str, fn(&mut App)) {
-    match &LinearAccount::get(cx).state {
-        Account::SignedIn(_) => ("Sign out", sign_out),
-        Account::SigningIn(_) => ("Cancel", cancel_sign_in),
-        _ => ("Sign in with Linear", sign_in),
-    }
+        let caption = if p.thread.is_some() {
+            "Assigned to you · click one to pin it to this thread"
+        } else {
+            "Assigned to you · open a thread to pin one to it"
+        };
+        col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(text(caption).font(k.ty.small_medium).color(c.text_muted).px(12.0).py(4.0))
+            .child(mine)
+    };
+    panel.child(search).child(body)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Account, LinearAccount, LinearPanel, checked, init, set_account};
-    use crate::linear::{Linear, Store};
-    use crate::test_support::{FakeLinear, TempDir, wait_until};
-    use gpui::VisualTestContext;
-    use gpui_kit::{AppContext, Entity};
-    use serde_json::json;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
-
-    /// A stand-in Linear with one issue per search term, signed in, and
-    /// the panel in a window.
-    fn panel<'a>(
-        tag: &str,
-        cx: &'a mut gpui::TestAppContext,
-    ) -> (
-        FakeLinear,
-        TempDir,
-        Entity<LinearPanel>,
-        &'a mut VisualTestContext,
-    ) {
-        let api = FakeLinear::new(|r| {
-            let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-            let term = body["variables"]["term"].as_str().unwrap_or("mine");
-            let issue = json!({
-                "identifier": "LAFT-1", "title": term, "url": "https://linear.app/x/issue/LAFT-1",
-                "branchName": "b", "priorityLabel": "High",
-                "state": { "name": "Todo", "color": "#aaaaaa", "type": "unstarted" },
-                "assignee": null,
-            });
-            let data = if body["query"].as_str().unwrap().contains("searchIssues") {
-                json!({ "searchIssues": { "nodes": [issue] } })
-            } else if body["query"].as_str().unwrap().contains("assignedIssues") {
-                json!({ "viewer": { "assignedIssues": { "nodes": [issue] } } })
-            } else {
-                json!({ "viewer": { "name": "M" }, "organization": { "name": "L" } })
-            };
-            (200, json!({ "data": data }).to_string())
-        });
-        let dir = TempDir::new(tag);
-        let linear = Linear::at(&api.url, Store::File(dir.join("tokens")));
-        linear.sign_in_as("a").unwrap();
-        cx.executor().allow_parking();
-        cx.update(gpui_kit::init);
-        cx.update(|cx| init(linear, cx));
-        let mut made = None;
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let view = cx.new(|cx| LinearPanel::new(window, cx));
-            made = Some(view.clone());
-            gpui_kit::base::Root::new(view, window, cx)
-        });
-        let signed_in = wait_until(Duration::from_secs(5), || {
-            cx.run_until_parked();
-            cx.update(|_, cx| LinearAccount::signed_in(cx))
-        });
-        assert!(signed_in);
-        (api, dir, made.unwrap(), cx)
-    }
-
-    /// Typed back to what was found, the panel shows what was found, not
-    /// what a search for the longer term answers.
-    #[gpui::test]
-    fn typed_back_the_search_shows_what_was_found(cx: &mut gpui::TestAppContext) {
-        let (_api, _dir, panel, cx) = panel("linear-panel-search", cx);
-        let type_in = |text: &str, cx: &mut VisualTestContext| {
-            panel.update_in(cx, |p, window, cx| {
-                p.query.update(cx, |q, cx| q.set_value(text, window, cx));
-                p.search(cx);
-            });
-        };
-        let found = |cx: &mut VisualTestContext| {
-            panel.read_with(cx, |p, _| {
-                let titles = p
-                    .found
-                    .as_ref()
-                    .and_then(|(_, f)| f.as_ref().ok())
-                    .map(|f| f.iter().map(|i| i.title.clone()).collect::<Vec<_>>());
-                (p.searching, titles)
-            })
-        };
-        // Typing pauses: the clock moves past the debounce.
-        type_in("lease", cx);
-        assert!(wait_until(Duration::from_secs(5), || {
-            cx.executor().advance_clock(Duration::from_millis(400));
-            cx.run_until_parked();
-            found(cx) == (false, Some(vec!["lease".into()]))
-        }));
-        type_in("leasex", cx);
-        assert!(found(cx).0, "searching");
-        type_in("lease", cx);
-        assert_eq!(found(cx), (false, Some(vec!["lease".to_string()])));
-        for _ in 0..10 {
-            cx.executor().advance_clock(Duration::from_millis(400));
-            std::thread::sleep(Duration::from_millis(30));
-            cx.run_until_parked();
-        }
-        assert_eq!(
-            found(cx),
-            (false, Some(vec!["lease".to_string()])),
-            "not leasex's"
-        );
-    }
-
-    /// Signed out and in again, what Linear said before isn't shown.
-    #[gpui::test]
-    fn a_new_sign_in_forgets_what_linear_said(cx: &mut gpui::TestAppContext) {
-        let (_api, _dir, panel, cx) = panel("linear-panel-forget", cx);
-        panel.update(cx, |p, cx| p.show(None, cx));
-        assert!(wait_until(Duration::from_secs(5), || {
-            cx.run_until_parked();
-            panel.read_with(cx, |p, _| p.mine.is_some())
-        }));
-        cx.update(|_, cx| set_account(Account::SignedOut(None), cx));
-        cx.run_until_parked();
-        assert!(panel.read_with(cx, |p, _| p.mine.is_none()));
-    }
-
-    /// A sign-in started while Lemur still checks the one it kept isn't
-    /// undone when the check ends: its Cancel stays.
-    #[gpui::test]
-    fn a_check_ending_leaves_a_sign_in_under_way(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            cx.set_global(LinearAccount {
-                linear: Linear::new(),
-                state: Account::Checking,
-            });
-            checked(Account::SignedOut(None), cx);
-            assert!(matches!(
-                LinearAccount::get(cx).state,
-                Account::SignedOut(_)
-            ));
-            set_account(Account::SigningIn(Arc::new(AtomicBool::new(false))), cx);
-            checked(Account::SignedOut(None), cx);
-            assert!(matches!(
-                LinearAccount::get(cx).state,
-                Account::SigningIn(_)
-            ));
-        });
-    }
-}
+#[path = "linear_panel_tests.rs"]
+mod tests;

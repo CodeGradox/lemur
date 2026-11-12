@@ -2,7 +2,7 @@
 
 Lemur ships as `Lemur.app` in a disk image: open it, drag Lemur onto the
 Applications shortcut, eject it. Releases are Apple Silicon (arm64) only and
-need macOS 11 or newer. The version lives in one place, `Cargo.toml`; the app
+need macOS 13 or newer. The version lives in one place, `Cargo.toml`; the app
 build writes it into `Info.plist`.
 
 ## Local builds
@@ -61,8 +61,8 @@ fixture app the same way, without credentials.
 ## Tests on main
 
 Every push to `main` runs **Build Lemur** (`.github/workflows/release.yml`)
-for the tests only: it installs the Rust version from `mise.toml`, Xcode's
-Metal toolchain and herdr-core (`scripts/install-herdr-core.sh`: a pinned
+for the tests only: it installs the Rust version from `mise.toml`, Zig
+and herdr-core (`scripts/install-herdr-core.sh`: a pinned
 version, checked against its checksum), and runs the tests. It gets no secrets and
 publishes nothing. A newer push cancels a run still going for an older one.
 These runs keep the compiled dependencies in GitHub's cache

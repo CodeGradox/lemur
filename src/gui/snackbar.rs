@@ -1,9 +1,9 @@
-//! Snackbars: messages in a dark pill at the bottom of the terminal, each
-//! with a × to close it.
+//! Snackbars: messages in a dark pill at the bottom of the terminal, each with a × to close
+//! it.
 
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
+use super::icons;
+use rune::{El, col, icon, row, text};
+use rune_kit::{IconButton, IconButtonVariant, Kit, Spinner};
 use std::time::Duration;
 
 /// What a message is, which decides how long it stays.
@@ -22,83 +22,35 @@ pub enum Kind {
 /// How long a note shows.
 pub const NOTE_TIME: Duration = Duration::from_secs(5);
 
-/// Stacks `snacks` at the bottom center of the area it's put in; the
-/// area around them still takes clicks.
-pub fn stack(snacks: Vec<AnyElement>) -> Div {
-    v_flex()
-        .absolute()
-        .left_0()
-        .right_0()
-        .bottom_4()
-        .px_4()
-        .gap_2()
-        .items_center()
-        .children(snacks)
+/// Stacks `snacks` at the bottom centre of the area it's put in.
+pub fn stack(snacks: Vec<El>) -> El {
+    col().key("snackbars").pin(Some(0.0), None, Some(0.0), Some(16.0)).px(16.0).gap(8.0).items_center().children(snacks)
 }
 
 /// One message; a click on its × calls `close`. Long ones wrap.
-pub fn snackbar(
-    id: &'static str,
-    text: impl Into<SharedString>,
-    kind: Kind,
-    close: impl Fn(&mut Window, &mut App) + 'static,
-    cx: &App,
-) -> AnyElement {
-    // Against the theme, to stand out: LAFT's dark pill in the light
-    // theme, its white one in the dark.
-    let dark = cx.theme().is_dark();
-    let (bg, fg, hover) = if dark {
-        (rgb(0xffffff), rgb(0x1f2937), black().opacity(0.08))
-    } else {
-        (rgb(0x3d4451), rgb(0xe5e6e6), white().opacity(0.12))
+pub fn snackbar<S: 'static>(id: &str, message: &str, kind: Kind, close: impl Fn(&mut S) + 'static, k: &Kit) -> El {
+    let c = &k.c;
+    let lead = match kind {
+        Kind::Progress => Spinner::new().build(k),
+        Kind::Note => icon(&icons::CIRCLE_CHECK, 14.0).color(c.success.icon),
+        Kind::Warning => icon(&icons::TRIANGLE_ALERT, 14.0).color(c.warning.icon),
+        Kind::Error => icon(&icons::CIRCLE_ALERT, 14.0).color(c.danger.icon),
     };
-    let icon = match kind {
-        Kind::Warning => Some((
-            IconName::TriangleAlert,
-            if dark { 0xf29349 } else { 0xffbd70 },
-        )),
-        Kind::Error => Some((IconName::CircleX, if dark { 0xcc6152 } else { 0xe88f82 })),
-        Kind::Progress | Kind::Note => None,
-    };
-    h_flex()
-        .id(id)
-        .occlude()
-        .max_w(px(560.0))
-        .items_start()
-        .gap_2()
-        .py(px(6.0))
-        .pr(px(6.0))
-        .pl_4()
-        .rounded(px(20.0))
-        .bg(bg)
-        .text_color(fg)
-        .text_sm()
-        .shadow_lg()
-        .when_some(icon, |this, (icon, color)| {
-            this.child(
-                Icon::new(icon)
-                    .small()
-                    .text_color(rgb(color))
-                    .flex_shrink_0()
-                    .mt(px(6.0)),
-            )
-        })
-        // As tall as the × on one line, so a short message sits centered.
-        .child(div().min_w_0().py(px(4.0)).child(text.into()))
-        .child(
-            div()
-                .id("close")
-                .debug_selector(move || format!("close {id}"))
-                .flex_shrink_0()
-                .size(px(28.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .cursor_pointer()
-                .hover(move |this| this.bg(hover))
-                .on_click(move |_, window, cx| close(window, cx))
-                .child(Icon::new(IconName::Close).small()),
-        )
-        .into_any_element()
+    let close = IconButton::new(&icons::X).variant(IconButtonVariant::GhostMuted).label("Close").on_press(close).build(k);
+    row()
+        .key(format!("snack-{id}"))
+        .max_w(640.0)
+        .min_h(36.0)
+        .pl(12.0)
+        .pr(4.0)
+        .py(4.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.lg)
+        .fill(c.layer_02)
+        .border(1.0, c.border_base)
+        .shadow(4.0, 16.0, c.scrim)
+        .child(lead)
+        .child(text(message.to_owned()).key(format!("snack-text-{id}")).font(k.ty.ui).color(c.text_base).wrap().max_w(560.0))
+        .child(close)
 }

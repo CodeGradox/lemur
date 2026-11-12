@@ -4,46 +4,44 @@
 //! it as a label on the terminal (`lemur.away`), so it stays away across
 //! restarts, and from any Mac.
 
-use super::{Key, Lemur, key};
+use super::{Key, Lemur, List, key};
 use crate::actions;
 use crate::config::ThreadOrder;
 use crate::snapshot::Session;
-use gpui_kit::*;
 
 impl Lemur {
     /// Puts thread `k` away. On show, the one you opened before it in its
     /// list shows instead, else its neighbour.
-    pub(super) fn put_away(&mut self, k: Key, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn put_away(&mut self, k: Key) {
         self.mark_away(&k, true);
         if self.active.as_ref() == Some(&k) {
             let next = self.successor(&k, ThreadOrder::Recent, |other| {
                 *other != k && self.session_of(other).is_some_and(|s| !s.away)
             });
-            self.hide_shown(None, cx);
+            self.hide_shown(None);
             self.active = None;
             if let Some((host, session)) = next {
-                self.open(host, session, window, cx);
+                self.open(host, session);
             }
-            self.follow_shown(cx);
+            self.follow_shown();
         }
-        self.save_away(k, true, cx);
+        self.save_away(k, true);
     }
 
     /// Brings thread `k` back, if it's away.
-    pub(super) fn bring_back(&mut self, k: &Key, cx: &mut Context<Self>) {
+    pub(super) fn bring_back(&mut self, k: &Key) {
         if self.session_of(k).is_some_and(|s| s.away) {
             self.mark_away(k, false);
-            self.save_away(k.clone(), false, cx);
+            self.save_away(k.clone(), false);
         }
     }
 
     /// Opens or folds the "Put away" of the list `list`.
-    pub(super) fn toggle_away_list(&mut self, list: SharedString, cx: &mut Context<Self>) {
+    pub(super) fn toggle_away_list(&mut self, list: List) {
         if !self.away_open.remove(&list) {
             self.away_open.insert(list);
         }
-        cx.notify();
-    }
+            }
 
     /// Shows it so at once, its list in its new order, until the next
     /// refresh says what herdr-core keeps.
@@ -67,33 +65,18 @@ impl Lemur {
         }
     }
 
-    fn save_away(&mut self, (host, session): Key, away: bool, cx: &mut Context<Self>) {
-        self.changes += 1;
-        cx.notify();
-        let cfg = self.cfg.clone();
-        self.in_background(
-            cx,
-            move || actions::set_away(&cfg, &host, &session, away),
-            |this, saved, _, cx| {
-                // Refreshes that started before herdr-core had it are stale.
-                this.changes += 1;
-                if let Err(e) = saved {
-                    this.fail(e, cx);
-                }
-                this.refresh(cx).detach();
-            },
-        )
-        .detach();
+    fn save_away(&mut self, (host, session): Key, away: bool) {
+        self.write_core(move |cfg| actions::set_away(cfg, &host, &session, away));
     }
 
     /// The threads put away that need you now: they come back.
-    pub(super) fn bring_back_needed(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn bring_back_needed(&mut self) {
         let needed: Vec<Key> = super::sessions(&self.snap)
             .filter(|(_, s)| s.away && s.activity == crate::snapshot::Activity::NeedsInput)
             .map(|(h, s)| key(h, s))
             .collect();
         for k in needed {
-            self.bring_back(&k, cx);
+            self.bring_back(&k);
         }
     }
 }

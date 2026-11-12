@@ -28,10 +28,9 @@ jobs:
       - name: Install the pinned toolchain
         run: |
           xcodebuild -version
-          # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
-          # Metal toolchain as a separate download.
-          xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
-              xcodebuild -downloadComponent MetalToolchain
+          # The terminal is Ghostty's, built from its source with Zig.
+          brew install zig
+          zig version
           rust="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$rust"
           rustup toolchain install "$rust" --profile minimal
@@ -99,10 +98,9 @@ jobs:
         run: |
           test "$(uname -m)" = "$ARCH"
           xcodebuild -version
-          # GPUI compiles its Metal shaders at build time; Xcode 26 ships the
-          # Metal toolchain as a separate download.
-          xcrun -sdk macosx metal --version >/dev/null 2>&1 ||
-              xcodebuild -downloadComponent MetalToolchain
+          # The terminal is Ghostty's, built from its source with Zig.
+          brew install zig
+          zig version
           rust="$(sed -n 's/^rust = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$rust"
           rustup toolchain install "$rust" --profile minimal
@@ -133,9 +131,9 @@ jobs:
           dmg="$BUILD_DIR/lemur.dmg"
           test "$(lipo -archs "$binary")" = "$ARCH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 11.0
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 13.0
           xcrun vtool -show-build "$binary"
-          xcrun vtool -show-build "$binary" | grep -Eq 'minos[[:space:]]+11\.0([[:space:]]|$)'
+          xcrun vtool -show-build "$binary" | grep -Eq 'minos[[:space:]]+13\.0([[:space:]]|$)'
           codesign --verify --deep --strict --verbose=2 "$app"
           hdiutil verify "$dmg"
           codesign --verify --strict --verbose=2 "$dmg"
@@ -195,6 +193,6 @@ jobs:
           test "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF" --jq .sha)" = "$RELEASE_COMMIT"
           gh release create "$tag" --verify-tag --target "$RELEASE_COMMIT" \
             --draft --title "Lemur $RELEASE_VERSION" \
-            --notes "Requires Apple Silicon and macOS 11 or newer; dictation needs macOS 26 or newer. Open the DMG, drag Lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
+            --notes "Requires Apple Silicon and macOS 13 or newer; dictation needs macOS 26 or newer. Open the DMG, drag Lemur into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional."
           gh release upload "$tag" lemur-macos-arm64.dmg SHA256SUMS.txt
           gh release edit "$tag" --draft=false --latest

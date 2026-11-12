@@ -750,11 +750,18 @@ pub fn rename_session(cfg: &Config, host: &str, session: &str, name: &str) -> Re
 }
 
 /// Where a file downloaded goes. Tests keep off the real one.
-fn downloads_dir() -> Result<PathBuf> {
+pub fn downloads_dir() -> Result<PathBuf> {
     #[cfg(test)]
     return Ok(std::env::temp_dir().join(format!("lemur-downloads-{}", std::process::id())));
     #[cfg(not(test))]
     Ok(crate::config::home()?.join("Downloads"))
+}
+
+/// Keeps a copy of `file`, as `download` fetched it, at `to`: not its permissions, so a
+/// program stays something you'd have to mean to run.
+pub fn keep_download_at(file: &Path, to: &Path) -> Result<()> {
+    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    std::fs::write(to, bytes).with_context(|| format!("writing {}", to.display()))
 }
 
 /// Keeps a copy of `file`, as `download` fetched it, in the Downloads folder;
@@ -850,14 +857,26 @@ fn terminal(host: &Host, session: &str) -> Result<hc::Terminal> {
 /// relative path is from the session's current folder, as Claude prints
 /// them.
 pub fn download(host: &Host, session: &str, path: &str) -> Result<PathBuf> {
+    copy_here(host, &printed_path(host, session, path, true)?)
+}
+
+/// A file on `host` as a file on this Mac, to drag to another app: on this Mac, the file
+/// itself; on another host, a copy (as `download` makes). With `session`, the path is as it
+/// printed it; without, the whole path.
+pub fn file_here(host: &Host, session: Option<&str>, path: &str) -> Result<PathBuf> {
+    let local = Remote::new(host).is_local();
+    match session {
+        Some(session) if local => Ok(PathBuf::from(printed_path(host, session, path, true)?)),
+        Some(session) => download(host, session, path),
+        None if local => Ok(PathBuf::from(path)),
+        None => copy_here(host, path),
+    }
+}
+
+/// Copies the file at `remote` on `host` into a temporary folder that mirrors the host's,
+/// and returns where it went.
+fn copy_here(host: &Host, remote: &str) -> Result<PathBuf> {
     let r = Remote::new(host);
-    let folder = terminal(host, session)?.folder().to_string();
-    let remote = r.run(&format!(
-        "set -e\np={}\ncase $p in /*) ;; *) p={}/\"$p\" ;; esac\n[ -f \"$p\" ] || {{ echo \"no file at $p\" >&2; exit 1; }}\ncd \"$(dirname \"$p\")\"\nprintf '%s/%s\\n' \"$(pwd -P)\" \"$(basename \"$p\")\"\n",
-        sh_path(path),
-        quote(&folder),
-    ))?;
-    let remote = remote.trim_end_matches('\n');
     // Only the folders' names: `..` can't climb out.
     let mirrored: PathBuf = Path::new(remote)
         .components()
@@ -874,6 +893,55 @@ pub fn download(host: &Host, session: &str, path: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     r.copy_from(remote, &local)?;
     Ok(local)
+}
+
+/// Where a path session `session` printed is on its host, its folders' links followed:
+/// a relative one is from the session's current folder, as Claude prints them. With
+/// `file`, it must be a file; otherwise anything there.
+fn printed_path(host: &Host, session: &str, path: &str, file: bool) -> Result<String> {
+    let folder = terminal(host, session)?.folder().to_string();
+    let check = if file {
+        "[ -f \"$p\" ] || { echo \"no file at $p\" >&2; exit 1; }"
+    } else {
+        "[ -e \"$p\" ] || { echo \"nothing at $p\" >&2; exit 1; }"
+    };
+    let remote = Remote::new(host).run(&format!(
+        "set -e\np={}\ncase $p in /*) ;; *) p={}/\"$p\" ;; esac\n{check}\ncd \"$(dirname \"$p\")\"\nprintf '%s/%s\\n' \"$(pwd -P)\" \"$(basename \"$p\")\"\n",
+        sh_path(path),
+        quote(&folder),
+    ))?;
+    Ok(remote.trim_end_matches('\n').to_string())
+}
+
+/// Opens a path session `session` printed in Zed, at `place` (`:line` or `:line:column`)
+/// if it was printed with one: on this Mac as it is, on another host through Zed's remote
+/// development, which reaches the host as Lemur does.
+pub fn open_in_zed(host: &Host, session: &str, path: &str, place: &str) -> Result<()> {
+    let path = printed_path(host, session, path, false)?;
+    let target = zed_target(host, &path, place);
+    match Command::new("zed").arg(&target).stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => bail!("zed exited with {status}"),
+        // Without Zed's command line tool, its app still opens what's on this Mac.
+        Err(_) if Remote::new(host).is_local() => {
+            let status = Command::new("open").args(["-a", "Zed"]).arg(&path).status().context("starting Zed")?;
+            if !status.success() {
+                bail!("Zed isn't installed");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e).context("running zed, Zed's command line tool (Zed → Install CLI)"),
+    }
+}
+
+/// What `zed` opens for `path` on `host`, at `place`: on another host, a URL naming it as
+/// Lemur's config does.
+fn zed_target(host: &Host, path: &str, place: &str) -> String {
+    if Remote::new(host).is_local() {
+        format!("{path}{place}")
+    } else {
+        format!("ssh://{}{path}{place}", host.ssh)
+    }
 }
 
 /// Shows a file with Quick Look, which previews it and never runs it.
@@ -1013,6 +1081,29 @@ mod tests {
         assert!(format!("{folder:#}").contains("no file at"), "{folder:#}");
         assert!(download(host, &t, "missing.rs").is_err());
         std::fs::remove_file(got).unwrap();
+    }
+
+    /// Zed opens a printed path, a folder too, at its line: on this Mac as it is, and on
+    /// another host through its remote development.
+    #[test]
+    fn zed_opens_a_printed_path_where_it_is() {
+        let server = HcServer::new("zed");
+        let dir = TempDir::new("zed");
+        let work = dir.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let t = server.run(&work.to_string_lossy(), &[], &["sleep", "600"]);
+        let cfg = server.config();
+        let host = cfg.host("local").unwrap();
+        listed_by(&server, &t);
+        let real = |p: &str| std::fs::canonicalize(work.join(p)).unwrap().to_string_lossy().into_owned();
+        assert_eq!(printed_path(host, &t, "src/a.rs", false).unwrap(), real("src/a.rs"));
+        assert_eq!(printed_path(host, &t, "src", false).unwrap(), real("src"));
+        assert!(printed_path(host, &t, "missing.rs", false).is_err());
+        assert_eq!(zed_target(host, "/w/src/a.rs", ":12:3"), "/w/src/a.rs:12:3");
+        let mut remote = host.clone();
+        remote.ssh = "dev@box".into();
+        assert_eq!(zed_target(&remote, "/w/src/a.rs", ":12"), "ssh://dev@box/w/src/a.rs:12");
     }
 
     /// Waits for the core to list `address`.

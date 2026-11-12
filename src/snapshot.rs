@@ -116,6 +116,9 @@ pub struct Session {
     /// Something other than its shell at its prompt runs in it, as Claude
     /// or a server, or herdr-core hasn't said what does yet.
     pub busy: bool,
+    /// What runs in it besides its shell at its prompt, by its program's name,
+    /// unless it's a program you work in rather than wait on (`WAITS_ON_YOU`).
+    pub command: Option<String>,
     /// Its program runs: herdr-core knows its pid. A kept terminal whose
     /// program was lost has none until its new shell starts.
     pub running: bool,
@@ -169,6 +172,21 @@ impl Session {
             Some(Agent::Claude)
         } else {
             None
+        }
+    }
+
+    /// The command a shell thread runs, by its program's name: none in an
+    /// agent's thread.
+    pub fn shell_runs(&self) -> Option<&str> {
+        self.command.as_deref().filter(|_| self.agent().is_none())
+    }
+
+    /// What its dot says it's doing: what its agent says, or for a shell,
+    /// working while it runs a command.
+    pub fn doing(&self) -> Activity {
+        match self.shell_runs() {
+            Some(_) => Activity::Working,
+            None => self.activity,
         }
     }
 
@@ -707,6 +725,11 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         started: t.created_ms,
         claude: None,
         busy: busy(t),
+        command: t
+            .foreground
+            .as_ref()
+            .filter(|f| busy(t) && !WAITS_ON_YOU.contains(&f.name.as_str()))
+            .map(|f| f.name.clone()),
         running: t.pid.is_some(),
         pid: t.pid,
         shell: label(SHELL).and_then(|p| p.parse().ok()),
@@ -791,6 +814,15 @@ fn parent_of(t: &Terminal) -> Option<String> {
 /// their processes.
 const SHELLS: [&str; 12] = [
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
+];
+
+/// Programs you work in rather than wait on, as the OS names their
+/// processes: open, they aren't a command at work. Claude and Codex say what
+/// they do themselves.
+const WAITS_ON_YOU: [&str; 24] = [
+    "vi", "vim", "nvim", "nano", "emacs", "micro", "hx", "kak", "less", "more", "most", "man",
+    "top", "htop", "btop", "watch", "fzf", "ssh", "mosh-client", "tmux", "screen", "zellij",
+    "claude", "codex",
 ];
 
 /// Whether `t` came back from its host restarting as a fresh shell at its
@@ -1679,5 +1711,45 @@ mod tests {
             "{:?}",
             read(&shell)
         );
+    }
+
+    /// A shell runs a command from when it starts until its prompt is back,
+    /// but not while what it started is a program you work in, as a pager.
+    #[test]
+    fn a_shell_runs_a_command_until_its_prompt_is_back() {
+        let server = HcServer::new("command");
+        let (quick, pager) = (server.run("/", &[], &["sh"]), server.run("/", &[], &["sh"]));
+        let core = server.core();
+        let read = |address: &str| {
+            core.terminals()
+                .into_iter()
+                .find(|t| t.address == address && t.foreground.is_some())
+                .map(|t| session(&t, 0))
+        };
+        let command = |address: &str| read(address).map(|s| s.command);
+        assert!(wait_until(Duration::from_secs(5), || command(&quick) == Some(None)));
+        assert!(wait_until(Duration::from_secs(5), || command(&pager) == Some(None)));
+        core.type_line(&quick, "sleep 3").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || command(&quick) == Some(Some("sleep".into()))),
+            "{:?}",
+            read(&quick)
+        );
+        let s = read(&quick).unwrap();
+        assert_eq!((s.shell_runs(), s.doing()), (Some("sleep"), Activity::Working));
+        assert!(
+            wait_until(Duration::from_secs(10), || command(&quick) == Some(None)),
+            "back at its prompt: {:?}",
+            read(&quick)
+        );
+        assert_eq!(read(&quick).unwrap().doing(), Activity::Unknown);
+
+        core.type_line(&pager, "less /etc/hosts").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || read(&pager).is_some_and(|s| s.busy)),
+            "{:?}",
+            read(&pager)
+        );
+        assert_eq!(command(&pager), Some(None), "less waits on you");
     }
 }
