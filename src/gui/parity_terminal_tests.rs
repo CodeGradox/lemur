@@ -758,6 +758,23 @@ fn the_terminal_keeps_the_scrollback_set() {
     assert!(history(&rt.state) >= 1000, "kept {}", history(&rt.state));
 }
 
+/// Attaching again, the stream starts on its own thread before the attach says it's done: what
+/// comes meanwhile is the new screen's. On the old one, it was lost, and the screen came back
+/// blank or in part.
+#[test]
+fn output_before_an_attach_is_done_goes_to_the_new_screen() {
+    let server = HcServer::new("pbird");
+    let (mut rt, k, _) = shown_in(&server, "/", &["sleep", "600"]);
+    // No frame between them, so nothing has said the attach is done.
+    rt.update(|s, _| {
+        s.connect(&k);
+        s.terminals.get_mut(&k).unwrap().feed(b"early bird");
+        s.terminals.get_mut(&k).unwrap().grid.as_mut().unwrap().refresh().unwrap();
+    });
+    assert!(!lines(&rt, &k).iter().any(|l| l.contains("early bird")), "not the screen on show's: {:?}", lines(&rt, &k));
+    assert!(wait_for(&mut rt, 10.0, |s| s.terminals[&k].painted), "attached again");
+}
+
 /// A font size from Settings reaches open terminals, and their programs: a bigger font fits
 /// fewer columns and lines in the same window.
 #[test]

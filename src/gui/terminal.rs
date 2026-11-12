@@ -266,7 +266,9 @@ impl TermView {
 
     /// Feeds relayed bytes in; false once the stream is over.
     fn ingest(&mut self, batch: Vec<Stream>) -> bool {
-        let Some(grid) = &mut self.grid else { return false };
+        // Attaching again, the stream can start before the attach says it's done: its bytes
+        // are the new screen's, not the one still on show.
+        let Some(grid) = self.fresh.as_mut().or(self.grid.as_mut()) else { return false };
         let mut open = true;
         // Its program ended: the thread goes from the sidebar, and this with it.
         let mut over = false;
