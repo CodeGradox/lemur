@@ -10,7 +10,7 @@ use crate::config::Host;
 use crate::hc::{self, Core, Stream};
 use futures::StreamExt;
 use rune::tok::Family;
-use rune::{El, TextStyle, col, el, memo, text};
+use rune::{Color, El, TextEdit, TextStyle, col, el, memo, text};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -116,6 +116,11 @@ pub struct TermView {
     pub bar_hover: bool,
     /// Its scroll bar's thumb is dragged, from the row it showed first at the press.
     pub bar_drag: Option<usize>,
+    /// What its find bar (⌘F) looks for, kept while it's closed, and whether it's open.
+    pub find: TextEdit,
+    pub finding: bool,
+    /// Typed in the find bar: the newest match is picked once there's one.
+    pub find_pick: bool,
     /// The cells it's shown at, and what the core was last told: the colours and cell size
     /// it's shown in, and whether it has the keyboard.
     pub size: Size,
@@ -156,6 +161,9 @@ impl TermView {
             status: None,
             bar_hover: false,
             bar_drag: None,
+            find: TextEdit::default(),
+            finding: false,
+            find_pick: false,
             size,
             told_display: None,
             told_focus: None,
@@ -556,7 +564,9 @@ impl Lemur {
     /// A text field of the window's has the keyboard. Rune keeps each field's `focused`, so
     /// a click elsewhere, which takes the keyboard from it, gives it back to the terminal.
     pub(super) fn editing(&self) -> bool {
-        self.prompt.as_ref().is_some_and(|p| p.input.focused || p.branch.as_ref().is_some_and(|b| b.focused)) || self.panels_editing()
+        self.prompt.as_ref().is_some_and(|p| p.input.focused || p.branch.as_ref().is_some_and(|b| b.focused))
+            || self.panels_editing()
+            || self.find_editing()
     }
 
     /// The peek has the keyboard: nothing's over it.
@@ -655,6 +665,16 @@ pub(super) fn screen(view: &TermView, m: Metrics, focused: bool, id: &str) -> El
     for (y, row) in grid.rows.iter().enumerate() {
         // A row Ghostty didn't rebuild keeps the elements built for it last time.
         rows = rows.child(memo(format!("tr-{id}-{y}"), (row.version, m.cell_w.to_bits(), m.cell_h.to_bits()), || row_el(id, y, row, m)));
+    }
+    // What ⌘F found, on its colour with its text in black over it.
+    for (i, &(row, start, end, picked)) in g.found().spans.iter().enumerate() {
+        let (x, y, w) = (f32::from(start) * m.cell_w, f32::from(row) * m.cell_h, f32::from(end - start) * m.cell_w);
+        let mut found = el().key(format!("found-{id}-{i}")).absolute(x, y).size(w, m.cell_h).fill(super::term_find::match_fill(picked));
+        for (col, words, r) in grid.rows.get(usize::from(row)).map(|r| span_runs(r, start, end)).unwrap_or_default() {
+            let style = if r.italic { m.style(r.bold).italic() } else { m.style(r.bold) };
+            found = found.child(text(words).font(style).color(Color::BLACK).absolute(f32::from(col - start) * m.cell_w, 0.0));
+        }
+        rows = rows.child(found);
     }
     for (i, &(row, start, end)) in view.hover.iter().flat_map(|link| &link.spans).enumerate() {
         let (x, w) = (f32::from(start) * m.cell_w, f32::from(end - start) * m.cell_w);

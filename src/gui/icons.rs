@@ -33,6 +33,7 @@ lucide! {
     CHEVRON_DOWN, "chevron-down", r#"<path d="m6 9 6 6 6-6"/>"#;
     CHEVRON_LEFT, "chevron-left", r#"<path d="m15 18-6-6 6-6"/>"#;
     CHEVRON_RIGHT, "chevron-right", r#"<path d="m9 18 6-6-6-6"/>"#;
+    CHEVRON_UP, "chevron-up", r#"<path d="m18 15-6-6-6 6"/>"#;
     CIRCLE_ALERT, "circle-alert", r#"<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>"#;
     CIRCLE_CHECK, "circle-check", r#"<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>"#;
     CIRCLE_STOP, "circle-stop", r#"<circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1"/>"#;

@@ -15,6 +15,9 @@ pub enum Action {
     PutAway,
     Dictate,
     Refresh,
+    Find,
+    FindNext,
+    FindPrevious,
     CommandPalette,
     ToggleSidebar,
     ToggleRightPanel,
@@ -49,6 +52,9 @@ pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
     (Action::PutAway, "Put Thread Away", "File", None),
     (Action::Dictate, "Dictate", "File", Some("mod+d")),
     (Action::Refresh, "Refresh", "File", None),
+    (Action::Find, "Find…", "Edit", Some("mod+f")),
+    (Action::FindNext, "Find Next", "Edit", Some("mod+g")),
+    (Action::FindPrevious, "Find Previous", "Edit", Some("mod+shift+g")),
     (Action::CommandPalette, "Command Palette…", "View", Some("mod+shift+p")),
     (Action::ToggleSidebar, "Toggle Sidebar", "View", Some("mod+b")),
     (Action::ToggleRightPanel, "Toggle Right Panel", "View", Some("mod+r")),
@@ -116,6 +122,9 @@ pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
         }
         Action::Dictate => s.dictate(),
         Action::Refresh => s.refresh(),
+        Action::Find => s.open_find(),
+        Action::FindNext => s.find_next(true),
+        Action::FindPrevious => s.find_next(false),
         Action::CommandPalette => s.open_palette(),
         Action::ToggleSidebar => s.sidebar.toggle(),
         Action::ToggleRightPanel => s.toggle_right_panel(),
@@ -156,6 +165,9 @@ menu_fn! {
     m_put_away => Action::PutAway;
     m_dictate => Action::Dictate;
     m_refresh => Action::Refresh;
+    m_find => Action::Find;
+    m_find_next => Action::FindNext;
+    m_find_previous => Action::FindPrevious;
     m_palette => Action::CommandPalette;
     m_sidebar => Action::ToggleSidebar;
     m_right => Action::ToggleRightPanel;
@@ -205,6 +217,9 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
         (Action::PutAway, m_put_away),
         (Action::Dictate, m_dictate),
         (Action::Refresh, m_refresh),
+        (Action::Find, m_find),
+        (Action::FindNext, m_find_next),
+        (Action::FindPrevious, m_find_previous),
         (Action::CommandPalette, m_palette),
         (Action::ToggleSidebar, m_sidebar),
         (Action::ToggleRightPanel, m_right),
@@ -231,11 +246,19 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
     let mut last = "Lemur";
     for (action, title, menu, key) in ACTIONS {
         let Some((_, f)) = fns.iter().find(|(a, _)| a == action) else { continue };
-        if *menu != last && last != "Lemur" {
+        if *menu != last && last != "Lemur" && last != "Edit" {
             app = app.menu_item(MenuItem::separator().menu(last));
         }
+        // Edit's go under macOS's own items, after a line.
+        if *menu == "Edit" && last != "Edit" {
+            app = app.menu_item(MenuItem::separator().menu("Edit").after("selectAll:"));
+        }
         last = menu;
-        app = app.menu_item(item(title, *f, menu, *key));
+        let mut it = item(title, *f, menu, *key);
+        if *menu == "Edit" {
+            it = it.after("selectAll:");
+        }
+        app = app.menu_item(it);
     }
     app
 }

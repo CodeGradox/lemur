@@ -46,6 +46,9 @@ mod snackbar;
 mod term_bar;
 #[cfg(test)]
 mod term_bar_tests;
+mod term_find;
+#[cfg(test)]
+mod term_find_tests;
 mod term_input;
 mod term_links;
 mod terminal;
@@ -647,6 +650,7 @@ fn poll(s: &mut Lemur, now: f64, tx: &mut Tx) -> bool {
     }
     let (drawn, again) = s.tick_terminals();
     changed |= drawn;
+    changed |= s.tick_find(tx);
     s.copy_programs_copies(tx);
     if let Some(again) = again {
         tx.wake_after(again);

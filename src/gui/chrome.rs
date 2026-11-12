@@ -318,7 +318,8 @@ fn main_pane(s: &Lemur, k: &Kit) -> El {
                         .on_pointer_move_local(|s: &mut Lemur, e, tx| s.term_hover(e, tx))
                         .on_drop_files(|s: &mut Lemur, files, _| s.drop_files(files))
                         .cursor(rune::Cursor::Text)
-                        .child(terminal::screen(view, s.metrics, focused, "main")),
+                        .child(terminal::screen(view, s.metrics, focused, "main"))
+                        .children(super::term_find::bar(view, key, k)),
                 )
         }
         None => col()

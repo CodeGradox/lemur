@@ -103,6 +103,9 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         "Terminal",
         &[
             told("Paste", Press::Keys(&["mod+v"]), "An image or copied files go to the host, and their paths are pasted."),
+            told("Find", Press::Actions(&[Action::Find]), "Through the scrollback too; Esc closes it."),
+            told("Next match up, older", Press::Actions(&[Action::FindNext]), "Enter does it in the find bar too."),
+            told("Next match down, newer", Press::Actions(&[Action::FindPrevious]), "⇧Enter does it in the find bar too."),
             told("Open a link", Press::Click("⌘-click"), "Holding ⌘ underlines it first."),
         ],
     ),

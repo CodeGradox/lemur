@@ -8,10 +8,11 @@ use libghostty_vt::key;
 use libghostty_vt::mouse;
 use libghostty_vt::render::{CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RenderState, RowId, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen};
-use libghostty_vt::selection::FormatOptions;
+use libghostty_vt::search::{MatchBuffer, Search, Status};
+use libghostty_vt::selection::{FormatOptions, Selection};
 use libghostty_vt::selection::gesture::{DragEvent, Gesture, Geometry, PressEvent, ReleaseEvent};
 use libghostty_vt::style::{self, RgbColor, Underline};
-use libghostty_vt::terminal::{ClipboardWriteError, Mode, Point, PointCoordinate, ScrollViewport, SizeReportSize, Terminal};
+use libghostty_vt::terminal::{ClipboardWriteError, Mode, Point, PointCoordinate, PointSpace, ScrollViewport, SizeReportSize, Terminal};
 use rune::{Color, Key, KeyEvent};
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
@@ -112,6 +113,18 @@ impl Row {
     }
 }
 
+/// What a search through the terminal (⌘F) found: how many matches, which one is picked
+/// (0 the newest), whether it's still looking, and the cells of those on show.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Found {
+    pub total: usize,
+    pub picked: Option<usize>,
+    pub searching: bool,
+    /// Each match on show, a row at a time: its row, its first column and the one after its
+    /// last, and whether it's the one picked.
+    pub spans: Vec<(u16, u16, u16, bool)>,
+}
+
 /// The size a program asks for (`CSI 18 t`): cells, and a cell's pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Size {
@@ -177,6 +190,10 @@ pub struct Grid {
     /// Output came since the rows were last brought up to date, or they wait for a hold
     /// to end.
     pub stale: bool,
+    /// Looking for text through the screen and its scrollback (⌘F), while it does.
+    search: Option<Search<'static, 'static>>,
+    matches: MatchBuffer,
+    found: Found,
 }
 
 fn ghostty_rgb(c: Rgb) -> RgbColor {
@@ -275,6 +292,9 @@ impl Grid {
             told,
             copies,
             stale: true,
+            search: None,
+            matches: MatchBuffer::new(),
+            found: Found::default(),
         };
         grid.set_palette(palette)?;
         grid.refresh()?;
@@ -426,9 +446,97 @@ impl Grid {
             self.held.set(None);
         }
         self.stale = false;
-        let mut p = self.painter.borrow_mut();
-        p.paint(&self.terminal)?;
-        Ok(std::mem::take(&mut p.changed))
+        let changed = {
+            let mut p = self.painter.borrow_mut();
+            p.paint(&self.terminal)?;
+            std::mem::take(&mut p.changed)
+        };
+        // Where the matches are on show moves with the rows.
+        Ok(self.read_found() || changed)
+    }
+
+    /// Looks for `needle` through the screen and its scrollback, ASCII letters in either
+    /// case; an empty one stops looking. Looking again for what it looks for keeps what it
+    /// found.
+    pub fn find(&mut self, needle: &str) -> Res<()> {
+        if needle.is_empty() {
+            self.search = None;
+            self.found = Found::default();
+            return Ok(());
+        }
+        let search = match &mut self.search {
+            Some(s) => s,
+            None => self.search.insert(Search::new(&mut self.terminal)?),
+        };
+        search.set_needle(&mut self.terminal, needle.as_bytes())?;
+        Ok(())
+    }
+
+    /// Looks further, for `budget` at most (a long scrollback takes a few goes), and takes in
+    /// output since. True when what it found changed.
+    pub fn find_more(&mut self, budget: Duration) -> bool {
+        let Grid { search: Some(search), terminal, .. } = self else { return false };
+        let start = Instant::now();
+        let _ = search.feed(terminal);
+        while start.elapsed() < budget {
+            match search.tick() {
+                Ok(Status::Running) => {}
+                Ok(Status::FeedRequired) => {
+                    let _ = search.feed(terminal);
+                }
+                _ => break,
+            }
+        }
+        self.read_found()
+    }
+
+    /// Picks the next match up, older (`older`), or the next down, scrolling to it when it's
+    /// off the screen. False with none.
+    pub fn find_next(&mut self, older: bool) -> bool {
+        let Grid { search: Some(search), terminal, .. } = self else { return false };
+        let picked = if older { search.select_next(terminal) } else { search.select_prev(terminal) };
+        self.stale = true;
+        picked.unwrap_or(false)
+    }
+
+    /// Whether it's looking for anything.
+    pub fn looking(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// What the search found, as of the last refresh.
+    pub fn found(&self) -> &Found {
+        &self.found
+    }
+
+    /// Takes in what the search found; true when it changed.
+    fn read_found(&mut self) -> bool {
+        let Grid { search: Some(search), terminal, matches, found, .. } = self else { return false };
+        let size = self.told.get();
+        let now = Found {
+            total: search.total_matches().unwrap_or(0),
+            picked: search.selected_index().ok().flatten(),
+            searching: search.status().is_ok_and(|s| s != Status::Complete),
+            spans: match search.snapshot(terminal) {
+                Ok(snap) => {
+                    let mut spans = Vec::new();
+                    if let Ok(on_show) = snap.viewport_matches(matches) {
+                        for m in on_show {
+                            spans_of(snap.terminal(), &m, size, false, &mut spans);
+                        }
+                    }
+                    // The one picked over its plain self.
+                    if let Ok(Some(m)) = snap.selected_match() {
+                        spans_of(snap.terminal(), &m, size, true, &mut spans);
+                    }
+                    spans
+                }
+                Err(_) => Vec::new(),
+            },
+        };
+        let changed = now != *found;
+        *found = now;
+        changed
     }
 
     /// What shows: the rows as of the last refresh.
@@ -653,6 +761,26 @@ impl Grid {
     #[cfg(test)]
     pub fn lines(&self) -> Vec<String> {
         self.frame().rows.iter().map(Row::text).collect()
+    }
+}
+
+/// The cells `m` covers on show, a row at a time, into `spans`. A match running off the top or
+/// the bottom shows from the first cell or to the last.
+fn spans_of(t: &Terminal<'static, '_>, m: &Selection<'_>, size: Size, picked: bool, spans: &mut Vec<(u16, u16, u16, bool)>) {
+    let on_show = |at| t.point_from_grid_ref(&at, PointSpace::Viewport).ok().flatten().map(|p| (p.y, p.x));
+    let (rows, cols) = (u32::from(size.lines), size.cols);
+    let (first, last) = match (on_show(m.start()), on_show(m.end())) {
+        (Some(a), Some(b)) => (a.min(b), a.max(b)),
+        (None, Some(b)) => ((0, 0), b),
+        (Some(a), None) => (a, (rows.saturating_sub(1), cols.saturating_sub(1))),
+        (None, None) => return,
+    };
+    for y in first.0..=last.0.min(rows.saturating_sub(1)) {
+        let from = if y == first.0 { first.1 } else { 0 };
+        let to = if y == last.0 { last.1 + 1 } else { cols };
+        if from < to {
+            spans.push((y as u16, from, to.min(cols), picked));
+        }
     }
 }
 
