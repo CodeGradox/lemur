@@ -775,6 +775,23 @@ fn output_before_an_attach_is_done_goes_to_the_new_screen() {
     assert!(wait_for(&mut rt, 10.0, |s| s.terminals[&k].painted), "attached again");
 }
 
+/// A character the terminal's font lacks comes from Menlo, as Core Text (and Ghostty) would
+/// have it, and keeps to its cell: Monaco has no ◯, and the font Rune found for it drew one
+/// wider than two cells, over its neighbours (Claude Code marks its agents with it).
+#[test]
+fn a_character_the_font_lacks_keeps_to_its_cell() {
+    let server = HcServer::new("pglyph");
+    let (mut rt, k, _) = shown_in(&server, "/", &["sleep", "600"]);
+    rt.update(|s, _| s.metrics = super::terminal::Metrics::new("Monaco", 13.0));
+    rt.update(|s, _| s.terminals.get_mut(&k).unwrap().feed("\u{25EF} code-review".as_bytes()));
+    std::thread::sleep(OUTPUT_EVERY);
+    frames(&mut rt, 10);
+    assert!(lines(&rt, &k)[0].starts_with("\u{25EF} code-review"), "{:?}", lines(&rt, &k));
+    let cell = rt.state.metrics.cell_w;
+    let circle = rt.presented("tr-main-0-0").expect("the circle's run").0;
+    assert!(circle[2] <= cell * 1.1, "the circle is {} wide, a cell {cell}", circle[2]);
+}
+
 /// A font size from Settings reaches open terminals, and their programs: a bigger font fits
 /// fewer columns and lines in the same window.
 #[test]
