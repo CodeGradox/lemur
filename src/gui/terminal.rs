@@ -62,8 +62,12 @@ impl Metrics {
     /// the real font says otherwise.
     pub fn new(family: &str, size: f64) -> Metrics {
         let size = size as f32;
+        // What the font lacks comes from Menlo, as Core Text's fallback (Ghostty's,
+        // Terminal's) has it, before the fonts Rune would find: theirs can be wider than the
+        // cell, a ◯ two and a half cells wide over its neighbours.
+        let family = if family.contains(',') { format!("{family}, Menlo") } else { format!("\"{family}\", Menlo") };
         Metrics {
-            family: Box::leak(family.to_owned().into_boxed_str()),
+            family: Box::leak(family.into_boxed_str()),
             size,
             cell_w: size * 1233.0 / 2048.0,
             cell_h: (size * 1.3).round(),
