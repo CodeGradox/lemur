@@ -635,6 +635,9 @@ fn on_key(s: &mut Lemur, ev: &KeyEvent, tx: &mut Tx) -> bool {
     match view.grid.as_mut().and_then(|g| g.key(ev, base)) {
         Some(bytes) => {
             view.send(bytes);
+            // The row or button clicked last lets go of Rune's focus: an arrow or Tab would
+            // show its ring (on a thread's × too), and Return or Space would then press it.
+            tx.blur();
             true
         }
         None => false,

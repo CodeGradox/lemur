@@ -658,6 +658,30 @@ fn a_click_on_a_button_leaves_the_keyboard_with_the_terminal() {
     );
 }
 
+/// A row clicked doesn't keep the keyboard's focus once keys go to the terminal: an arrow
+/// typed there showed its focus ring, on its × too, and Return would then press it.
+#[test]
+fn keys_for_the_terminal_leave_no_focus_on_a_row() {
+    let server = HcServer::new("rring");
+    let a = server.run("/", &[], &["sh"]);
+    let b = server.run("/", &[], &["sh"]);
+    let mut rt = loaded(&server);
+    click(&mut rt, &format!("row-local-{b}"));
+    assert_eq!(rt.state.active, Some(key(&b)));
+    let (x, y) = rt.find("term-area").expect("the terminal");
+    rt.pointer_move(x, y);
+    press(&mut rt, K::Up, Mods::default());
+    for _ in 0..10 {
+        rt.frame(1.0 / 60.0);
+    }
+    let lit: Vec<_> = rt.elements().into_iter().filter(|e| e.focus_visible).map(|e| e.path).collect();
+    assert!(lit.is_empty(), "a focus ring on {lit:?}");
+    let x_path = format!("row-local-{b}/status/close");
+    let close = rt.elements().into_iter().find(|e| e.path.ends_with(&x_path)).map(|e| e.opacity);
+    assert_eq!(close, Some(0.0), "its × is hidden");
+    let _ = a;
+}
+
 /// What's typed into a field beside the terminal (the notes) is the field's, not the
 /// terminal's, from the first key.
 #[test]
