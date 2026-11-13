@@ -61,7 +61,9 @@ jobs:
       group: build-${{ github.ref }}
       cancel-in-progress: false
     runs-on: macos-26
-    timeout-minutes: 60
+    # Tests, then a release build of Rune and Ghostty from scratch and Apple's notary:
+    # 3.0.0 took 43 minutes.
+    timeout-minutes: 120
     env:
       ARCH: arm64
     outputs:
