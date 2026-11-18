@@ -1,9 +1,12 @@
 //! Links to Claude artifacts and GitHub pull requests that agents used or
-//! posted in a folder, read from Claude Code's session logs on its host:
-//! `.claude/projects/<the folder, by another name>/`, subagents' logs too.
-//! Only what agents wrote counts, their messages and tool calls: a tool's
-//! results name artifacts nobody is working on as well, as the ones it
-//! lists. What's known of a pull request comes from `gh`.
+//! posted in a folder, or you did, and every other link you or they wrote,
+//! read from Claude Code's session logs on its host: `.claude/projects/<the
+//! folder, by another name>/`, subagents' logs too. Artifacts and pull
+//! requests count in agents' messages and tool calls and in what you typed;
+//! other links only in messages, as a tool call's are mostly in code or
+//! commands. A tool's results never count: they name artifacts nobody is
+//! working on as well, as the ones it lists. What's known of a pull request
+//! comes from `gh`.
 
 use crate::config::Host;
 use crate::gh::{PullRequest, State};
@@ -13,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// A link found: what the agent called it, if it did, and when it first
-/// came up, as the log has it (ISO 8601 in UTC, so its order is the time's).
+/// A link found, an artifact's or any other: what the agent or you called
+/// it, if either did, and when it first came up, as the log has it (ISO
+/// 8601 in UTC, so its order is the time's).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
     pub url: String,
@@ -23,12 +27,40 @@ pub struct Artifact {
 }
 
 impl Artifact {
-    /// What to call it: its title, or the end of its link.
+    /// What to call it: its title; else an artifact's id, the end of its
+    /// link, and another link without its `https://`.
     pub fn name(&self) -> &str {
-        self.title
-            .as_deref()
-            .unwrap_or_else(|| self.url.rsplit('/').next().unwrap_or(&self.url))
+        self.title.as_deref().unwrap_or_else(|| match self.is_artifact() {
+            true => self.url.rsplit('/').next().unwrap_or(&self.url),
+            false => {
+                let bare = self.url.split_once("://").map_or(self.url.as_str(), |(_, rest)| rest);
+                bare.strip_suffix('/').unwrap_or(bare)
+            }
+        })
     }
+
+    /// A Claude artifact's link, not another.
+    pub fn is_artifact(&self) -> bool {
+        is_artifact(&self.url)
+    }
+}
+
+fn is_artifact(url: &str) -> bool {
+    url.contains("claude.ai/artifact/") || url.contains("claude.ai/code/artifact/")
+}
+
+/// `url` as reached from here, said on another host: its own `localhost`,
+/// where an agent there has its servers, is `host` from here.
+pub fn reached(url: &str, host: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    for own in ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"] {
+        if let Some(after) = rest.strip_prefix(own)
+            && (after.is_empty() || after.starts_with([':', '/', '?', '#']))
+        {
+            return format!("{scheme}://{host}{after}");
+        }
+    }
+    url.to_string()
 }
 
 /// A name you gave a link, and when, in seconds since the epoch. Empty, it
@@ -57,7 +89,9 @@ pub struct Place {
     /// doesn't change these.
     #[serde(default)]
     names: BTreeMap<String, Given>,
-    #[serde(default)]
+    /// Under a name of its own since every link is read: logs read before
+    /// for artifacts and pull requests alone are read whole once more.
+    #[serde(default, rename = "links_looked")]
     pub looked: Option<u64>,
 }
 
@@ -228,6 +262,7 @@ fn key(host: &str, path: &str) -> String {
 /// What a look at a folder finds.
 #[derive(Debug, Default, PartialEq)]
 pub struct Scan {
+    /// The artifacts, and the other links.
     pub artifacts: Vec<Artifact>,
     /// The GitHub repository of its `origin`, as `gh --repo` takes it.
     pub repo: Option<String>,
@@ -252,11 +287,14 @@ fn logs_folder(path: &str) -> String {
         .collect()
 }
 
-/// Prints the folder's repository and branch; then each link in what agents
-/// wrote, as a Markdown link's text and link when it's an artifact's, and
-/// the time of each record with one after its links; then `@@end`. Records
-/// with none print nothing: a time for each would pass what herdr-core keeps
-/// of the output at some 3 GB of logs.
+/// Prints the folder's repository and branch; then each artifact's and pull
+/// request's link in what agents wrote or you typed, as a Markdown link's
+/// text and link when it's an artifact's, and the time of each record with
+/// one after its links; then `@@said`, and the same of every link in agents'
+/// messages and what you typed; then `@@end`. Records with none print
+/// nothing: a time for each would pass what herdr-core keeps of the output
+/// at some 3 GB of logs. Claude Code keeps each part of an agent's message
+/// (its text, a tool call) a record of its own, and marks what you typed.
 fn script(path: &str, minutes: Option<u64>) -> String {
     let recent = minutes.map_or(String::new(), |m| format!("-mmin -{m} "));
     format!(
@@ -267,13 +305,42 @@ fn script(path: &str, minutes: Option<u64>) -> String {
          }}\n\
          d=\"${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}/projects/{folder}\"\n\
          [ -d \"$d\" ] && find \"$d\" -type f -name '*.jsonl' {recent}\
-         -exec grep -h '\"type\":\"assistant\"' {{}} + | \
+         -exec grep -hE '\"type\":\"assistant\"|{you}' {{}} + | \
          grep -E 'claude\\.ai/|github\\.com/' | \
          grep -oE '(\\[[^]\"\\\\]{{1,120}}\\]\\()?(https://)?claude\\.ai/(code/)?artifact/[A-Za-z0-9-]{{16,}}|https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+|\"timestamp\":\"[^\"]*\"'\n\
+         echo @@said\n\
+         [ -d \"$d\" ] && find \"$d\" -type f -name '*.jsonl' {recent}\
+         -exec grep -hE '\"role\":\"assistant\",\"content\":\\[\\{{\"type\":\"text\"|{you}' {{}} + | \
+         grep -E 'https?://' | \
+         grep -oE '(\\[[^]\"\\\\]{{1,120}}\\]\\()?https?://[^][\"\\\\<>(){{}}|` ]+|\"timestamp\":\"[^\"]*\"'\n\
          echo @@end\n",
         dir = sh_path(path),
         folder = logs_folder(path),
+        you = "\"origin\":\\{\"kind\":\"human\"\\}",
     )
+}
+
+/// A link in what was said, `[its text](link` or the link, unless what's
+/// before `@@said` has it: an artifact's, or a pull request of `repo`'s.
+fn said_link(line: &str, repo: Option<&str>) -> Option<Artifact> {
+    let (text, url) = match line.strip_prefix('[').and_then(|l| l.split_once("](")) {
+        Some((text, url)) => (Some(text), url),
+        None => (None, line),
+    };
+    // Where a sentence ends, or Markdown's emphasis, isn't the link's.
+    let url = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '*']);
+    let ours = |pr: &str| {
+        let (name, number) = pr.split_once("/pull/").unwrap_or_default();
+        repo.is_some_and(|r| r.eq_ignore_ascii_case(name)) && number.parse::<u64>().is_ok()
+    };
+    let somewhere = url.split_once("://").is_some_and(|(_, rest)| !rest.is_empty());
+    if !somewhere || is_artifact(url) || url.strip_prefix("https://github.com/").is_some_and(ours) {
+        return None;
+    }
+    let title = text
+        .map(|text| text.replace(['*', '`'], "").trim().to_string())
+        .filter(|text| !text.is_empty() && !text.contains("://"));
+    Some(Artifact { url: url.to_string(), title, at: String::new() })
 }
 
 /// Reads what `script` prints: no `@@end`, and it didn't get to finish.
@@ -287,6 +354,8 @@ fn parse(out: &str) -> Result<Scan> {
     let mut prs = vec![];
     // Those at the end of `found` still waiting for their record's time.
     let mut undated = 0;
+    // Past `@@said`: links in what was said.
+    let mut said = false;
     for line in lines.lines() {
         if let Some(remote) = line.strip_prefix("@@origin ") {
             repo = crate::gh::repo_of(remote);
@@ -294,6 +363,13 @@ fn parse(out: &str) -> Result<Scan> {
             branch = name;
         } else if let Some(name) = line.strip_prefix("@@default ") {
             default = name.strip_prefix("origin/").unwrap_or(name);
+        } else if line == "@@said" {
+            said = true;
+        } else if said && !line.starts_with("\"timestamp\":\"") {
+            if let Some(link) = said_link(line, repo.as_deref()) {
+                found.push(link);
+                undated += 1;
+            }
         } else if let Some(link) = line.strip_prefix("https://github.com/") {
             if let Some((name, number)) = link.split_once("/pull/")
                 && let Ok(number) = number.parse::<u64>()
@@ -610,6 +686,99 @@ mod tests {
         );
 
         assert!(run(&config, "/srv/other", None).is_empty(), "no such logs");
+    }
+
+    /// Every link in what an agent said and what you typed counts, as
+    /// Claude Code writes them; another link in a tool call, a tool's result
+    /// or the agent's thinking doesn't. Artifacts and this repository's pull
+    /// requests count as before, in what you typed too.
+    #[test]
+    fn every_link_said_or_typed_counts() {
+        let config = TempDir::new("said-links");
+        let dir = config.join("api");
+        std::fs::create_dir(&dir).unwrap();
+        let git = |args: &[&str]| crate::test_support::git_in(&dir, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["remote", "add", "origin", "git@github.com:owner/api.git"]);
+        let path = dir.to_string_lossy().into_owned();
+        let logs = config.join("projects").join(logs_folder(&path));
+        std::fs::create_dir_all(&logs).unwrap();
+        let agent = |content: String, at: &str| {
+            format!(
+                "{{\"parentUuid\":null,\"message\":{{\"model\":\"m\",\"id\":\"x\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{content}]}},\
+                 \"type\":\"assistant\",\"timestamp\":\"{at}\"}}"
+            )
+        };
+        let user = |content: &str, at: &str, extra: &str| {
+            format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":{content}}},\"timestamp\":\"{at}\"{extra}}}")
+        };
+        let log = [
+            agent(
+                format!(
+                    "{{\"type\":\"text\",\"text\":\"See [the **docs**](https://docs.example.com/guide/), `https://localhost:3000/x` or https://example.com/a?b=1&c=2.\\nThe doc: https://claude.ai/artifact/{ONE}.\"}}"
+                ),
+                "T1",
+            ),
+            agent(
+                format!(
+                    "{{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{{\"command\":\"curl https://api.example.com/x; open https://claude.ai/artifact/{TWO}\"}}}}"
+                ),
+                "T2",
+            ),
+            agent("{\"type\":\"thinking\",\"thinking\":\"maybe https://thought.example.com\"}".into(), "T3"),
+            user(
+                "\"Look at https://linear.app/laft/issue/DEV-1, https://github.com/owner/api/pull/7 and https://github.com/zed-industries/zed/pull/1\"",
+                "T4",
+                ",\"origin\":{\"kind\":\"human\"}",
+            ),
+            user(
+                "[{\"tool_use_id\":\"t\",\"type\":\"tool_result\",\"content\":\"https://from.a.tool.example.com/x\"}]",
+                "T5",
+                ",\"toolUseResult\":{}",
+            ),
+            user("\"https://not.typed.example.com/x\"", "T6", ""),
+        ]
+        .join("\n");
+        std::fs::write(logs.join("session.jsonl"), log + "\n").unwrap();
+
+        let scan = scanned(&config, &path, None);
+        assert_eq!(scan.prs, [7], "this repository's");
+        let mut got: Vec<(&str, Option<&str>, &str)> =
+            scan.artifacts.iter().map(|a| (a.url.as_str(), a.title.as_deref(), a.at.as_str())).collect();
+        got.sort();
+        let (one, two) = (format!("https://claude.ai/artifact/{ONE}"), format!("https://claude.ai/artifact/{TWO}"));
+        assert_eq!(
+            got,
+            [
+                (one.as_str(), None, "T1"),
+                (two.as_str(), None, "T2"),
+                ("https://docs.example.com/guide/", Some("the docs"), "T1"),
+                ("https://example.com/a?b=1&c=2", None, "T1"),
+                ("https://github.com/zed-industries/zed/pull/1", None, "T4"),
+                ("https://linear.app/laft/issue/DEV-1", None, "T4"),
+                ("https://localhost:3000/x", None, "T1"),
+            ]
+        );
+        let named = |url: &str| Artifact { url: url.into(), title: None, at: String::new() }.name().to_string();
+        assert_eq!(named("https://docs.example.com/guide/"), "docs.example.com/guide");
+        assert_eq!(named(&one), ONE, "an artifact by its id");
+    }
+
+    /// A link to another host's own `localhost` goes to that host; any other
+    /// is left as it is.
+    #[test]
+    fn another_hosts_localhost_is_that_host() {
+        for (said, there) in [
+            ("http://localhost:3000/admin?q=1", "http://agent:3000/admin?q=1"),
+            ("http://127.0.0.1:5173", "http://agent:5173"),
+            ("http://0.0.0.0:8080/", "http://agent:8080/"),
+            ("http://[::1]:3000", "http://agent:3000"),
+            ("https://localhost", "https://agent"),
+            ("http://localhost.example.com:3000", "http://localhost.example.com:3000"),
+            ("https://docs.example.com/localhost", "https://docs.example.com/localhost"),
+        ] {
+            assert_eq!(reached(said, "agent"), there, "{said}");
+        }
     }
 
     /// After the first look, only logs written since are read: they can be

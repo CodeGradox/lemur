@@ -426,11 +426,7 @@ fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec
         .filter(|p| *p != w.path && p.starts_with(&format!("{}/", w.path)))
         .collect();
     let local = h.ssh == "local";
-    let name = match &view.machine.tailnet {
-        _ if local => "localhost".to_string(),
-        Some(tailnet) => tailnet.clone(),
-        None => h.name.clone(),
-    };
+    let name = reach(s, h);
     // And those the thread on show started, in whichever worktree: its core calls its
     // terminal `t7`, lemur `agent/t7`.
     let terminal = s.active.as_ref().and_then(|(_, a)| a.rsplit('/').next()).unwrap_or_default();
@@ -458,6 +454,17 @@ fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec
             }
         })
         .collect()
+}
+
+/// The name that reaches host `h`'s servers from here: `localhost` for this Mac's, else its
+/// tailnet name, else its own.
+pub(super) fn reach(s: &Lemur, h: &crate::config::Host) -> String {
+    let tailnet = s.snap.hosts.iter().find(|v| v.name == h.name).and_then(|v| v.machine.tailnet.clone());
+    match tailnet {
+        _ if h.ssh == "local" => "localhost".to_string(),
+        Some(tailnet) => tailnet,
+        None => h.name.clone(),
+    }
 }
 
 /// A question over the window, as an alert.

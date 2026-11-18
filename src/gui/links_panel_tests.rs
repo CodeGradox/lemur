@@ -195,6 +195,48 @@ fn links_list_by_themselves_and_stay_off_once_removed() {
     assert!(lists(&mut rt, &[]), "{:?}", rt.state.panels.links.listed());
 }
 
+/// A link you or an agent wrote that isn't an artifact lists under Links, opens with a
+/// click, and goes for good on its ×.
+#[test]
+fn other_links_list_too() {
+    let server = HcServer::new("lkother");
+    let dir = TempDir::new("lkother");
+    let said = "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Dashboard: [Grafana](https://grafana.example.com/d/abc)\"}]},\"type\":\"assistant\",\"timestamp\":\"2026-11-03\"}\n";
+    std::fs::write(logs_of(&server, "/srv/api").join("a.jsonl"), line(ONE, "Handover", "2026-11-01") + said).unwrap();
+    let mut rt = with_links(&server, &dir);
+    show(&mut rt, &server, "/srv/api", "api");
+    assert!(lists(&mut rt, &["Grafana", "Handover"]), "{:?}", rt.state.panels.links.listed());
+    frames(&mut rt, 20);
+    let texts: Vec<String> = rt.elements().into_iter().filter(|e| !e.exiting).filter_map(|e| e.text).collect();
+    assert!(texts.windows(4).any(|w| w == ["Artifacts", "Handover", "Links", "Grafana"]), "{texts:?}");
+
+    click(&mut rt, "links-artifact-0");
+    assert_eq!(rt.take_url_requests(), ["https://grafana.example.com/d/abc"]);
+    click(&mut rt, "links-artifact-remove-0");
+    assert_eq!(rt.state.panels.links.listed().1, ["Handover"]);
+}
+
+/// A link an agent on another host wrote to its `localhost` opens that host's: as the status
+/// bar's servers do, by its name from here.
+#[test]
+fn another_hosts_localhost_opens_there() {
+    let server = HcServer::new("lkthere");
+    let dir = TempDir::new("lkthere");
+    let mut rt = with_links(&server, &dir);
+    let mut host = server.config().hosts.remove(0);
+    (host.name, host.ssh) = ("agent".into(), "agent".into());
+    // As read already: the test reads no other host's logs.
+    let p = &mut rt.state.panels.links;
+    let said = |url: &str| crate::links::Artifact { url: url.into(), title: None, at: "2026-11-03".into() };
+    p.store.place_mut("agent", "/srv/api").links = vec![said("http://localhost:3000/admin"), said("https://grafana.example.com/d/abc")];
+    p.place = Some((host, "/srv/api".into(), "api".into()));
+    frames(&mut rt, 20);
+    click(&mut rt, "links-artifact-0");
+    assert_eq!(rt.take_url_requests(), ["http://agent:3000/admin"]);
+    click(&mut rt, "links-artifact-1");
+    assert_eq!(rt.take_url_requests(), ["https://grafana.example.com/d/abc"]);
+}
+
 /// A worktree's pull requests list with what `gh` says of them, and change as it does:
 /// those of its branch, and those agents linked to, of its repository only. A click opens
 /// one, and × takes it off for good. A merged one isn't asked after again. Without `gh`, or
