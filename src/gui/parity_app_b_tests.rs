@@ -1407,7 +1407,7 @@ fn other_threads_are_one_section_by_host() {
 }
 
 /// The status bar says where the thread on show runs: its host, its worktree's branch, and
-/// the servers running there, as links.
+/// the servers running there, as links, with those it started in another worktree.
 #[test]
 fn the_status_bar_links_the_worktrees_servers() {
     let server = HcServer::new("pstatus");
@@ -1415,9 +1415,10 @@ fn the_status_bar_links_the_worktrees_servers() {
     cfg.bases.push(Base::new("local", "/srv/api"));
     let mut rt = window(cfg);
     rt.set_viewport((1200.0, 700.0), 2.0);
-    let serve = |port, cwd: &str| crate::machine::Server { port, addr: "127.0.0.1".into(), name: "ruby".into(), cwd: cwd.into() };
+    let serve = |port, cwd: &str| crate::machine::Server { port, addr: "127.0.0.1".into(), name: "ruby".into(), cwd: cwd.into(), pid: None, terminal: None };
+    let started = crate::machine::Server { terminal: Some("main-shell".into()), ..serve(3030, "/srv/api/.claude/worktrees/auth") };
     let machine = crate::machine::Reading {
-        servers: vec![serve(3020, "/srv/api/.claude/worktrees/auth"), serve(3000, "/srv/api")],
+        servers: vec![serve(3020, "/srv/api/.claude/worktrees/auth"), serve(3000, "/srv/api"), started],
         ..Default::default()
     };
     let snap = project_snapshot(&["t"], machine);
@@ -1430,6 +1431,13 @@ fn the_status_bar_links_the_worktrees_servers() {
     assert!(rt.find("port-3000").is_none(), "the main checkout's");
     click(&mut rt, "port-3020");
     assert_eq!(rt.take_url_requests(), ["http://localhost:3020"]);
+    assert!(rt.find("port-3030").is_some(), "in its folder");
+
+    open(&mut rt, "main-shell");
+    frames(&mut rt, 20);
+    assert!(rt.find("port-3000").is_some());
+    assert!(rt.find("port-3030").is_some(), "the one it started");
+    assert!(rt.find("port-3020").is_none(), "the other worktree's");
 }
 
 /// ⌘J lists the threads to go to under the new one's name: typing narrows them, ↓ goes past

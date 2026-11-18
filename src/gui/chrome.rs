@@ -401,8 +401,8 @@ fn status_bar(s: &Lemur, k: &Kit) -> El {
     bar
 }
 
-/// The worktree's servers, by port: a link to each one that can be reached from here.
-/// Another host's is reached by its tailnet name.
+/// The worktree's servers, and those the thread on show started, by port: a link to each
+/// one that can be reached from here. Another host's is reached by its tailnet name.
 fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec<El> {
     let c = &k.c;
     let Some(view) = s.snap.hosts.iter().find(|h| h.name == host) else { return vec![] };
@@ -421,7 +421,10 @@ fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec
         Some(tailnet) => tailnet.clone(),
         None => h.name.clone(),
     };
-    machine::servers_in(&view.machine.servers, &w.path, &deeper)
+    // And those the thread on show started, in whichever worktree: its core calls its
+    // terminal `t7`, lemur `agent/t7`.
+    let terminal = s.active.as_ref().and_then(|(_, a)| a.rsplit('/').next()).unwrap_or_default();
+    machine::servers_in(&view.machine.servers, &w.path, &deeper, terminal)
         .into_iter()
         .map(|server| {
             let url = format!("http://{name}:{}", server.port);

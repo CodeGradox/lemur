@@ -671,12 +671,18 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
             None => gone.push(t.clone()),
         }
     }
+    // Claude Code listens on a port of its own: not a server it started.
+    let claudes = claude_pids(&data.agents);
+    let mut machine = data.machine.clone();
+    machine
+        .servers
+        .retain(|s| s.pid.is_none_or(|pid| !claudes.contains(&pid)));
     HostView {
         name: host.name.clone(),
         error: None,
         needs_you: false,
         home: data.home.clone(),
-        machine: data.machine.clone(),
+        machine,
         bases,
         other,
         gone,
@@ -1012,6 +1018,12 @@ fn claude_activity(
     Some(found)
 }
 
+/// The pids of the Claudes `claude agents --json` lists.
+fn claude_pids(agents: &str) -> HashSet<u32> {
+    let agents: Vec<RunningClaude> = serde_json::from_str(agents.trim()).unwrap_or_default();
+    agents.into_iter().filter_map(|a| a.pid).collect()
+}
+
 /// The worktree containing `path`, preferring the deepest match: linked
 /// worktrees under `.claude/worktrees/` sit inside the main checkout.
 pub fn find_worktree(bases: &[BaseView], path: &str) -> Option<(usize, usize)> {
@@ -1305,6 +1317,22 @@ mod tests {
             (Activity::Working, None),
             "no report: claude agents says"
         );
+    }
+
+    /// A Claude's own port isn't one of its worktree's servers; the dev
+    /// server it started is.
+    #[test]
+    fn claudes_own_port_is_no_server() {
+        let cfg = cfg();
+        let data = parse(
+            &cfg,
+            &cfg.hosts[0],
+            "@@ports\n50437\t127.0.0.1\t200\t2.1.325\t/srv/api\n3000\t0.0.0.0\t300\tnode\t/srv/api\n\
+             @@agents\n[{\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\"}]\n",
+        );
+        let h = view(&cfg, &cfg.hosts[0], &data, &[]);
+        let ports: Vec<u16> = h.machine.servers.iter().map(|s| s.port).collect();
+        assert_eq!(ports, [3000]);
     }
 
     /// What a program said is over once its shell is back at its prompt: a
