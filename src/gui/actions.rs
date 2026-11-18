@@ -133,8 +133,14 @@ pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
         Action::ToggleChanges => s.toggle_right(Right::Changes),
         Action::ToggleLinks => s.toggle_right(Right::Links),
         Action::ToggleAgents => s.toggle_right(Right::Agents),
-        Action::NextThread => s.cycle_threads(false, tx),
-        Action::PreviousThread => s.cycle_threads(true, tx),
+        Action::NextThread => {
+            s.cycle_threads(false, tx);
+            super::chrome::switched(tx);
+        }
+        Action::PreviousThread => {
+            s.cycle_threads(true, tx);
+            super::chrome::switched(tx);
+        }
         Action::MoveTabLeft => s.move_tab(true),
         Action::MoveTabRight => s.move_tab(false),
         Action::NextAgent => s.next_agent(false),
@@ -143,7 +149,10 @@ pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
         Action::ZoomOut => s.step_zoom(true),
         Action::ActualSize => s.set_zoom(1.0),
         Action::UpdateCore => s.update_core(),
-        Action::GoToTab(i) => s.go_to_tab(i),
+        Action::GoToTab(i) => {
+            s.go_to_tab(i);
+            super::chrome::switched(tx);
+        }
         Action::PasteDictation => s.paste_dictation(),
     }
 }

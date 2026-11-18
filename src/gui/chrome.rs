@@ -145,7 +145,10 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
         .overflow(TabOverflow::ShrinkThenScroll { min_width: TAB_WIDTH, max_width: TAB_WIDTH, pinned_width: 36.0, fade_width: 24.0 })
         .drag_state(&s.tab_drag, |s: &mut Lemur| &mut s.tab_drag)
         .close_icon(&icons::X)
-        .on_select(move |s: &mut Lemur, id, _| s.open(host.clone(), id.to_string()))
+        .on_select(move |s: &mut Lemur, id, tx| {
+            s.open(host.clone(), id.to_string());
+            switched(tx);
+        })
         .on_close({
             let host = active.0.clone();
             move |s: &mut Lemur, id, _| s.confirm_close_of((host.clone(), id.to_string()))
@@ -171,6 +174,13 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
     strip = strip.busy_indicator(working);
     // + after the arrows, as the strip's own trailing action would sit inside them.
     Some(row().key("tab-row").shrink().min_w(0.0).gap(TAB_GAP).center_y().child(scroll_arrows(strip.build(k), &ids, s.tab_aim.as_deref(), k)).children(plus))
+}
+
+/// Another tab is on show: it lands at once. Faded, a tab's status slot (painted in the tab's
+/// colour so a long title never shows through it) changes colour on another curve than the
+/// tab, and shows as a box until both settle.
+pub(super) fn switched(tx: &mut Tx) {
+    tx.instant();
 }
 
 /// Where a tab is in the tab bar's view: cut off at its start or end, by more than half or

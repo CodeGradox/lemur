@@ -1539,3 +1539,69 @@ fn a_new_tab_comes_into_view() {
     }
     assert!(out.is_empty(), "a new tab out of view: {out:?}");
 }
+
+/// Going to another tab, by ⌃Tab, ⌘2 or a click, its status slot (the busy dot's place, painted
+/// in the tab's colour) changes with the tab and never shows as a box of its own.
+#[test]
+fn a_tabs_status_slot_changes_with_it() {
+    // How far a tab's status slot is from its pill at worst, over `ground` (the strip's).
+    fn gap(rt: &Runtime<Lemur>, ground: [f32; 3]) -> f32 {
+        let els = rt.elements();
+        let over = |below: [f32; 3], e: &ElementInfo| {
+            let a = e.fill.a * e.opacity;
+            let c = [e.fill.r, e.fill.g, e.fill.b];
+            [0, 1, 2].map(|i| below[i] * (1.0 - a) + c[i] * a)
+        };
+        let mut worst: f32 = 0.0;
+        for tab in ["t-a", "t-b"] {
+            let Some(t) = els.iter().find(|e| e.key.as_deref() == Some(tab)) else { continue };
+            let under = |key: &str| els.iter().filter(|c| c.path.starts_with(&t.path) && c.key.as_deref() == Some(key)).collect::<Vec<_>>();
+            let Some(pill) = under("pill").into_iter().next() else { continue };
+            let pill = over(ground, pill);
+            let mut slot = pill;
+            for key in ["status", "ground-base", "ground-rest", "ground", "ground-hover"] {
+                for e in under(key) {
+                    slot = over(slot, e);
+                }
+            }
+            worst = (0..3).map(|i| (slot[i] - pill[i]).abs()).fold(worst, f32::max);
+        }
+        worst
+    }
+    let server = HcServer::new("pslot");
+    let mut rt = window(server.config());
+    rt.set_viewport((1200.0, 700.0), 2.0);
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Idle)]);
+    let mut worst = vec![];
+    let mut go = |rt: &mut Runtime<Lemur>, how: &str, go: &dyn Fn(&mut Runtime<Lemur>)| {
+        open(rt, "a");
+        rt.pointer_move(600.0, 400.0);
+        frames(rt, 90);
+        // The active tab's slot is painted in the strip's ground.
+        let ground = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("status") && e.path.contains("t-a"))
+            .map(|e| [e.fill.r, e.fill.g, e.fill.b])
+            .expect("the active tab's slot");
+        go(rt);
+        let mut most: f32 = 0.0;
+        for _ in 0..40 {
+            rt.frame(1.0 / 60.0);
+            most = most.max(gap(rt, ground));
+        }
+        assert_eq!(rt.state.active, Some(key("b")), "{how}");
+        worst.push((how.to_string(), most));
+    };
+    go(&mut rt, "⌃Tab", &|rt| rt.key(KeyEvent { key: K::Tab, mods: ctrl() }));
+    rt.key(KeyEvent { key: K::Modifier { modifier: rune::Modifier::ControlLeft, pressed: false }, mods: Mods::default() });
+    go(&mut rt, "⌘2", &|rt| rt.key(KeyEvent { key: K::Command('2'), mods: cmd() }));
+    go(&mut rt, "a click", &|rt| {
+        let (r, _) = rt.presented("t-b").expect("tab b");
+        let (x, y) = (r[0] + 5.0, r[1] + r[3] / 2.0);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+    });
+    assert!(worst.iter().all(|(_, gap)| *gap < 1e-4), "the slot shows: {worst:?}");
+}
