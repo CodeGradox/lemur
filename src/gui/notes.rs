@@ -275,7 +275,7 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
         // Built again only when the notes change: the window draws often, as terminals do.
         Some(_) => memo("notes-scroll", (&n.edit, n.cmd, on_show, k.dark), || editor(n, on_show, k)),
         None => col().key("notes-none").w_full().px(12.0).child(
-            text("Open a thread, or Notes in a worktree's + menu, to see its notes.").font(k.ty.ui).color(c.text_muted).wrap(),
+            text("Open a thread to see its worktree's notes.").font(k.ty.ui).color(c.text_muted).wrap(),
         ),
     };
     let mut panel = col().key("notes-panel").w_full().h_full().child(header).child(body);

@@ -1,4 +1,4 @@
-//! ⌃Tab: going through the threads of the worktree on show, along the tabs or, as Settings
+//! ⌃Tab: going through the threads beside the one on show, along the tabs or, as Settings
 //! can say, the one opened last first, the way ⌘Tab goes through apps. While ⌃ is held each
 //! Tab goes one further; letting go of it settles on the thread on show.
 
@@ -39,8 +39,7 @@ impl Lemur {
         names.into_iter().map(|name| (host.clone(), name)).collect()
     }
 
-    /// Shows the next thread of the worktree on show, or with `back` the one before, in the
-    /// order Settings says.
+    /// Shows the next of the tabs, or with `back` the one before, in the order Settings says.
     pub fn cycle_threads(&mut self, back: bool, tx: &Tx) {
         if self.overlaid() {
             return;

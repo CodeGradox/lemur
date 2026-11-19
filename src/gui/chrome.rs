@@ -67,9 +67,9 @@ fn tab_picked(s: &mut Lemur, picked: &str, key: Key) {
     }
 }
 
-/// The tabs of the threads where the one on show runs: its worktree's, or its host's
-/// outside every worktree. + offers what starts there. Dragged, they move in the sidebar
-/// too: it's one order.
+/// The tabs of the threads beside the one on show: its folder's, or its project's in no
+/// folder, or its host's outside every project. + offers what starts where it runs.
+/// Dragged, they move in the sidebar too: it's one order.
 fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
     let active = s.active.clone()?;
     let siblings = s.siblings(&active);
@@ -139,7 +139,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
     });
     let list = s.list_of(&active);
     let mut strip = TabStrip::new("tabs", TabOrientation::Horizontal)
-        .label("Threads in this worktree")
+        .label("Threads beside this one")
         .tabs(items)
         .active(Some(active.1.as_str()))
         .overflow(TabOverflow::ShrinkThenScroll { min_width: TAB_WIDTH, max_width: TAB_WIDTH, pinned_width: 36.0, fade_width: 24.0 })

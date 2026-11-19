@@ -520,8 +520,8 @@ fn api_window(server: &HcServer) -> Runtime<Lemur> {
 }
 
 /// Opening a thread points the notes at its worktree without opening the
-/// panel; Notes in a worktree's menu opens it on that one, and opening the
-/// thread again takes them back.
+/// panel; opening another worktree's notes opens it on that one, and opening
+/// the thread again takes them back.
 #[test]
 fn notes_follow_the_opened_thread() {
     let server = HcServer::new("rnotes");
