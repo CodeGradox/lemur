@@ -304,6 +304,22 @@ pub struct Base {
     /// Its Hidden section is open; it's folded otherwise.
     #[serde(default)]
     pub hidden_open: bool,
+    /// The folders its threads are put in, in the sidebar's order. A thread
+    /// says which it's in (`lemur.folder`), by the folder's `id`.
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+}
+
+/// A folder of a project's threads, in the sidebar.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Folder {
+    /// What its threads say they're in: it stays as the folder is renamed.
+    pub id: String,
+    pub name: String,
+    /// Folded away to its one row.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// A thread Claude runs in, as lemur keeps it to resume it.
@@ -395,6 +411,7 @@ impl Base {
             hidden_worktrees: vec![],
             collapsed_worktrees: vec![],
             hidden_open: false,
+            folders: vec![],
         }
     }
 
@@ -558,8 +575,8 @@ impl Config {
     }
 
     /// Saves how a project shows in the sidebar (whether it's folded, its
-    /// worktrees' order and colors, which are hidden and which folded, and
-    /// whether its Hidden section is open) to its entry in the config file
+    /// worktrees' order and colors, which are hidden and which folded,
+    /// whether its Hidden section is open, and its folders) to its entry in the config file
     /// at `path`. Defaults are left out of the file.
     pub fn save_project_look(path: &Path, base: &Base) -> Result<()> {
         edit(path, |doc| {
@@ -607,6 +624,24 @@ impl Config {
                 table.insert("hidden_open", toml_edit::value(true));
             } else {
                 table.remove("hidden_open");
+            }
+            if base.folders.is_empty() {
+                table.remove("folders");
+            } else {
+                let folders: toml_edit::Array = base
+                    .folders
+                    .iter()
+                    .map(|f| {
+                        let mut t = toml_edit::InlineTable::new();
+                        t.insert("id", f.id.as_str().into());
+                        t.insert("name", f.name.as_str().into());
+                        if f.collapsed {
+                            t.insert("collapsed", true.into());
+                        }
+                        toml_edit::Value::InlineTable(t)
+                    })
+                    .collect();
+                table.insert("folders", toml_edit::value(folders));
             }
             Ok(())
         })
@@ -1290,6 +1325,10 @@ path = \"~/projects/api\"
         site.hidden_worktrees = vec!["/srv/site/.worktrees/b".into()];
         site.collapsed_worktrees = vec!["/srv/site".into()];
         site.hidden_open = true;
+        site.folders = vec![
+            Folder { id: "a1".into(), name: "Billing work".into(), collapsed: true },
+            Folder { id: "b2".into(), name: "Search".into(), collapsed: false },
+        ];
         Config::save_project_look(&path, &site).unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
@@ -1299,6 +1338,7 @@ path = \"~/projects/api\"
         assert_eq!(cfg.bases[1].hidden_worktrees, site.hidden_worktrees);
         assert_eq!(cfg.bases[1].collapsed_worktrees, site.collapsed_worktrees);
         assert!(cfg.bases[1].hidden_open);
+        assert_eq!(cfg.bases[1].folders, site.folders);
         assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
         assert!(cfg.bases[0].hidden_worktrees.is_empty());
         site.worktree_colors.clear();
@@ -1308,13 +1348,15 @@ path = \"~/projects/api\"
         site.hidden_worktrees.clear();
         site.collapsed_worktrees.clear();
         site.hidden_open = false;
+        site.folders.clear();
         Config::save_project_look(&path, &site).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
             !saved.contains("color")
                 && !saved.contains("collapsed")
                 && !saved.contains("order")
-                && !saved.contains("hidden"),
+                && !saved.contains("hidden")
+                && !saved.contains("folders"),
             "{saved}"
         );
 

@@ -158,10 +158,8 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
             move |s: &mut Lemur, id, _| s.ask_name(Ask::Rename { host: host.clone(), session: id.to_string() })
         })
         .on_reorder(move |s: &mut Lemur, r: TabReorder, _| {
-            // The tabs leave out what's put away; the list has it, at its end.
-            let Some(sessions) = s.list_mut(&list) else { return };
-            let at = |name: &str| sessions.iter().position(|t| t.name == name);
-            let (Some(from), Some(to)) = (at(&numbered[r.from]), at(&numbered[r.to])) else { return };
+            // The tabs leave out what's put away, and the list has folders' rows too.
+            let (Some(from), Some(to)) = (s.row_of(&list, &numbered[r.from]), s.row_of(&list, &numbered[r.to])) else { return };
             s.reorder(list.clone(), from, to);
         });
     // A working tab has the sidebar's dot, not the kit's ring: breathing, and holding still

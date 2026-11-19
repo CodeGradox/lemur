@@ -7,7 +7,7 @@ use super::prompt::Ask;
 use super::snackbar::Kind;
 use super::tests::{apply, cmd, key, made_up, open, press, refreshing, type_text, window};
 use super::{Action, Lemur, List, Right, actions, move_item, moved_to};
-use crate::config::{Agent, Base, Config, Host};
+use crate::config::{Agent, Base, Config, Folder, Host};
 use crate::snapshot::{self, Activity};
 use crate::test_support::{HcServer, TempDir, git_in, wait_until};
 use rune::{ElementInfo, Key as K, KeyEvent, Mods, PhysicalInput, Runtime, TitlebarAction};
@@ -569,8 +569,7 @@ fn removing_a_project_keeps_the_sidebar_consistent() {
 }
 
 /// v2 `removing_a_changed_worktree_asks_again`: a worktree with changes isn't removed
-/// without asking again, and its thread keeps running until it is; its folder's color goes
-/// with it.
+/// without asking again, and its thread keeps running until it is.
 #[test]
 fn removing_a_changed_worktree_asks_again() {
     let server = HcServer::new("pa-rmdirty");
@@ -600,11 +599,9 @@ fn removing_a_changed_worktree_asks_again() {
     rt.update(|s, _| s.dialog = None);
     assert!(alive());
 
-    rt.update(|s, _| s.set_worktree_color(0, &path, Some("red")));
     remove(&mut rt, true);
     assert!(wait_for(&mut rt, 10.0, |_| !wt.exists()), "{:?}", rt.state.status);
     assert!(wait_until(Duration::from_secs(5), || !alive()));
-    assert!(wait_for(&mut rt, 5.0, |s| s.cfg.bases[0].worktree_colors.is_empty()));
 }
 
 /// Opens the remove dialog for `worktree` of project 0; returns the threads it names.
@@ -950,9 +947,9 @@ fn names_are_asked_for_in_the_spotlight() {
 }
 
 /// v2 `projects_fold_and_worktrees_take_a_color`: clicking a project's name folds it away
-/// and back; a worktree's folder takes a color and gives it up.
+/// and back.
 #[test]
-fn projects_fold_and_worktrees_take_a_color() {
+fn projects_fold_away_and_back() {
     let server = HcServer::new("pa-fold");
     let mut cfg = server.config();
     cfg.bases.push(Base::new("local", "/srv/api"));
@@ -962,44 +959,39 @@ fn projects_fold_and_worktrees_take_a_color() {
     assert!(folded(&rt.state));
     click(&mut rt, "project-0/section-header");
     assert!(!folded(&rt.state));
-
-    rt.update(|s, _| s.set_worktree_color(0, "/srv/api", Some("teal")));
-    let colors = |s: &Lemur| s.cfg.bases[0].worktree_colors.clone();
-    assert_eq!(colors(&rt.state).get("/srv/api").map(String::as_str), Some("teal"));
-    assert!(!colors(&rt.state).contains_key("/srv/api/wt"));
-    rt.update(|s, _| s.set_worktree_color(0, "/srv/api", None));
-    assert!(colors(&rt.state).is_empty());
 }
 
-/// v2 `a_long_worktree_name_stops_before_what_sits_beside_it`: a folded worktree's long
-/// name ends before what runs in it, its counts by icon, and before its button.
+/// Project `path` on the test's host, with a folder `f1` called `name`.
+fn with_folder(server: &HcServer, path: &str, name: &str, collapsed: bool) -> Config {
+    let mut cfg = server.config();
+    let mut base = Base::new("local", path);
+    base.folders.push(Folder { id: "f1".into(), name: name.into(), collapsed });
+    cfg.bases.push(base);
+    cfg
+}
+
+/// A folded folder's long name ends before what runs in it, its counts by icon.
 #[test]
-fn a_long_worktree_name_stops_before_what_sits_beside_it() {
+fn a_long_folder_name_stops_before_what_sits_beside_it() {
     let server = HcServer::new("pa-long");
     let dir = TempDir::new("pa-long");
-    let branch = "fix/a-branch-name-long-enough-to-reach-what-sits-beside-it";
-    let repo = repo(&dir, "api", branch, &[]);
+    let repo = repo(&dir, "api", "main", &[]);
     let path = path_of(&repo);
-    // An agent and a shell, as counts wider than its button.
-    server.run(&path, &["lemur.kind=claude"], &["sleep", "600"]);
-    server.run(&path, &[], &["sleep", "600"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path));
-    let mut rt = loaded_with(cfg);
+    // An agent and a shell, as counts.
+    server.run(&path, &["lemur.kind=claude", "lemur.folder=f1"], &["sleep", "600"]);
+    server.run(&path, &["lemur.folder=f1"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "a folder named long enough to reach what sits beside it", true));
     assert!(refreshing(&mut rt, 10.0, |s| s.snap.hosts[0].bases[0].worktrees.first().is_some_and(|w| w.sessions.len() == 2)));
-    let row_key = format!("wt-{path}");
-    click(&mut rt, &row_key);
     frames(&mut rt, 30);
+    let row_key = "folder-0-f1";
     let rect = |what: &str| info(&rt, what).unwrap_or_else(|| panic!("no {what}")).rect;
     let right = |r: [f32; 4]| r[0] + r[2];
-    let (row, label, counts, plus) =
-        (rect(&row_key), rect(&format!("{row_key}/label")), rect("counts"), rect(&format!("plus-{path}")));
+    let (row, label, counts) = (rect(row_key), rect(&format!("{row_key}/label")), rect("counts"));
     // How many of each, by their icons: no Codex here.
     let count = |kind: &str| info(&rt, &format!("count-{kind}")).and_then(|e| e.text);
     assert_eq!((count("claude").as_deref(), count("codex"), count("shell").as_deref()), (Some("1"), None, Some("1")));
     assert!(right(label) <= counts[0] + 0.5, "{label:?} {counts:?}");
-    assert!(right(label) <= plus[0] + 0.5, "{label:?} {plus:?}");
-    assert!(right(counts) <= right(row) + 0.5 && right(plus) <= right(row) + 0.5, "{counts:?} {plus:?} {row:?}");
+    assert!(right(counts) <= right(row) + 0.5, "{counts:?} {row:?}");
 }
 
 /// v2 `a_threads_indicators_are_separated`: a small dot separates what a thread's row says
@@ -1019,64 +1011,58 @@ fn a_threads_indicators_are_separated() {
     assert_eq!(q.matches('·').count(), 0, "{q}");
 }
 
-/// A click whose pointer moves a little before it lets go, as a hand's does, folds a worktree
+/// A click whose pointer moves a little before it lets go, as a hand's does, folds a folder
 /// with its animation all the same: its threads fade out rather than vanish.
 #[test]
-fn a_worktree_folds_with_its_animation_though_the_pointer_moved() {
+fn a_folder_folds_with_its_animation_though_the_pointer_moved() {
     let server = HcServer::new("pa-foldanim");
     let dir = TempDir::new("pa-foldanim");
     let repo = repo(&dir, "api", "main", &[]);
     let path = path_of(&repo);
-    let t = server.run(&path, &[], &["sleep", "600"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path));
-    let mut rt = loaded_with(cfg);
+    let t = server.run(&path, &["lemur.folder=f1"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "work", false));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some()));
     frames(&mut rt, 20);
     let row = format!("row-local-{t}");
-    let (x, y) = rt.find(&format!("wt-{path}")).expect("the worktree");
+    let (x, y) = rt.find("folder-0-f1").expect("the folder");
     rt.pointer_move(x, y);
     frames(&mut rt, 2);
     rt.pointer_down(x, y);
     rt.pointer_move(x + 1.0, y + 1.0);
     rt.pointer_up(x + 1.0, y + 1.0);
     rt.frame(1.0 / 60.0);
-    assert!(rt.state.cfg.bases[0].collapsed_worktrees.contains(&path), "it folded");
+    assert!(rt.state.cfg.bases[0].folders[0].collapsed, "it folded");
     let fading = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(row.as_str()));
     assert!(fading.is_some_and(|e| e.exiting), "its threads fade out");
 }
 
-/// v2 `clicking_a_worktree_folds_its_threads`: clicking a worktree folds its threads away
-/// and back, saying what runs in it while folded; its + starts a terminal there, or opens
-/// its notes, and leaves it open.
+/// v2 `clicking_a_worktree_folds_its_threads`: clicking a folder folds its threads away and
+/// back, saying what runs in it while folded; the project's + starts a terminal in its own
+/// checkout.
 #[test]
-fn clicking_a_worktree_folds_its_threads() {
+fn clicking_a_folder_folds_its_threads() {
     let server = HcServer::new("pa-foldwt");
     let dir = TempDir::new("pa-foldwt");
     let repo = repo(&dir, "api", "main", &[]);
     let path = path_of(&repo);
-    let t = server.run(&path, &[], &["sleep", "600"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path));
-    let mut rt = loaded_with(cfg);
+    let t = server.run(&path, &["lemur.folder=f1"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "work", false));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some()));
     frames(&mut rt, 20);
     let row = format!("row-local-{t}");
-    let wt = format!("wt-{path}");
     assert!(shows(&rt, &row));
     assert!(info(&rt, "counts").is_none(), "open, it shows them");
-    click(&mut rt, &wt);
+    click(&mut rt, "folder-0-f1");
     frames(&mut rt, 20);
     assert!(!shows(&rt, &row));
     // Folded, it says what runs in it, by icon.
     assert_eq!(info(&rt, "count-shell").and_then(|e| e.text).as_deref(), Some("1"));
-    click(&mut rt, &wt);
+    click(&mut rt, "folder-0-f1");
     frames(&mut rt, 20);
     assert!(shows(&rt, &row));
 
-    // Its + menu starts a terminal there.
     let before = server.addresses().len();
-    click(&mut rt, &format!("plus-{path}"));
+    click(&mut rt, "project-plus-0");
     assert!(rt.popup_menu().expect("its menu").find("new-terminal").is_some());
     rt.resolve_popup(Some("new-terminal")).unwrap();
     assert!(wait_for(&mut rt, 10.0, |_| server.addresses().len() > before), "no terminal started: {:?}", rt.state.status);
@@ -1084,101 +1070,39 @@ fn clicking_a_worktree_folds_its_threads() {
     let new = started.iter().find(|x| x.address != t).unwrap();
     assert_eq!(new.cwd, path);
     assert_eq!(new.labels.get("lemur.kind").map(String::as_str), Some("shell"));
-    frames(&mut rt, 20);
-    assert!(shows(&rt, &row), "still open");
-
-    // Or opens its notes.
-    click(&mut rt, &format!("plus-{path}"));
-    assert!(rt.popup_menu().expect("its menu").find("notes").is_some());
-    rt.resolve_popup(Some("notes")).unwrap();
-    frames(&mut rt, 20);
-    assert_eq!(rt.state.right(), Some(Right::Notes));
-    let header: Vec<String> = rt.elements().into_iter().filter(|e| e.path.contains("/notes-header")).filter_map(|e| e.text).collect();
-    assert!(header.iter().any(|t| t.ends_with("· main")), "the notes of main: {header:?}");
 }
 
-/// v2 `folds_outlast_their_project_folding`: a folded worktree stays folded, and an open
-/// Hidden row open, while their project is folded away and back, and in the next lemur.
+/// v2 `folds_outlast_their_project_folding`: a folded folder stays folded while its project
+/// is folded away and back, and in the next lemur.
 #[test]
 fn folds_outlast_their_project_folding() {
     let server = HcServer::new("pa-foldkeep");
     let dir = TempDir::new("pa-foldkeep");
-    let repo = repo(&dir, "api", "main", &["a"]);
+    let repo = repo(&dir, "api", "main", &[]);
     let path = path_of(&repo);
-    let t = server.run(&path, &[], &["sleep", "600"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path));
-    let mut rt = loaded_with(cfg);
+    let t = server.run(&path, &["lemur.folder=f1"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "work", false));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some()));
-    let a = rt.state.snap.hosts[0].bases[0].worktrees[1].path.clone();
-    rt.update(|s, _| s.set_worktree_hidden(0, &a, true));
     let threads = |rt: &Runtime<Lemur>| shows(rt, &format!("row-local-{t}"));
-    let hidden = |rt: &Runtime<Lemur>| shows(rt, &format!("wt-{a}"));
-
-    click(&mut rt, "hidden-0");
-    click(&mut rt, &format!("wt-{path}"));
+    click(&mut rt, "folder-0-f1");
     frames(&mut rt, 20);
-    assert!(hidden(&rt) && !threads(&rt));
+    assert!(!threads(&rt));
 
     click(&mut rt, "project-0/section-header");
     frames(&mut rt, 20);
-    assert!(!hidden(&rt) && !shows(&rt, &format!("wt-{path}")));
+    assert!(!shows(&rt, "folder-0-f1"));
     click(&mut rt, "project-0/section-header");
     frames(&mut rt, 20);
-    assert!(!threads(&rt), "the worktree stays folded");
-    assert!(hidden(&rt), "Hidden stays open");
+    assert!(shows(&rt, "folder-0-f1"));
+    assert!(!threads(&rt), "the folder stays folded");
 
     let cfg = rt.state.cfg.clone();
-    assert_eq!(cfg.bases[0].collapsed_worktrees, [path.as_str()]);
-    assert!(cfg.bases[0].hidden_open);
+    assert!(cfg.bases[0].folders[0].collapsed);
     let mut next = loaded_with(cfg);
     assert!(refreshing(&mut next, 10.0, |s| s.session_of(&key(&t)).is_some()));
     frames(&mut next, 20);
-    assert!(shows(&next, &format!("wt-{path}")));
-    assert!(!threads(&next), "the next lemur keeps the worktree folded");
-    assert!(hidden(&next), "and Hidden open");
-}
-
-/// v2 `hidden_worktrees_wait_under_their_project`: hiding a worktree moves it to its
-/// project's Hidden row, folded until clicked; the others still drag past it, and unhiding
-/// moves it back to its place.
-#[test]
-fn hidden_worktrees_wait_under_their_project() {
-    let server = HcServer::new("pa-hide");
-    let dir = TempDir::new("pa-hide");
-    let repo = repo(&dir, "api", "main", &["a", "b"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path_of(&repo)));
-    let mut rt = loaded_with(cfg);
-    let names = |s: &Lemur| -> Vec<String> { s.snap.hosts[0].bases[0].worktrees.iter().map(super::worktree_label).collect() };
-    assert_eq!(names(&rt.state), ["main", "a", "b"]);
-    let path = |s: &Lemur, i: usize| s.snap.hosts[0].bases[0].worktrees[i].path.clone();
-    let (main, a, b) = (path(&rt.state, 0), path(&rt.state, 1), path(&rt.state, 2));
-    assert!(!shows(&rt, "hidden-0"));
-
-    rt.update(|s, _| s.set_worktree_hidden(0, &a, true));
-    frames(&mut rt, 20);
-    assert!(!shows(&rt, &format!("wt-{a}")), "folded away");
-    assert!(shows(&rt, &format!("wt-{main}")) && shows(&rt, &format!("wt-{b}")));
-    assert_eq!(rt.state.cfg.bases[0].hidden_worktrees, [a.as_str()]);
-
-    // b and main are the rows that drag; a keeps its place behind them.
-    let top = |s: &Lemur, p: &str| s.places[&format!("wt-{p}")].0;
-    let dy = top(&rt.state, &main) - top(&rt.state, &b);
-    drag(&mut rt, &format!("wt-{b}"), 0.0, dy);
-    assert_eq!(names(&rt.state), ["b", "main", "a"]);
-
-    click(&mut rt, "hidden-0");
-    assert!(shows(&rt, &format!("wt-{a}")), "opened");
-
-    rt.update(|s, _| s.set_worktree_hidden(0, &a, false));
-    frames(&mut rt, 20);
-    assert!(!shows(&rt, "hidden-0"));
-    assert!(shows(&rt, &format!("wt-{a}")));
-    assert!(rt.state.cfg.bases[0].hidden_worktrees.is_empty());
-    rt.update(|s, _| s.refresh());
-    settle(&mut rt, 1.5);
-    assert_eq!(names(&rt.state), ["b", "main", "a"]);
+    assert!(shows(&next, "folder-0-f1"));
+    assert!(!threads(&next), "the next lemur keeps the folder folded");
 }
 
 /// v2 `menu_actions_reach_the_main_window`: ⌘O opens the folder picker, ⌘R toggles the
@@ -1339,58 +1263,199 @@ fn a_session_that_finishes_elsewhere_is_marked_done() {
     assert!(rt.state.done.is_empty(), "working again clears it: {:?}", rt.state.done);
 }
 
-/// v2 `opening_a_thread_unfolds_its_way`: opening a thread unfolds its project, its
-/// worktree and the Hidden row it's under, for good; the header names all three.
+/// v2 `opening_a_thread_unfolds_its_way`: opening a thread unfolds its project and its
+/// folder, for good; the header names its project and worktree.
 #[test]
 fn opening_a_thread_unfolds_its_way() {
     let server = HcServer::new("pa-reveal");
     let dir = TempDir::new("pa-reveal");
     let repo = repo(&dir, "api", "main", &["a"]);
     let wt = path_of(&repo.join("wt/a"));
-    let thread = server.run(&wt, &["lemur.label=t"], &["sleep", "600"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path_of(&repo)));
-    let mut rt = loaded_with(cfg);
+    let thread = server.run(&wt, &["lemur.label=t", "lemur.folder=f1"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path_of(&repo), "work", true));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&thread)).is_some()));
-    let a = rt.state.snap.hosts[0].bases[0].worktrees[1].path.clone();
-    rt.update(|s, _| {
-        s.set_worktree_hidden(0, &a, true);
-        s.toggle_worktree(0, &a);
-        s.toggle_project(0);
-    });
+    rt.update(|s, _| s.toggle_project(0));
     frames(&mut rt, 20);
-    assert!(!shows(&rt, &format!("wt-{a}")));
+    assert!(!shows(&rt, "folder-0-f1"));
 
     open(&mut rt, &thread);
     frames(&mut rt, 20);
-    assert!(shows(&rt, &format!("wt-{a}")));
+    assert!(shows(&rt, "folder-0-f1"));
     assert!(shows(&rt, &format!("row-local-{thread}")));
     let base = &rt.state.cfg.bases[0];
-    assert!(!base.collapsed && base.collapsed_worktrees.is_empty() && base.hidden_open);
+    assert!(!base.collapsed && !base.folders[0].collapsed);
     assert_eq!(rt.state.titles("local", &thread), (Some("api › a".to_string()), "t".to_string()));
 }
 
-/// v2 `tabs_are_the_threads_of_the_worktree_on_show`: the tabs are the threads of the
-/// worktree on show: a click opens one, and its × closes it, asking first while its
-/// program runs.
+/// Right-clicks what's keyed `key`.
+fn right_click(rt: &mut Runtime<Lemur>, key: &str) {
+    frames(rt, 20);
+    let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no element keyed {key}"));
+    rt.pointer_move(x, y);
+    rt.secondary_down(x, y);
+    rt.secondary_up(x, y);
+    frames(rt, 2);
+}
+
+/// The folder herdr-core says terminal `t` is in, by its id: "" for none.
+fn folder_of(server: &HcServer, t: &str) -> String {
+    let terminals = server.core().terminals();
+    terminals.iter().find(|x| x.address == t).and_then(|x| x.labels.get("lemur.folder").cloned()).unwrap_or_default()
+}
+
+/// How far down what's keyed `key` shows.
+fn top_of(rt: &Runtime<Lemur>, key: &str) -> f32 {
+    rt.find(key).unwrap_or_else(|| panic!("no element keyed {key}")).1
+}
+
+/// Dragged below a folder's row, a thread goes in the folder; dragged above every folder's,
+/// out of it. It shows there at once, and herdr-core keeps it.
 #[test]
-fn tabs_are_the_threads_of_the_worktree_on_show() {
+fn threads_drag_into_folders_and_out() {
+    let server = HcServer::new("pa-fdrag");
+    let dir = TempDir::new("pa-fdrag");
+    let repo = repo(&dir, "api", "main", &[]);
+    let path = path_of(&repo);
+    let a = server.run(&path, &["lemur.label=a"], &["sleep", "600"]);
+    let b = server.run(&path, &["lemur.label=b"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "work", false));
+    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b].iter().all(|t| s.session_of(&key(t)).is_some())));
+    frames(&mut rt, 20);
+    let (row_a, row_b) = (format!("row-local-{a}"), format!("row-local-{b}"));
+    // a, b, then the folder: a goes two rows down, below its row.
+    let dy = top_of(&rt, "folder-0-f1") - top_of(&rt, &row_a);
+    drag(&mut rt, &row_a, 0.0, dy);
+    assert_eq!(rt.state.session_of(&key(&a)).and_then(|s| s.folder.clone()).as_deref(), Some("f1"), "at once");
+    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &a) == "f1"));
+    assert_eq!(folder_of(&server, &b), "");
+    frames(&mut rt, 20);
+    assert!(top_of(&rt, &row_a) > top_of(&rt, "folder-0-f1"), "under its folder");
+
+    // Back above it, out: first of those in none.
+    let dy = top_of(&rt, &row_b) - top_of(&rt, &row_a);
+    drag(&mut rt, &row_a, 0.0, dy);
+    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &a).is_empty()));
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&a)).is_some_and(|t| t.folder.is_none())));
+    frames(&mut rt, 20);
+    assert!(top_of(&rt, &row_a) < top_of(&rt, &row_b));
+}
+
+/// A folder dragged below the next takes its threads along.
+#[test]
+fn a_folder_drags_its_threads_along() {
+    let server = HcServer::new("pa-fmove");
+    let dir = TempDir::new("pa-fmove");
+    let repo = repo(&dir, "api", "main", &[]);
+    let path = path_of(&repo);
+    let x = server.run(&path, &["lemur.folder=f1"], &["sleep", "600"]);
+    let y = server.run(&path, &["lemur.folder=f2"], &["sleep", "600"]);
+    let mut cfg = with_folder(&server, &path, "one", false);
+    cfg.bases[0].folders.push(Folder { id: "f2".into(), name: "two".into(), collapsed: false });
+    let mut rt = loaded_with(cfg);
+    assert!(refreshing(&mut rt, 10.0, |s| [&x, &y].iter().all(|t| s.session_of(&key(t)).is_some())));
+    frames(&mut rt, 20);
+    // one, x, two, y: one goes two rows down.
+    let dy = top_of(&rt, "folder-0-f2") - top_of(&rt, "folder-0-f1");
+    drag(&mut rt, "folder-0-f1", 0.0, dy);
+    let ids: Vec<&str> = rt.state.cfg.bases[0].folders.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["f2", "f1"]);
+    assert!(!rt.state.cfg.bases[0].folders[1].collapsed, "a drag isn't a click");
+    frames(&mut rt, 20);
+    let tops = [top_of(&rt, "folder-0-f2"), top_of(&rt, &format!("row-local-{y}")), top_of(&rt, "folder-0-f1"), top_of(&rt, &format!("row-local-{x}"))];
+    assert!(tops.windows(2).all(|w| w[0] < w[1]), "{tops:?}");
+    assert_eq!((folder_of(&server, &x), folder_of(&server, &y)), ("f1".to_string(), "f2".to_string()));
+}
+
+/// A thread's right-click puts it in a new folder, named in the spotlight; in one there is;
+/// or in none.
+#[test]
+fn a_threads_menu_moves_it_among_folders() {
+    let server = HcServer::new("pa-fmenu");
+    let dir = TempDir::new("pa-fmenu");
+    let repo = repo(&dir, "api", "main", &[]);
+    let path = path_of(&repo);
+    let t = server.run(&path, &["lemur.label=t"], &["sleep", "600"]);
+    let mut cfg = server.config();
+    cfg.bases.push(Base::new("local", &path));
+    let mut rt = loaded_with(cfg);
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some()));
+    let row = format!("row-local-{t}");
+    right_click(&mut rt, &row);
+    rt.resolve_popup(Some("new-folder")).unwrap();
+    assert!(matches!(rt.state.prompt.as_ref().map(|p| &p.what), Some(Ask::NewFolder { .. })));
+    type_text(&mut rt, "Billing work");
+    press(&mut rt, K::Enter, Mods::default());
+    assert!(rt.state.prompt.is_none());
+    let folders = rt.state.cfg.bases[0].folders.clone();
+    assert_eq!(folders.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Billing work"]);
+    let id = folders[0].id.clone();
+    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t) == id));
+    frames(&mut rt, 20);
+    let folder = format!("folder-0-{id}");
+    assert!(top_of(&rt, &row) > top_of(&rt, &folder), "in it");
+
+    right_click(&mut rt, &row);
+    rt.resolve_popup(Some("folder:")).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t).is_empty()));
+    frames(&mut rt, 20);
+    assert!(top_of(&rt, &row) < top_of(&rt, &folder), "out of it");
+    right_click(&mut rt, &row);
+    rt.resolve_popup(Some(&format!("folder:{id}"))).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t) == id));
+}
+
+/// A folder's right-click renames it, or deletes it: its threads stay, after those in no
+/// folder.
+#[test]
+fn a_folders_menu_renames_and_deletes_it() {
+    let server = HcServer::new("pa-fname");
+    let dir = TempDir::new("pa-fname");
+    let repo = repo(&dir, "api", "main", &[]);
+    let path = path_of(&repo);
+    let t = server.run(&path, &["lemur.folder=f1"], &["sleep", "600"]);
+    let u = server.run(&path, &[], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "work", false));
+    assert!(refreshing(&mut rt, 10.0, |s| [&t, &u].iter().all(|x| s.session_of(&key(x)).is_some())));
+    right_click(&mut rt, "folder-0-f1");
+    rt.resolve_popup(Some("rename")).unwrap();
+    assert_eq!(rt.state.prompt.as_ref().map(|p| p.input.text.as_str()), Some("work"));
+    type_text(&mut rt, "later");
+    press(&mut rt, K::Enter, Mods::default());
+    assert_eq!(rt.state.cfg.bases[0].folders[0].name, "later");
+
+    right_click(&mut rt, "folder-0-f1");
+    rt.resolve_popup(Some("delete")).unwrap();
+    assert!(rt.state.cfg.bases[0].folders.is_empty());
+    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t).is_empty()));
+    frames(&mut rt, 20);
+    assert!(!shows(&rt, "folder-0-f1"));
+    assert!(top_of(&rt, &format!("row-local-{u}")) < top_of(&rt, &format!("row-local-{t}")));
+}
+
+/// v2 `tabs_are_the_threads_of_the_worktree_on_show`: the tabs are the threads of the
+/// folder on show, whatever worktree they run in: a click opens one, and its × closes it,
+/// asking first while its program runs. Those in no folder are the tabs of each other.
+#[test]
+fn tabs_are_the_threads_of_the_folder_on_show() {
     let server = HcServer::new("pa-tabs");
     let dir = TempDir::new("pa-tabs");
     let repo = repo(&dir, "api", "main", &["auth"]);
     let wt = path_of(&repo.join("wt/auth"));
-    let a = server.run(&wt, &["lemur.label=a"], &["sleep", "600"]);
-    let b = server.run(&wt, &["lemur.label=b"], &["sleep", "600"]);
-    let c = server.run(&path_of(&repo), &["lemur.label=c"], &["sleep", "600"]);
-    let mut cfg = server.config();
-    cfg.bases.push(Base::new("local", &path_of(&repo)));
-    let mut rt = loaded_with(cfg);
-    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b, &c].iter().all(|t| s.session_of(&key(t)).is_some_and(|x| x.busy))));
+    let a = server.run(&wt, &["lemur.label=a", "lemur.folder=f1"], &["sleep", "600"]);
+    let b = server.run(&path_of(&repo), &["lemur.label=b", "lemur.folder=f1"], &["sleep", "600"]);
+    let c = server.run(&wt, &["lemur.label=c"], &["sleep", "600"]);
+    let d = server.run(&path_of(&repo), &["lemur.label=d"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path_of(&repo), "work", false));
+    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b, &c, &d].iter().all(|t| s.session_of(&key(t)).is_some_and(|x| x.busy))));
+    let tab = |t: &str| format!("t-{t}");
+    open(&mut rt, &c);
+    frames(&mut rt, 20);
+    assert!(shows(&rt, &tab(&c)) && shows(&rt, &tab(&d)), "those in no folder");
+    assert!(!shows(&rt, &tab(&a)) && !shows(&rt, &tab(&b)));
     open(&mut rt, &a);
     frames(&mut rt, 20);
-    let tab = |t: &str| format!("t-{t}");
     assert!(shows(&rt, &tab(&a)) && shows(&rt, &tab(&b)));
-    assert!(!shows(&rt, &tab(&c)), "c runs in another worktree");
+    assert!(!shows(&rt, &tab(&c)) && !shows(&rt, &tab(&d)), "c and d are in no folder");
 
     click(&mut rt, &tab(&b));
     assert_eq!(rt.state.active, Some(key(&b)));

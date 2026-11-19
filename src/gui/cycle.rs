@@ -15,14 +15,19 @@ pub(super) fn by_recent(mut threads: Vec<Key>, recent: &[Key]) -> Vec<Key> {
 }
 
 impl Lemur {
-    /// The threads of the worktree `active` runs in, or of its host's threads outside every
-    /// worktree.
+    /// The threads of the folder `active` is in, or of its project's in none, or of its
+    /// host's threads outside every project.
     pub fn siblings(&self, active: &Key) -> Vec<Key> {
         let (host, session) = active;
         // Those put away aren't tabs, unless on show.
         let shown = |s: &&Session| !s.away || s.name == *session;
-        let names: Vec<String> = match self.snap.worktrees(host).find(|w| w.sessions.iter().any(|s| s.name == *session)) {
-            Some(w) => w.sessions.iter().filter(shown).map(|s| s.name.clone()).collect(),
+        let names: Vec<String> = match self.group_of(active) {
+            Some(mut names) => {
+                if !names.contains(session) {
+                    names.push(session.clone());
+                }
+                names
+            }
             None => self
                 .snap
                 .hosts

@@ -3,7 +3,7 @@ use crate::config::{Agent, ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
 use crate::snapshot::{
-    AWAY, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
+    AWAY, FOLDER, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
 };
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
@@ -545,10 +545,12 @@ pub fn set_issue(cfg: &Config, host: &str, session: &str, issue: Option<&str>) -
     core.label(session, &[(ISSUE, issue.unwrap_or_default())])
 }
 
-pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
+/// Puts threads in their order, each in its folder of their project, by
+/// the folder's id: none with "".
+pub fn set_order(cfg: &Config, host: &str, sessions: &[(String, String)]) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
-    for (i, s) in sessions.iter().enumerate() {
-        core.label(s, &[(ORDER, &i.to_string())])?;
+    for (i, (s, folder)) in sessions.iter().enumerate() {
+        core.label(s, &[(ORDER, &i.to_string()), (FOLDER, folder)])?;
     }
     Ok(())
 }

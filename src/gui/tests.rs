@@ -67,6 +67,7 @@ pub(super) fn session(name: &str, activity: Activity) -> Session {
         away: false,
         silent: false,
         issue: None,
+        folder: None,
     }
 }
 
@@ -544,44 +545,6 @@ fn dragging_a_row_reorders_its_list() {
     // A press that doesn't move is a click.
     click(&mut rt, "row-local-c");
     assert_eq!(rt.state.active, Some(key("c")));
-}
-
-/// A worktree's row dragged under the next one swaps with it, and the project keeps
-/// that order.
-#[test]
-fn dragging_a_worktree_reorders_its_project() {
-    use crate::config::Base;
-    use crate::snapshot::{BaseView, Worktree};
-    let server = HcServer::new("rwdrag");
-    let mut rt = window(server.config());
-    let base: Base = toml::from_str("host = \"local\"\npath = \"/repo\"").unwrap();
-    rt.state.cfg.bases = vec![base];
-    let worktree = |path: &str, main: bool| Worktree {
-        path: path.into(),
-        branch: Some(path.trim_start_matches('/').replace('/', "-")),
-        head: None,
-        main,
-        sessions: vec![],
-        gone: vec![],
-    };
-    let mut snap = made_up(&[]);
-    snap.hosts[0].bases = vec![BaseView {
-        index: 0,
-        error: None,
-        worktrees: ["/repo", "/repo/one", "/repo/two", "/repo/three"].into_iter().map(|p| worktree(p, p == "/repo")).collect(),
-        plain: false,
-    }];
-    rt.update(|s, _| s.set_snapshot(snap));
-    for _ in 0..20 {
-        rt.frame(1.0 / 60.0);
-    }
-    let (_, one) = rt.find("wt-/repo/one").expect("a row for /repo/one");
-    let (_, two) = rt.find("wt-/repo/two").expect("a row for /repo/two");
-    drag(&mut rt, "wt-/repo/one", two - one + 4.0);
-    let shown: Vec<String> = rt.state.snap.hosts[0].bases[0].worktrees.iter().map(|w| w.path.clone()).collect();
-    assert_eq!(shown, ["/repo", "/repo/two", "/repo/one", "/repo/three"]);
-    assert_eq!(rt.state.cfg.bases[0].worktree_order, shown, "kept");
-    assert!(rt.state.moving.is_none(), "the drag is over");
 }
 
 /// A project dragged by its header under the next one swaps with it.

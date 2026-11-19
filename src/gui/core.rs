@@ -417,14 +417,23 @@ impl Lemur {
         }
     }
 
-    /// Moves a thread within its list: the sidebar shows the new order at once, and
-    /// herdr-core keeps it.
+    /// Moves row `from` of a list to `to`: the sidebar shows the new order at once, and
+    /// herdr-core keeps it. A project's rows are its threads' and its folders'
+    /// (`drop_row`).
     pub fn reorder(&mut self, list: List, from: usize, to: usize) {
+        if let Some(index) = self.project_at(&list) {
+            return self.drop_row(index, from, to);
+        }
         let Some(sessions) = self.list_mut(&list) else { return };
         if !move_item(sessions, from, to) {
             return;
         }
-        let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+        let names: Vec<(String, String)> = sessions.iter().map(|s| (s.name.clone(), String::new())).collect();
+        self.write_places(list, names);
+    }
+
+    /// Has herdr-core keep the threads of `list` in `names`' order, each in its folder.
+    pub(super) fn write_places(&mut self, list: List, names: Vec<(String, String)>) {
         self.changes += 1;
         match self.ordering.get_mut(&list) {
             // One order at a time, the latest next: two written at once would interleave
@@ -448,16 +457,14 @@ impl Lemur {
         let Some(at) = tabs.iter().position(|k| *k == active) else { return };
         let next = if back { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < tabs.len()) };
         let Some(next) = next else { return };
-        let list: List = (active.0.clone(), self.project_of(&active.0, &active.1).map(|(_, w)| w.path.clone()));
-        // In the list, with what's put away among it.
-        let place = |this: &mut Self, name: &str| this.list_mut(&list)?.iter().position(|s| s.name == name);
-        let (Some(from), Some(to)) = (place(self, &active.1), place(self, &tabs[next].1)) else { return };
+        let list = self.list_of(&active);
+        let (Some(from), Some(to)) = (self.row_of(&list, &active.1), self.row_of(&list, &tabs[next].1)) else { return };
         self.reorder(list, from, to);
     }
 
     /// Writes the order dragged into `list` to herdr-core, a label a thread, then the one
     /// dragged meanwhile, if any.
-    fn write_order(&mut self, list: List, names: Vec<String>) {
+    fn write_order(&mut self, list: List, names: Vec<(String, String)>) {
         let cfg = self.cfg.clone();
         let host = list.0.clone();
         self.in_background(

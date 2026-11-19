@@ -38,6 +38,9 @@ pub enum Ask {
     Rename { host: String, session: String },
     /// Nothing new: a thread to go to.
     Find,
+    /// A folder for project `base`'s threads, with `thread` in it.
+    NewFolder { base: usize, thread: Option<Key> },
+    RenameFolder { base: usize, id: String },
 }
 
 /// A name being asked for, in the spotlight.
@@ -90,6 +93,8 @@ impl Lemur {
                 .map(|(_, s)| s.own_label.clone())
                 .unwrap_or_else(|| self.label_of(host, session)),
             Ask::Find => String::new(),
+            Ask::NewFolder { .. } => "New folder".into(),
+            Ask::RenameFolder { base, id } => self.folder_name(*base, id).unwrap_or_default(),
         };
         let branch = match &what {
             Ask::NewWorktree { base, .. } => {
@@ -210,6 +215,7 @@ impl Lemur {
         let (kinds, count) = match prompt.what {
             Ask::NewWorktree { .. } => (KINDS.len(), 0),
             Ask::NewThread { .. } => (KINDS.len(), self.matches(prompt).len()),
+            Ask::NewFolder { .. } | Ask::RenameFolder { .. } => return,
             _ => (0, self.matches(prompt).len()),
         };
         let total = kinds + count;
@@ -271,16 +277,24 @@ impl Lemur {
         let name = text.trim().to_string();
         let branch = prompt.branch.as_ref().map(|b| b.text.trim().to_string()).filter(|b| !b.is_empty());
         let from = prompt.from.clone();
-        let valid = actions::validate_name(&name).and_then(|()| branch.as_deref().map_or(Ok(()), actions::validate_branch));
+        let folder = matches!(prompt.what, Ask::NewFolder { .. } | Ask::RenameFolder { .. });
+        let valid = if folder {
+            super::folders::validate_folder_name(&name)
+        } else {
+            actions::validate_name(&name).and_then(|()| branch.as_deref().map_or(Ok(()), actions::validate_branch))
+        };
         if let Err(e) = valid {
             prompt.error = Some((format!("{e:#}"), text));
             return;
         }
         let Some(Prompt { what, .. }) = self.prompt.take() else { return };
         let cfg = self.cfg.clone();
-        let doing = match &what {
+        let doing = match what {
             Ask::Rename { .. } => "renaming",
             Ask::Find => return,
+            // Lemur's own: at once.
+            Ask::NewFolder { base, thread } => return self.new_folder(base, name, thread),
+            Ask::RenameFolder { base, ref id } => return self.rename_folder(base, id, name),
             _ => "starting",
         };
         let said = self.busy(format!("{doing} {name}…"));
@@ -294,7 +308,7 @@ impl Lemur {
                 Ask::NewThread { host, dir, agent, .. } => {
                     actions::start_in(&cfg, &host, &dir, &name, agent).map(|started| Done::Started(started, None))
                 }
-                Ask::Find => unreachable!("going to a thread starts nothing"),
+                Ask::Find | Ask::NewFolder { .. } | Ask::RenameFolder { .. } => unreachable!("going to a thread starts nothing, nor does a folder"),
                 Ask::Rename { host, session } => {
                     actions::rename_session(&cfg, &host, &session, &name).map(|session| Done::Renamed { host, session, name })
                 }
@@ -460,6 +474,10 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
             (&icons::SEARCH, "Go to a thread".to_string(), "↑↓ pick · ⏎ go · esc cancel")
         }
         Ask::Rename { host, session } => (&icons::PENCIL, format!("Rename {}", s.label_of(host, session)), "⏎ rename · esc cancel"),
+        Ask::NewFolder { base, .. } => (&icons::FOLDER, format!("New folder in {}", s.cfg.bases[*base].name()), "⏎ make · esc cancel"),
+        Ask::RenameFolder { base, id } => {
+            (&icons::PENCIL, format!("Rename {}", s.folder_name(*base, id).unwrap_or_default()), "⏎ rename · esc cancel")
+        }
     };
     let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
     let pick_row = |id: String, label: String, detail: Option<String>, lead: El, picked: bool| card::pick_row(id, Some(lead), label, detail, None, picked, k);

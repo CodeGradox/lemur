@@ -66,48 +66,21 @@ impl Lemur {
         self.save_look(index);
     }
 
-    /// Folds a worktree's threads away in the sidebar, or opens them again.
-    pub(super) fn toggle_worktree(&mut self, index: usize, worktree: &str) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        let folded = base.collapsed_worktrees.len();
-        base.collapsed_worktrees.retain(|p| p != worktree);
-        if base.collapsed_worktrees.len() == folded {
-            base.collapsed_worktrees.push(worktree.to_string());
-        }
-        self.save_look(index);
-    }
-
-    /// Opens a project's Hidden row, or folds it again.
-    pub(super) fn toggle_hidden(&mut self, index: usize) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        base.hidden_open = !base.hidden_open;
-        self.save_look(index);
-    }
-
-    /// Unfolds what keeps a thread's row out of sight: its project, its
-    /// worktree, and the Hidden row the worktree is under.
+    /// Unfolds what keeps a thread's row out of sight: its project, and its folder.
     pub(super) fn reveal(&mut self, host: &str, session: &str) {
-        let Some((index, worktree)) = self
-            .project_of(host, session)
-            .map(|(index, w)| (index, w.path.clone()))
-        else {
+        let Some(index) = self.project_of(host, session).map(|(index, _)| index) else {
             return;
         };
+        let folder = self.session_of(&(host.to_string(), session.to_string())).and_then(|s| s.folder.clone());
         let base = &mut self.cfg.bases[index];
-        let hidden = base.hidden_worktrees.contains(&worktree);
-        if !base.collapsed
-            && !base.collapsed_worktrees.contains(&worktree)
-            && (base.hidden_open || !hidden)
-        {
+        let folded = base.folders.iter_mut().find(|f| f.collapsed && Some(&f.id) == folder.as_ref());
+        if !base.collapsed && folded.is_none() {
             return;
+        }
+        if let Some(f) = folded {
+            f.collapsed = false;
         }
         base.collapsed = false;
-        base.collapsed_worktrees.retain(|p| *p != worktree);
-        base.hidden_open |= hidden;
         self.save_look(index);
     }
 
@@ -117,79 +90,6 @@ impl Lemur {
             return;
         };
         base.color = color.map(str::to_string);
-        self.save_look(index);
-    }
-
-    /// Colors a worktree's folder icon, or with `None` takes its color off.
-    pub(super) fn set_worktree_color(
-        &mut self,
-        index: usize,
-        worktree: &str,
-        color: Option<&str>) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        match color {
-            Some(color) => base
-                .worktree_colors
-                .insert(worktree.to_string(), color.to_string()),
-            None => base.worktree_colors.remove(worktree),
-        };
-        self.save_look(index);
-    }
-
-    /// Moves a worktree to its project's Hidden section, or with `hidden`
-    /// false back out of it, to its place in the order.
-    pub(super) fn set_worktree_hidden(
-        &mut self,
-        index: usize,
-        worktree: &str,
-        hidden: bool) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        base.hidden_worktrees.retain(|p| p != worktree);
-        if hidden {
-            base.hidden_worktrees.push(worktree.to_string());
-        }
-        self.save_look(index);
-    }
-
-    /// Moves a worktree within its project, `from` and `to` counting the
-    /// worktrees that aren't hidden: the sidebar shows the new order at
-    /// once, and the config keeps it.
-    pub(super) fn reorder_worktrees(
-        &mut self,
-        index: usize,
-        from: usize,
-        to: usize) {
-        let Some(view) = self
-            .snap
-            .hosts
-            .iter_mut()
-            .flat_map(|h| h.bases.iter_mut())
-            .find(|b| b.index == index)
-        else {
-            return;
-        };
-        // Hidden ones keep their places among the rest.
-        let hidden = &self.cfg.bases[index].hidden_worktrees;
-        let shown: Vec<usize> = (0..view.worktrees.len())
-            .filter(|&i| !hidden.contains(&view.worktrees[i].path))
-            .collect();
-        let (Some(&from), Some(&to)) = (shown.get(from), shown.get(to)) else {
-            return;
-        };
-        if !move_item(&mut view.worktrees, from, to) {
-            return;
-        }
-        let order: Vec<String> = view.worktrees.iter().map(|w| w.path.clone()).collect();
-        for data in &mut self.data {
-            data.sort_worktrees(index, &order);
-        }
-        self.cfg.bases[index].worktree_order = order;
-        // A refresh already under way sorts by the old order.
-        self.changes += 1;
         self.save_look(index);
     }
 
@@ -225,7 +125,7 @@ impl Lemur {
 
     /// Keeps how a project shows in the sidebar in the config file: its
     /// fold, and its worktrees' order, colors, folds and which are hidden.
-    fn save_look(&mut self, index: usize) {
+    pub(super) fn save_look(&mut self, index: usize) {
         if let Some(file) = self.prefs.config_file()
             && let Err(e) = Config::save_project_look(file, &self.cfg.bases[index])
         {

@@ -18,6 +18,7 @@ mod commands;
 mod core;
 mod cycle;
 mod dictation;
+mod folders;
 mod gkeys;
 mod grid;
 mod icons;
@@ -76,8 +77,8 @@ use terminal::{Metrics, TermView};
 pub use actions::Action;
 
 pub type Key = (String, String);
-/// A list of threads: a host's worktree, by path, or with `None` the host's sessions
-/// outside every base.
+/// A list of threads: a host's project, by its folder (`folders`), or with `None` the
+/// host's sessions outside every project.
 pub type List = (String, Option<String>);
 
 const REFRESH: Duration = Duration::from_secs(3);
@@ -214,7 +215,7 @@ pub struct Lemur {
     agent_walk: Vec<Key>,
     /// Lists whose dragged order is being written to herdr-core, and the order dragged
     /// meanwhile, written next.
-    ordering: HashMap<List, Option<Vec<String>>>,
+    ordering: HashMap<List, Option<Vec<(String, String)>>>,
     /// Terminals setting up a host (`hc machine add`), and the host each sets up.
     setups: HashMap<Key, Host>,
     /// Gone threads being resumed, by host and session.
@@ -250,6 +251,8 @@ pub struct Lemur {
     pub row_drag: rune_kit::shell::Reorder,
     /// The list `row_drag` is for: the one under the pointer as a drag starts.
     pub row_drag_list: List,
+    /// When a folder's row was last let go after a drag: the press that ends it isn't a click.
+    pub folder_dropped: Option<Instant>,
     /// A worktree or project being dragged by its row or header, by key, and how far; and
     /// where each of those is laid out (`y`, height), to drop it by.
     pub moving: Option<(String, f32)>,
@@ -395,6 +398,7 @@ impl Lemur {
             tab_drag: TabDragState::new(),
             row_drag: rune_kit::shell::Reorder::new().gap(1.0),
             row_drag_list: (String::new(), None),
+            folder_dropped: None,
             moving: None,
             places: HashMap::new(),
             saved_widths: (sidebar_width, notes_width),

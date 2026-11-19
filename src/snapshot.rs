@@ -137,6 +137,8 @@ pub struct Session {
     pub silent: bool,
     /// The Linear issue pinned to it, by its key.
     pub issue: Option<String>,
+    /// The folder of its project it's in (`config::Folder`'s id), if any.
+    pub folder: Option<String>,
 }
 
 /// Something a thread runs to help it: one of Claude Code's subagents, as
@@ -252,6 +254,9 @@ pub const AWAY: &str = "lemur.away";
 pub const SILENT: &str = "lemur.silent";
 /// The Linear issue pinned to a thread, by its key (`LAFT-3184`).
 pub const ISSUE: &str = "lemur.issue";
+/// The folder of its project a thread is in, by the folder's id
+/// (`config::Folder`).
+pub const FOLDER: &str = "lemur.folder";
 /// The pid of the shell a Claude thread's Claude runs in, as lemur last
 /// saw it. herdr-core keeps lemur's terminals: after their host restarts,
 /// each comes back at its address with a fresh shell and another pid.
@@ -301,14 +306,6 @@ pub struct HostData {
 }
 
 impl HostData {
-    /// Puts project `index`'s worktrees in the order dragged, as the next
-    /// refresh would: a recompose builds from this.
-    pub fn sort_worktrees(&mut self, index: usize, order: &[String]) {
-        for b in self.bases.iter_mut().filter(|b| b.index == index) {
-            sort_worktrees(b, order);
-        }
-    }
-
     /// Renumbers its projects' views as the config's bases move, dropping
     /// those `renumber` says are gone: they point into the bases by index.
     pub fn renumber_bases(&mut self, renumber: impl Fn(usize) -> Option<usize>) {
@@ -743,6 +740,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         away: label(AWAY).is_some(),
         silent: label(SILENT).is_some(),
         issue: label(ISSUE).cloned(),
+        folder: label(FOLDER).filter(|f| !f.is_empty()).cloned(),
     }
 }
 
@@ -890,19 +888,16 @@ fn followed_title(t: &Terminal) -> Option<String> {
     (!dull.into_iter().any(|d| d.to_lowercase() == said)).then_some(title)
 }
 
+/// Where `s` goes among the threads of its list, as `sort` puts them.
+pub fn rank(s: &Session) -> (bool, bool, Option<u32>, u64, &str) {
+    (s.away, s.order.is_none(), s.order, s.started, &s.name)
+}
+
 /// Threads in the order they were dragged into; ones never placed follow,
 /// oldest first. Those put away go last, so the rest are the first in a
 /// list, as the sidebar and the tabs show and drag them.
 fn sort(sessions: &mut [Session]) {
-    sessions.sort_by(|a, b| {
-        (a.away, a.order.is_none(), a.order, a.started, &a.name).cmp(&(
-            b.away,
-            b.order.is_none(),
-            b.order,
-            b.started,
-            &b.name,
-        ))
-    });
+    sessions.sort_by(|a, b| rank(a).cmp(&rank(b)));
 }
 
 fn parse_worktree_line(base: &mut BaseView, line: &str) {
@@ -1689,7 +1684,7 @@ mod tests {
         // d and b were placed; a and c never were, so they follow, oldest
         // first.
         let (a, b, c, d) = (&names[0], &names[1], &names[2], &names[3]);
-        crate::actions::set_order(&cfg, "local", &[d.clone(), b.clone()]).unwrap();
+        crate::actions::set_order(&cfg, "local", &[(d.clone(), String::new()), (b.clone(), String::new())]).unwrap();
         let placed = [d, b, a, c].map(String::clone);
         assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == placed));
         // One put away goes last, whatever its place, and is marked so.

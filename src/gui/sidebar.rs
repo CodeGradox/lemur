@@ -1,12 +1,12 @@
-//! The sidebar: each project's worktrees and their threads, as rows to open, fold and
-//! right-click; then Other, each host's threads outside every project; the hosts' load at
-//! the foot.
+//! The sidebar: each project's threads, from all its worktrees, in folders of yours or
+//! none (`folders`), as rows to open, fold, drag and right-click; then Other, each host's
+//! threads outside every project; the hosts' load at the foot.
 
 use super::prompt::{Ask, agent_glyph, agent_icon, new_menu, new_picked};
 use super::silence::silence_label;
-use super::{Key, Lemur, List, Right, icons, key, worktree_label};
-use crate::config::{Agent, Base, COLORS, ClaudeThread};
-use crate::snapshot::{Activity, Session, Worktree};
+use super::{Key, Lemur, List, icons, key, worktree_label};
+use crate::config::{Agent, Base, COLORS, ClaudeThread, Folder};
+use crate::snapshot::{Activity, BaseView, Session};
 use rune::{Color, El, LoopSpec, PointerPress, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
 use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarRow, TOOLBAR_HEIGHT};
 use rune_kit::Kit;
@@ -78,11 +78,6 @@ fn drags(e: El, id: String, drop: impl Fn(&mut Lemur, f32) + 'static) -> El {
     })
 }
 
-/// A worktree's folder colour, from its name in the config.
-fn worktree_color(base: &Base, worktree: &str) -> Option<Color> {
-    color_named(base.worktree_colors.get(worktree)?)
-}
-
 /// One of `COLORS`, by its name.
 fn color_named(name: &str) -> Option<Color> {
     let (_, hex) = COLORS.iter().find(|(n, _)| *n == name)?;
@@ -95,9 +90,9 @@ fn divider(key: String, k: &Kit) -> El {
 }
 
 /// A project's header, as Linear's and ClickUp's: a mark in its colour (gray unless one is
-/// picked) with its initial, its name and its host, then its menu and the arrow the meters at
-/// the foot have, which turns as it folds. A press folds it.
-fn project_header(base: &Base, host: &str, index: usize, menu: El, k: &Kit) -> El {
+/// picked) with its initial, its name and its host, then its +, its menu and the arrow the
+/// meters at the foot have, which turns as it folds. A press folds it.
+fn project_header(base: &Base, host: &str, index: usize, plus: El, menu: El, k: &Kit) -> El {
     let c = &k.c;
     let name = base.name();
     let color = base.color.as_deref().and_then(color_named).or_else(|| color_named("gray")).unwrap_or(c.icon_muted);
@@ -125,6 +120,7 @@ fn project_header(base: &Base, host: &str, index: usize, menu: El, k: &Kit) -> E
         .radius(k.radius.md)
         .child(title)
         .child(el().grow(1.0).a11y_hidden())
+        .child(plus)
         .child(menu)
         .child(super::meter::chevron(base.collapsed, k))
         .on_press(move |s: &mut Lemur| s.toggle_project(index));
@@ -197,12 +193,27 @@ pub fn status_dot(color: Color, tip: String, breathes: bool) -> El {
 
 
 /// What a right click on a thread offers, and what it runs.
-fn thread_menu(s: &Session) -> PopupMenu {
-    PopupMenu::new()
+/// A thread's right-click: renaming it, peeking at it, silencing it, putting it away; in a
+/// project, moving it to one of `folders`, or a new one.
+fn thread_menu(s: &Session, folders: Option<&[Folder]>) -> PopupMenu {
+    let mut menu = PopupMenu::new()
         .item(PopupItem::new("rename", "Rename…"))
         .item(PopupItem::new("peek", "Peek"))
         .item(PopupItem::new("silence", silence_label(s.silent)))
-        .item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") })
+        .item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") });
+    if let Some(folders) = folders {
+        let filed = folders.iter().any(|f| s.folder.as_deref() == Some(f.id.as_str()));
+        let mut to = PopupMenu::new();
+        for f in folders {
+            to = to.item(PopupItem::new(format!("folder:{}", f.id), f.name.clone()).checked(s.folder.as_deref() == Some(f.id.as_str())));
+        }
+        if !folders.is_empty() {
+            to = to.separator();
+        }
+        to = to.item(PopupItem::new("folder:", "No folder").checked(!filed)).item(PopupItem::new("new-folder", "New folder…"));
+        menu = menu.separator().submenu("Move to folder", to);
+    }
+    menu
 }
 
 fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {
@@ -213,13 +224,22 @@ fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {
         "silence" => s.set_silent(key, !silent),
         "bring-back" => s.bring_back(&key),
         "put-away" => s.put_away(key),
+        "new-folder" => {
+            if let Some((base, _)) = s.project_of(&key.0, &key.1) {
+                s.ask_name(Ask::NewFolder { base, thread: Some(key) });
+            }
+        }
+        folder if folder.starts_with("folder:") => {
+            let id = &folder["folder:".len()..];
+            s.move_to_folder(&key, Some(id).filter(|id| !id.is_empty()));
+        }
         _ => {}
     }
 }
 
-/// A thread's row: its agent's icon, its name, then the issue pinned to it, what helps it
-/// and its age; its dot, a × under the pointer.
-fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &List)>, k: &Kit) -> El {
+/// A thread's row, `depth` in: its agent's icon, its name, then the issue pinned to it, what
+/// helps it and its age; its dot, a × under the pointer.
+fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &List)>, depth: u8, k: &Kit) -> El {
     let c = &k.c;
     let key = key(host, t);
     let (dot, tip, breathes) = s.activity(&key, t, k);
@@ -233,7 +253,7 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
     said.push(age(t.idle_secs));
     let mut r = SidebarRow::new(t.label.clone())
         .avatar(agent_icon(t.agent(), k))
-        .depth(1)
+        .depth(depth)
         .detail(said.join(" · "))
         .status(RowStatus::Other(status_dot(dot, tip, breathes)))
         .selected(s.active.as_ref() == Some(&key));
@@ -247,7 +267,8 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
         r = r.reorder(&state, index, count, |s: &mut Lemur| &mut s.row_drag, move |s, from, to| s.reorder(list.clone(), from, to));
     }
     let (open, close, rename, menu) = (key.clone(), key.clone(), key.clone(), key.clone());
-    let picked_menu = thread_menu(t);
+    let folders = s.project_of(host, &t.name).map(|(index, _)| s.cfg.bases[index].folders.as_slice());
+    let picked_menu = thread_menu(t, folders);
     let hovered = place.map(|(.., list)| list.clone());
     r.on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
         .on_close(move |s: &mut Lemur, _| s.confirm_close_of(close.clone()))
@@ -272,16 +293,16 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
         })
 }
 
-/// A thread whose session is gone, dimmed: clicking it or its ▶ resumes it, and its
-/// right-click menu can forget it instead.
-fn gone_row(t: &ClaudeThread, k: &Kit) -> El {
+/// A thread whose session is gone, dimmed, `depth` in: clicking it or its ▶ resumes it, and
+/// its right-click menu can forget it instead.
+fn gone_row(t: &ClaudeThread, depth: u8, k: &Kit) -> El {
     let (resume, forget, row_resume) = (t.clone(), t.clone(), t.clone());
     let play = icons::button(&icons::PLAY, "Its session is gone: resume Claude")
         .on_press(move |s: &mut Lemur| s.resume(vec![resume.clone()]))
         .build(k);
     SidebarRow::new(t.shown())
         .avatar(agent_icon(Some(Agent::Claude), k))
-        .depth(1)
+        .depth(depth)
         .trailing(play)
         .on_select(move |s: &mut Lemur, _| s.resume(vec![row_resume.clone()]))
         .build(&named(k))
@@ -298,153 +319,115 @@ fn gone_row(t: &ClaudeThread, k: &Kit) -> El {
         })
 }
 
-/// A list's threads, then those put away under a row that opens them, then those gone.
-fn threads(s: &Lemur, host: &str, worktree: Option<&str>, sessions: &[Session], gone: &[ClaudeThread], k: &Kit) -> Vec<El> {
+/// A host's threads outside every project, then those put away under a row that opens
+/// them, then those gone.
+fn threads(s: &Lemur, host: &str, sessions: &[Session], gone: &[ClaudeThread], k: &Kit) -> Vec<El> {
     let (away, shown): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|t| t.away);
     // Those put away come last in a list, so the rest keep their places for dragging.
     let count = shown.len();
-    let list: List = (host.to_string(), worktree.map(str::to_string));
-    let mut rows: Vec<El> = shown.into_iter().enumerate().map(|(i, t)| thread_row(s, host, t, Some((i, count, &list)), k)).collect();
-    if !away.is_empty() {
-        let open = s.away_open.contains(&list);
-        let toggle = list.clone();
-        rows.push(
-            SidebarRow::new(format!("Put away ({})", away.len()))
-                .depth(1)
-                .on_select(move |s: &mut Lemur, _| s.toggle_away_list(toggle.clone()))
-                .build(&named(k))
-                .key(format!("away-{host}-{}", worktree.unwrap_or_default()))
-                .opacity(0.7),
-        );
-        if open {
-            rows.extend(away.into_iter().map(|t| thread_row(s, host, t, None, k)));
-        }
-    }
-    rows.extend(gone.iter().map(|t| gone_row(t, k)));
+    let list: List = (host.to_string(), None);
+    let mut rows: Vec<El> = shown.into_iter().enumerate().map(|(i, t)| thread_row(s, host, t, Some((i, count, &list)), 1, k)).collect();
+    rows.extend(away_rows(s, host, &list, &away, 1, k));
+    rows.extend(gone.iter().map(|t| gone_row(t, 1, k)));
     rows
 }
 
-/// What a right click on a worktree, or its +, offers: what starts there, its notes; its
-/// colour, hiding it, and removing a linked one.
-fn worktree_menu(base: &Base, w: &Worktree, hidden: bool, full: bool) -> PopupMenu {
-    let mut menu = new_menu().separator().item(PopupItem::new("notes", "Notes").symbol("doc.text"));
-    if !full {
-        return menu;
+/// The threads of `list` put away, under a row that opens them, `depth` in.
+fn away_rows(s: &Lemur, host: &str, list: &List, away: &[&Session], depth: u8, k: &Kit) -> Vec<El> {
+    if away.is_empty() {
+        return vec![];
     }
-    let current = base.worktree_colors.get(&w.path).cloned();
-    let mut colors = PopupMenu::new();
-    for (name, _) in COLORS {
-        colors = colors.item(PopupItem::new(format!("color:{name}"), title_case(name)).checked(current.as_deref() == Some(name)));
+    let open = s.away_open.contains(list);
+    let toggle = list.clone();
+    let mut rows = vec![
+        SidebarRow::new(format!("Put away ({})", away.len()))
+            .depth(depth)
+            .on_select(move |s: &mut Lemur, _| s.toggle_away_list(toggle.clone()))
+            .build(&named(k))
+            .key(format!("away-{host}-{}", list.1.as_deref().unwrap_or_default()))
+            .opacity(0.7),
+    ];
+    if open {
+        rows.extend(away.iter().map(|t| thread_row(s, host, t, None, depth, k)));
     }
-    colors = colors.separator().item(PopupItem::new("color:", "No color").checked(current.is_none()));
-    menu = menu.separator().submenu("Color", colors).item(PopupItem::new("hide", if hidden { "Unhide" } else { "Hide" }));
-    // The main checkout and a plain folder are the project itself.
-    if !w.main {
-        menu = menu.separator().item(PopupItem::new("remove", "Remove worktree…"));
-    }
-    menu
+    rows
 }
 
-fn worktree_picked(s: &mut Lemur, picked: &str, host: &str, base: usize, path: &str, label: &str) {
-    if new_picked(s, picked, host, path, Some(base)) {
-        return;
+/// A project's rows: its threads in no folder, then each folder with its threads, then
+/// those put away and those gone. Dragged, a thread or a folder takes another place among
+/// them (`folders::moved`).
+fn project_rows(s: &Lemur, host: &str, index: usize, b: &BaseView, k: &Kit) -> Vec<El> {
+    let l = super::folders::listed(&s.cfg.bases[index], b);
+    let count = l.items().len();
+    let list = s.project_list(index);
+    let mut rows = vec![];
+    let mut at = 0;
+    for t in &l.loose {
+        rows.push(thread_row(s, host, t, Some((at, count, &list)), 0, k));
+        at += 1;
     }
-    let hidden = s.cfg.bases[base].hidden_worktrees.iter().any(|p| p == path);
-    match picked {
-        "notes" => s.open_notes(host, path, label),
-        "hide" => s.set_worktree_hidden(base, path, !hidden),
-        "remove" => {
-            let removal = s.removal(base, path.to_string(), label.to_string());
-            s.confirm_remove_worktree(removal, None);
+    for (f, threads) in &l.folders {
+        rows.push(folder_row(s, index, f, threads, (at, count, &list), k));
+        at += 1;
+        if !f.collapsed {
+            for t in threads {
+                rows.push(thread_row(s, host, t, Some((at, count, &list)), 1, k));
+                at += 1;
+            }
         }
-        color if color.starts_with("color:") => {
-            let name = &color["color:".len()..];
-            s.set_worktree_color(base, path, (!name.is_empty()).then_some(name));
-        }
-        _ => {}
     }
+    rows.extend(away_rows(s, host, &list, &l.away, 0, k));
+    rows.extend(l.gone.iter().map(|t| gone_row(t, 0, k)));
+    rows
 }
 
-/// A worktree with its threads: its folder or branch, folded to how many run in it.
-fn worktree_rows(s: &Lemur, host: &str, index: usize, w: &Worktree, k: &Kit) -> Vec<El> {
-    let c = &k.c;
-    let base = &s.cfg.bases[index];
-    let label = worktree_label(w);
-    let folded = base.collapsed_worktrees.contains(&w.path);
-    let hidden = base.hidden_worktrees.contains(&w.path);
-    let color = worktree_color(base, &w.path).unwrap_or(c.icon_muted);
-    let glyph = if w.main { &icons::FOLDER } else { &icons::GIT_BRANCH };
-    let lead = row().size(16.0, 16.0).center().child(icon(glyph, 14.0).color(color));
-    let path = w.path.clone();
-    let (host_s, plus_path, plus_label) = (host.to_string(), w.path.clone(), label.clone());
-    let plus_menu = worktree_menu(base, w, hidden, false);
-    let plus = icons::button(&icons::PLUS, "New terminal or Claude here, or notes")
-        .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
-            let (host, path, label) = (host_s.clone(), plus_path.clone(), plus_label.clone());
-            tx.popup_menu(plus_menu.clone(), format!("plus-{path}"), move |s: &mut Lemur, picked, _| {
-                if let Some(p) = picked {
-                    worktree_picked(s, p, &host, index, &path, &label);
-                }
+/// A folder's row: its name and, folded, how many of each kind run in it. A click folds or
+/// opens it, a right-click renames or deletes it; dragged, it takes another place among the
+/// folders, its threads with it.
+fn folder_row(s: &Lemur, index: usize, f: &Folder, threads: &[&Session], (at, count, list): (usize, usize, &List), k: &Kit) -> El {
+    let folded = f.collapsed;
+    let counts = (folded && !threads.is_empty()).then(|| counts(threads, k));
+    let trailing = row().gap(6.0).center_y().children(counts).child(super::meter::chevron(folded, k).key("fold"));
+    let mut r = SidebarRow::new(f.name.clone()).icon(&icons::FOLDER).trailing(trailing);
+    if folded && threads.iter().any(|t| t.activity == Activity::NeedsInput) {
+        r = r.status(RowStatus::Attention);
+    }
+    let state = if s.row_drag_list == *list { s.row_drag } else { Reorder::new().gap(1.0) };
+    let dropped = list.clone();
+    r = r.reorder(&state, at, count, |s: &mut Lemur| &mut s.row_drag, move |s, from, to| {
+        s.folder_dropped = Some(std::time::Instant::now());
+        s.reorder(dropped.clone(), from, to);
+    });
+    let (toggle, menu_id) = (f.id.clone(), f.id.clone());
+    let hovered = list.clone();
+    r.on_select(move |s: &mut Lemur, _| {
+        // Let go after a drag, it isn't a click.
+        if s.folder_dropped.take().is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(500)) {
+            s.toggle_folder(index, &toggle);
+        }
+    })
+        .build(&named(k))
+        .key(format!("folder-{index}-{}", f.id))
+        .expanded(!folded)
+        .on_hover_change(move |s: &mut Lemur, inside, tx: &mut Tx| {
+            if inside && s.row_drag.dragging().is_none() {
+                s.row_drag_list = hovered.clone();
+                tx.live_only();
+            }
+        })
+        .on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
+            let id = menu_id.clone();
+            let menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…")).item(PopupItem::new("delete", "Delete folder"));
+            tx.popup_menu(menu, press, move |s: &mut Lemur, picked, _| match picked {
+                Some("rename") => s.ask_name(Ask::RenameFolder { base: index, id: id.clone() }),
+                Some("delete") => s.delete_folder(index, &id),
+                _ => {}
             });
         })
-        .build(k)
-        .key(format!("plus-{}", w.path));
-    let shows_counts = folded && !w.sessions.is_empty();
-    let counts = shows_counts.then(|| counts(&w.sessions, k));
-    // As the meters at the foot have it: down while open, turning to the right as it folds.
-    // With no threads to fold, the same space, so the + buttons line up.
-    let arrow = if w.sessions.is_empty() && w.gone.is_empty() { el().size(12.0, 12.0) } else { super::meter::chevron(folded, k) };
-    let trailing = row().gap(6.0).center_y().children(counts).child(plus).child(arrow.key("fold"));
-    let mut r = SidebarRow::new(label.clone()).avatar(lead).trailing(trailing);
-    // The counts are icons, so the row says them in words.
-    let mut said = None;
-    if shows_counts {
-        let agents = w.sessions.iter().filter(|t| t.agent().is_some()).count();
-        let shells = w.sessions.len() - agents;
-        let say = |n: usize, one: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") };
-        let running = match (agents, shells) {
-            (0, sh) => say(sh, "shell"),
-            (a, 0) => say(a, "agent"),
-            (a, sh) => format!("{}, {}", say(a, "agent"), say(sh, "shell")),
-        };
-        said = Some(running);
-        if w.sessions.iter().any(|t| t.activity == Activity::NeedsInput) {
-            r = r.status(RowStatus::Attention);
-            said = said.map(|running| format!("{running}, Needs attention"));
-        }
-    }
-    let menu = worktree_menu(base, w, hidden, true);
-    let (host_m, path_m, label_m) = (host.to_string(), w.path.clone(), label.clone());
-    let id = format!("wt-{}", w.path);
-    let drag_path = w.path.clone();
-    let built = r.on_select(move |s: &mut Lemur, _| s.toggle_worktree(index, &path)).build(&named(k));
-    let built = match said {
-        Some(said) => built.description(said),
-        None => built,
-    };
-    // Dragged onto another worktree of its project, it moves there; its threads follow.
-    let built = drags(note_place(lift(s, built, &id, k), id.clone()), id, move |s, dy| s.drop_worktree(index, &drag_path, dy));
-    let mut rows = vec![
-        built
-            .key(format!("wt-{}", w.path))
-            .expanded(!folded)
-            .on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
-                let (host, path, label) = (host_m.clone(), path_m.clone(), label_m.clone());
-                tx.popup_menu(menu.clone(), press, move |s: &mut Lemur, picked, _| {
-                    if let Some(p) = picked {
-                        worktree_picked(s, p, &host, index, &path, &label);
-                    }
-                });
-            }),
-    ];
-    if !folded {
-        rows.extend(threads(s, host, Some(&w.path), &w.sessions, &w.gone, k));
-    }
-    rows
 }
 
-/// What runs in a folded worktree: each kind of thread's icon and how many there are.
-fn counts(sessions: &[Session], k: &Kit) -> El {
+/// What runs in a folded folder: each kind of thread's icon and how many there are.
+fn counts(sessions: &[&Session], k: &Kit) -> El {
     let kinds = [(Some(Agent::Claude), "claude"), (Some(Agent::Codex), "codex"), (None, "shell")];
     row().key("counts").gap(8.0).center_y().a11y_hidden().children(kinds.into_iter().filter_map(|(agent, kind)| {
         let n = sessions.iter().filter(|t| t.agent() == agent).count();
@@ -454,10 +437,23 @@ fn counts(sessions: &[Session], k: &Kit) -> El {
     }))
 }
 
-/// A project's menu: resuming its gone threads, and removing it.
+/// A project's menu: a new folder, a new worktree or removing one; resuming its gone
+/// threads, its colour, and removing it.
 fn project_menu(s: &Lemur, index: usize) -> PopupMenu {
     let gone = s.gone_in(index);
-    let mut menu = PopupMenu::new();
+    let mut menu = PopupMenu::new().item(PopupItem::new("new-folder", "New folder…"));
+    // A folder without git has no worktrees.
+    if let Some((_, b)) = s.project_view(index).filter(|(_, b)| !b.plain) {
+        menu = menu.item(PopupItem::new("new-worktree", "New worktree…"));
+        let mut linked = PopupMenu::new();
+        for w in b.worktrees.iter().filter(|w| !w.main) {
+            linked = linked.item(PopupItem::new(format!("remove-worktree:{}", w.path), worktree_label(w)));
+        }
+        if b.worktrees.iter().any(|w| !w.main) {
+            menu = menu.submenu("Remove worktree", linked);
+        }
+    }
+    menu = menu.separator();
     if !gone.is_empty() {
         menu = menu.item(PopupItem::new("resume-all", format!("Resume all threads ({})", gone.len()))).separator();
     }
@@ -472,6 +468,16 @@ fn project_menu(s: &Lemur, index: usize) -> PopupMenu {
 
 fn project_picked(s: &mut Lemur, picked: &str, index: usize) {
     match picked {
+        "new-folder" => s.ask_name(Ask::NewFolder { base: index, thread: None }),
+        "new-worktree" => s.ask_name(Ask::NewWorktree { base: index, agent: Some(Agent::Claude) }),
+        removing if removing.starts_with("remove-worktree:") => {
+            let path = &removing["remove-worktree:".len()..];
+            let label = s.project_view(index).and_then(|(_, b)| b.worktrees.iter().find(|w| w.path == path)).map(worktree_label);
+            if let Some(label) = label {
+                let removal = s.removal(index, path.to_string(), label);
+                s.confirm_remove_worktree(removal, None);
+            }
+        }
         "resume-all" => {
             let gone = s.gone_in(index);
             s.resume(gone);
@@ -508,7 +514,7 @@ fn host_row(s: &Lemur, name: &str, home: &str, k: &Kit) -> El {
             })
             .build(k)
             .key(format!("host-plus-{name}"));
-        // Where a worktree has its arrow, so the + buttons line up.
+        // Where a folder has its arrow, so the + buttons line up.
         r = r.trailing(row().gap(6.0).center_y().child(plus).child(el().size(12.0, 12.0)));
     }
     r.build(&named(k)).key(format!("host-{name}"))
@@ -559,41 +565,23 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
         let index = b.index;
         let base = &s.cfg.bases[index];
         let mut rows = vec![];
-        // A folder without git has no worktrees to add.
-        if !b.plain {
-            rows.push(
-                SidebarRow::new("New worktree")
-                    .icon(&icons::PLUS)
-                    .on_select(move |s: &mut Lemur, _| s.ask_name(Ask::NewWorktree { base: index, agent: Some(Agent::Claude) }))
-                    .build(&named(k))
-                    .key(format!("new-worktree-{index}")),
-            );
-        }
         if let Some(e) = &b.error {
             rows.push(SidebarRow::new(e.clone()).icon(&icons::TRIANGLE_ALERT).build(&named(k)).key(format!("error-{index}")).opacity(0.7));
         }
-        let mut hidden = vec![];
-        for w in &b.worktrees {
-            if base.hidden_worktrees.contains(&w.path) {
-                hidden.extend(worktree_rows(s, &h.name, index, w, k));
-            } else {
-                rows.extend(worktree_rows(s, &h.name, index, w, k));
-            }
-        }
-        // Under the rest, in their order.
-        if !hidden.is_empty() {
-            rows.push(
-                SidebarRow::new("Hidden")
-                    .trailing(super::meter::chevron(!base.hidden_open, k))
-                    .on_select(move |s: &mut Lemur, _| s.toggle_hidden(index))
-                    .build(&named(k))
-                    .key(format!("hidden-{index}"))
-                    .opacity(0.8),
-            );
-            if base.hidden_open {
-                rows.extend(hidden);
-            }
-        }
+        rows.extend(project_rows(s, &h.name, index, b, k));
+        // In its own checkout.
+        let (host, dir) = (h.name.clone(), b.worktrees.iter().find(|w| w.main).map_or_else(|| base.path.clone(), |w| w.path.clone()));
+        let plus = icons::button(&icons::PLUS, "New terminal or Claude here")
+            .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
+                let (host, dir) = (host.clone(), dir.clone());
+                tx.popup_menu(new_menu(), format!("project-plus-{index}"), move |s: &mut Lemur, picked, _| {
+                    if let Some(p) = picked {
+                        new_picked(s, p, &host, &dir, Some(index));
+                    }
+                });
+            })
+            .build(k)
+            .key(format!("project-plus-{index}"));
         let menu_button = icons::button(&icons::ELLIPSIS, "Project")
             .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| {
                 tx.popup_menu(project_menu(s, index), format!("project-menu-{index}"), move |s: &mut Lemur, picked, _| {
@@ -607,7 +595,7 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
         // Dragged by its header to another place among the projects.
         let title = format!("{} · {}", base.name(), h.name);
         let id = format!("project-{index}");
-        let header = project_header(base, &h.name, index, menu_button, k);
+        let header = project_header(base, &h.name, index, plus, menu_button, k);
         let header = drags(note_place(header, id.clone()), id.clone(), move |s, dy| s.drop_project(index, dy));
         let mut section = col().key(id.clone()).role("group").label(title).w_full().gap(2.0).motion(k.motion.disclosure).child(header);
         if !base.collapsed {
@@ -639,7 +627,7 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
             sb = sb.child(group(format!("host-section-{}", h.name), &h.name, rows, k));
         } else {
             other.push(host_row(s, &h.name, &h.home, k));
-            other.extend(threads(s, &h.name, None, &h.other, &h.gone, k));
+            other.extend(threads(s, &h.name, &h.other, &h.gone, k));
         }
     }
     if !other.is_empty() {
@@ -696,32 +684,13 @@ impl Lemur {
         }))
     }
 
-    /// Opens the notes panel on a worktree's notes.
+    /// Opens the notes panel on a worktree's notes, as the tests do: the Notes button opens
+    /// those of the thread on show.
+    #[cfg(test)]
     pub fn open_notes(&mut self, host: &str, worktree: &str, label: &str) {
         self.show_notes(host, worktree, label);
-        self.right_last = Right::Notes;
+        self.right_last = super::Right::Notes;
         self.inspector.set_open(true);
-    }
-
-    /// Worktree `path` of project `index` was dragged `dy` points: it takes the place of the
-    /// worktree under the pointer, counting those that aren't hidden.
-    fn drop_worktree(&mut self, index: usize, path: &str, dy: f32) {
-        let base = &self.cfg.bases[index];
-        let shown: Vec<String> = self
-            .snap
-            .hosts
-            .iter()
-            .flat_map(|h| h.bases.iter())
-            .filter(|b| b.index == index)
-            .flat_map(|b| b.worktrees.iter())
-            .filter(|w| !base.hidden_worktrees.contains(&w.path))
-            .map(|w| w.path.clone())
-            .collect();
-        let Some(from) = shown.iter().position(|p| p == path) else { return };
-        let ids: Vec<String> = shown.iter().map(|p| format!("wt-{p}")).collect();
-        if let Some(to) = self.place_at(&ids[from], &ids, dy) {
-            self.reorder_worktrees(index, from, to);
-        }
     }
 
     /// Project `index` was dragged `dy` points by its header: it takes the place of the
@@ -741,8 +710,11 @@ impl Lemur {
         ids.iter().rposition(|i| self.places.get(i).is_some_and(|(top, _)| *top <= at)).or(Some(0))
     }
 
-    /// Notes the list `list`'s order as the sidebar shows it.
+    /// The list thread `key` is in: its project's, or its host's outside every project.
     pub fn list_of(&self, key: &Key) -> List {
-        (key.0.clone(), self.project_of(&key.0, &key.1).map(|(_, w)| w.path.clone()))
+        match self.project_of(&key.0, &key.1) {
+            Some((index, _)) => self.project_list(index),
+            None => (key.0.clone(), None),
+        }
     }
 }
