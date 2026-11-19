@@ -16,13 +16,12 @@ use rune_kit::{Kit, TextInput};
 const SHOWN: usize = 8;
 
 /// What a new thread can run, as they're listed: an agent, or a shell.
-pub(super) const KINDS: [Option<Agent>; 3] = [Some(Agent::Claude), Some(Agent::Codex), None];
+pub(super) const KINDS: [Option<Agent>; 2] = [Some(Agent::Claude), None];
 
 /// What a new thread is called until you name it.
 pub(super) fn default_label(agent: Option<Agent>) -> &'static str {
     match agent {
         Some(Agent::Claude) => "claude",
-        Some(Agent::Codex) => "codex",
         None => "shell",
     }
 }
@@ -407,14 +406,13 @@ pub fn new_menu() -> PopupMenu {
     if let Some(k) = key(super::Action::NewTerminal) {
         terminal = terminal.key_equivalent(k);
     }
-    let mut named = PopupItem::new("new-named", "Claude, Codex or shell, named…").symbol("plus");
+    let mut named = PopupItem::new("new-named", "Claude or shell, named…").symbol("plus");
     if let Some(k) = key(super::Action::NewThreadHere) {
         named = named.key_equivalent(k);
     }
     PopupMenu::new()
         .item(terminal)
         .item(PopupItem::new("new-claude", "New Claude").symbol("sparkle"))
-        .item(PopupItem::new("new-codex", "New Codex").symbol("chevron.left.forwardslash.chevron.right"))
         .item(named)
 }
 
@@ -425,7 +423,6 @@ pub fn new_picked(s: &mut Lemur, picked: &str, host: &str, dir: &str, base: Opti
     match picked {
         "new-terminal" => s.start_now(host, dir, None),
         "new-claude" => s.start_now(host, dir, Some(Agent::Claude)),
-        "new-codex" => s.start_now(host, dir, Some(Agent::Codex)),
         "new-named" => s.ask_name(Ask::NewThread { host, base, dir, agent: Some(Agent::Claude) }),
         _ => return false,
     }
@@ -442,7 +439,6 @@ pub fn agent_icon(agent: Option<Agent>, k: &Kit) -> El {
 pub fn agent_glyph(agent: Option<Agent>, k: &Kit) -> (&'static rune::Icon, rune::Color) {
     match agent {
         Some(Agent::Claude) => (&icons::CLAUDE, rune::color::hex("#d97757").unwrap()),
-        Some(Agent::Codex) => (&icons::CODE_XML, rune::color::hex("#4f8fe8").unwrap()),
         None => (&icons::SQUARE_TERMINAL, k.c.icon_muted),
     }
 }
@@ -457,7 +453,7 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
     let (glyph, what, hint) = match &prompt.what {
         Ask::NewWorktree { base, agent } => {
             kind = Some(*agent);
-            (&icons::FOLDER, format!("New worktree in {}", s.cfg.bases[*base].name()), "↑↓ Claude, Codex or shell · ⏎ start · esc cancel")
+            (&icons::FOLDER, format!("New worktree in {}", s.cfg.bases[*base].name()), "↑↓ Claude or shell · ⏎ start · esc cancel")
         }
         Ask::NewThread { host, dir, agent, .. } => {
             // While a thread is picked, what to start isn't.
@@ -466,7 +462,7 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
             (
                 &icons::PLUS,
                 format!("New in {}, or go to", s.worktree_name(host, dir)),
-                "↑↓ Claude, Codex, shell or a thread · ⏎ start or go · esc cancel",
+                "↑↓ Claude, shell or a thread · ⏎ start or go · esc cancel",
             )
         }
         Ask::Find => {
@@ -487,7 +483,6 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
         for (i, agent) in KINDS.iter().enumerate() {
             let name = match agent {
                 Some(Agent::Claude) => "Claude",
-                Some(Agent::Codex) => "Codex",
                 None => "Shell",
             };
             let a = *agent;

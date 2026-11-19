@@ -279,13 +279,9 @@ fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>) -> Result
     if agent == Some(Agent::Claude) {
         return start_claude(host, dir, label);
     }
-    let (kind, command) = match agent {
-        Some(agent) => ("codex", Some(host.command(agent))),
-        None => ("shell", None),
-    };
     Ok(Started {
         host: host.name.clone(),
-        session: start_thread(host, dir, label, kind, command, None)?,
+        session: start_thread(host, dir, label, "shell", None, None)?,
         claude: None,
     })
 }
@@ -1877,14 +1873,14 @@ mod tests {
 
     #[test]
     fn the_program_of_a_hosts_command_is_found_in_it() {
-        assert_eq!(program_of("codex"), Some("codex"));
-        assert_eq!(program_of("  codex --full-auto"), Some("codex"));
+        assert_eq!(program_of("claude"), Some("claude"));
+        assert_eq!(program_of("  claude --verbose"), Some("claude"));
         assert_eq!(
             program_of("FOO=1 BAR=2 ~/bin/claude -x"),
             Some("~/bin/claude")
         );
-        assert_eq!(program_of("$(which codex)"), None);
-        assert_eq!(program_of("\"my codex\""), None);
+        assert_eq!(program_of("$(which claude)"), None);
+        assert_eq!(program_of("\"my claude\""), None);
         assert_eq!(program_of("FOO=1"), None);
         assert_eq!(program_of(""), None);
     }
@@ -1903,28 +1899,18 @@ mod tests {
         let path = repo.canonicalize().unwrap().to_string_lossy().into_owned();
         let mut cfg = server.config();
         cfg.bases.push(crate::config::Base::new("local", &path));
-        cfg.hosts[0].claude = "lemur-has-no-claude".into();
-        cfg.hosts[0].codex = "lemur-has-no-codex --flag".into();
+        cfg.hosts[0].claude = "lemur-has-no-claude --flag".into();
 
-        let cases = [
-            (Agent::Claude, "Claude Code", "lemur-has-no-claude"),
-            (Agent::Codex, "Codex", "lemur-has-no-codex"),
-        ];
-        for (agent, name, program) in cases {
-            let said = format!("{name} isn't installed on local: its shell can't find `{program}`");
-            let e = new_thread_in(&cfg, 0, &path, "x", Some(agent))
-                .err()
-                .unwrap();
-            assert_eq!(format!("{e:#}"), said);
-            let e = new_worktree_thread(&cfg, 0, "x", "x", Some(agent), None, None)
-                .err()
-                .unwrap();
-            assert_eq!(format!("{e:#}"), said);
-            let e = start_in(&cfg, "local", &path, "x", Some(agent))
-                .err()
-                .unwrap();
-            assert_eq!(format!("{e:#}"), said);
-        }
+        let agent = Some(Agent::Claude);
+        let said = "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`";
+        let e = new_thread_in(&cfg, 0, &path, "x", agent).err().unwrap();
+        assert_eq!(format!("{e:#}"), said);
+        let e = new_worktree_thread(&cfg, 0, "x", "x", agent, None, None)
+            .err()
+            .unwrap();
+        assert_eq!(format!("{e:#}"), said);
+        let e = start_in(&cfg, "local", &path, "x", agent).err().unwrap();
+        assert_eq!(format!("{e:#}"), said);
         assert!(server.addresses().is_empty(), "no terminal");
         assert!(!repo.join(".claude/worktrees/x").exists(), "no worktree");
 
@@ -1942,28 +1928,6 @@ mod tests {
 
         let shell = new_thread_in(&cfg, 0, &path, "sh", None).unwrap();
         assert_eq!(server.addresses(), [shell.session]);
-    }
-
-    /// Codex starts as the host says, typed into the thread's shell; there's
-    /// no conversation of Claude's to keep.
-    #[test]
-    fn codex_starts_in_a_thread_of_its_own() {
-        let server = HcServer::new("codex-start");
-        let dir = TempDir::new("codex-start");
-        let path = dir.canonicalize().unwrap().to_string_lossy().into_owned();
-        let mut cfg = server.config();
-        cfg.hosts[0].codex = r#"sh -c 'echo "codex was started $*"' codex"#.into();
-        let started = start_in(&cfg, "local", &path, "codex", Some(Agent::Codex)).unwrap();
-        assert!(started.claude.is_none());
-        let t = server.core().terminals();
-        let t = t.iter().find(|t| t.address == started.session).unwrap();
-        assert_eq!(t.labels.get(KIND).map(String::as_str), Some("codex"));
-        assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("codex"));
-        assert!(wait_until(Duration::from_secs(10), || {
-            server
-                .hc(&["read", &started.session])
-                .contains("codex was started")
-        }));
     }
 
     /// A download never overwrites what's in the folder: it takes the next free

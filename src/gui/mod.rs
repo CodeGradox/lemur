@@ -126,12 +126,10 @@ pub struct Prefs {
     pub thread_order: ThreadOrder,
     pub terminal: Terminal,
     pub claude_usage: bool,
-    pub codex_usage: bool,
     /// Milliseconds a notification shows before it goes by itself; 0 keeps it.
     pub notification_dismiss_ms: u32,
-    /// Which threads notify: Claude's, Codex's, and shells' as a command finishes.
+    /// Which threads notify: Claude's, and shells' as a command finishes.
     pub claude_notifications: bool,
-    pub codex_notifications: bool,
     pub shell_notifications: bool,
     /// How large the window draws everything, 1 as it is.
     pub zoom: f32,
@@ -147,10 +145,8 @@ impl Prefs {
             thread_order: cfg.thread_order,
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
-            codex_usage: cfg.codex_usage,
             notification_dismiss_ms: cfg.notification_dismiss_ms,
             claude_notifications: cfg.claude_notifications,
-            codex_notifications: cfg.codex_notifications,
             shell_notifications: cfg.shell_notifications,
             zoom: cfg.zoom.unwrap_or(1.0),
             file,
@@ -161,7 +157,6 @@ impl Prefs {
     pub fn notifies(&self, agent: Option<Agent>) -> bool {
         match agent {
             Some(Agent::Claude) => self.claude_notifications,
-            Some(Agent::Codex) => self.codex_notifications,
             None => self.shell_notifications,
         }
     }

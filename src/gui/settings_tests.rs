@@ -175,8 +175,8 @@ fn the_notification_dismiss_is_set_and_kept() {
     assert!(rt.state.panels.settings.error.is_none());
 }
 
-/// Claude's, Codex's and shells' notifications go on and off one by one, all on at first,
-/// and the config keeps only those off.
+/// Claude's and shells' notifications go on and off one by one, both on at first, and the
+/// config keeps only those off.
 #[test]
 fn which_threads_notify_is_set_and_kept() {
     let dir = TempDir::new("settings-notifies");
@@ -187,18 +187,17 @@ fn which_threads_notify_is_set_and_kept() {
     rt.state.prefs = Prefs::new(&cfg, Some(file.clone()));
     rt.update(|s, _| s.open_settings());
     click(&mut rt, "settings-page-notifications");
-    let all = |s: &Lemur| (s.prefs.claude_notifications, s.prefs.codex_notifications, s.prefs.shell_notifications);
-    assert_eq!(all(&rt.state), (true, true, true));
+    let all = |s: &Lemur| (s.prefs.claude_notifications, s.prefs.shell_notifications);
+    assert_eq!(all(&rt.state), (true, true));
     click(&mut rt, "settings-notify-shell");
-    assert_eq!(all(&rt.state), (true, true, false));
-    click(&mut rt, "settings-notify-codex");
-    assert_eq!(all(&rt.state), (true, false, false));
+    assert_eq!(all(&rt.state), (true, false));
+    click(&mut rt, "settings-notify-claude");
+    assert_eq!(all(&rt.state), (false, false));
     let kept = std::fs::read_to_string(&file).unwrap();
-    assert!(kept.contains("codex_notifications = false") && kept.contains("shell_notifications = false"), "{kept}");
-    assert!(!kept.contains("claude_notifications"), "{kept}");
+    assert!(kept.contains("claude_notifications = false") && kept.contains("shell_notifications = false"), "{kept}");
     click(&mut rt, "settings-notify-shell");
-    click(&mut rt, "settings-notify-codex");
-    assert_eq!(all(&rt.state), (true, true, true));
+    click(&mut rt, "settings-notify-claude");
+    assert_eq!(all(&rt.state), (true, true));
     let kept = std::fs::read_to_string(&file).unwrap();
     assert!(kept.contains("# mine") && !kept.contains("notifications"), "{kept}");
     assert!(rt.state.panels.settings.error.is_none());

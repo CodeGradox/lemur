@@ -987,9 +987,9 @@ fn a_long_folder_name_stops_before_what_sits_beside_it() {
     let rect = |what: &str| info(&rt, what).unwrap_or_else(|| panic!("no {what}")).rect;
     let right = |r: [f32; 4]| r[0] + r[2];
     let (row, label, counts) = (rect(row_key), rect(&format!("{row_key}/label")), rect("counts"));
-    // How many of each, by their icons: no Codex here.
+    // How many of each, by their icons.
     let count = |kind: &str| info(&rt, &format!("count-{kind}")).and_then(|e| e.text);
-    assert_eq!((count("claude").as_deref(), count("codex"), count("shell").as_deref()), (Some("1"), None, Some("1")));
+    assert_eq!((count("claude").as_deref(), count("shell").as_deref()), (Some("1"), Some("1")));
     assert!(right(label) <= counts[0] + 0.5, "{label:?} {counts:?}");
     assert!(right(counts) <= right(row) + 0.5, "{counts:?} {row:?}");
 }

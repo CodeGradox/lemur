@@ -464,7 +464,6 @@ fn session(name: &str) -> Session {
         activity: Activity::Idle,
         waiting_for: None,
         started_claude: false,
-        codex: false,
         order: None,
         started: 0,
         claude: None,

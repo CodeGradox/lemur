@@ -224,7 +224,7 @@ fn a_silenced_thread_makes_no_notifications() {
 
 /// A shell's command finishing out of sight notifies once it has run `COMMAND_NEWS`, naming
 /// the command; one done sooner doesn't, nor any with shells' notifications off. Its dot
-/// says it's done either way. Claude's and Codex's go on and off apart.
+/// says it's done either way. Claude's go on and off apart.
 #[test]
 fn a_shells_command_notifies_once_it_has_run_a_while() {
     use crate::gui::core::COMMAND_NEWS;

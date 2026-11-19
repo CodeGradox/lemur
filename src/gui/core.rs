@@ -566,7 +566,6 @@ impl Lemur {
             Some(Agent::Claude) => {
                 "Claude quits, and its terminal ends. Lemur forgets the conversation, as it does for a thread killed."
             }
-            Some(Agent::Codex) => "Codex quits, and its terminal ends.",
             None => "The terminal ends, and whatever runs in it.",
         };
         self.ask_close(key, label, description);
@@ -678,7 +677,7 @@ impl Lemur {
     pub fn about(&mut self) {
         self.dialog = Some(super::Dialog {
             title: format!("Lemur {}", env!("CARGO_PKG_VERSION")),
-            description: "Claude Code and Codex sessions on your hosts, in herdr-core.".into(),
+            description: "Claude Code sessions on your hosts, in herdr-core.".into(),
             ok: "OK",
             check: None,
             on_ok: Box::new(|_, _| {}),

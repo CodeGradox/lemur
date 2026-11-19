@@ -71,7 +71,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         &[
             told("New terminal", Press::Actions(&[Action::NewTerminal]), "A new tab where the thread on show runs."),
             told(
-                "New Claude or Codex thread or shell, or go to one",
+                "New Claude thread or shell, or go to one",
                 Press::Actions(&[Action::NewThreadHere]),
                 "Named, where the thread on show runs; type to find another thread.",
             ),
@@ -127,7 +127,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
     (
         "Naming in the spotlight",
         &[
-            plain("Pick Claude, Codex or Shell, for a new thread", Press::Keys(&["up", "down"])),
+            plain("Pick Claude or Shell, for a new thread", Press::Keys(&["up", "down"])),
             plain("Start or rename", Press::Keys(&["enter"])),
             plain("Next field", Press::Keys(&["tab"])),
             plain("Cancel", Press::Keys(&["escape"])),

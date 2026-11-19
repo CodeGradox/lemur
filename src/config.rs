@@ -55,27 +55,28 @@ pub struct Config {
     /// until turned on in Settings.
     #[serde(default)]
     pub claude_usage: bool,
-    /// The same of Codex's.
-    #[serde(default)]
-    pub codex_usage: bool,
+    /// From before Lemur dropped Codex, as the other `codex` keys: read, so a config
+    /// that has them still loads, and ignored.
+    #[serde(default, rename = "codex_usage")]
+    _codex_usage: Option<toml::Value>,
     /// Milliseconds a notification shows before it goes by itself; 0, the default, keeps
     /// it until it's dismissed.
     #[serde(default)]
     pub notification_dismiss_ms: u32,
-    /// Which threads notify: Claude's and Codex's when they finish or need input, and a
-    /// shell's when a command finishes. All do until turned off in Settings.
+    /// Which threads notify: Claude's when they finish or need input, and a shell's when
+    /// a command finishes. Both do until turned off in Settings.
     #[serde(default = "notifies")]
     pub claude_notifications: bool,
-    #[serde(default = "notifies")]
-    pub codex_notifications: bool,
+    #[serde(default, rename = "codex_notifications")]
+    _codex_notifications: Option<toml::Value>,
     #[serde(default = "notifies")]
     pub shell_notifications: bool,
-    /// The sidebar's foot, minimized to one line each: Claude's usage, Codex's,
-    /// and the hosts' load by host name.
+    /// The sidebar's foot, minimized to one line each: Claude's usage, and the hosts'
+    /// load by host name.
     #[serde(default)]
     pub minimized_usage: bool,
-    #[serde(default)]
-    pub minimized_codex_usage: bool,
+    #[serde(default, rename = "minimized_codex_usage")]
+    _minimized_codex_usage: Option<toml::Value>,
     #[serde(default)]
     pub minimized_hosts: Vec<String>,
     #[serde(default)]
@@ -138,7 +139,6 @@ impl ThreadOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Claude,
-    Codex,
 }
 
 impl Agent {
@@ -146,7 +146,6 @@ impl Agent {
     pub fn name(self) -> &'static str {
         match self {
             Agent::Claude => "Claude Code",
-            Agent::Codex => "Codex",
         }
     }
 }
@@ -267,9 +266,10 @@ pub struct Host {
     /// Command that starts Claude Code in a new session.
     #[serde(default = "default_claude")]
     pub claude: String,
-    /// Command that starts Codex in a new session.
-    #[serde(default = "default_codex")]
-    pub codex: String,
+    /// From before Lemur dropped Codex: read, so a config that has it still loads, and
+    /// ignored.
+    #[serde(default, rename = "codex")]
+    pub(crate) _codex: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -361,10 +361,6 @@ fn default_claude() -> String {
     "claude".into()
 }
 
-fn default_codex() -> String {
-    "codex".into()
-}
-
 fn notifies() -> bool {
     true
 }
@@ -383,7 +379,7 @@ impl Host {
             hc_session: None,
             tmux_socket: None,
             claude: default_claude(),
-            codex: default_codex(),
+            _codex: None,
         }
     }
 
@@ -391,7 +387,6 @@ impl Host {
     pub fn command(&self, agent: Agent) -> &str {
         match agent {
             Agent::Claude => &self.claude,
-            Agent::Codex => &self.codex,
         }
     }
 }
@@ -489,7 +484,6 @@ impl Config {
         thread_order: ThreadOrder,
         terminal: &Terminal,
         claude_usage: bool,
-        codex_usage: bool,
     ) -> Result<()> {
         edit(path, |doc| {
             doc["theme"] = toml_edit::value(theme.as_str());
@@ -507,11 +501,6 @@ impl Config {
                 doc["claude_usage"] = toml_edit::value(true);
             } else {
                 doc.remove("claude_usage");
-            }
-            if codex_usage {
-                doc["codex_usage"] = toml_edit::value(true);
-            } else {
-                doc.remove("codex_usage");
             }
             let table = doc
                 .entry("terminal")
@@ -690,11 +679,11 @@ impl Config {
         })
     }
 
-    /// Saves which threads notify, Claude's, Codex's and shells', to the config file at
-    /// `path`. Notifying, the default, goes without saying.
-    pub fn save_notifications(path: &Path, claude: bool, codex: bool, shell: bool) -> Result<()> {
+    /// Saves which threads notify, Claude's and shells', to the config file at `path`.
+    /// Notifying, the default, goes without saying.
+    pub fn save_notifications(path: &Path, claude: bool, shell: bool) -> Result<()> {
         edit(path, |doc| {
-            for (key, on) in [("claude_notifications", claude), ("codex_notifications", codex), ("shell_notifications", shell)] {
+            for (key, on) in [("claude_notifications", claude), ("shell_notifications", shell)] {
                 if on {
                     doc.remove(key);
                 } else {
@@ -705,24 +694,18 @@ impl Config {
         })
     }
 
-    /// Keeps which of the sidebar's foot is minimized: Claude's usage, Codex's,
-    /// and the hosts' load.
+    /// Keeps which of the sidebar's foot is minimized: Claude's usage, and the hosts'
+    /// load.
     pub fn save_minimized(
         path: &Path,
         usage: bool,
-        codex_usage: bool,
         hosts: &[String],
     ) -> Result<()> {
         edit(path, |doc| {
-            for (key, on) in [
-                ("minimized_usage", usage),
-                ("minimized_codex_usage", codex_usage),
-            ] {
-                if on {
-                    doc[key] = toml_edit::value(true);
-                } else {
-                    doc.remove(key);
-                }
+            if usage {
+                doc["minimized_usage"] = toml_edit::value(true);
+            } else {
+                doc.remove("minimized_usage");
             }
             if hosts.is_empty() {
                 doc.remove("minimized_hosts");
@@ -944,6 +927,24 @@ mod tests {
         assert!(toml::from_str::<Config>("theme = \"blue\"").is_err());
     }
 
+    /// A config from before Lemur dropped Codex still loads, and its Codex keys stay in
+    /// the file as they were.
+    #[test]
+    fn codex_keys_from_before_are_ignored() {
+        let path = std::env::temp_dir().join(format!("lemur-codex-{}.toml", std::process::id()));
+        let before = "codex_usage = true\ncodex_notifications = false\nminimized_codex_usage = true\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\ncodex = \"codex --full-auto\"\n";
+        std::fs::write(&path, before).unwrap();
+        let cfg: Config = toml::from_str(before).unwrap();
+        assert_eq!(cfg.hosts[0].claude, "claude");
+        Config::save_notifications(&path, true, false).unwrap();
+        Config::save_minimized(&path, true, &[]).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for kept in ["codex_usage = true", "codex_notifications = false", "minimized_codex_usage = true", "codex = \"codex --full-auto\""] {
+            assert!(saved.contains(kept), "{saved}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn thread_order_defaults_to_tabs() {
         let cfg: Config = toml::from_str("").unwrap();
@@ -1030,7 +1031,6 @@ path = \"~/projects/api\"
             ThreadOrder::Recent,
             &terminal,
             true,
-            true,
         )
         .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
@@ -1045,7 +1045,6 @@ path = \"~/projects/api\"
         assert_eq!(cfg.dictation_language, Language::Norwegian);
         assert_eq!(cfg.thread_order, ThreadOrder::Recent);
         assert!(cfg.claude_usage);
-        assert!(cfg.codex_usage);
         assert_eq!(cfg.terminal, terminal);
         assert_eq!(cfg.bases[0].path, "~/projects/api");
 
@@ -1062,7 +1061,6 @@ path = \"~/projects/api\"
             Language::English,
             ThreadOrder::default(),
             &terminal,
-            false,
             false,
         )
         .unwrap();
@@ -1091,14 +1089,13 @@ path = \"~/projects/api\"
             "# mine\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n",
         )
         .unwrap();
-        Config::save_minimized(&path, true, true, &["agent".into()]).unwrap();
+        Config::save_minimized(&path, true, &["agent".into()]).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         let cfg: Config = toml::from_str(&saved).unwrap();
         assert!(cfg.minimized_usage);
-        assert!(cfg.minimized_codex_usage);
         assert_eq!(cfg.minimized_hosts, ["agent"]);
         assert!(saved.contains("# mine"), "{saved}");
-        Config::save_minimized(&path, false, false, &[]).unwrap();
+        Config::save_minimized(&path, false, &[]).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("minimized"), "{saved}");
         let _ = std::fs::remove_file(path);
@@ -1166,17 +1163,17 @@ path = \"~/projects/api\"
         let path = std::env::temp_dir().join(format!("lemur-notify-{}.toml", std::process::id()));
         std::fs::write(&path, "theme = \"dark\"\n\n[[hosts]]\nname = \"agent\"\nssh = \"agent\"\n").unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let all = |cfg: &Config| (cfg.claude_notifications, cfg.codex_notifications, cfg.shell_notifications);
-        assert_eq!(all(&cfg), (true, true, true), "unset, all notify");
-        Config::save_notifications(&path, true, false, false).unwrap();
+        let all = |cfg: &Config| (cfg.claude_notifications, cfg.shell_notifications);
+        assert_eq!(all(&cfg), (true, true), "unset, all notify");
+        Config::save_notifications(&path, true, false).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("codex_notifications = false\nshell_notifications = false\n"), "{saved}");
+        assert!(saved.contains("shell_notifications = false\n"), "{saved}");
         assert!(!saved.contains("claude_notifications"), "{saved}");
         let cfg: Config = toml::from_str(&saved).unwrap();
-        assert_eq!(all(&cfg), (true, false, false));
+        assert_eq!(all(&cfg), (true, false));
         assert_eq!(cfg.hosts[0].name, "agent");
 
-        Config::save_notifications(&path, true, true, true).unwrap();
+        Config::save_notifications(&path, true, true).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("notifications"), "{saved}");
         let _ = std::fs::remove_file(path);

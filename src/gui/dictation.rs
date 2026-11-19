@@ -193,7 +193,7 @@ impl Lemur {
         self.prefs.dictation_language = language;
         let p = &self.prefs;
         let saved = p.config_file().map(|file| {
-            Config::save_settings(file, p.theme, p.dictation_language, p.thread_order, &p.terminal, p.claude_usage, p.codex_usage)
+            Config::save_settings(file, p.theme, p.dictation_language, p.thread_order, &p.terminal, p.claude_usage)
         });
         if let Some(Err(e)) = saved {
             self.fail(e);

@@ -54,7 +54,6 @@ pub(super) fn session(name: &str, activity: Activity) -> Session {
         activity,
         waiting_for: None,
         started_claude: false,
-        codex: false,
         order: None,
         started: 0,
         claude: None,
@@ -342,8 +341,8 @@ fn cmd_p_goes_to_a_thread() {
     assert!(rt.state.prompt.is_none());
 }
 
-/// ⌘J asks what starts where the thread on show runs, Claude to start with; ↓ picks Codex,
-/// then the shell, and a name typed sticks.
+/// ⌘J asks what starts where the thread on show runs, Claude to start with; ↓ picks the
+/// shell, and the name follows.
 #[test]
 fn cmd_j_asks_for_claude_or_a_shell_here() {
     let server = HcServer::new("rcmdj");
@@ -358,8 +357,8 @@ fn cmd_j_asks_for_claude_or_a_shell_here() {
     assert_eq!(agent(&rt.state), Some(Agent::Claude));
     assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "claude");
     rt.update(|s, _| s.step(false));
-    assert_eq!(agent(&rt.state), Some(Agent::Codex));
-    assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "codex", "the name follows");
+    assert_eq!(agent(&rt.state), None);
+    assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "shell", "the name follows");
     press(&mut rt, K::Escape, Mods::default());
     assert!(rt.state.prompt.is_none(), "Escape cancels");
 }

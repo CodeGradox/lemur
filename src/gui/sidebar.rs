@@ -428,7 +428,7 @@ fn folder_row(s: &Lemur, index: usize, f: &Folder, threads: &[&Session], (at, co
 
 /// What runs in a folded folder: each kind of thread's icon and how many there are.
 fn counts(sessions: &[&Session], k: &Kit) -> El {
-    let kinds = [(Some(Agent::Claude), "claude"), (Some(Agent::Codex), "codex"), (None, "shell")];
+    let kinds = [(Some(Agent::Claude), "claude"), (None, "shell")];
     row().key("counts").gap(8.0).center_y().a11y_hidden().children(kinds.into_iter().filter_map(|(agent, kind)| {
         let n = sessions.iter().filter(|t| t.agent() == agent).count();
         let (glyph, ink) = agent_glyph(agent, k);

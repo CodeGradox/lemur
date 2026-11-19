@@ -537,37 +537,30 @@ fn closing_a_thread_shows_another() {
     assert!(rt.state.keyboard_on_terminal(), "the neighbour has the keyboard");
 }
 
-/// Codex shows as Codex: started for it, or found reporting as it (as it does on its own,
-/// to herdr-core) with its status, whatever it was started for. A plain terminal isn't an
-/// agent.
+/// Codex, from before Lemur dropped it, shows as a shell: started for it, or reporting as
+/// it (as it does on its own, to herdr-core). Claude reporting is Claude, whatever the
+/// thread was started for.
 #[test]
-fn codex_threads_show_as_codex() {
+fn codex_threads_show_as_shells() {
     let server = HcServer::new("pcodex");
-    let report = |state: &str| format!(r#"printf '\033]7501;state={state}:app=codex\033\\'; exec sleep 600"#);
+    let report = |state: &str, app: &str| format!(r#"printf '\033]7501;state={state}:app={app}\033\\'; exec sleep 600"#);
     let started = server.run("/", &["lemur.kind=codex"], &["sleep", "600"]);
-    let by_hand = server.run("/", &[], &["sh", "-c", &report("working")]);
-    let asks = server.run("/", &["lemur.kind=claude"], &["sh", "-c", &report("blocked")]);
-    let plain = server.run("/", &[], &["sleep", "600"]);
+    let by_hand = server.run("/", &[], &["sh", "-c", &report("working", "codex")]);
+    let asks = server.run("/", &[], &["sh", "-c", &report("blocked", "claude-code")]);
     let mut rt = loaded(server.config());
     let session = |s: &Lemur, name: &str| sessions(&s.snap).find(|(_, t)| t.name == name).map(|(_, t)| (t.agent(), t.activity));
-    let reported = refreshing(&mut rt, 10.0, |s| {
-        session(s, &asks) == Some((Some(Agent::Codex), Activity::NeedsInput))
-            && session(s, &by_hand) == Some((Some(Agent::Codex), Activity::Working))
-    });
-    assert!(reported, "{:?} {:?}", session(&rt.state, &asks), session(&rt.state, &by_hand));
-    assert_eq!(session(&rt.state, &started), Some((Some(Agent::Codex), Activity::Unknown)));
-    assert_eq!(session(&rt.state, &plain), Some((None, Activity::Unknown)));
+    let reported = refreshing(&mut rt, 10.0, |s| session(s, &asks) == Some((Some(Agent::Claude), Activity::NeedsInput)));
+    assert!(reported, "{:?}", session(&rt.state, &asks));
+    assert_eq!(session(&rt.state, &by_hand), Some((None, Activity::Unknown)));
+    assert_eq!(session(&rt.state, &started), Some((None, Activity::Unknown)));
 
     let listed: Vec<String> = rt.state.agents().iter().map(|(_, s)| s.name.clone()).collect();
-    assert!(listed.contains(&started) && listed.contains(&by_hand) && listed.contains(&asks), "{listed:?}");
-    assert!(!listed.contains(&plain), "{listed:?}");
-    let noted = sessions(&rt.state.snap).filter(|(_, s)| s.codex).filter_map(|(_, s)| s.shell_to_note()).count();
-    assert_eq!(noted, 0, "only Claude's are kept to resume");
+    assert!(listed.contains(&asks), "{listed:?}");
+    assert!(!listed.contains(&started) && !listed.contains(&by_hand), "{listed:?}");
 }
 
-/// Picking an agent the host doesn't have says so where failures show, for Codex and for
-/// Claude, a thread and a new worktree alike: nothing starts, and Lemur goes on, a shell
-/// starting as ever. With the agent there, Codex starts, labelled for it.
+/// Picking Claude where the host doesn't have it says so where failures show, a thread and a
+/// new worktree alike: nothing starts, and Lemur goes on, a shell starting as ever.
 #[test]
 fn picking_an_agent_the_host_lacks_says_so() {
     let server = HcServer::new("pnoagent");
@@ -579,7 +572,6 @@ fn picking_an_agent_the_host_lacks_says_so() {
     let path = repo.canonicalize().unwrap().to_string_lossy().into_owned();
     let mut cfg = server.config();
     cfg.hosts[0].claude = "lemur-has-no-claude".into();
-    cfg.hosts[0].codex = "lemur-has-no-codex".into();
     cfg.bases.push(Base::new("local", &path));
     let mut rt = loaded(cfg);
     let start = |rt: &mut Runtime<Lemur>, ask: super::prompt::Ask| {
@@ -597,15 +589,11 @@ fn picking_an_agent_the_host_lacks_says_so() {
         rt.state.status.take().unwrap().0
     };
     let thread = |agent: Agent| super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(agent) };
-    for (agent, said) in [
-        (Agent::Codex, "Codex isn't installed on local: its shell can't find `lemur-has-no-codex`"),
-        (Agent::Claude, "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`"),
-    ] {
-        start(&mut rt, thread(agent));
-        assert_eq!(failed(&mut rt), said);
-        start(&mut rt, super::prompt::Ask::NewWorktree { base: 0, agent: Some(agent) });
-        assert_eq!(failed(&mut rt), said);
-    }
+    let said = "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`";
+    start(&mut rt, thread(Agent::Claude));
+    assert_eq!(failed(&mut rt), said);
+    start(&mut rt, super::prompt::Ask::NewWorktree { base: 0, agent: Some(Agent::Claude) });
+    assert_eq!(failed(&mut rt), said);
     assert!(server.addresses().is_empty(), "no terminal");
     assert!(!repo.join(".claude/worktrees/x").exists(), "no worktree");
     assert!(rt.state.cfg.threads.is_empty());
@@ -613,14 +601,6 @@ fn picking_an_agent_the_host_lacks_says_so() {
     // Lemur goes on: a shell starts.
     start(&mut rt, super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: None });
     assert!(wait_for(&mut rt, 10.0, |s| s.active.is_some()), "{:?}", rt.state.status);
-
-    // And Codex, with it there.
-    rt.state.cfg.hosts[0].codex = "sleep 600".into();
-    start(&mut rt, thread(Agent::Codex));
-    let started =
-        refreshing(&mut rt, 10.0, |s| s.active.as_ref().and_then(|k| s.session_of(k)).is_some_and(|t| t.agent() == Some(Agent::Codex)));
-    assert!(started, "{:?}", rt.state.status);
-    assert!(rt.state.cfg.threads.is_empty(), "no Claude to keep");
 }
 
 /// A thread shows what its program calls it until you name it, and a rename starts from its
@@ -1459,7 +1439,7 @@ fn cmd_j_and_cmd_p_go_to_threads() {
     type_text(&mut rt, "bui");
     assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "bui");
     assert_eq!(listed(&rt.state), ["build"]);
-    for _ in 0..3 {
+    for _ in 0..2 {
         press(&mut rt, K::Down, Mods::default());
     }
     assert_eq!(rt.state.prompt.as_ref().unwrap().go, Some(0));
