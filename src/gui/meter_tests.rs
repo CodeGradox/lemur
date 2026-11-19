@@ -231,6 +231,44 @@ fn the_meter_follows_settings() {
     assert!(rt.state.panels.meters.claude.shown.is_none());
 }
 
+/// Unavailable, the meter's line has a ↻ that asks again, minimized too, and says it's asking
+/// meanwhile, the ↻ faint; pressing it leaves the meter as minimized as it was.
+#[test]
+fn an_unavailable_meter_asks_again_from_its_line() {
+    let server = HcServer::new("rmeter-again");
+    let dir = TempDir::new("rmeter-again");
+    let printed = dir.join("printed.jsonl");
+    std::fs::write(&printed, usage::PRINTED).unwrap();
+    let mut cfg = server.config();
+    cfg.hosts[0].claude = "false".into();
+    let mut rt = loaded(cfg);
+    let texts = |rt: &Runtime<Lemur>| rt.elements().into_iter().filter(|e| !e.exiting).filter_map(|e| e.text).collect::<Vec<_>>();
+    set(&mut rt, Agent::Claude, true);
+    assert!(answer(&mut rt, Agent::Claude).expect("asked").is_err());
+    assert!(rt.find("usage-again").is_some());
+    click(&mut rt, "usage-header");
+    assert!(rt.state.cfg.minimized_usage);
+    assert!(rt.find("usage-again").is_some(), "minimized too");
+
+    // Slow to answer, so it's seen asking.
+    rt.update(|s, _| s.cfg.hosts[0].claude = format!("sleep 1; cat {} #", printed.display()));
+    click(&mut rt, "usage-again");
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert!(rt.state.cfg.minimized_usage, "still minimized");
+    assert!(texts(&rt).contains(&"asking…".to_string()), "{:?}", texts(&rt));
+    assert!(rt.find("usage-again").is_some(), "it stays put");
+    click(&mut rt, "usage-again");
+    assert!(rt.state.cfg.minimized_usage, "pressed again while it asks, it doesn't open the meter");
+    assert!(wait_for(&mut rt, 10.0, |s| matches!(s.panels.meters.claude.shown, Some(Ok(_)))));
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert!(rt.find("usage-again").is_none(), "answered");
+    assert!(!texts(&rt).contains(&"asking…".to_string()));
+}
+
 /// Codex's usage has a meter of its own: off, it doesn't ask; on, it asks Codex and shows
 /// what it says, beside Claude's, or why it can't.
 #[test]

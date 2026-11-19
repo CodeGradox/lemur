@@ -195,8 +195,8 @@ pub fn meters(s: &Lemur, k: &Kit) -> Vec<El> {
 
 /// The agent's name and when its next limit starts over, then a bar for
 /// each limit, or that it couldn't be asked; what each says on hover. A
-/// click on the bars asks again; on its name, it minimizes the meter to
-/// that line, the most used limit beside it.
+/// click on the bars asks again, as the ↻ beside "unavailable" does; on its
+/// name, it minimizes the meter to that line, the most used limit beside it.
 fn usage_meter(s: &Lemur, agent: Agent, k: &Kit) -> Option<El> {
     // As Settings has it, even before the meter has followed: it asks at the next tick.
     if !setting(&s.prefs, agent) {
@@ -229,12 +229,27 @@ fn usage_meter(s: &Lemur, agent: Agent, k: &Kit) -> Option<El> {
                 .child(text(used).font(k.ty.small).color(c.text_muted).truncate().grow(1.0).align(rune::Align::End))
         })
         .collect();
-    let right = if minimized { shown.brief } else { shown.right };
+    let right = match () {
+        _ if failed && meter.asking => "asking…".to_string(),
+        _ if minimized => shown.brief,
+        _ => shown.right,
+    };
+    // Unavailable, it can be asked again from its line, minimized too. Asking, it stays put,
+    // faint: disabled, a press would go through to the line, which minimizes.
+    let again = failed.then(|| {
+        icons::button(&icons::REFRESH, "Try again")
+            .control_size(rune_kit::ControlSize::Mini)
+            .on_press(move |s: &mut Lemur| s.ask_usage(agent))
+            .build(k)
+            .key(format!("{id}-again"))
+            .opacity(if meter.asking { 0.4 } else { 1.0 })
+    });
     let header = minimizable_header(format!("{id}-header"), k)
         .on_press(move |s: &mut Lemur| s.toggle_usage_minimized(agent))
         .child(agent_icon(Some(agent), k))
         .child(text(name).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0))
         .child(text(right).font(k.ty.small).color(c.text_muted))
+        .children(again)
         .child(chevron(minimized, k));
     let body = (open && (failed || !rows.is_empty() || !totals.is_empty())).then(|| {
         let mut body = col().key(format!("{id}-bars")).gap(6.0).cursor(rune::Cursor::Pointer).on_press(move |s: &mut Lemur| s.ask_usage(agent));
