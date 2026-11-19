@@ -477,6 +477,7 @@ fn session(name: &str) -> Session {
         silent: false,
         issue: None,
         folder: None,
+        color: None,
     }
 }
 

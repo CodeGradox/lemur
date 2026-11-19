@@ -1434,6 +1434,47 @@ fn a_folders_menu_renames_and_deletes_it() {
     assert!(top_of(&rt, &format!("row-local-{u}")) < top_of(&rt, &format!("row-local-{t}")));
 }
 
+/// A thread's right-click, or its tab's, gives it a colour: its icon shows white on a tile
+/// of it, in the sidebar and its tab, and herdr-core keeps it. No colour takes it off; one
+/// Lemur doesn't know shows none.
+#[test]
+fn a_thread_takes_a_colour() {
+    let server = HcServer::new("pa-colour");
+    let t = server.run("/", &["lemur.label=t"], &["sleep", "600"]);
+    let odd = server.run("/", &["lemur.label=odd", "lemur.color=mauve"], &["sleep", "600"]);
+    let mut rt = loaded(&server);
+    assert!(refreshing(&mut rt, 10.0, |s| [&t, &odd].iter().all(|x| s.session_of(&key(x)).is_some())));
+    let row = format!("row-local-{t}");
+    let tile = |rt: &Runtime<Lemur>, under: &str| {
+        let els = rt.elements();
+        let at = els.iter().find(|e| e.key.as_deref() == Some(under) && !e.exiting).map(|e| e.path.clone());
+        at.and_then(|at| els.into_iter().find(|e| e.key.as_deref() == Some("color-tile") && e.path.starts_with(&at) && !e.exiting)).map(|e| e.fill)
+    };
+    let label = |t: &str| {
+        let terminals = server.core().terminals();
+        terminals.iter().find(|x| x.address == t).and_then(|x| x.labels.get("lemur.color").cloned()).unwrap_or_default()
+    };
+    assert!(tile(&rt, &row).is_none());
+    assert_eq!(rt.state.session_of(&key(&odd)).and_then(|s| s.color.clone()), None, "not one of the colours");
+
+    right_click(&mut rt, &row);
+    rt.resolve_popup(Some("color:purple")).unwrap();
+    frames(&mut rt, 20);
+    let purple = rune::color::hex("#a855f7").unwrap();
+    assert_eq!(tile(&rt, &row), Some(purple), "at once");
+    assert!(wait_for(&mut rt, 5.0, |_| label(&t) == "purple"));
+    open(&mut rt, &t);
+    frames(&mut rt, 20);
+    assert_eq!(tile(&rt, &format!("t-{t}")), Some(purple), "its tab too");
+
+    right_click(&mut rt, &format!("t-{t}"));
+    rt.resolve_popup(Some("color:")).unwrap();
+    assert!(wait_for(&mut rt, 5.0, |_| label(&t).is_empty()));
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some_and(|x| x.color.is_none())));
+    frames(&mut rt, 20);
+    assert!(tile(&rt, &row).is_none());
+}
+
 /// v2 `tabs_are_the_threads_of_the_worktree_on_show`: the tabs are the threads of the
 /// folder on show, whatever worktree they run in: a click opens one, and its × closes it,
 /// asking first while its program runs. Those in no folder are the tabs of each other.

@@ -84,6 +84,7 @@ impl Lemur {
                     claude_session: run.id.clone(),
                     label: Some(s.own_label.clone()),
                     issue: s.issue.clone(),
+                    color: s.color.clone(),
                 })
             })
             .collect();

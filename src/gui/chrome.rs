@@ -3,7 +3,7 @@
 //! what shows over the window (the spotlight, a dialog, a peek, snackbars).
 
 use super::card;
-use super::prompt::{Ask, agent_icon, new_menu, new_picked};
+use super::prompt::{Ask, new_menu, new_picked, thread_icon};
 use super::silence::silence_label;
 use super::snackbar;
 use super::{Action, Key, Lemur, Right, icons, panels, peek, prompt, sessions, sidebar, terminal};
@@ -27,8 +27,8 @@ const TAB_WIDTH: f32 = 72.0;
 /// resize grip, as wide, so the gap shows where to drag.
 const FRAME: f32 = 6.0;
 
-/// A tab's right-click menu, as Herdr's: rename it, start a terminal beside it, put it away,
-/// close it.
+/// A tab's right-click menu, as Herdr's: rename it, start a terminal beside it, its colour,
+/// put it away, close it.
 fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
     let mut menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…"));
     if s.place_of(key).is_some() {
@@ -40,7 +40,7 @@ fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
     }
     menu = menu.separator();
     if let Some(t) = s.session_of(key) {
-        menu = menu.item(PopupItem::new("silence", silence_label(t.silent)));
+        menu = menu.item(PopupItem::new("silence", silence_label(t.silent))).submenu("Color", super::sidebar::thread_colors(t.color.as_deref()));
     }
     let mut close = PopupItem::new("close", "Close");
     if let Some(k) = Action::CloseThread.key_equivalent() {
@@ -63,6 +63,10 @@ fn tab_picked(s: &mut Lemur, picked: &str, key: Key) {
         }
         "put-away" => s.put_away(key),
         "close" => s.confirm_close_of(key),
+        color if color.starts_with("color:") => {
+            let name = &color["color:".len()..];
+            s.set_thread_color(key, Some(name).filter(|n| !n.is_empty()));
+        }
         _ => {}
     }
 }
@@ -94,7 +98,7 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
             let menu_key = key.clone();
             let label = t.label.clone();
             let mut item = TabItem::new(key.1.as_str(), (i + 1).to_string())
-                .avatar(agent_icon(t.agent(), k))
+                .avatar(thread_icon(t.agent(), t.color.as_deref(), k))
                 .status(status.filter(|st| !shown || *st == TabItemStatus::Busy));
             item = item.decorate(move |tab, _| {
                 let label_tip = label;
@@ -294,7 +298,7 @@ fn pane_header(s: &Lemur, key: &Key, k: &Kit) -> Option<El> {
             .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
             // On the terminal's own background, as if part of it.
             .fill(rune::color::hex(&super::palette::hex(s.palette().background)).unwrap_or(c.bg_base))
-            .child(agent_icon(t.agent(), k))
+            .child(thread_icon(t.agent(), t.color.as_deref(), k))
             .child(text(what).font(k.ty.ui).color(c.text_muted))
             .child(text(t.label.clone()).key("header-name").font(k.ty.ui_medium).color(c.text_base).truncate())
             .child(text(t.path.clone()).font(k.ty.small).color(c.text_faint).truncate_head().grow(1.0)),

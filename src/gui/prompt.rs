@@ -435,6 +435,14 @@ pub fn agent_icon(agent: Option<Agent>, k: &Kit) -> El {
     row().size(16.0, 16.0).center().child(icon(glyph, 14.0).color(ink))
 }
 
+/// A thread's icon: its agent's, or a terminal; given a colour, white on a tile of it, as a
+/// project's mark is.
+pub fn thread_icon(agent: Option<Agent>, color: Option<&str>, k: &Kit) -> El {
+    let Some(fill) = color.and_then(super::sidebar::color_named) else { return agent_icon(agent, k) };
+    let (glyph, _) = agent_glyph(agent, k);
+    row().key("color-tile").size(18.0, 18.0).radius(5.0).fill(fill).center().child(icon(glyph, 11.0).color(rune::Color::WHITE))
+}
+
 /// A thread's glyph and its colour: its agent's, or a terminal.
 pub fn agent_glyph(agent: Option<Agent>, k: &Kit) -> (&'static rune::Icon, rune::Color) {
     match agent {

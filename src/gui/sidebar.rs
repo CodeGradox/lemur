@@ -2,7 +2,7 @@
 //! none (`folders`), as rows to open, fold, drag and right-click; then Other, each host's
 //! threads outside every project; the hosts' load at the foot.
 
-use super::prompt::{Ask, agent_glyph, agent_icon, new_menu, new_picked};
+use super::prompt::{Ask, agent_glyph, new_menu, new_picked, thread_icon};
 use super::silence::silence_label;
 use super::{Key, Lemur, List, icons, key, worktree_label};
 use crate::config::{Agent, Base, COLORS, ClaudeThread, Folder};
@@ -79,7 +79,7 @@ fn drags(e: El, id: String, drop: impl Fn(&mut Lemur, f32) + 'static) -> El {
 }
 
 /// One of `COLORS`, by its name.
-fn color_named(name: &str) -> Option<Color> {
+pub(super) fn color_named(name: &str) -> Option<Color> {
     let (_, hex) = COLORS.iter().find(|(n, _)| *n == name)?;
     rune::color::hex(&format!("#{hex:06x}"))
 }
@@ -193,14 +193,24 @@ pub fn status_dot(color: Color, tip: String, breathes: bool) -> El {
 
 
 /// What a right click on a thread offers, and what it runs.
-/// A thread's right-click: renaming it, peeking at it, silencing it, putting it away; in a
-/// project, moving it to one of `folders`, or a new one.
+/// A thread's colours to pick from, `current` checked: those of `COLORS`, or none.
+pub(super) fn thread_colors(current: Option<&str>) -> PopupMenu {
+    let mut colors = PopupMenu::new();
+    for (name, _) in COLORS {
+        colors = colors.item(PopupItem::new(format!("color:{name}"), title_case(name)).checked(current == Some(name)));
+    }
+    colors.separator().item(PopupItem::new("color:", "No color").checked(current.is_none()))
+}
+
+/// A thread's right-click: renaming it, peeking at it, silencing it, putting it away, its
+/// colour; in a project, moving it to one of `folders`, or a new one.
 fn thread_menu(s: &Session, folders: Option<&[Folder]>) -> PopupMenu {
     let mut menu = PopupMenu::new()
         .item(PopupItem::new("rename", "Rename…"))
         .item(PopupItem::new("peek", "Peek"))
         .item(PopupItem::new("silence", silence_label(s.silent)))
-        .item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") });
+        .item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") })
+        .submenu("Color", thread_colors(s.color.as_deref()));
     if let Some(folders) = folders {
         let filed = folders.iter().any(|f| s.folder.as_deref() == Some(f.id.as_str()));
         let mut to = PopupMenu::new();
@@ -233,6 +243,10 @@ fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {
             let id = &folder["folder:".len()..];
             s.move_to_folder(&key, Some(id).filter(|id| !id.is_empty()));
         }
+        color if color.starts_with("color:") => {
+            let name = &color["color:".len()..];
+            s.set_thread_color(key, Some(name).filter(|n| !n.is_empty()));
+        }
         _ => {}
     }
 }
@@ -252,7 +266,7 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
     }
     said.push(age(t.idle_secs));
     let mut r = SidebarRow::new(t.label.clone())
-        .avatar(agent_icon(t.agent(), k))
+        .avatar(thread_icon(t.agent(), t.color.as_deref(), k))
         .depth(depth)
         .detail(said.join(" · "))
         .status(RowStatus::Other(status_dot(dot, tip, breathes)))
@@ -301,7 +315,7 @@ fn gone_row(t: &ClaudeThread, depth: u8, k: &Kit) -> El {
         .on_press(move |s: &mut Lemur| s.resume(vec![resume.clone()]))
         .build(k);
     SidebarRow::new(t.shown())
-        .avatar(agent_icon(Some(Agent::Claude), k))
+        .avatar(thread_icon(Some(Agent::Claude), t.color.as_deref(), k))
         .depth(depth)
         .trailing(play)
         .on_select(move |s: &mut Lemur, _| s.resume(vec![row_resume.clone()]))
@@ -708,6 +722,19 @@ impl Lemur {
         let &(y, h) = self.places.get(id)?;
         let at = y + h / 2.0 + dy;
         ids.iter().rposition(|i| self.places.get(i).is_some_and(|(top, _)| *top <= at)).or(Some(0))
+    }
+
+    /// Colours thread `key`, or with `None` takes its colour off: it shows at once, herdr-core
+    /// keeps it on the terminal, and a thread kept to resume keeps it too.
+    pub(super) fn set_thread_color(&mut self, key: Key, color: Option<&str>) {
+        let color = color.map(str::to_string);
+        if let Some(s) = self.session_mut(&key) {
+            s.color = color.clone();
+        }
+        if let Some(thread) = self.cfg.threads.iter().find(|t| t.host == key.0 && t.session == key.1).cloned() {
+            self.keep_thread(ClaudeThread { color: color.clone(), ..thread });
+        }
+        self.write_core(move |cfg| crate::actions::set_color(cfg, &key.0, &key.1, color.as_deref()));
     }
 
     /// The list thread `key` is in: its project's, or its host's outside every project.

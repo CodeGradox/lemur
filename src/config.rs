@@ -341,6 +341,9 @@ pub struct ClaudeThread {
     /// resumed.
     #[serde(default)]
     pub issue: Option<String>,
+    /// Its colour, one of `COLORS`, given again when it's resumed.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 impl ClaudeThread {
@@ -761,6 +764,9 @@ impl Config {
             }
             if let Some(issue) = &thread.issue {
                 fields.push(("issue", issue));
+            }
+            if let Some(color) = &thread.color {
+                fields.push(("color", color));
             }
             push_table(doc, "threads", &fields)
         })
@@ -1235,6 +1241,7 @@ collapsed = true
             claude_session: id.into(),
             label: Some("review".into()),
             issue: (id == "3").then(|| "LAFT-3184".into()),
+            color: (id == "3").then(|| "teal".into()),
         };
         let threads = |path: &Path| -> Vec<ClaudeThread> {
             toml::from_str::<Config>(&std::fs::read_to_string(path).unwrap())

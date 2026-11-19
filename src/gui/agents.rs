@@ -3,7 +3,7 @@
 //! order whatever they're doing, each with what it runs to help it under it, as
 //! Herdr's agents list. A click opens one.
 
-use super::prompt::agent_icon;
+use super::prompt::{agent_icon, thread_icon};
 use super::sidebar::status_dot;
 use super::silence::silence_label;
 use super::{Key, Lemur, icons, key, sessions, worktree_label};
@@ -144,7 +144,7 @@ fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
     }
     let open = key.clone();
     SidebarRow::new(t.label.clone())
-        .avatar(agent_icon(t.agent(), k))
+        .avatar(thread_icon(t.agent(), t.color.as_deref(), k))
         .subtitle(place)
         .trailing(trailing)
         .status(RowStatus::Other(status_dot(color, tip, breathes)))

@@ -235,6 +235,7 @@ fn linear_issues_pin_to_the_thread_on_show() {
         claude_session: crate::actions::random_uuid(),
         label: None,
         issue: None,
+        color: None,
     };
     rt.update(|s, _| {
         s.keep_thread(thread);

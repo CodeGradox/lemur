@@ -137,6 +137,8 @@ pub struct Session {
     pub issue: Option<String>,
     /// The folder of its project it's in (`config::Folder`'s id), if any.
     pub folder: Option<String>,
+    /// Its colour, one of `config::COLORS`, if it was given one.
+    pub color: Option<String>,
 }
 
 /// Something a thread runs to help it: one of Claude Code's subagents, as
@@ -249,6 +251,8 @@ pub const ISSUE: &str = "lemur.issue";
 /// The folder of its project a thread is in, by the folder's id
 /// (`config::Folder`).
 pub const FOLDER: &str = "lemur.folder";
+/// A thread's colour, one of `config::COLORS`, by its name.
+pub const COLOR: &str = "lemur.color";
 /// The pid of the shell a Claude thread's Claude runs in, as lemur last
 /// saw it. herdr-core keeps lemur's terminals: after their host restarts,
 /// each comes back at its address with a fresh shell and another pid.
@@ -724,6 +728,7 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         silent: label(SILENT).is_some(),
         issue: label(ISSUE).cloned(),
         folder: label(FOLDER).filter(|f| !f.is_empty()).cloned(),
+        color: label(COLOR).filter(|c| crate::config::COLORS.iter().any(|(name, _)| name == c)).cloned(),
     }
 }
 
@@ -1515,6 +1520,7 @@ mod tests {
             claude_session: "0fdfabeb-ca80-4916-a103-275bbb5e8614".into(),
             label: None,
             issue: None,
+            color: None,
         };
         let auth = "/home/agent/projects/api/.claude/worktrees/auth";
         cfg.threads = vec![

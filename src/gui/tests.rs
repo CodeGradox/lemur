@@ -67,6 +67,7 @@ pub(super) fn session(name: &str, activity: Activity) -> Session {
         silent: false,
         issue: None,
         folder: None,
+        color: None,
     }
 }
 

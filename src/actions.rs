@@ -3,7 +3,7 @@ use crate::config::{Agent, ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
 use crate::snapshot::{
-    AWAY, FOLDER, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
+    AWAY, COLOR, FOLDER, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
 };
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
@@ -281,7 +281,7 @@ fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>) -> Result
     }
     Ok(Started {
         host: host.name.clone(),
-        session: start_thread(host, dir, label, "shell", None, None)?,
+        session: start_thread(host, dir, label, "shell", None, &[])?,
         claude: None,
     })
 }
@@ -340,7 +340,7 @@ fn find_program(program: &str) -> String {
 fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
     let id = random_uuid();
     let command = format!("{} --session-id {id}", host.claude);
-    let address = start_thread(host, dir, label, "claude", Some(&command), None)?;
+    let address = start_thread(host, dir, label, "claude", Some(&command), &[])?;
     Ok(Started {
         host: host.name.clone(),
         session: address.clone(),
@@ -351,6 +351,7 @@ fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
             claude_session: id,
             label: Some(label.to_string()),
             issue: None,
+            color: None,
         }),
     })
 }
@@ -358,14 +359,15 @@ fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
 /// Starts a thread labelled `label` in `dir` on `host`: the host's shell,
 /// and with `command`, what starts its agent typed into it, so the shell has
 /// set up PATH first. The terminal's labels file it under `dir`, say what it
-/// was started for (`kind`), and pin `issue` to it. Returns its address.
+/// was started for (`kind`), and give it `kept`'s (the issue pinned to it, its
+/// colour). Returns its address.
 fn start_thread(
     host: &Host,
     dir: &str,
     label: &str,
     kind: &str,
     command: Option<&str>,
-    issue: Option<&str>,
+    kept: &[(&str, &str)],
 ) -> Result<String> {
     validate_name(label)?;
     let (core, on) = hc::for_host(host)?;
@@ -374,8 +376,8 @@ fn start_thread(
         (KIND.to_string(), kind.to_string()),
         (WORKTREE.to_string(), dir.to_string()),
     ]);
-    if let Some(issue) = issue {
-        labels.insert(ISSUE.to_string(), issue.to_string());
+    for (name, value) in kept {
+        labels.insert(name.to_string(), value.to_string());
     }
     let terminals = core.terminals();
     let on_host = terminals.iter().filter(|t| hc::on_host(t, on.as_deref()));
@@ -473,14 +475,11 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         wait_for_program(&core, &thread.session);
         return Ok(thread.session.clone());
     }
-    start_thread(
-        host,
-        &thread.path,
-        &label,
-        "claude",
-        Some(&resume),
-        thread.issue.as_deref(),
-    )
+    let kept: Vec<(&str, &str)> = [(ISSUE, &thread.issue), (COLOR, &thread.color)]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value.as_deref()?)))
+        .collect();
+    start_thread(host, &thread.path, &label, "claude", Some(&resume), &kept)
 }
 
 /// Waits a moment for what was typed into the shell of terminal `address`
@@ -539,6 +538,13 @@ pub fn set_silent(cfg: &Config, host: &str, session: &str, silent: bool) -> Resu
 pub fn set_issue(cfg: &Config, host: &str, session: &str, issue: Option<&str>) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
     core.label(session, &[(ISSUE, issue.unwrap_or_default())])
+}
+
+/// Gives a thread colour `color`, one of `COLORS` by its name, or with `None`
+/// takes its colour off.
+pub fn set_color(cfg: &Config, host: &str, session: &str, color: Option<&str>) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(COLOR, color.unwrap_or_default())])
 }
 
 /// Puts threads in their order, each in its folder of their project, by
@@ -1437,9 +1443,10 @@ mod tests {
         assert!(wait_until(Duration::from_secs(5), || !server
             .addresses()
             .contains(&started.session)));
-        // Resumed with the Linear issue pinned to it.
+        // Resumed with the Linear issue pinned to it, and its colour.
         let pinned = ClaudeThread {
             issue: Some("LAFT-3184".into()),
+            color: Some("teal".into()),
             ..claude.clone()
         };
         let again = resume_thread(&cfg, &pinned).unwrap();
@@ -1452,6 +1459,7 @@ mod tests {
         assert_eq!(t.labels.get(KIND).map(String::as_str), Some("claude"));
         assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("claude"));
         assert_eq!(t.labels.get(ISSUE).map(String::as_str), Some("LAFT-3184"));
+        assert_eq!(t.labels.get(COLOR).map(String::as_str), Some("teal"));
 
         // Nothing starts where its folder was, or with an ID that isn't one.
         let before = server.addresses().len();
@@ -1671,6 +1679,7 @@ mod tests {
             claude_session: random_uuid(),
             label: None,
             issue: None,
+            color: None,
         };
         let before = server.addresses().len();
         let err = resume_thread(&cfg, &thread).unwrap_err();
@@ -1921,6 +1930,7 @@ mod tests {
             claude_session: random_uuid(),
             label: None,
             issue: None,
+            color: None,
         };
         let e = resume_thread(&cfg, &thread).err().unwrap();
         assert!(format!("{e:#}").contains("isn't installed"), "{e:#}");

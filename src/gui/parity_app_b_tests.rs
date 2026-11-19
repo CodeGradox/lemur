@@ -1172,6 +1172,7 @@ fn a_double_click_resumes_a_thread_once() {
         claude_session: "e7f3a2c4-1b5d-4c8e-9f0a-2d3b4c5d6e7f".into(),
         label: Some("gone".into()),
         issue: None,
+        color: None,
     };
     cfg.threads.push(thread.clone());
     let mut rt = loaded(cfg);
