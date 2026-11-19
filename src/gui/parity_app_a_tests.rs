@@ -1297,7 +1297,9 @@ fn right_click(rt: &mut Runtime<Lemur>, key: &str) {
     frames(rt, 2);
 }
 
-/// The folder herdr-core says terminal `t` is in, by its id: "" for none.
+/// The folder herdr-core says terminal `t` is in, by its id: "" for none. Wait for it with
+/// the window running: a move made while the last is still being written waits for the
+/// window to hear that one's done.
 fn folder_of(server: &HcServer, t: &str) -> String {
     let terminals = server.core().terminals();
     terminals.iter().find(|x| x.address == t).and_then(|x| x.labels.get("lemur.folder").cloned()).unwrap_or_default()
@@ -1326,7 +1328,7 @@ fn threads_drag_into_folders_and_out() {
     let dy = top_of(&rt, "folder-0-f1") - top_of(&rt, &row_a);
     drag(&mut rt, &row_a, 0.0, dy);
     assert_eq!(rt.state.session_of(&key(&a)).and_then(|s| s.folder.clone()).as_deref(), Some("f1"), "at once");
-    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &a) == "f1"));
+    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &a) == "f1"));
     assert_eq!(folder_of(&server, &b), "");
     frames(&mut rt, 20);
     assert!(top_of(&rt, &row_a) > top_of(&rt, "folder-0-f1"), "under its folder");
@@ -1334,7 +1336,7 @@ fn threads_drag_into_folders_and_out() {
     // Back above it, out: first of those in none.
     let dy = top_of(&rt, &row_b) - top_of(&rt, &row_a);
     drag(&mut rt, &row_a, 0.0, dy);
-    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &a).is_empty()));
+    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &a).is_empty()));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&a)).is_some_and(|t| t.folder.is_none())));
     frames(&mut rt, 20);
     assert!(top_of(&rt, &row_a) < top_of(&rt, &row_b));
@@ -1389,19 +1391,19 @@ fn a_threads_menu_moves_it_among_folders() {
     let folders = rt.state.cfg.bases[0].folders.clone();
     assert_eq!(folders.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Billing work"]);
     let id = folders[0].id.clone();
-    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t) == id));
+    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &t) == id));
     frames(&mut rt, 20);
     let folder = format!("folder-0-{id}");
     assert!(top_of(&rt, &row) > top_of(&rt, &folder), "in it");
 
     right_click(&mut rt, &row);
     rt.resolve_popup(Some("folder:")).unwrap();
-    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t).is_empty()));
+    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &t).is_empty()));
     frames(&mut rt, 20);
     assert!(top_of(&rt, &row) < top_of(&rt, &folder), "out of it");
     right_click(&mut rt, &row);
     rt.resolve_popup(Some(&format!("folder:{id}"))).unwrap();
-    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t) == id));
+    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &t) == id));
 }
 
 /// A folder's right-click renames it, or deletes it: its threads stay, after those in no
@@ -1426,7 +1428,7 @@ fn a_folders_menu_renames_and_deletes_it() {
     right_click(&mut rt, "folder-0-f1");
     rt.resolve_popup(Some("delete")).unwrap();
     assert!(rt.state.cfg.bases[0].folders.is_empty());
-    assert!(wait_until(Duration::from_secs(5), || folder_of(&server, &t).is_empty()));
+    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &t).is_empty()));
     frames(&mut rt, 20);
     assert!(!shows(&rt, "folder-0-f1"));
     assert!(top_of(&rt, &format!("row-local-{u}")) < top_of(&rt, &format!("row-local-{t}")));
