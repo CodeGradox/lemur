@@ -147,6 +147,27 @@ fn popups_go_by_themselves_after_the_dismiss_period() {
     assert!(popups(&rt).is_empty(), "a came over 3 s ago");
 }
 
+/// The Dock icon counts the notifications out, as they come and go.
+#[test]
+fn the_dock_icon_counts_the_notifications_out() {
+    let mut rt = window(toml::from_str("notification_dismiss_ms = 2000").unwrap());
+    let count = |rt: &Runtime<Lemur>| rt.state.panels.notify.badge;
+    rt.window_focus(false);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(count(&rt), 0);
+    apply(&mut rt, &[("a", Activity::Working), ("b", Activity::Working)]);
+    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::NeedsInput)]);
+    assert_eq!(count(&rt), 2);
+    // Newer news of a thread replaces its notification.
+    apply(&mut rt, &[("a", Activity::Working), ("b", Activity::NeedsInput)]);
+    apply(&mut rt, &[("a", Activity::NeedsInput), ("b", Activity::NeedsInput)]);
+    assert_eq!(count(&rt), 2);
+    rt.update(|s, _| s.close_popup(&key("a")));
+    assert_eq!(count(&rt), 1);
+    run_for(&mut rt, 2.1);
+    assert_eq!(count(&rt), 0, "gone by itself");
+}
+
 /// A silenced thread makes no notifications, and a popup it made goes; what it's doing
 /// shows as ever. herdr-core keeps that, and it can notify again.
 #[test]

@@ -15,10 +15,10 @@ futures = "0.3"
 # Ghostty's terminal core, libghostty-vt. Its build script fetches Ghostty at the commit the
 # bindings pin and builds it with Zig 0.17 (mise.toml).
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "84373f8d48b8f0b794e259f74a71a52686616f5d", default-features = false }
-# Asking for attention (the Dock icon's bounce) when a thread has news, which Rune can't on
-# macOS. arboard builds both already.
+# Asking for attention (the Dock icon's bounce) when a thread has news, and the count of it on
+# the Dock icon, which Rune can't on macOS. arboard builds both already.
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
 # Held keys repeating in the terminal (see `gui::held_keys_repeat`).
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDictionary", "NSString", "NSUserDefaults", "NSValue"] }
 png = "0.18.1"
