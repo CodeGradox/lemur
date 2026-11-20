@@ -32,8 +32,9 @@ pub enum Ask {
     /// With `agent` running in it, or with none just a shell.
     NewWorktree { base: usize, agent: Option<Agent> },
     /// `agent`, or with none just a shell, in `dir` on `host`: a worktree of project `base`,
-    /// or the folder of a thread outside every project.
-    NewThread { host: String, base: Option<usize>, dir: String, agent: Option<Agent> },
+    /// or the folder of a thread outside every project; in `folder` of the project's, by
+    /// its id, to show beside the thread it was started from.
+    NewThread { host: String, base: Option<usize>, dir: String, agent: Option<Agent>, folder: Option<String> },
     Rename { host: String, session: String },
     /// Nothing new: a thread to go to.
     Find,
@@ -121,8 +122,8 @@ impl Lemur {
         self.prompt = None;
     }
 
-    /// ⌘J: asks for a new agent's thread or shell where the one on show runs: its worktree,
-    /// or its folder outside every worktree.
+    /// ⌘J: asks for a new agent's thread or shell where the one on show runs (its worktree,
+    /// or its folder outside every worktree), in the same folder of its project's.
     pub fn new_thread_here(&mut self) {
         if self.overlaid() {
             return;
@@ -130,7 +131,8 @@ impl Lemur {
         let Some(key) = self.active.clone() else { return };
         // Not listed yet: there's no telling where it runs.
         let Some((dir, base)) = self.place_of(&key) else { return self.ask_name(Ask::Find) };
-        self.ask_name(Ask::NewThread { host: key.0, base, dir, agent: Some(Agent::Claude) });
+        let folder = self.folder_beside(&key);
+        self.ask_name(Ask::NewThread { host: key.0, base, dir, agent: Some(Agent::Claude), folder });
     }
 
     /// ⌘P: the spotlight, to go to any thread.
@@ -304,8 +306,8 @@ impl Lemur {
                     actions::new_worktree_thread(&cfg, base, &name, default_label(agent), agent, branch.as_deref(), from.as_deref())
                         .map(|(started, note)| Done::Started(started, note))
                 }
-                Ask::NewThread { host, dir, agent, .. } => {
-                    actions::start_in(&cfg, &host, &dir, &name, agent).map(|started| Done::Started(started, None))
+                Ask::NewThread { host, dir, agent, folder, .. } => {
+                    actions::start_in_folder(&cfg, &host, &dir, &name, agent, folder.as_deref()).map(|started| Done::Started(started, None))
                 }
                 Ask::Find | Ask::NewFolder { .. } | Ask::RenameFolder { .. } => unreachable!("going to a thread starts nothing, nor does a folder"),
                 Ask::Rename { host, session } => {
@@ -367,17 +369,18 @@ impl Lemur {
         }
         let Some(key) = self.active.clone() else { return };
         let Some((dir, _)) = self.place_of(&key) else { return };
-        self.start_now(key.0, dir, None);
+        let folder = self.folder_beside(&key);
+        self.start_now(key.0, dir, None, folder);
     }
 
     /// Starts `agent`, or with none a shell, in `dir` on `host`, labelled after what it
-    /// runs, and shows it.
-    pub fn start_now(&mut self, host: String, dir: String, agent: Option<Agent>) {
+    /// runs, in `folder` of its project's, and shows it.
+    pub fn start_now(&mut self, host: String, dir: String, agent: Option<Agent>, folder: Option<String>) {
         let label = default_label(agent);
         let said = self.busy(format!("starting {label}…"));
         let cfg = self.cfg.clone();
         self.in_background(
-            move || actions::start_in(&cfg, &host, &dir, label, agent),
+            move || actions::start_in_folder(&cfg, &host, &dir, label, agent, folder.as_deref()),
             move |s, started| {
                 s.done(&said);
                 match started {
@@ -417,13 +420,13 @@ pub fn new_menu() -> PopupMenu {
 }
 
 /// Runs what `new_menu` picked, in `dir` on `host`, a worktree of project `base` or any
-/// folder. True if it was one of its items.
-pub fn new_picked(s: &mut Lemur, picked: &str, host: &str, dir: &str, base: Option<usize>) -> bool {
+/// folder, in `folder` of the project's. True if it was one of its items.
+pub fn new_picked(s: &mut Lemur, picked: &str, host: &str, dir: &str, base: Option<usize>, folder: Option<String>) -> bool {
     let (host, dir) = (host.to_string(), dir.to_string());
     match picked {
-        "new-terminal" => s.start_now(host, dir, None),
-        "new-claude" => s.start_now(host, dir, Some(Agent::Claude)),
-        "new-named" => s.ask_name(Ask::NewThread { host, base, dir, agent: Some(Agent::Claude) }),
+        "new-terminal" => s.start_now(host, dir, None, folder),
+        "new-claude" => s.start_now(host, dir, Some(Agent::Claude), folder),
+        "new-named" => s.ask_name(Ask::NewThread { host, base, dir, agent: Some(Agent::Claude), folder }),
         _ => return false,
     }
     true

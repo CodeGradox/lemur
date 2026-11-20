@@ -522,7 +522,7 @@ fn host_row(s: &Lemur, name: &str, home: &str, k: &Kit) -> El {
                 let (host, dir) = (host.clone(), dir.clone());
                 tx.popup_menu(new_menu(), format!("host-plus-{host}"), move |s: &mut Lemur, picked, _| {
                     if let Some(p) = picked {
-                        new_picked(s, p, &host, &dir, None);
+                        new_picked(s, p, &host, &dir, None, None);
                     }
                 });
             })
@@ -590,7 +590,7 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32) -> El {
                 let (host, dir) = (host.clone(), dir.clone());
                 tx.popup_menu(new_menu(), format!("project-plus-{index}"), move |s: &mut Lemur, picked, _| {
                     if let Some(p) = picked {
-                        new_picked(s, p, &host, &dir, Some(index));
+                        new_picked(s, p, &host, &dir, Some(index), None);
                     }
                 });
             })

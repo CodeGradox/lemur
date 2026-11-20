@@ -215,7 +215,7 @@ pub fn new_worktree_thread(
         quote(&from),
     ))?;
     let dir = out.lines().last().unwrap_or_default();
-    let started = start_on(host, dir, label, agent)?;
+    let started = start_on(host, dir, label, agent, &[])?;
     let note = (!fetched)
         .then(|| format!("couldn't fetch {from}; the worktree starts where it was last fetched"));
     Ok((started, note))
@@ -268,20 +268,34 @@ pub fn start_in(
     label: &str,
     agent: Option<Agent>,
 ) -> Result<Started> {
+    start_in_folder(cfg, host, dir, label, agent, None)
+}
+
+/// Starts a thread as `start_in` does, in `folder` of its project's, by the
+/// folder's id: it shows there from the first.
+pub fn start_in_folder(
+    cfg: &Config,
+    host: &str,
+    dir: &str,
+    label: &str,
+    agent: Option<Agent>,
+    folder: Option<&str>,
+) -> Result<Started> {
     let host = cfg.host_or_err(host)?;
     if let Some(agent) = agent {
         installed(host, agent)?;
     }
-    start_on(host, dir, label, agent)
+    let kept: Vec<(&str, &str)> = folder.map(|f| (FOLDER, f)).into_iter().collect();
+    start_on(host, dir, label, agent, &kept)
 }
 
-fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>) -> Result<Started> {
+fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>, kept: &[(&str, &str)]) -> Result<Started> {
     if agent == Some(Agent::Claude) {
-        return start_claude(host, dir, label);
+        return start_claude(host, dir, label, kept);
     }
     Ok(Started {
         host: host.name.clone(),
-        session: start_thread(host, dir, label, "shell", None, &[])?,
+        session: start_thread(host, dir, label, "shell", None, kept)?,
         claude: None,
     })
 }
@@ -336,11 +350,12 @@ fn find_program(program: &str) -> String {
 }
 
 /// Starts Claude in a thread labelled `label`, in `dir` on `host`, with a
-/// session ID of lemur's, and returns the thread with what resumes it.
-fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
+/// session ID of lemur's and `kept`'s labels, and returns the thread with what
+/// resumes it.
+fn start_claude(host: &Host, dir: &str, label: &str, kept: &[(&str, &str)]) -> Result<Started> {
     let id = random_uuid();
     let command = format!("{} --session-id {id}", host.claude);
-    let address = start_thread(host, dir, label, "claude", Some(&command), &[])?;
+    let address = start_thread(host, dir, label, "claude", Some(&command), kept)?;
     Ok(Started {
         host: host.name.clone(),
         session: address.clone(),

@@ -246,6 +246,14 @@ impl Lemur {
         }
     }
 
+    /// The folder of its project thread `key` is in, by its id, for a thread started beside
+    /// it: none outside every project, or in no folder.
+    pub(super) fn folder_beside(&self, key: &Key) -> Option<String> {
+        let (index, _) = self.project_of(&key.0, &key.1)?;
+        let folder = self.session_of(key)?.folder.clone()?;
+        self.cfg.bases[index].folders.iter().any(|f| f.id == folder).then_some(folder)
+    }
+
     /// What folder `id` of project `index` is called.
     pub(super) fn folder_name(&self, index: usize, id: &str) -> Option<String> {
         self.cfg.bases.get(index)?.folders.iter().find(|f| f.id == id).map(|f| f.name.clone())

@@ -54,7 +54,8 @@ fn tab_picked(s: &mut Lemur, picked: &str, key: Key) {
         "rename" => s.ask_name(Ask::Rename { host: key.0, session: key.1 }),
         "new-terminal" => {
             if let Some((dir, _)) = s.place_of(&key) {
-                s.start_now(key.0, dir, None);
+                let folder = s.folder_beside(&key);
+                s.start_now(key.0, dir, None, folder);
             }
         }
         "silence" => {
@@ -127,14 +128,16 @@ fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
         .collect();
     let host = active.0.clone();
     let place = s.place_of(&active);
+    // Beside the one on show, in its folder.
+    let folder = s.folder_beside(&active);
     let plus = place.map(|(dir, base)| {
         let (host, dir) = (host.clone(), dir);
         icons::button(&icons::PLUS, "New terminal or Claude here")
             .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
-                let (host, dir) = (host.clone(), dir.clone());
+                let (host, dir, folder) = (host.clone(), dir.clone(), folder.clone());
                 tx.popup_menu(new_menu(), "new-tab", move |s: &mut Lemur, picked, _| {
                     if let Some(p) = picked {
-                        new_picked(s, p, &host, &dir, base);
+                        new_picked(s, p, &host, &dir, base, folder.clone());
                     }
                 });
             })

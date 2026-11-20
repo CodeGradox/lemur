@@ -799,7 +799,7 @@ fn gone_threads_resume_their_claude() {
         wait_until(Duration::from_secs(5), || server.hc(&["read", &session]).contains(text))
     };
 
-    rt.update(|s, _| s.ask_name(Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(Agent::Claude) }));
+    rt.update(|s, _| s.ask_name(Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(Agent::Claude), folder: None }));
     frames(&mut rt, 2);
     type_text(&mut rt, "claude");
     press(&mut rt, K::Enter, Mods::default());
@@ -903,7 +903,7 @@ fn cmd_j_starts_beside_a_thread_outside_every_project() {
 
     press(&mut rt, K::Command('j'), cmd());
     let prompt = rt.state.prompt.as_ref().expect("asking");
-    let Ask::NewThread { host, base, dir: at, agent } = &prompt.what else { panic!("not a new thread: {:?}", prompt.what) };
+    let Ask::NewThread { host, base, dir: at, agent, .. } = &prompt.what else { panic!("not a new thread: {:?}", prompt.what) };
     assert_eq!((host.as_str(), *base, at.as_str(), *agent), ("local", None, here.as_str(), Some(Agent::Claude)));
     let listed: Vec<String> = rt.state.matches(prompt).into_iter().map(|m| m.key.1).collect();
     assert_eq!(listed, [mine.clone(), elsewhere.clone()], "those here first");
@@ -1340,6 +1340,39 @@ fn threads_drag_into_folders_and_out() {
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&a)).is_some_and(|t| t.folder.is_none())));
     frames(&mut rt, 20);
     assert!(top_of(&rt, &row_a) < top_of(&rt, &row_b));
+}
+
+/// ⌘T, or the tab bar's +, starts a terminal in the folder of the thread on show, so its
+/// tab comes beside that one's; from a thread in no folder, in none.
+#[test]
+fn a_terminal_started_from_a_tab_joins_its_folder() {
+    let server = HcServer::new("pa-fnew");
+    let dir = TempDir::new("pa-fnew");
+    let repo = repo(&dir, "api", "main", &[]);
+    let path = path_of(&repo);
+    let a = server.run(&path, &["lemur.label=a", "lemur.folder=f1"], &["sleep", "600"]);
+    let b = server.run(&path, &["lemur.label=b"], &["sleep", "600"]);
+    let mut rt = loaded_with(with_folder(&server, &path, "work", false));
+    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b].iter().all(|t| s.session_of(&key(t)).is_some())));
+    let started = |before: &[String]| server.addresses().into_iter().find(|x| !before.contains(x));
+
+    open(&mut rt, &a);
+    let before = server.addresses();
+    press(&mut rt, K::Command('t'), cmd());
+    assert!(wait_for(&mut rt, 10.0, |_| started(&before).is_some()), "{:?}", rt.state.status);
+    let new = started(&before).unwrap();
+    assert_eq!(folder_of(&server, &new), "f1");
+    assert!(refreshing(&mut rt, 10.0, |s| s.siblings(&key(&a)).contains(&key(&new))), "a tab beside a's");
+
+    open(&mut rt, &b);
+    frames(&mut rt, 20);
+    let before = server.addresses();
+    click(&mut rt, "new-tab");
+    rt.resolve_popup(Some("new-terminal")).unwrap();
+    assert!(wait_for(&mut rt, 10.0, |_| started(&before).is_some()), "{:?}", rt.state.status);
+    let other = started(&before).unwrap();
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&other)).is_some()));
+    assert_eq!(folder_of(&server, &other), "", "b is in no folder");
 }
 
 /// A folder dragged below the next takes its threads along.

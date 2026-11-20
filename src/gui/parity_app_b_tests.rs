@@ -588,7 +588,7 @@ fn picking_an_agent_the_host_lacks_says_so() {
         assert!(said, "{:?}", rt.state.status);
         rt.state.status.take().unwrap().0
     };
-    let thread = |agent: Agent| super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(agent) };
+    let thread = |agent: Agent| super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(agent), folder: None };
     let said = "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`";
     start(&mut rt, thread(Agent::Claude));
     assert_eq!(failed(&mut rt), said);
@@ -599,7 +599,7 @@ fn picking_an_agent_the_host_lacks_says_so() {
     assert!(rt.state.cfg.threads.is_empty());
 
     // Lemur goes on: a shell starts.
-    start(&mut rt, super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: None });
+    start(&mut rt, super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: None, folder: None });
     assert!(wait_for(&mut rt, 10.0, |s| s.active.is_some()), "{:?}", rt.state.status);
 }
 
