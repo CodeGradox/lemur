@@ -1375,6 +1375,33 @@ fn a_terminal_started_from_a_tab_joins_its_folder() {
     assert_eq!(folder_of(&server, &other), "", "b is in no folder");
 }
 
+/// ⌃Tab goes through every thread on the host of the one on show, as the sidebar lists them:
+/// in and out of folders, and into another project's.
+#[test]
+fn ctrl_tab_goes_through_the_whole_host() {
+    let server = HcServer::new("pa-hostcycle");
+    let dir = TempDir::new("pa-hostcycle");
+    let api = path_of(&repo(&dir, "api", "main", &[]));
+    let web = path_of(&repo(&dir, "web", "main", &[]));
+    let a = server.run(&api, &["lemur.label=a", "lemur.order=0"], &["sleep", "600"]);
+    let b = server.run(&api, &["lemur.label=b", "lemur.folder=f1", "lemur.order=1"], &["sleep", "600"]);
+    let c = server.run(&web, &["lemur.label=c"], &["sleep", "600"]);
+    let d = server.run("/", &["lemur.label=d"], &["sleep", "600"]);
+    let mut cfg = with_folder(&server, &api, "work", true);
+    cfg.bases.push(Base::new("local", &web));
+    let mut rt = loaded_with(cfg);
+    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b, &c, &d].iter().all(|t| s.session_of(&key(t)).is_some())));
+    let order: Vec<String> = rt.state.host_threads("local").into_iter().map(|(_, t)| t).collect();
+    assert_eq!(order, [a.clone(), b.clone(), c.clone(), d.clone()], "a folded folder's too");
+    open(&mut rt, &a);
+    let mut seen = vec![];
+    for _ in 0..4 {
+        rt.update(|s, tx| s.cycle_threads(false, tx));
+        seen.push(rt.state.active.clone().unwrap().1);
+    }
+    assert_eq!(seen, [b, c, d, a]);
+}
+
 /// A folder dragged below the next takes its threads along.
 #[test]
 fn a_folder_drags_its_threads_along() {

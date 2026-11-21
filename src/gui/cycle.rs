@@ -1,6 +1,6 @@
-//! ⌃Tab: going through the threads beside the one on show, along the tabs or, as Settings
-//! can say, the one opened last first, the way ⌘Tab goes through apps. While ⌃ is held each
-//! Tab goes one further; letting go of it settles on the thread on show.
+//! ⌃Tab: going through the threads on the host of the one on show, in the sidebar's order
+//! or, as Settings can say, the one opened last first, the way ⌘Tab goes through apps. While
+//! ⌃ is held each Tab goes one further; letting go of it settles on the thread on show.
 
 use super::{Key, Lemur};
 use crate::config::ThreadOrder;
@@ -39,14 +39,34 @@ impl Lemur {
         names.into_iter().map(|name| (host.clone(), name)).collect()
     }
 
-    /// Shows the next of the tabs, or with `back` the one before, in the order Settings says.
+    /// Every thread on `host` in the sidebar's order, none put away: each project's, those in
+    /// no folder then each folder's, folded or not; then those outside every project.
+    pub(super) fn host_threads(&self, host: &str) -> Vec<Key> {
+        let mut names: Vec<String> = vec![];
+        for index in (0..self.cfg.bases.len()).filter(|&i| self.cfg.bases[i].host == host) {
+            if let Some((base, b)) = self.project_view(index) {
+                let l = super::folders::listed(base, b);
+                names.extend(l.loose.iter().chain(l.folders.iter().flat_map(|(_, t)| t)).map(|s| s.name.clone()));
+            }
+        }
+        let other = self.snap.hosts.iter().filter(|h| h.name == host).flat_map(|h| &h.other);
+        names.extend(other.filter(|s| !s.away).map(|s| s.name.clone()));
+        names.into_iter().map(|name| (host.to_string(), name)).collect()
+    }
+
+    /// Shows the next thread on the host of the one on show, or with `back` the one before,
+    /// in the order Settings says.
     pub fn cycle_threads(&mut self, back: bool, tx: &Tx) {
         if self.overlaid() {
             return;
         }
         let Some(active) = self.active.clone() else { return };
         if self.cycling.is_none() {
-            let threads = self.siblings(&active);
+            let mut threads = self.host_threads(&active.0);
+            // Put away, it's still where it starts from.
+            if !threads.contains(&active) {
+                threads.push(active.clone());
+            }
             let order = match self.prefs.thread_order {
                 ThreadOrder::Tabs => threads,
                 ThreadOrder::Recent => by_recent(threads, &self.recent),

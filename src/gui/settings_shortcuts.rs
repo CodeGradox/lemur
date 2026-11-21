@@ -155,8 +155,9 @@ pub(super) fn page(s: &Lemur, k: &Kit) -> Vec<El> {
         |s, id| s.set_thread_order(ThreadOrder::ALL.into_iter().find(|o| o.as_str() == id).unwrap_or_default()),
         k,
     );
-    let help = "The order ⌃Tab goes through the worktree's threads in, and ⌃⇧Tab back, and which one shows when you \
-                close one. By last opened starts with the thread opened before this one, as ⌘Tab does with apps.";
+    let help = "The order ⌃Tab goes through the threads on the host of the one on show in, and ⌃⇧Tab back, and which \
+                one shows when you close one. By last opened starts with the thread opened before this one, as ⌘Tab \
+                does with apps.";
     let mut groups = vec![group(None, None, vec![item("thread-order", "Thread order", order, Some(help.into()), k)], k)];
     for (g, (title, list)) in SHORTCUTS.iter().enumerate() {
         let items = list
@@ -177,7 +178,7 @@ pub(super) fn page(s: &Lemur, k: &Kit) -> Vec<El> {
 
 fn thread_order_label(order: ThreadOrder) -> &'static str {
     match order {
-        ThreadOrder::Tabs => "Along the tabs",
+        ThreadOrder::Tabs => "As the sidebar lists them",
         ThreadOrder::Recent => "By last opened",
     }
 }
