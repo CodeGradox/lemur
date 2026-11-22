@@ -269,6 +269,16 @@ fn the_thread_order_is_picked_on_the_shortcuts_page() {
     assert_eq!(rt.state.prefs.thread_order, crate::config::ThreadOrder::Recent);
 }
 
+/// What the sidebar calls a folder you haven't named is picked on the appearance page.
+#[test]
+fn folder_names_are_picked_on_the_appearance_page() {
+    let mut rt = settings_on(no_config(), "appearance");
+    assert_eq!(rt.state.prefs.folder_names, crate::config::FolderNames::Random);
+    click(&mut rt, "settings-folder-names-trigger");
+    rt.resolve_popup(Some("worktree")).expect("the names menu");
+    assert_eq!(rt.state.prefs.folder_names, crate::config::FolderNames::Worktree);
+}
+
 /// A first host added through the picker counts for Settings' herdr-core page at once, not
 /// after a restart: it would say all's up to date.
 #[test]

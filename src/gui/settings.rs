@@ -12,7 +12,7 @@ use super::palette::{Palette, Rgb, SLOTS, Slot, hex, rgb, set_color};
 use super::terminal::Metrics;
 use super::core::COMMAND_NEWS;
 use super::{Lemur, icons};
-use crate::config::{Agent, Config, FONT_SIZES, Language, SCROLLBACKS, ThemeChoice, ThreadOrder, parse_hex};
+use crate::config::{Agent, Config, FONT_SIZES, FolderNames, Language, SCROLLBACKS, ThemeChoice, ThreadOrder, parse_hex};
 use crate::core_update::{self, Versions};
 use rune::{El, Icon, Key as K, PopupMenu, ScrollSpec, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Select, SelectAppearance, Switch, TextInput};
@@ -134,6 +134,16 @@ impl Lemur {
     fn set_thread_order(&mut self, order: ThreadOrder) {
         self.prefs.thread_order = order;
         self.save_settings();
+    }
+
+    /// The sidebar's folders you haven't named go by it at once.
+    fn set_folder_names(&mut self, names: FolderNames) {
+        self.prefs.folder_names = names;
+        let saved = self.prefs.config_file().map(|file| Config::save_folder_names(file, names));
+        self.panels.settings.error = match saved {
+            Some(Err(e)) => Some(format!("{e:#}")),
+            _ => None,
+        };
     }
 
     /// Notifications go by themselves once they've shown `ms`, or with 0 stay till they're
@@ -487,7 +497,33 @@ fn appearance(s: &Lemur, k: &Kit) -> Vec<El> {
         |s, id| s.set_theme(ThemeChoice::ALL.into_iter().find(|t| t.as_str() == id).unwrap_or_default()),
         k,
     );
-    vec![group(None, None, vec![item("theme", "Theme", theme, Some("System follows macOS's light or dark mode.".into()), k)], k)]
+    let names = FolderNames::ALL.iter().map(|n| (n.as_str().to_owned(), folder_names_label(*n).to_owned())).collect();
+    let folder_names = picker(
+        "folder-names",
+        "Folder names",
+        names,
+        s.prefs.folder_names.as_str(),
+        |s, id| s.set_folder_names(FolderNames::ALL.into_iter().find(|n| n.as_str() == id).unwrap_or_default()),
+        k,
+    );
+    let help = "What the sidebar calls a folder until you rename it, with a right-click. Random words gives each its own, \
+                as calm-heron. Worktree names it after the worktree its Claude works in, or else its first thread.";
+    vec![group(
+        None,
+        None,
+        vec![
+            item("theme", "Theme", theme, Some("System follows macOS's light or dark mode.".into()), k),
+            item("folder-names", "Folder names", folder_names, Some(help.into()), k),
+        ],
+        k,
+    )]
+}
+
+fn folder_names_label(names: FolderNames) -> &'static str {
+    match names {
+        FolderNames::Random => "Random words",
+        FolderNames::Worktree => "Worktree",
+    }
 }
 
 fn notifications(s: &Lemur, k: &Kit) -> Vec<El> {

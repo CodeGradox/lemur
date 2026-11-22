@@ -63,6 +63,21 @@ pub fn random_name(taken: impl Fn(&str) -> bool) -> String {
     name
 }
 
+/// The `adjective-noun` name `seed` makes, like `calm-heron`: always the same one for it,
+/// from one run of Lemur to the next (FNV-1a, which doesn't change as Rust's hasher may).
+pub fn name_from(seed: &str) -> String {
+    let mut n: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.bytes() {
+        n = (n ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    let n = (n ^ (n >> 32)) as usize;
+    format!(
+        "{}-{}",
+        ADJECTIVES[n % ADJECTIVES.len()],
+        NOUNS[(n / ADJECTIVES.len()) % NOUNS.len()]
+    )
+}
+
 /// A random version 4 UUID, as Claude Code's `--session-id` takes one.
 pub fn random_uuid() -> String {
     use std::hash::{BuildHasher, Hasher};
@@ -271,8 +286,8 @@ pub fn start_in(
     start_in_folder(cfg, host, dir, label, agent, None)
 }
 
-/// Starts a thread as `start_in` does, in `folder` of its project's, by the
-/// folder's id: it shows there from the first.
+/// Starts a thread as `start_in` does, in `folder` of its host's, by the
+/// folder's id, or with none in one of its own: it shows there from the first.
 pub fn start_in_folder(
     cfg: &Config,
     host: &str,
@@ -562,8 +577,14 @@ pub fn set_color(cfg: &Config, host: &str, session: &str, color: Option<&str>) -
     core.label(session, &[(COLOR, color.unwrap_or_default())])
 }
 
-/// Puts threads in their order, each in its folder of their project, by
-/// the folder's id: none with "".
+/// Puts thread `session` in folder `folder` of its host's, by its id: one of its own with "".
+pub fn set_folder(cfg: &Config, host: &str, session: &str, folder: &str) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(FOLDER, folder)])
+}
+
+/// Puts threads in their order, each in its folder of their host's, by
+/// the folder's id: one of its own with "".
 pub fn set_order(cfg: &Config, host: &str, sessions: &[(String, String)]) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
     for (i, (s, folder)) in sessions.iter().enumerate() {
@@ -1865,6 +1886,16 @@ mod tests {
             Some(Kept::Changes)
         );
         assert_eq!(kept("agent: fatal: '/w' is not a working tree"), None);
+    }
+
+    #[test]
+    fn a_seed_always_makes_the_same_two_words() {
+        let name = name_from("agent/t7");
+        assert_eq!(name, name_from("agent/t7"));
+        let (adjective, noun) = name.split_once('-').unwrap();
+        assert!(ADJECTIVES.contains(&adjective) && NOUNS.contains(&noun), "{name}");
+        let names: std::collections::HashSet<String> = (0..50).map(|i| name_from(&format!("agent/t{i}"))).collect();
+        assert!(names.len() > 40, "spread out: {names:?}");
     }
 
     #[test]

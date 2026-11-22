@@ -4,7 +4,6 @@
 
 use super::{Key, Lemur};
 use crate::config::ThreadOrder;
-use crate::snapshot::Session;
 use rune::Tx;
 
 /// `threads` by when they were last opened (`recent`, the latest first); ones never opened
@@ -15,43 +14,23 @@ pub(super) fn by_recent(mut threads: Vec<Key>, recent: &[Key]) -> Vec<Key> {
 }
 
 impl Lemur {
-    /// The threads of the folder `active` is in, or of its project's in none, or of its
-    /// host's threads outside every project.
+    /// The threads of the folder `active` is in, as ⌘1 to ⌘9 go through them: those put away
+    /// aren't, unless on show.
     pub fn siblings(&self, active: &Key) -> Vec<Key> {
         let (host, session) = active;
-        // Those put away aren't tabs, unless on show.
-        let shown = |s: &&Session| !s.away || s.name == *session;
-        let names: Vec<String> = match self.group_of(active) {
-            Some(mut names) => {
-                if !names.contains(session) {
-                    names.push(session.clone());
-                }
-                names
-            }
-            None => self
-                .snap
-                .hosts
-                .iter()
-                .filter(|h| h.name == *host)
-                .flat_map(|h| h.other.iter().filter(shown).map(|s| s.name.clone()))
-                .collect(),
-        };
+        let mut names = self.group_of(active);
+        if !names.contains(session) {
+            names.push(session.clone());
+        }
         names.into_iter().map(|name| (host.clone(), name)).collect()
     }
 
-    /// Every thread on `host` in the sidebar's order, none put away: each project's, those in
-    /// no folder then each folder's, folded or not; then those outside every project.
+    /// Every thread on `host` in the sidebar's order, none put away: each folder's, folded or
+    /// not.
     pub(super) fn host_threads(&self, host: &str) -> Vec<Key> {
-        let mut names: Vec<String> = vec![];
-        for index in (0..self.cfg.bases.len()).filter(|&i| self.cfg.bases[i].host == host) {
-            if let Some((base, b)) = self.project_view(index) {
-                let l = super::folders::listed(base, b);
-                names.extend(l.loose.iter().chain(l.folders.iter().flat_map(|(_, t)| t)).map(|s| s.name.clone()));
-            }
-        }
-        let other = self.snap.hosts.iter().filter(|h| h.name == host).flat_map(|h| &h.other);
-        names.extend(other.filter(|s| !s.away).map(|s| s.name.clone()));
-        names.into_iter().map(|name| (host.to_string(), name)).collect()
+        let Some(h) = self.host_view(host) else { return vec![] };
+        let l = super::folders::listed(h);
+        l.groups.iter().flat_map(|g| &g.threads).map(|s| (host.to_string(), s.name.clone())).collect()
     }
 
     /// Shows the next thread on the host of the one on show, or with `back` the one before,

@@ -40,6 +40,9 @@ pub struct Config {
     /// The order ⌃Tab, and ⌃⇧Tab back, go through a worktree's threads in.
     #[serde(default)]
     pub thread_order: ThreadOrder,
+    /// What the sidebar calls a folder you haven't named.
+    #[serde(default)]
+    pub folder_names: FolderNames,
     /// The sidebar's width in pixels, as last dragged; unset is lemur's own.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
@@ -131,6 +134,29 @@ impl ThreadOrder {
         match self {
             ThreadOrder::Tabs => "tabs",
             ThreadOrder::Recent => "recent",
+        }
+    }
+}
+
+/// What the sidebar calls a folder you haven't named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderNames {
+    /// Two words of its own, as Rex names a session: `calm-heron`.
+    #[default]
+    Random,
+    /// The folder of the worktree its Claude, or else its first thread, works in.
+    Worktree,
+}
+
+impl FolderNames {
+    pub const ALL: [FolderNames; 2] = [FolderNames::Random, FolderNames::Worktree];
+
+    /// The name the config file uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FolderNames::Random => "random",
+            FolderNames::Worktree => "worktree",
         }
     }
 }
@@ -270,6 +296,10 @@ pub struct Host {
     /// ignored.
     #[serde(default, rename = "codex")]
     pub(crate) _codex: Option<toml::Value>,
+    /// The sidebar's folders of its threads that you named or folded; the rest show as
+    /// they are. A thread says which it's in (`lemur.folder`), by the folder's `id`.
+    #[serde(default)]
+    pub folders: Vec<Folder>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,19 +334,21 @@ pub struct Base {
     /// Its Hidden section is open; it's folded otherwise.
     #[serde(default)]
     pub hidden_open: bool,
-    /// The folders its threads are put in, in the sidebar's order. A thread
-    /// says which it's in (`lemur.folder`), by the folder's `id`.
-    #[serde(default)]
-    pub folders: Vec<Folder>,
+    /// From Lemur 3.1's betas, when a project had folders: read, so a config that has them
+    /// still loads, and ignored.
+    #[serde(default, rename = "folders")]
+    pub(crate) _folders: Option<toml::Value>,
 }
 
-/// A folder of a project's threads, in the sidebar.
+/// A folder of a host's threads, in the sidebar, as you named or folded it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Folder {
-    /// What its threads say they're in: it stays as the folder is renamed.
+    /// What its threads say they're in.
     pub id: String,
-    pub name: String,
+    /// The name you gave it; without one it's named after its first Claude thread.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Folded away to its one row.
     #[serde(default)]
     pub collapsed: bool,
@@ -383,6 +415,7 @@ impl Host {
             tmux_socket: None,
             claude: default_claude(),
             _codex: None,
+            folders: vec![],
         }
     }
 
@@ -409,7 +442,7 @@ impl Base {
             hidden_worktrees: vec![],
             collapsed_worktrees: vec![],
             hidden_open: false,
-            folders: vec![],
+            _folders: None,
         }
     }
 
@@ -568,7 +601,7 @@ impl Config {
 
     /// Saves how a project shows in the sidebar (whether it's folded, its
     /// worktrees' order and colors, which are hidden and which folded,
-    /// whether its Hidden section is open, and its folders) to its entry in the config file
+    /// whether its Hidden section is open) to its entry in the config file
     /// at `path`. Defaults are left out of the file.
     pub fn save_project_look(path: &Path, base: &Base) -> Result<()> {
         edit(path, |doc| {
@@ -617,30 +650,44 @@ impl Config {
             } else {
                 table.remove("hidden_open");
             }
-            if base.folders.is_empty() {
-                table.remove("folders");
-            } else {
-                let folders: toml_edit::Array = base
-                    .folders
-                    .iter()
-                    .map(|f| {
-                        let mut t = toml_edit::InlineTable::new();
-                        t.insert("id", f.id.as_str().into());
-                        t.insert("name", f.name.as_str().into());
-                        if f.collapsed {
-                            t.insert("collapsed", true.into());
-                        }
-                        toml_edit::Value::InlineTable(t)
-                    })
-                    .collect();
-                table.insert("folders", toml_edit::value(folders));
-            }
             Ok(())
         })
     }
 
     /// Saves the side panels' widths, as dragged, to the config file at
     /// `path`. A panel at lemur's own width is left out of the file.
+    /// Saves the folders of `host`'s threads you named or folded to its entry in the config
+    /// file at `path`; none leaves the key out.
+    pub fn save_host_folders(path: &Path, host: &Host) -> Result<()> {
+        edit(path, |doc| {
+            let named = |t: &toml_edit::Table| t.get("name").and_then(|v| v.as_str()) == Some(host.name.as_str());
+            let Some(table) = tables_mut(doc, "hosts")?.and_then(|h| h.iter_mut().find(|t| named(t))) else {
+                return Ok(());
+            };
+            if host.folders.is_empty() {
+                table.remove("folders");
+                return Ok(());
+            }
+            let folders: toml_edit::Array = host
+                .folders
+                .iter()
+                .map(|f| {
+                    let mut t = toml_edit::InlineTable::new();
+                    t.insert("id", f.id.as_str().into());
+                    if let Some(name) = &f.name {
+                        t.insert("name", name.as_str().into());
+                    }
+                    if f.collapsed {
+                        t.insert("collapsed", true.into());
+                    }
+                    toml_edit::Value::InlineTable(t)
+                })
+                .collect();
+            table.insert("folders", toml_edit::value(folders));
+            Ok(())
+        })
+    }
+
     pub fn save_panel_widths(path: &Path, sidebar: Option<f32>, notes: Option<f32>) -> Result<()> {
         edit(path, |doc| {
             for (key, width) in [("sidebar_width", sidebar), ("notes_width", notes)] {
@@ -663,6 +710,19 @@ impl Config {
                 doc.remove("notification_dismiss_ms");
             } else {
                 doc["notification_dismiss_ms"] = toml_edit::value(i64::from(ms));
+            }
+            Ok(())
+        })
+    }
+
+    /// Saves what the sidebar calls a folder you haven't named to the config file at
+    /// `path`. Random words, the default, go without saying.
+    pub fn save_folder_names(path: &Path, names: FolderNames) -> Result<()> {
+        edit(path, |doc| {
+            if names == FolderNames::default() {
+                doc.remove("folder_names");
+            } else {
+                doc["folder_names"] = toml_edit::value(names.as_str());
             }
             Ok(())
         })
@@ -715,32 +775,6 @@ impl Config {
             } else {
                 let hosts: toml_edit::Array = hosts.iter().collect();
                 doc["minimized_hosts"] = toml_edit::value(hosts);
-            }
-            Ok(())
-        })
-    }
-
-    /// Puts the config file's `[[bases]]` entries in the order of `bases`,
-    /// each with its comments. They swap places in the file, so what's
-    /// between them, like `[[hosts]]`, stays where it is.
-    pub fn save_project_order(path: &Path, bases: &[Base]) -> Result<()> {
-        edit(path, |doc| {
-            let Some(tables) = bases_mut(doc)? else {
-                return Ok(());
-            };
-            let mut entries: Vec<toml_edit::Table> = std::mem::take(tables).into_iter().collect();
-            let mut places: Vec<Option<isize>> = entries.iter().map(|t| t.position()).collect();
-            places.sort();
-            // One the sidebar doesn't know goes last.
-            entries.sort_by_key(|t| {
-                bases
-                    .iter()
-                    .position(|b| is_base(t, b))
-                    .unwrap_or(usize::MAX)
-            });
-            for (mut entry, place) in entries.into_iter().zip(places) {
-                entry.set_position(place);
-                tables.push(entry);
             }
             Ok(())
         })
@@ -948,6 +982,42 @@ mod tests {
         for kept in ["codex_usage = true", "codex_notifications = false", "minimized_codex_usage = true", "codex = \"codex --full-auto\""] {
             assert!(saved.contains(kept), "{saved}");
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A config from 3.1's betas, when projects had folders, still loads, and keeps them.
+    #[test]
+    fn a_projects_folders_from_before_are_ignored() {
+        let path = std::env::temp_dir().join(format!("lemur-project-folders-{}.toml", std::process::id()));
+        let before = "[[bases]]\nhost = \"agent\"\npath = \"~/api\"\nfolders = [{ id = \"a1\", name = \"auth\", collapsed = true, worktree = \"~/api/wt/auth\" }]\n";
+        std::fs::write(&path, before).unwrap();
+        let cfg: Config = toml::from_str(before).unwrap();
+        let mut base = cfg.bases[0].clone();
+        base.color = Some("teal".into());
+        Config::save_project_look(&path, &base).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("worktree = \"~/api/wt/auth\""));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn folder_names_default_to_random_words() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.folder_names, FolderNames::Random);
+        for names in FolderNames::ALL {
+            let cfg: Config =
+                toml::from_str(&format!("folder_names = \"{}\"", names.as_str())).unwrap();
+            assert_eq!(cfg.folder_names, names);
+        }
+        assert!(toml::from_str::<Config>("folder_names = \"claude\"").is_err());
+
+        let path = std::env::temp_dir().join(format!("lemur-folder-names-{}.toml", std::process::id()));
+        std::fs::write(&path, "# mine\ntheme = \"dark\"\n").unwrap();
+        Config::save_folder_names(&path, FolderNames::Worktree).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# mine") && saved.contains("folder_names = \"worktree\""), "{saved}");
+        Config::save_folder_names(&path, FolderNames::Random).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("folder_names"), "the default goes without saying: {saved}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1186,47 +1256,6 @@ path = \"~/projects/api\"
     }
 
     #[test]
-    fn saving_the_project_order_moves_entries_with_their_comments() {
-        let path = std::env::temp_dir().join(format!("lemur-order-{}.toml", std::process::id()));
-        let original = "\
-[[hosts]]
-name = \"agent\"
-ssh = \"agent\"
-
-# the api
-[[bases]]
-host = \"agent\"
-path = \"~/api\"
-
-[[hosts]]
-name = \"local\"
-ssh = \"local\"
-
-# this app
-[[bases]]
-host = \"local\"
-path = \"~/lemur\"
-collapsed = true
-";
-        std::fs::write(&path, original).unwrap();
-        let cfg: Config = toml::from_str(original).unwrap();
-        let reversed: Vec<Base> = cfg.bases.iter().rev().cloned().collect();
-        Config::save_project_order(&path, &reversed).unwrap();
-        let saved = std::fs::read_to_string(&path).unwrap();
-        let cfg: Config = toml::from_str(&saved).unwrap();
-        let paths: Vec<&str> = cfg.bases.iter().map(|b| b.path.as_str()).collect();
-        assert_eq!(paths, ["~/lemur", "~/api"], "{saved}");
-        assert!(cfg.bases[0].collapsed);
-        let at = |text: &str| saved.find(text).expect(text);
-        // Each comment travels with its entry; the hosts stay where they were.
-        assert!(at("# this app") < at("~/lemur") && at("~/lemur") < at("# the api"));
-        assert!(at("name = \"agent\"") < at("# this app"), "{saved}");
-        assert!(at("# this app") < at("name = \"local\""), "{saved}");
-        assert!(at("name = \"local\"") < at("# the api"), "{saved}");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn saving_threads_keeps_one_entry_per_session() {
         let path = std::env::temp_dir().join(format!("lemur-threads-{}.toml", std::process::id()));
         std::fs::write(
@@ -1329,10 +1358,6 @@ path = \"~/projects/api\"
         site.hidden_worktrees = vec!["/srv/site/.worktrees/b".into()];
         site.collapsed_worktrees = vec!["/srv/site".into()];
         site.hidden_open = true;
-        site.folders = vec![
-            Folder { id: "a1".into(), name: "Billing work".into(), collapsed: true },
-            Folder { id: "b2".into(), name: "Search".into(), collapsed: false },
-        ];
         Config::save_project_look(&path, &site).unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.bases[1].worktree_colors, site.worktree_colors);
@@ -1342,7 +1367,6 @@ path = \"~/projects/api\"
         assert_eq!(cfg.bases[1].hidden_worktrees, site.hidden_worktrees);
         assert_eq!(cfg.bases[1].collapsed_worktrees, site.collapsed_worktrees);
         assert!(cfg.bases[1].hidden_open);
-        assert_eq!(cfg.bases[1].folders, site.folders);
         assert!(cfg.bases[0].worktree_colors.is_empty() && !cfg.bases[0].collapsed);
         assert!(cfg.bases[0].hidden_worktrees.is_empty());
         site.worktree_colors.clear();
@@ -1352,17 +1376,29 @@ path = \"~/projects/api\"
         site.hidden_worktrees.clear();
         site.collapsed_worktrees.clear();
         site.hidden_open = false;
-        site.folders.clear();
         Config::save_project_look(&path, &site).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
             !saved.contains("color")
                 && !saved.contains("collapsed")
                 && !saved.contains("order")
-                && !saved.contains("hidden")
-                && !saved.contains("folders"),
+                && !saved.contains("hidden"),
             "{saved}"
         );
+
+        // A host's folders go in its entry, and none takes the key out.
+        let mut agent = cfg.hosts[1].clone();
+        agent.folders = vec![
+            Folder { id: "a1".into(), name: Some("Billing work".into()), collapsed: true },
+            Folder { id: "b2".into(), name: None, collapsed: true },
+        ];
+        Config::save_host_folders(&path, &agent).unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.hosts[1].folders, agent.folders);
+        assert!(cfg.hosts[0].folders.is_empty());
+        agent.folders.clear();
+        Config::save_host_folders(&path, &agent).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("folders"));
 
         // A symlinked config stays a link.
         let real = path.with_extension("real.toml");

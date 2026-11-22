@@ -62,12 +62,12 @@ mod parity_terminal_tests;
 mod parity_differential_confirm;
 
 use crate::attach::Active;
-use crate::config::{Agent, Config, Host, Language, Terminal, ThemeChoice, ThreadOrder};
+use crate::config::{Agent, Config, FolderNames, Host, Language, Terminal, ThemeChoice, ThreadOrder};
 use crate::snapshot::{Activity, HostData, Session, Snapshot, Worktree};
 use bg::Bg;
 use rune::{AppSpec, Cx, El, KeyEvent, Titlebar, Tx, Waker, el};
 use rune_kit::Kit;
-use rune_kit::shell::{PaneState, TOOLBAR_HEIGHT, TabDragState};
+use rune_kit::shell::{PaneState, TOOLBAR_HEIGHT};
 use snackbar::Kind;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,8 +77,8 @@ use terminal::{Metrics, TermView};
 pub use actions::Action;
 
 pub type Key = (String, String);
-/// A list of threads: a host's project, by its folder (`folders`), or with `None` the
-/// host's sessions outside every project.
+/// The rows a drag moves among: a host's, by its name, its folders' and their threads
+/// (`folders`). The second is `None`: a host has one list.
 pub type List = (String, Option<String>);
 
 const REFRESH: Duration = Duration::from_secs(3);
@@ -124,6 +124,8 @@ pub struct Prefs {
     pub theme: ThemeChoice,
     pub dictation_language: Language,
     pub thread_order: ThreadOrder,
+    /// What the sidebar calls a folder you haven't named.
+    pub folder_names: FolderNames,
     pub terminal: Terminal,
     pub claude_usage: bool,
     /// Milliseconds a notification shows before it goes by itself; 0 keeps it.
@@ -143,6 +145,7 @@ impl Prefs {
             theme: cfg.theme,
             dictation_language: cfg.dictation_language,
             thread_order: cfg.thread_order,
+            folder_names: cfg.folder_names,
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
             notification_dismiss_ms: cfg.notification_dismiss_ms,
@@ -189,6 +192,9 @@ pub struct Lemur {
     pub loaded: bool,
     pub terminals: HashMap<Key, TermView>,
     pub active: Option<Key>,
+    /// The host the sidebar shows with no thread of its on show: one picked over the
+    /// sidebar with none to open, or whose last one ended. Opening a thread clears it.
+    pub(super) host_shown: Option<String>,
     /// Threads by when they were last opened, the latest first.
     recent: Vec<Key>,
     /// ⌃Tab going through a worktree's threads: in which order, and where it's at. It
@@ -241,17 +247,12 @@ pub struct Lemur {
     pub metrics: Metrics,
     /// The terminal's area in the window, which its grid fits.
     term_area: (f32, f32),
-    /// The tab bar's drag, and the sidebar's.
-    pub tab_drag: TabDragState,
+    /// The sidebar's drag.
     pub row_drag: rune_kit::shell::Reorder,
     /// The list `row_drag` is for: the one under the pointer as a drag starts.
     pub row_drag_list: List,
     /// When a folder's row was last let go after a drag: the press that ends it isn't a click.
     pub folder_dropped: Option<Instant>,
-    /// A worktree or project being dragged by its row or header, by key, and how far; and
-    /// where each of those is laid out (`y`, height), to drop it by.
-    pub moving: Option<(String, f32)>,
-    pub places: HashMap<String, (f32, f32)>,
     /// When the sidebar's width was last saved.
     saved_widths: (f32, f32),
     /// Each worktree's lines added and removed, for the status bar.
@@ -266,11 +267,9 @@ pub struct Lemur {
     window_w: f32,
     wanted: (f32, f32),
     fitted: (f32, f32),
-    /// The thread on show and the window's width when its tab was last scrolled into view;
+    /// The thread on show and the window's width when its row was last scrolled into view;
     /// None to scroll it again.
     revealed: Option<(Key, f32)>,
-    /// The tab the tab bar's ‹ or › last scrolled to (`chrome::scroll_arrows`).
-    tab_aim: Option<String>,
     /// macOS keeps the window's place and size, to open there next time.
     frame_kept: bool,
     /// Files to drag out to other apps, as far as they've got here.
@@ -322,30 +321,6 @@ pub fn key(host: &str, s: &Session) -> Key {
     (host.to_string(), s.name.clone())
 }
 
-/// Moves `items[from]` to `to`. False if that's no move, or either is out of range.
-pub fn move_item<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
-    if from == to || from >= items.len() || to >= items.len() {
-        return false;
-    }
-    let moved = items.remove(from);
-    items.insert(to, moved);
-    true
-}
-
-/// Where the item that was at `index` is once `move_item` has moved the one at `from` to
-/// `to`.
-pub fn moved_to(index: usize, from: usize, to: usize) -> usize {
-    if index == from {
-        to
-    } else if from < index && index <= to {
-        index - 1
-    } else if to <= index && index < from {
-        index + 1
-    } else {
-        index
-    }
-}
-
 impl Lemur {
     pub fn new(cfg: Config, state_file: Option<PathBuf>, config_file: Option<PathBuf>) -> Lemur {
         // Notes and links live beside the state file, in ~/.lemur; tests have neither.
@@ -365,6 +340,7 @@ impl Lemur {
             loaded: false,
             terminals: HashMap::new(),
             active: None,
+            host_shown: None,
             recent: vec![],
             cycling: None,
             sidebar: PaneState::new(sidebar_width).range(SIDEBAR.0, SIDEBAR.1),
@@ -390,12 +366,9 @@ impl Lemur {
             dark: true,
             metrics,
             term_area: (900.0, 600.0),
-            tab_drag: TabDragState::new(),
             row_drag: rune_kit::shell::Reorder::new().gap(1.0),
             row_drag_list: (String::new(), None),
             folder_dropped: None,
-            moving: None,
-            places: HashMap::new(),
             saved_widths: (sidebar_width, notes_width),
             diffs: changes::Changes::default(),
             ticks: 0,
@@ -404,7 +377,6 @@ impl Lemur {
             wanted: (sidebar_width, notes_width),
             fitted: (sidebar_width, notes_width),
             revealed: None,
-            tab_aim: None,
             frame_kept: false,
             carried: HashMap::new(),
             watching: false,
@@ -522,17 +494,17 @@ impl Lemur {
         }
     }
 
-    /// The tab on show scrolls into view when another thread shows, however it was picked,
-    /// or the window's width changes. Scrolled away by hand, it stays put till then.
-    fn reveal_tab(&mut self, tx: &mut Tx) {
-        // A thread just started shows before the snapshot lists it, and its tab with it.
+    /// The sidebar's row of the thread on show scrolls into view when another thread shows,
+    /// however it was picked, or the window's width changes. Scrolled away by hand, it stays
+    /// put till then.
+    fn reveal_row(&mut self, tx: &mut Tx) {
+        // A thread just started shows before the snapshot lists it, and its row with it.
         let now = self.active.clone().filter(|k| self.session_of(k).is_some()).map(|k| (k, self.window_w));
         if now != self.revealed {
-            if let Some(((_, session), _)) = &now {
-                tx.scroll_into_view_in("tabs-scroll", format!("t-{session}"));
+            if let Some(((host, session), _)) = &now {
+                tx.scroll_into_view_in("sidebar-scroll", format!("row-{host}-{session}"));
             }
             self.revealed = now;
-            self.tab_aim = None;
         }
     }
 
@@ -659,7 +631,7 @@ fn poll(s: &mut Lemur, now: f64, tx: &mut Tx) -> bool {
     }
     s.fit_panes();
     s.save_panel_widths();
-    s.reveal_tab(tx);
+    s.reveal_row(tx);
     // Once the window is there: it isn't in `setup`.
     if !s.frame_kept && windowed() {
         s.frame_kept = rune_mac::remember_frame("Lemur");

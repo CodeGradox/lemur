@@ -1,7 +1,8 @@
 //! The spotlight: names asked for a new worktree, a new thread or a rename, and threads to
 //! go to (⌘J lists them under the new thread's name, the worktree's first; ⌘P lists them
-//! all). What's typed narrows them down; ↑↓ picks one and ⏎ opens it. Also what starts at
-//! once, without a name: a terminal (⌘T) or an agent, and the menu offering them.
+//! all); and ⌘K's projects, to start a thread beside the one on show. What's typed narrows
+//! them down; ↑↓ picks one and ⏎ opens it. Also what starts at once, without a name: a
+//! terminal (⌘T) or an agent, and the menu offering them.
 
 use super::card;
 use super::icons;
@@ -9,7 +10,7 @@ use super::snackbar::Kind;
 use super::{Key, Lemur, sessions, worktree_label};
 use crate::actions;
 use crate::config::{Agent, ClaudeThread, leaf};
-use rune::{El, Key as K, PopupItem, PopupMenu, TextEdit, Tx, col, icon, row, text};
+use rune::{El, Key as K, PopupMenu, TextEdit, Tx, col, icon, row, text};
 use rune_kit::{Kit, TextInput};
 
 /// How many threads the spotlight lists at most.
@@ -32,15 +33,17 @@ pub enum Ask {
     /// With `agent` running in it, or with none just a shell.
     NewWorktree { base: usize, agent: Option<Agent> },
     /// `agent`, or with none just a shell, in `dir` on `host`: a worktree of project `base`,
-    /// or the folder of a thread outside every project; in `folder` of the project's, by
-    /// its id, to show beside the thread it was started from.
+    /// or the folder of a thread outside every project; in `folder` of its host's, by its
+    /// id, to show beside the thread it was started from.
     NewThread { host: String, base: Option<usize>, dir: String, agent: Option<Agent>, folder: Option<String> },
     Rename { host: String, session: String },
     /// Nothing new: a thread to go to.
     Find,
-    /// A folder for project `base`'s threads, with `thread` in it.
-    NewFolder { base: usize, thread: Option<Key> },
-    RenameFolder { base: usize, id: String },
+    /// `agent`, or with none a shell, in a project picked or a host's home, in the folder of
+    /// the thread on show, as Rex starts a tab in the session on show.
+    Start { agent: Option<Agent> },
+    /// Folder `id` of `host`'s.
+    RenameFolder { host: String, id: String },
 }
 
 /// A name being asked for, in the spotlight.
@@ -56,6 +59,16 @@ pub struct Prompt {
     pub error: Option<(String, String)>,
     /// The thread picked to go to, among those listed.
     pub go: Option<usize>,
+}
+
+/// Where ⌘K can start a thread: a project's own checkout, or a host's home; or, with no
+/// `dir`, adding a project.
+pub struct Place {
+    pub host: String,
+    pub dir: String,
+    pub base: Option<usize>,
+    pub label: String,
+    pub detail: String,
 }
 
 /// A thread to go to, as the spotlight lists it.
@@ -92,9 +105,8 @@ impl Lemur {
                 .find(|(h, s)| h == host && s.name == *session)
                 .map(|(_, s)| s.own_label.clone())
                 .unwrap_or_else(|| self.label_of(host, session)),
-            Ask::Find => String::new(),
-            Ask::NewFolder { .. } => "New folder".into(),
-            Ask::RenameFolder { base, id } => self.folder_name(*base, id).unwrap_or_default(),
+            Ask::Find | Ask::Start { .. } => String::new(),
+            Ask::RenameFolder { host, id } => self.folder_name(host, id),
         };
         let branch = match &what {
             Ask::NewWorktree { base, .. } => {
@@ -123,7 +135,7 @@ impl Lemur {
     }
 
     /// ⌘J: asks for a new agent's thread or shell where the one on show runs (its worktree,
-    /// or its folder outside every worktree), in the same folder of its project's.
+    /// or its folder outside every worktree), in the same folder of its host's.
     pub fn new_thread_here(&mut self) {
         if self.overlaid() {
             return;
@@ -140,6 +152,77 @@ impl Lemur {
         if !self.overlaid() {
             self.ask_name(Ask::Find);
         }
+    }
+
+    /// ⌘K: the spotlight, to start Claude or a shell in a project, in the folder of the
+    /// thread on show.
+    pub fn start_thread(&mut self) {
+        if !self.overlaid() {
+            self.ask_name(Ask::Start { agent: Some(Agent::Claude) });
+        }
+    }
+
+    /// ⇧⌘N, or a host's +, as Rex starts a session: a shell in a new folder, in the home of
+    /// `host`, or of the host the sidebar shows.
+    pub fn new_folder(&mut self, host: Option<String>) {
+        if self.overlaid() {
+            return;
+        }
+        let h = match host {
+            Some(host) => self.host_view(&host),
+            None => self.shown_host(),
+        };
+        let Some(h) = h else { return };
+        if h.home.is_empty() {
+            return self.note(format!("{} hasn't said where its home is yet", h.name));
+        }
+        let (host, home) = (h.name.clone(), h.home.clone());
+        self.start_now(host, home, None, None);
+    }
+
+    /// Where ⌘K can start a thread for what's typed: each word of it is in the place's name,
+    /// its host or its path. On the host the sidebar shows only, never another's, as a Rex
+    /// session is on one: its projects in the config's order, then its home, then adding a
+    /// project.
+    pub fn places(&self, prompt: &Prompt) -> Vec<Place> {
+        if !matches!(prompt.what, Ask::Start { .. }) {
+            return vec![];
+        }
+        let shown = |host: &str| self.cfg.host(host).map_or_else(|| host.to_string(), super::picker::host_label);
+        let on = self.shown_host().map(|h| h.name.clone()).unwrap_or_default();
+        let mut places = vec![];
+        for (index, base) in self.cfg.bases.iter().enumerate().filter(|(_, b)| b.host == on) {
+            let main = self.project_view(index).and_then(|b| b.worktrees.iter().find(|w| w.main));
+            let dir = main.map_or_else(|| base.path.clone(), |w| w.path.clone());
+            places.push(Place { host: base.host.clone(), dir, base: Some(index), label: base.name(), detail: shown(&base.host) });
+        }
+        for h in self.snap.hosts.iter().filter(|h| h.name == on && !h.home.is_empty()) {
+            places.push(Place { host: h.name.clone(), dir: h.home.clone(), base: None, label: "Home".into(), detail: shown(&h.name) });
+        }
+        let typed = prompt.input.text.to_lowercase();
+        let words: Vec<&str> = typed.split_whitespace().collect();
+        places.retain(|p| {
+            let text = format!("{} {} {} {}", p.label, p.detail, p.host, p.dir).to_lowercase();
+            words.iter().all(|w| text.contains(w))
+        });
+        places.truncate(SHOWN);
+        places.push(Place { host: String::new(), dir: String::new(), base: None, label: "Add project…".into(), detail: String::new() });
+        places
+    }
+
+    /// Starts what ⌘K asked for in place `pick` of those listed, in the folder of the thread
+    /// on show if it's on that host, else in one of its own; or adds a project.
+    fn start_place(&mut self, pick: usize) {
+        let Some(prompt) = &self.prompt else { return };
+        let Ask::Start { agent } = prompt.what else { return };
+        let Some(place) = self.places(prompt).into_iter().nth(pick) else { return };
+        self.close_prompt();
+        if place.dir.is_empty() {
+            return self.open_picker();
+        }
+        let beside = self.active.clone().filter(|(host, _)| *host == place.host);
+        let folder = beside.and_then(|key| self.folder_beside(&key));
+        self.start_now(place.host, place.dir, agent, folder);
     }
 
     /// The text changed: an error about the name it had goes, and the pick starts over.
@@ -160,6 +243,7 @@ impl Lemur {
             (Ask::Find, go) => {
                 self.go_to(go);
             }
+            (Ask::Start { .. }, go) => self.start_place(go.unwrap_or(0)),
             (_, Some(i)) => {
                 self.go_to(Some(i));
             }
@@ -216,7 +300,9 @@ impl Lemur {
         let (kinds, count) = match prompt.what {
             Ask::NewWorktree { .. } => (KINDS.len(), 0),
             Ask::NewThread { .. } => (KINDS.len(), self.matches(prompt).len()),
-            Ask::NewFolder { .. } | Ask::RenameFolder { .. } => return,
+            // ↑↓ go through the places; what starts is clicked.
+            Ask::Start { .. } => (0, self.places(prompt).len()),
+            Ask::RenameFolder { .. } => return,
             _ => (0, self.matches(prompt).len()),
         };
         let total = kinds + count;
@@ -257,8 +343,8 @@ impl Lemur {
         let Some(prompt) = &mut self.prompt else { return };
         let (picked, named) = match &mut prompt.what {
             Ask::NewThread { agent: picked, .. } => (picked, true),
-            // Its name is the worktree's.
-            Ask::NewWorktree { agent: picked, .. } => (picked, false),
+            // Its name is the worktree's, and ⌘K's is what it shows.
+            Ask::NewWorktree { agent: picked, .. } | Ask::Start { agent: picked, .. } => (picked, false),
             _ => return,
         };
         prompt.go = None;
@@ -278,7 +364,7 @@ impl Lemur {
         let name = text.trim().to_string();
         let branch = prompt.branch.as_ref().map(|b| b.text.trim().to_string()).filter(|b| !b.is_empty());
         let from = prompt.from.clone();
-        let folder = matches!(prompt.what, Ask::NewFolder { .. } | Ask::RenameFolder { .. });
+        let folder = matches!(prompt.what, Ask::RenameFolder { .. });
         let valid = if folder {
             super::folders::validate_folder_name(&name)
         } else {
@@ -292,10 +378,9 @@ impl Lemur {
         let cfg = self.cfg.clone();
         let doing = match what {
             Ask::Rename { .. } => "renaming",
-            Ask::Find => return,
+            Ask::Find | Ask::Start { .. } => return,
             // Lemur's own: at once.
-            Ask::NewFolder { base, thread } => return self.new_folder(base, name, thread),
-            Ask::RenameFolder { base, ref id } => return self.rename_folder(base, id, name),
+            Ask::RenameFolder { ref host, ref id } => return self.rename_folder(host, id, name),
             _ => "starting",
         };
         let said = self.busy(format!("{doing} {name}…"));
@@ -309,7 +394,7 @@ impl Lemur {
                 Ask::NewThread { host, dir, agent, folder, .. } => {
                     actions::start_in_folder(&cfg, &host, &dir, &name, agent, folder.as_deref()).map(|started| Done::Started(started, None))
                 }
-                Ask::Find | Ask::NewFolder { .. } | Ask::RenameFolder { .. } => unreachable!("going to a thread starts nothing, nor does a folder"),
+                Ask::Find | Ask::Start { .. } | Ask::RenameFolder { .. } => unreachable!("going to a thread starts nothing, nor does a folder"),
                 Ask::Rename { host, session } => {
                     actions::rename_session(&cfg, &host, &session, &name).map(|session| Done::Renamed { host, session, name })
                 }
@@ -374,7 +459,7 @@ impl Lemur {
     }
 
     /// Starts `agent`, or with none a shell, in `dir` on `host`, labelled after what it
-    /// runs, in `folder` of its project's, and shows it.
+    /// runs, in `folder` of its host's (one of its own with none), and shows it.
     pub fn start_now(&mut self, host: String, dir: String, agent: Option<Agent>, folder: Option<String>) {
         let label = default_label(agent);
         let said = self.busy(format!("starting {label}…"));
@@ -399,37 +484,6 @@ impl Lemur {
         }
         self.open_fresh(started.host, started.session);
     }
-}
-
-/// What can start in a folder, as a menu: a terminal or an agent at once, or one named in
-/// the spotlight, each with the key that does it for the thread on show.
-pub fn new_menu() -> PopupMenu {
-    let key = |a: super::Action| a.key_equivalent();
-    let mut terminal = PopupItem::new("new-terminal", "New terminal").symbol("apple.terminal");
-    if let Some(k) = key(super::Action::NewTerminal) {
-        terminal = terminal.key_equivalent(k);
-    }
-    let mut named = PopupItem::new("new-named", "Claude or shell, named…").symbol("plus");
-    if let Some(k) = key(super::Action::NewThreadHere) {
-        named = named.key_equivalent(k);
-    }
-    PopupMenu::new()
-        .item(terminal)
-        .item(PopupItem::new("new-claude", "New Claude").symbol("sparkle"))
-        .item(named)
-}
-
-/// Runs what `new_menu` picked, in `dir` on `host`, a worktree of project `base` or any
-/// folder, in `folder` of the project's. True if it was one of its items.
-pub fn new_picked(s: &mut Lemur, picked: &str, host: &str, dir: &str, base: Option<usize>, folder: Option<String>) -> bool {
-    let (host, dir) = (host.to_string(), dir.to_string());
-    match picked {
-        "new-terminal" => s.start_now(host, dir, None, folder),
-        "new-claude" => s.start_now(host, dir, Some(Agent::Claude), folder),
-        "new-named" => s.ask_name(Ask::NewThread { host, base, dir, agent: Some(Agent::Claude), folder }),
-        _ => return false,
-    }
-    true
 }
 
 /// A thread's icon: its agent's, or a terminal.
@@ -480,13 +534,16 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
             listed = true;
             (&icons::SEARCH, "Go to a thread".to_string(), "↑↓ pick · ⏎ go · esc cancel")
         }
+        Ask::Start { agent } => {
+            kind = Some(*agent);
+            (&icons::PLUS, "New thread in a project".to_string(), "↑↓ pick · ⏎ start · esc cancel")
+        }
         Ask::Rename { host, session } => (&icons::PENCIL, format!("Rename {}", s.label_of(host, session)), "⏎ rename · esc cancel"),
-        Ask::NewFolder { base, .. } => (&icons::FOLDER, format!("New folder in {}", s.cfg.bases[*base].name()), "⏎ make · esc cancel"),
-        Ask::RenameFolder { base, id } => {
-            (&icons::PENCIL, format!("Rename {}", s.folder_name(*base, id).unwrap_or_default()), "⏎ rename · esc cancel")
+        Ask::RenameFolder { host, id } => {
+            (&icons::PENCIL, format!("Rename {}", s.folder_name(host, id)), "⏎ rename · empty gives it back its own · esc cancel")
         }
     };
-    let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. });
+    let is_new = matches!(prompt.what, Ask::NewThread { .. } | Ask::NewWorktree { .. } | Ask::Start { .. });
     let pick_row = |id: String, label: String, detail: Option<String>, lead: El, picked: bool| card::pick_row(id, Some(lead), label, detail, None, picked, k);
     let mut card = card::surface("spotlight", card::WIDTH, k).child(card::title("spotlight-title", glyph, what, k));
     if is_new {
@@ -505,7 +562,11 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
         card = card.child(kinds).child(card::divider(k));
     }
     let input = TextInput::new(&prompt.input)
-        .placeholder(if prompt.what == Ask::Find { "Go to a thread…" } else { "name" })
+        .placeholder(match prompt.what {
+            Ask::Find => "Go to a thread…",
+            Ask::Start { .. } => "Project…",
+            _ => "name",
+        })
         .width(None)
         .plain()
         .on_edit(|s: &mut Lemur| &mut s.prompt.as_mut().expect("a prompt").input)
@@ -546,6 +607,21 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
             }
             card = card.child(card::divider(k)).child(rows);
         }
+    }
+    if matches!(prompt.what, Ask::Start { .. }) {
+        let picked = prompt.go.unwrap_or(0);
+        let mut rows = col().key("places").padding(4.0).gap(2.0);
+        for (i, p) in s.places(prompt).into_iter().enumerate() {
+            let glyph = match (p.base, p.dir.is_empty()) {
+                (Some(_), _) => &icons::FOLDER,
+                (None, false) => &icons::HOUSE,
+                (None, true) => &icons::PLUS,
+            };
+            let detail = Some(p.detail).filter(|d| !d.is_empty());
+            let lead = row().size(16.0, 16.0).center().child(icon(glyph, 14.0).color(c.icon_muted));
+            rows = rows.child(pick_row(format!("place-{i}"), p.label, detail, lead, picked == i).on_press(move |s: &mut Lemur| s.start_place(i)));
+        }
+        card = card.child(card::divider(k)).child(rows);
     }
     if let Some(branch) = &prompt.branch {
         let line = |label: &str, field: El| {

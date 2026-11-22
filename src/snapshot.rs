@@ -135,7 +135,8 @@ pub struct Session {
     pub silent: bool,
     /// The Linear issue pinned to it, by its key.
     pub issue: Option<String>,
-    /// The folder of its project it's in (`config::Folder`'s id), if any.
+    /// The folder of its host's it's in, by its id (`config::Folder`'s); none for one of
+    /// its own.
     pub folder: Option<String>,
     /// Its colour, one of `config::COLORS`, if it was given one.
     pub color: Option<String>,
@@ -248,8 +249,8 @@ pub const AWAY: &str = "lemur.away";
 pub const SILENT: &str = "lemur.silent";
 /// The Linear issue pinned to a thread, by its key (`LAFT-3184`).
 pub const ISSUE: &str = "lemur.issue";
-/// The folder of its project a thread is in, by the folder's id
-/// (`config::Folder`).
+/// The folder of its host's a thread is in, by the folder's id
+/// (`config::Folder`); none for one of its own.
 pub const FOLDER: &str = "lemur.folder";
 /// A thread's colour, one of `config::COLORS`, by its name.
 pub const COLOR: &str = "lemur.color";

@@ -71,6 +71,8 @@ pub(super) fn session(name: &str, activity: Activity) -> Session {
     }
 }
 
+/// A snapshot of `sessions` on this Mac, outside every project, all in one folder, so
+/// they're each other's tabs.
 pub(super) fn made_up(sessions: &[(&str, Activity)]) -> Snapshot {
     Snapshot {
         hosts: vec![HostView {
@@ -80,7 +82,11 @@ pub(super) fn made_up(sessions: &[(&str, Activity)]) -> Snapshot {
             home: String::new(),
             machine: Default::default(),
             bases: vec![],
-            other: sessions.iter().map(|(n, a)| session(n, *a)).collect(),
+            other: sessions
+                .iter()
+                .enumerate()
+                .map(|(i, (n, a))| Session { folder: Some("f".into()), started: i as u64, ..session(n, *a) })
+                .collect(),
             gone: vec![],
         }],
     }
@@ -134,7 +140,7 @@ fn screen(rt: &Runtime<Lemur>, k: &Key) -> Vec<String> {
 }
 
 /// The sidebar lists the core's terminals, and a click on one shows it in a terminal of
-/// its own, with its tab.
+/// its own.
 #[test]
 fn the_sidebar_follows_the_core_and_a_click_shows_a_thread() {
     let server = HcServer::new("rside");
@@ -144,7 +150,6 @@ fn the_sidebar_follows_the_core_and_a_click_shows_a_thread() {
     assert!(rt.find(&row).is_some(), "a row for {t}");
     click(&mut rt, &row);
     assert_eq!(rt.state.active, Some(key(&t)));
-    assert!(rt.find(&format!("t-{t}")).is_some(), "its tab");
     assert!(wait_for(&mut rt, 10.0, |s| s.terminals.get(&key(&t)).is_some_and(|v| v.is_attached())), "attached");
 }
 
@@ -264,14 +269,15 @@ fn threads_are_marked_done_and_come_back_when_needed() {
 #[test]
 fn moving_a_tab_reorders_its_list() {
     let server = HcServer::new("rorder");
-    let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &[], &["sleep", "600"]));
+    let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &["lemur.folder=f1"], &["sleep", "600"]));
     let mut rt = loaded(&server);
     open(&mut rt, &a);
-    let shown = |s: &Lemur| s.snap.hosts[0].other.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+    let shown = |s: &Lemur| super::folders::listed(&s.snap.hosts[0]).placed().into_iter().map(|(t, _)| t).collect::<Vec<_>>();
     press(&mut rt, K::Right, Mods { shift: true, ..cmd() });
     assert_eq!(shown(&rt.state), [b.as_str(), &a, &c]);
     let list: List = ("local".into(), None);
-    rt.update(|s, _| s.reorder(list, 0, 2));
+    // Its folder's row first.
+    rt.update(|s, _| s.reorder(list, 1, 3));
     assert_eq!(shown(&rt.state), [a.as_str(), &c, &b]);
     // The second order is written once the first is: the window has to run for that.
     let cfg = server.config();
@@ -539,44 +545,12 @@ fn dragging_a_row_reorders_its_list() {
     let (_, a) = rt.find("row-local-a").unwrap();
     let (_, b) = rt.find("row-local-b").unwrap();
     drag(&mut rt, "row-local-a", 2.0 * (b - a));
-    let shown: Vec<String> = rt.state.snap.hosts[0].other.iter().map(|t| t.name.clone()).collect();
+    let shown: Vec<String> = super::folders::listed(&rt.state.snap.hosts[0]).placed().into_iter().map(|(t, _)| t).collect();
     assert_eq!(shown, ["b", "c", "a"]);
     assert!(rt.state.row_drag.dragging().is_none(), "the drag is over");
     // A press that doesn't move is a click.
     click(&mut rt, "row-local-c");
     assert_eq!(rt.state.active, Some(key("c")));
-}
-
-/// A project dragged by its header under the next one swaps with it.
-#[test]
-fn dragging_a_project_by_its_header_reorders_the_projects() {
-    use crate::config::Base;
-    use crate::snapshot::{BaseView, Worktree};
-    let server = HcServer::new("rpdrag");
-    let mut rt = window(server.config());
-    let base = |path: &str| -> Base { toml::from_str(&format!("host = \"local\"\npath = \"{path}\"")).unwrap() };
-    rt.state.cfg.bases = vec![base("/first"), base("/second"), base("/third")];
-    let view = |index: usize, path: &str| BaseView {
-        index,
-        error: None,
-        worktrees: vec![Worktree { path: path.into(), branch: Some("main".into()), head: None, main: true, sessions: vec![], gone: vec![] }],
-        plain: false,
-    };
-    let mut snap = made_up(&[]);
-    snap.hosts[0].bases = vec![view(0, "/first"), view(1, "/second"), view(2, "/third")];
-    rt.update(|s, _| s.set_snapshot(snap));
-    for _ in 0..20 {
-        rt.frame(1.0 / 60.0);
-    }
-    let header = |rt: &Runtime<Lemur>, i: usize| rt.state.places[&format!("project-{i}")].0;
-    let dy = header(&rt, 1) - header(&rt, 0) + 4.0;
-    drag(&mut rt, "project-0/section-header", dy);
-    let names: Vec<&str> = rt.state.cfg.bases.iter().map(|b| b.path.as_str()).collect();
-    assert_eq!(names, ["/second", "/first", "/third"]);
-    // A press that doesn't move still folds it.
-    let folded = rt.state.cfg.bases[0].collapsed;
-    click(&mut rt, "project-0/section-header");
-    assert_ne!(rt.state.cfg.bases[0].collapsed, folded);
 }
 
 /// A click outside a peek closes it; one on it doesn't.
@@ -840,7 +814,7 @@ fn the_sidebars_title_is_on_the_title_bars_row() {
     for _ in 0..20 {
         rt.frame(1.0 / 60.0);
     }
-    for b in ["sidebar-head", "find-thread", "add-folder", "refresh"] {
+    for b in ["sidebar-head", "find-thread", "new-thread", "refresh"] {
         let (_, y) = rt.find(b).unwrap_or_else(|| panic!("no {b}"));
         assert!(y < rune_kit::shell::TOOLBAR_HEIGHT, "{b} at {y}, under the title bar");
     }
@@ -849,38 +823,35 @@ fn the_sidebars_title_is_on_the_title_bars_row() {
     assert!(refresh < toggle, "refresh at {refresh}, past the toggle at {toggle}");
     click(&mut rt, "find-thread");
     assert!(rt.state.prompt.is_some(), "Go to thread opened");
+    press(&mut rt, K::Escape, Mods::default());
+    click(&mut rt, "new-thread");
+    let asked = rt.state.prompt.as_ref().map(|p| p.what.clone());
+    assert_eq!(asked, Some(super::prompt::Ask::Start { agent: Some(Agent::Claude) }), "New thread opened");
 }
 
-/// A project's mark is gray until a colour is picked from its menu, and gray picks none
-/// again; a line stands between each group and the next, none over the first.
+/// The sidebar shows one host at a time: with no thread on show, the first reached. Its name
+/// picks another, which shows though it has no thread to open.
 #[test]
-fn projects_take_a_color_and_lines_part_them() {
-    let server = HcServer::new("rprojcolor");
+fn the_sidebar_shows_one_host_at_a_time() {
+    let server = HcServer::new("rlines");
     let mut cfg = server.config();
-    cfg.bases.push(crate::config::Base::new("local", "/srv/api"));
-    cfg.bases.push(crate::config::Base::new("local", "/srv/web"));
+    let mut mac = crate::config::Host::new("mac", "local");
+    mac.hc_session = cfg.hosts[0].hc_session.clone();
+    cfg.hosts.push(mac);
     let mut rt = window(cfg);
     rt.state.refresh();
     assert!(wait_for(&mut rt, 10.0, |s| s.loaded), "the first snapshot");
     for _ in 0..20 {
         rt.frame(1.0 / 60.0);
     }
-    let lines: Vec<bool> = ["line-project-0", "line-project-1", "line-other"].iter().map(|k| rt.find(k).is_some()).collect();
-    assert_eq!(lines, [false, true, true], "lines under the first project and before Other");
-
-    let mark = |rt: &Runtime<Lemur>| rt.elements().into_iter().find(|e| e.path.contains("project-1") && e.key.as_deref() == Some("project-mark")).map(|e| e.fill);
-    let gray = mark(&rt).expect("web's mark");
-    click(&mut rt, "project-menu-1");
-    assert!(rt.popup_menu().expect("its menu").find("color:gray").is_some_and(|i| i.is_checked()));
-    rt.resolve_popup(Some("color:teal")).unwrap();
+    let shown = |rt: &Runtime<Lemur>| ["host-section-local", "host-section-mac"].map(|k| rt.find(k).is_some());
+    assert_eq!(shown(&rt), [true, false], "the first, threads or none");
+    click(&mut rt, "host-switch");
+    rt.resolve_popup(Some("mac")).expect("the hosts");
     for _ in 0..20 {
         rt.frame(1.0 / 60.0);
     }
-    assert_eq!(rt.state.cfg.bases[1].color.as_deref(), Some("teal"));
-    assert_ne!(mark(&rt), Some(gray), "teal now");
-    click(&mut rt, "project-menu-1");
-    rt.resolve_popup(Some("color:gray")).unwrap();
-    assert_eq!(rt.state.cfg.bases[1].color, None, "gray is no colour of its own");
+    assert_eq!(shown(&rt), [false, true]);
 }
 
 /// The key that works from any app asks which thread to go to.
@@ -915,8 +886,8 @@ fn a_printed_path_held_with_cmd_drags_out() {
     assert!(lifted.is_some(), "the path drawn over the terminal");
 }
 
-/// A shell thread's dot is green while it runs a command, saying which, as its tab's is, and
-/// blue once it's done out of sight.
+/// A shell thread's dot is green while it runs a command, saying which, and blue once it's
+/// done out of sight.
 #[test]
 fn a_shell_running_a_command_has_the_working_dot() {
     let server = HcServer::new("rshelldot");
@@ -927,7 +898,7 @@ fn a_shell_running_a_command_has_the_working_dot() {
         rt.update(|s, _| s.set_snapshot(snap));
         rt.frame(1.0 / 60.0);
     };
-    // What the dots say, in the sidebar's row for b and in its tab.
+    // What the dots say.
     let says = |rt: &mut Runtime<Lemur>, of: &str| {
         rt.frame(1.0 / 60.0);
         let live = rt.elements().into_iter().filter(|e| !e.exiting);
@@ -936,17 +907,16 @@ fn a_shell_running_a_command_has_the_working_dot() {
     put(&mut rt, Some("sleep"));
     open(&mut rt, "a");
     let row = rt.elements().into_iter().find(|e| e.help.as_deref() == Some("Running sleep")).map(|e| e.path);
-    assert!(row.is_some_and(|p| !p.contains("t-b")), "the sidebar's dot says what runs");
-    assert!(says(&mut rt, "t-b").contains(&"Working".to_string()), "the tab's breathes");
+    assert!(row.is_some_and(|p| p.contains("row-local-b")), "the sidebar's dot says what runs");
     put(&mut rt, None);
     let all = says(&mut rt, "");
     assert!(all.contains(&"Done".to_string()) && !all.contains(&"Running sleep".to_string()), "{all:?}");
 }
 
-/// A working thread's tab has the sidebar's dot, breathing while Lemur is in front and still
-/// behind other apps, not the kit's spinning ring.
+/// A working thread's row has a dot breathing while Lemur is in front, and still behind
+/// other apps.
 #[test]
-fn a_working_tab_has_the_breathing_dot() {
+fn a_working_thread_has_the_breathing_dot() {
     let server = HcServer::new("rtabdot");
     let mut rt = window(server.config());
     apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Working)]);
@@ -954,8 +924,8 @@ fn a_working_tab_has_the_breathing_dot() {
     // The dot's opacity a little apart, once it's settled: it changes while it breathes.
     let breathes = |rt: &mut Runtime<Lemur>| {
         let opacity = |rt: &mut Runtime<Lemur>| {
-            let tab = rt.elements().into_iter().filter(|e| e.path.contains("t-b") && !e.exiting).collect::<Vec<_>>();
-            tab.iter().find(|e| e.help.as_deref() == Some("Working")).map(|e| e.opacity).expect("the tab's dot")
+            let row = rt.elements().into_iter().filter(|e| e.path.contains("row-local-b") && !e.exiting).collect::<Vec<_>>();
+            row.iter().find(|e| e.help.as_deref() == Some("Working")).map(|e| e.opacity).expect("the row's dot")
         };
         for _ in 0..120 {
             rt.frame(1.0 / 60.0);
@@ -972,13 +942,3 @@ fn a_working_tab_has_the_breathing_dot() {
     assert!(!breathes(&mut rt), "still, behind other apps");
 }
 
-/// The + menu shows the keys that do what it offers, as v2's did: ⌘T for a new terminal, ⌘J
-/// for one named. So do a tab's menu's New terminal and Close.
-#[test]
-fn the_new_menu_shows_its_keys() {
-    let key = |a: Action| format!("{:?}", a.key_equivalent().expect("a key"));
-    assert_eq!(key(Action::NewTerminal), format!("{:?}", "cmd+t".parse::<rune::Shortcut>().unwrap()));
-    let menu = format!("{:?}", super::prompt::new_menu());
-    assert!(menu.contains(&key(Action::NewTerminal)) && menu.contains(&key(Action::NewThreadHere)), "{menu}");
-    assert!(Action::CloseThread.key_equivalent().is_some());
-}

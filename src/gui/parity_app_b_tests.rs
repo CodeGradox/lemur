@@ -46,7 +46,7 @@ fn info(rt: &Runtime<Lemur>, key: &str) -> Option<ElementInfo> {
     rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key) && !e.exiting)
 }
 
-/// Presses the × inside the element keyed `outer` (a tab, a sidebar row), with the pointer
+/// Presses the × inside the element keyed `outer` (a sidebar row), with the pointer
 /// over it first, as the × shows only then.
 fn press_close_in(rt: &mut Runtime<Lemur>, outer: &str) {
     frames(rt, 20);
@@ -145,198 +145,85 @@ fn project_snapshot(threads: &[&str], machine: crate::machine::Reading) -> Snaps
     }
 }
 
-/// ⌘1 to ⌘9 show what the tabs at those places show when clicked, from the terminal with
-/// the keyboard. With no tab at the place, or the palette up, nothing changes.
+/// ⌘1 to ⌘9 show the threads of the folder on show by their place in the sidebar, from the
+/// terminal with the keyboard. With no thread at the place, or the palette up, nothing
+/// changes.
 #[test]
-fn cmd_digits_show_the_tabs_by_their_place() {
+fn cmd_digits_show_the_folders_threads_by_their_place() {
     let server = HcServer::new("pdigits");
     let mut rt = window(server.config());
-    // Wide enough to show all nine, to click.
-    rt.set_viewport((2400.0, 820.0), 2.0);
     let names: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
     let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
     apply(&mut rt, &listed);
     open(&mut rt, "t4");
     frames(&mut rt, 20);
     let shown = |rt: &Runtime<Lemur>| rt.state.active.clone().map(|(_, s)| s).unwrap();
-    // The tabs from the left, by what a click on each shows.
-    let mut along: Vec<(f32, String)> =
-        names.iter().map(|n| (rt.find(&format!("t-{n}")).unwrap_or_else(|| panic!("{n}'s tab")).0, n.clone())).collect();
-    along.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let tabs: Vec<String> = along
-        .iter()
-        .map(|(_, n)| {
-            click(&mut rt, &format!("t-{n}"));
-            shown(&rt)
-        })
-        .collect();
-    for n in &names {
-        assert!(tabs.contains(n), "{n} isn't on a tab: {tabs:?}");
-    }
+    // The rows from the top.
+    let mut down: Vec<(f32, String)> = names.iter().map(|n| (rt.find(&format!("row-local-{n}")).unwrap_or_else(|| panic!("{n}'s row")).1, n.clone())).collect();
+    down.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let rows: Vec<String> = down.into_iter().map(|(_, n)| n).collect();
 
     for i in [8, 0, 3, 7, 1, 6, 2, 5, 4] {
         press(&mut rt, K::Command(char::from(b'1' + i as u8)), cmd());
-        assert_eq!(shown(&rt), tabs[i], "⌘{}", i + 1);
+        assert_eq!(shown(&rt), rows[i], "⌘{}", i + 1);
     }
 
     press(&mut rt, K::Command('p'), Mods { shift: true, ..cmd() });
     assert!(rt.state.panels.commands.is_some(), "the palette");
     press(&mut rt, K::Command('1'), cmd());
-    assert_eq!(shown(&rt), tabs[4], "the palette is up");
+    assert_eq!(shown(&rt), rows[4], "the palette is up");
     press(&mut rt, K::Escape, Mods::default());
     assert!(rt.state.panels.commands.is_none());
 
-    let fewer: Vec<(&str, Activity)> = listed.iter().copied().filter(|(n, _)| *n != tabs[8]).collect();
+    let fewer: Vec<(&str, Activity)> = listed.iter().copied().filter(|(n, _)| *n != rows[8]).collect();
     apply(&mut rt, &fewer);
     frames(&mut rt, 20);
-    assert!(rt.find(&format!("t-{}", tabs[8])).is_none());
     press(&mut rt, K::Command('9'), cmd());
-    assert_eq!(shown(&rt), tabs[4], "no ninth tab now");
+    assert_eq!(shown(&rt), rows[4], "no ninth thread now");
 }
 
-/// The first nine tabs show the number ⌘ goes to them with; a tenth has no key, so no
-/// number. (v3 says it on hover, beside the name.)
-#[test]
-fn the_tabs_show_their_numbers() {
-    let server = HcServer::new("pnumbers");
-    let mut rt = window(server.config());
-    rt.set_viewport((2400.0, 820.0), 2.0);
-    let names: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
-    let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
-    apply(&mut rt, &listed);
-    open(&mut rt, "t0");
-    frames(&mut rt, 20);
-    let helps: Vec<String> = rt.elements().into_iter().filter(|e| !e.exiting).filter_map(|e| e.help).collect();
-    for (i, n) in names.iter().enumerate().take(9) {
-        let want = format!("{n}  ⌘{}", i + 1);
-        assert!(helps.contains(&want), "tab {i} says {want:?}: {helps:?}");
-    }
-    assert!(rt.find("t-t9").is_some(), "a tenth tab");
-    assert!(helps.contains(&"t9".to_string()), "named: {helps:?}");
-    assert!(!helps.iter().any(|h| h.starts_with("t9  ⌘")), "with no number: {helps:?}");
-}
-
-/// Whether the tab of `name` is wholly in view in the tab bar.
-fn tab_in_view(rt: &mut Runtime<Lemur>, name: &str) -> bool {
+/// Whether the sidebar's row of `name` is wholly in view.
+fn row_in_view(rt: &mut Runtime<Lemur>, name: &str) -> bool {
     frames(rt, 40);
-    let e = info(rt, &format!("t-{name}")).unwrap_or_else(|| panic!("{name}'s tab"));
-    e.rect[2] > 0.0 && e.visible[2] >= e.rect[2] - 1.0
+    let e = info(rt, &format!("row-local-{name}")).unwrap_or_else(|| panic!("{name}'s row"));
+    e.rect[3] > 0.0 && e.visible[3] >= e.rect[3] - 1.0
 }
 
-/// With more tabs than fit, the one on show scrolls into view: by key, opened some other
-/// way, new, or in a narrower window. Scrolled by hand it can leave, and stays out of view
-/// until a thread is shown again.
+/// With more threads than the sidebar shows, the row of the one on show scrolls into view:
+/// by key, opened some other way, or just started.
 #[test]
-fn the_tab_on_show_stays_in_view() {
+fn the_row_on_show_stays_in_view() {
     let server = HcServer::new("pinview");
     let mut rt = window(server.config());
-    // Room for a whole tab between the scroll arrows.
     rt.set_viewport((1000.0, 600.0), 2.0);
-    let mut names: Vec<String> = (0..16).map(|i| format!("t{i}")).collect();
+    let mut names: Vec<String> = (0..40).map(|i| format!("t{i}")).collect();
     let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
     apply(&mut rt, &listed);
     open(&mut rt, "t0");
-    assert!(tab_in_view(&mut rt, "t0"), "the first tab");
-    assert!(!tab_in_view(&mut rt, "t15"), "more tabs than fit");
+    assert!(row_in_view(&mut rt, "t0"), "the first row");
+    assert!(!row_in_view(&mut rt, "t39"), "more rows than fit");
     let mut out = vec![];
     let mut check = |rt: &mut Runtime<Lemur>, name: &str, how: &str| {
-        if !tab_in_view(rt, name) {
+        if !row_in_view(rt, name) {
             out.push(format!("{how}: {name}"));
         }
     };
-
-    press(&mut rt, K::Command('9'), cmd());
-    assert_eq!(rt.state.active, Some(key("t8")));
-    check(&mut rt, "t8", "by key");
-    press(&mut rt, K::Command('1'), cmd());
-    check(&mut rt, "t0", "by key, back");
     press(&mut rt, K::Tab, Mods { shift: true, ..ctrl() });
     rt.key(KeyEvent { key: K::Modifier { modifier: rune::Modifier::ControlLeft, pressed: false }, mods: Mods::default() });
-    assert_eq!(rt.state.active, Some(key("t15")));
-    check(&mut rt, "t15", "the previous thread, round the end");
+    assert_eq!(rt.state.active, Some(key("t39")));
+    check(&mut rt, "t39", "the previous thread, round the end");
     press(&mut rt, K::Command('1'), cmd());
-    check(&mut rt, "t0", "by key, back again");
-    open(&mut rt, "t15");
-    check(&mut rt, "t15", "opened some other way");
+    check(&mut rt, "t0", "by key, back");
+    open(&mut rt, "t30");
+    check(&mut rt, "t30", "opened some other way");
 
-    // Scrolled by hand away from the tab on show, the first.
-    press(&mut rt, K::Command('1'), cmd());
-    if tab_in_view(&mut rt, "t0") {
-        let (x, y) = rt.find("t-t0").expect("its tab");
-        rt.wheel_xy(x, y, 400.0, 0.0);
-        if tab_in_view(&mut rt, "t0") {
-            rt.wheel_xy(x, y, -400.0, 0.0);
-        }
-        assert!(!tab_in_view(&mut rt, "t0"), "scrolled away by hand");
-        rt.update(|_, _| {});
-        assert!(!tab_in_view(&mut rt, "t0"), "and left there");
-    }
-    press(&mut rt, K::Command('1'), cmd());
-    check(&mut rt, "t0", "shown again, it snaps back");
-
-    rt.set_viewport((1100.0, 600.0), 2.0);
-    open(&mut rt, "t15");
-    check(&mut rt, "t15", "opened again");
-    rt.set_viewport((950.0, 600.0), 2.0);
-    check(&mut rt, "t15", "in a narrower window");
-
-    names.push("t16".into());
+    rt.update(|s, _| s.open_fresh("local".into(), "t40".into()));
+    frames(&mut rt, 10);
+    names.push("t40".into());
     let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
     apply(&mut rt, &listed);
-    open(&mut rt, "t16");
-    check(&mut rt, "t16", "a new tab");
-    assert!(out.is_empty(), "the tab on show out of view: {out:?}");
-}
-
-/// With more tabs than fit, ‹ and › stand at the tab bar's ends, so it's plain there are
-/// more: › scrolls it a tab on, ‹ a tab back. With them all in view, neither shows.
-#[test]
-fn arrows_show_there_are_more_tabs() {
-    let server = HcServer::new("tabarrows");
-    let mut rt = window(server.config());
-    rt.set_viewport((1280.0, 800.0), 2.0);
-    let arrows = |rt: &Runtime<Lemur>| (info(rt, "tabs-back").is_some(), info(rt, "tabs-forward").is_some());
-    apply(&mut rt, &[("t0", Activity::Idle), ("t1", Activity::Idle)]);
-    open(&mut rt, "t0");
-    frames(&mut rt, 40);
-    assert_eq!(arrows(&rt), (false, false), "two tabs fit");
-
-    // Three don't, as the window's other buttons leave the tabs about 500 points.
-    let names: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
-    let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
-    apply(&mut rt, &listed);
-    frames(&mut rt, 40);
-    assert_eq!(arrows(&rt), (true, true), "twelve don't");
-    let in_view: Vec<bool> = names.iter().map(|n| tab_in_view(&mut rt, n)).collect();
-    let next = in_view.iter().position(|v| !v).expect("a tab out of view");
-    assert!(in_view[..next].iter().all(|v| *v), "the first ones in view: {in_view:?}");
-
-    // At the start, ‹ has nowhere to go.
-    click(&mut rt, "tabs-back");
-    assert!(tab_in_view(&mut rt, "t0"), "still at the start");
-    click(&mut rt, "tabs-forward");
-    assert!(tab_in_view(&mut rt, &names[next]), "› brings the next tab in");
-    assert!(!tab_in_view(&mut rt, "t0"), "and the first goes");
-    click(&mut rt, "tabs-forward");
-    assert!(tab_in_view(&mut rt, &names[next + 1]), "and the one after");
-    click(&mut rt, "tabs-back");
-    click(&mut rt, "tabs-back");
-    assert!(tab_in_view(&mut rt, "t0"), "‹ goes back to the first");
-    // Pressed quickly, before the bar is where the last press sent it: a tab a press still.
-    for _ in 0..3 {
-        let (x, y) = rt.find("tabs-forward").expect("›");
-        rt.pointer_move(x, y);
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        frames(&mut rt, 3);
-    }
-    assert!(tab_in_view(&mut rt, &names[next + 2]), "three quick presses, three tabs on");
-    assert_eq!(rt.state.active, Some(key("t0")), "scrolling shows no other thread");
-
-    // A window wide enough for them all has no arrows.
-    rt.set_viewport((3000.0, 600.0), 2.0);
-    frames(&mut rt, 40);
-    assert_eq!(arrows(&rt), (false, false), "all fit again");
+    check(&mut rt, "t40", "just started");
+    assert!(out.is_empty(), "the row on show out of view: {out:?}");
 }
 
 /// The status bar doesn't count the agents; it says how many need you, when any do.
@@ -353,12 +240,11 @@ fn the_status_bar_says_how_many_need_you() {
     assert_eq!(info(&rt, "needs-you").and_then(|e| e.text).as_deref(), Some("1 needs you"), "one does");
 }
 
-/// A tab is as narrow with a long name as with a short one, and shows its number, as ⌘1 to
-/// ⌘9 take it: hovered it says the name, and the terminal's header names the thread on show.
+/// The terminal's header names the thread on show.
 #[test]
-fn a_threads_name_is_on_hover_and_in_the_header() {
+fn the_header_names_the_thread_on_show() {
     let server = HcServer::new("pnames");
-    let long = "a-name-long-enough-to-make-a-titled-tab-wide";
+    let long = "a-name-long-enough-to-make-a-row-wide";
     let mut rt = window(server.config());
     rt.set_viewport((1200.0, 700.0), 2.0);
     let mut snap = made_up(&[("a", Activity::Idle), ("b", Activity::Idle)]);
@@ -367,19 +253,9 @@ fn a_threads_name_is_on_hover_and_in_the_header() {
     rt.update(|s, _| s.set_snapshot(snap));
     open(&mut rt, "a");
     frames(&mut rt, 30);
-    let width = |rt: &Runtime<Lemur>, k: &str| rt.presented(k).unwrap_or_else(|| panic!("{k}")).0[2];
-    let (short, wide) = (width(&rt, "t-a"), width(&rt, "t-b"));
-    assert!((wide - short).abs() < 4.0, "{short} {wide}");
-    // The tab keeps its title under the pointer too, faded out until it's there.
-    let shows = |rt: &Runtime<Lemur>, k: &str| {
-        rt.elements().into_iter().filter(|e| e.path.contains(k) && !e.exiting && e.opacity > 0.0).filter_map(|e| e.text).collect::<Vec<_>>()
-    };
-    assert_eq!((shows(&rt, "t-a"), shows(&rt, "t-b")), (vec!["1".to_string()], vec!["2".to_string()]), "their numbers, not their names");
     let header = |rt: &Runtime<Lemur>| info(rt, "header-name").and_then(|e| e.text);
     assert_eq!(header(&rt).as_deref(), Some("ab"));
-    let helps: Vec<String> = rt.elements().into_iter().filter(|e| !e.exiting).filter_map(|e| e.help).collect();
-    assert!(helps.iter().any(|h| h.starts_with(long)), "on hover: {helps:?}");
-    click(&mut rt, "t-b");
+    click(&mut rt, "row-local-b");
     assert_eq!(rt.state.active, Some(key("b")));
     frames(&mut rt, 20);
     assert_eq!(header(&rt).as_deref(), Some(long));
@@ -451,13 +327,13 @@ fn a_thread_shown_no_more_hears_it_lost_focus() {
     assert_eq!(ins(server.hc(&["read", &a])), 2, "back: {}", server.hc(&["read", &a]));
 }
 
-/// Along the tabs, as at first, closing the thread on show, with ⌘W or its ×, shows the
-/// next tab, or the one before if it was the last. By when they were opened, the next tab
-/// wouldn't be the one in either case.
+/// In the sidebar's order, as at first, closing the thread on show, with ⌘W or its row's ×,
+/// shows the next in its folder, or the one before if it was the last. By when they were
+/// opened, the next wouldn't be the one in either case.
 #[test]
 fn closing_a_thread_shows_the_next_tab() {
     let server = HcServer::new("pclosetab");
-    let [a, b, c, d] = ["a", "b", "c", "d"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+    let [a, b, c, d] = ["a", "b", "c", "d"].map(|l| server.run("/", &[&format!("lemur.label={l}"), "lemur.folder=f1"], &["sleep", "600"]));
     let mut rt = loaded(server.config());
     rt.set_viewport((1200.0, 700.0), 2.0);
     for t in [&c, &b, &a, &d] {
@@ -465,17 +341,17 @@ fn closing_a_thread_shows_the_next_tab() {
     }
     assert!(busy(&mut rt, &key(&d), true), "d runs sleep");
 
-    // d is the last tab; by when they were opened, a.
+    // d is the last; by when they were opened, a.
     press(&mut rt, K::Command('w'), cmd());
     assert!(rt.state.dialog.is_some(), "asked");
     click(&mut rt, "dialog-ok");
     assert!(refreshing(&mut rt, 10.0, |s| s.active == Some(key(&c))), "{:?}", rt.state.active);
 
-    // Tabs a, b and c, on b; by when they were opened, a.
+    // a, b and c, on b; by when they were opened, a.
     open(&mut rt, &a);
     open(&mut rt, &b);
     assert!(busy(&mut rt, &key(&b), true));
-    press_close_in(&mut rt, &format!("t-{b}"));
+    press_close_in(&mut rt, &format!("row-local-{b}"));
     assert!(rt.state.dialog.is_some(), "its × asks");
     click(&mut rt, "dialog-ok");
     assert!(refreshing(&mut rt, 10.0, |s| s.active == Some(key(&c))), "{:?}", rt.state.active);
@@ -501,7 +377,7 @@ fn putting_a_thread_away_shows_the_one_opened_before() {
 #[test]
 fn closing_a_thread_shows_another() {
     let server = HcServer::new("pcloseoth");
-    let [a, b, c] = ["a", "b", "c"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+    let [a, b, c] = ["a", "b", "c"].map(|l| server.run("/", &[&format!("lemur.label={l}"), "lemur.folder=f1"], &["sleep", "600"]));
     let mut rt = loaded(server.config());
     rt.state.prefs.thread_order = ThreadOrder::Recent;
     for t in [&c, &a, &b] {
@@ -654,8 +530,7 @@ fn a_thread_put_away_comes_back_when_it_needs_you() {
     idle(&mut rt, 1.5);
     assert_eq!(listed(&rt.state), std::slice::from_ref(&a), "herdr-core keeps it away");
     frames(&mut rt, 20);
-    assert!(rt.find("away-local-").is_some(), "under Put away");
-    assert!(rt.find(&format!("t-{b}")).is_none(), "nor a tab");
+    assert!(rt.find("away-local").is_some(), "under Put away");
 
     open(&mut rt, &b);
     assert!(wait_until(Duration::from_secs(5), || !labelled(&server, &b, snapshot::AWAY)), "opened, it's back");
@@ -801,8 +676,8 @@ fn a_list_of_threads_all_put_away_still_shows_them() {
     rt.state.refresh();
     idle(&mut rt, 1.5);
     frames(&mut rt, 20);
-    assert!(rt.find("away-local-").is_some(), "under Put away");
-    click(&mut rt, "away-local-");
+    assert!(rt.find("away-local").is_some(), "under Put away");
+    click(&mut rt, "away-local");
     assert!(rt.find(&format!("row-local-{a}")).is_some(), "its row, opened");
 }
 
@@ -955,18 +830,18 @@ fn an_unreached_host_keeps_its_terminals() {
     assert!(refreshing(&mut rt, 10.0, |s| shown(s) == (None, false)), "{:?}", shown(&rt.state));
 }
 
-/// A tab closed with its ×, as herdr-core tells of it, hands the keyboard to the one shown
-/// instead: ⌘J works at once. Its program running, the × asks first, as ⌘W does.
+/// A thread closed with its row's ×, as herdr-core tells of it, hands the keyboard to the one
+/// shown instead: ⌘J works at once. Its program running, the × asks first, as ⌘W does.
 #[test]
 fn the_tab_shown_after_a_close_has_the_keyboard() {
     let server = HcServer::new("pclosex");
-    let [a, b] = ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+    let [a, b] = ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}"), "lemur.folder=f1"], &["sleep", "600"]));
     let mut rt = loaded(server.config());
     rt.set_viewport((1200.0, 700.0), 2.0);
     open(&mut rt, &a);
     assert!(busy(&mut rt, &key(&a), true));
     // a's ×; a runs sleep, so it asks.
-    press_close_in(&mut rt, &format!("t-{a}"));
+    press_close_in(&mut rt, &format!("row-local-{a}"));
     assert!(rt.state.dialog.is_some(), "asked");
     click(&mut rt, "dialog-ok");
     assert!(wait_until(Duration::from_secs(5), || !server.addresses().contains(&a)));
@@ -981,7 +856,7 @@ fn the_tab_shown_after_a_close_has_the_keyboard() {
 #[test]
 fn a_thread_shown_instead_leaves_the_keyboard_where_it_is() {
     let server = HcServer::new("pendedel");
-    let [a, b] = ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}")], &["sleep", "600"]));
+    let [a, b] = ["a", "b"].map(|l| server.run("/", &[&format!("lemur.label={l}"), "lemur.folder=f1"], &["sleep", "600"]));
     let mut rt = loaded(server.config());
     open(&mut rt, &a);
     press(&mut rt, K::Command('p'), cmd());
@@ -1125,9 +1000,9 @@ fn an_order_being_written_holds_up_only_its_host() {
     }
 }
 
-/// A worktree's removal goes by its project, not where that was in the config: projects
-/// moved meanwhile, it removes the right worktree; its project removed, nothing, where asking
-/// again would have panicked.
+/// A worktree's removal goes by its project, not where that was in the config: another
+/// removed meanwhile, it removes the right worktree; its project removed, nothing, where
+/// asking again would have panicked.
 #[test]
 fn removing_a_worktree_goes_by_its_project() {
     let server = HcServer::new("premoval");
@@ -1139,7 +1014,8 @@ fn removing_a_worktree_goes_by_its_project() {
     cfg.bases = vec![Base::new("local", &api), Base::new("local", &web)];
     let mut rt = loaded(cfg);
     let removal = rt.state.removal(1, wt.clone(), "x".into());
-    rt.update(|s, _| s.reorder_projects(0, 1));
+    let first = rt.state.cfg.bases[0].clone();
+    rt.update(|s, _| s.remove_project(&first));
     rt.update(|s, _| s.remove_worktree(removal.clone(), false));
     let gone = wait_for(&mut rt, 10.0, |_| !Path::new(&wt).join(".git").exists());
     assert!(gone, "web's worktree went: {:?}", rt.state.status);
@@ -1322,69 +1198,122 @@ fn the_sidebars_close_asks_as_cmd_w_does() {
     assert!(server.addresses().contains(&a), "cancelled");
 }
 
-/// Every host is listed in Other, threads or none, and its + starts a terminal in its home
-/// there.
+/// Every host has a section, threads or none, and its + starts a shell in its home in a
+/// new folder, as ⇧⌘N does on the host of the thread on show: never in that one's.
 #[test]
-fn every_host_starts_threads_from_other() {
+fn every_host_starts_folders_from_its_section() {
     let server = HcServer::new("phostnew");
     let mut rt = loaded(server.config());
     assert!(refreshing(&mut rt, 5.0, |s| !s.snap.hosts[0].home.is_empty()));
     frames(&mut rt, 20);
-    assert!(rt.find("host-local").is_some(), "no threads, still listed");
+    assert!(rt.find("host-section-local").is_some(), "no threads, still listed");
     let home = std::env::var("HOME").unwrap();
     assert_eq!(rt.state.snap.hosts[0].home, home);
 
-    // Its last item names one in the spotlight, there too.
+    let started = |before: &[String]| server.core().terminals().into_iter().find(|t| !before.contains(&t.address));
     click(&mut rt, "host-plus-local");
-    assert!(rt.popup_menu().is_some(), "its menu");
-    rt.resolve_popup(Some("new-named")).unwrap();
-    frames(&mut rt, 2);
-    let asked = match rt.state.prompt.as_ref().map(|p| &p.what) {
-        Some(super::prompt::Ask::NewThread { host, base, dir, .. }) => Some((host.clone(), *base, dir.clone())),
-        _ => None,
-    };
-    assert_eq!(asked, Some(("local".to_string(), None, home.clone())));
-    press(&mut rt, K::Escape, Mods::default());
-    assert!(rt.state.prompt.is_none());
-
-    click(&mut rt, "host-plus-local");
-    rt.resolve_popup(Some("new-terminal")).unwrap();
-    let mut started = None;
+    let mut first = None;
     assert!(wait_until(Duration::from_secs(5), || {
         rt.frame(1.0 / 60.0);
-        started = server.core().terminals().into_iter().next();
-        started.is_some()
+        first = started(&[]);
+        first.is_some()
     }));
-    let started = started.unwrap();
-    assert_eq!(started.cwd, home);
-    assert_eq!(started.labels.get(snapshot::KIND).map(String::as_str), Some("shell"));
-    assert!(wait_for(&mut rt, 10.0, |s| s.active == Some(key(&started.address))), "the new terminal shows");
+    let first = first.unwrap();
+    assert_eq!(first.cwd, home);
+    assert_eq!(first.labels.get(snapshot::KIND).map(String::as_str), Some("shell"));
+    assert!(wait_for(&mut rt, 10.0, |s| s.active == Some(key(&first.address))), "the new terminal shows");
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&first.address)).is_some()));
+
+    let before = server.addresses();
+    press(&mut rt, K::Command('n'), Mods { shift: true, ..cmd() });
+    let mut second = None;
+    assert!(wait_until(Duration::from_secs(5), || {
+        rt.frame(1.0 / 60.0);
+        second = started(&before);
+        second.is_some()
+    }));
+    let second = second.unwrap();
+    assert_eq!(second.cwd, home);
+    assert_eq!(second.labels.get(snapshot::FOLDER), None, "a folder of its own");
+    assert!(wait_for(&mut rt, 10.0, |s| s.active == Some(key(&second.address))));
+    assert!(!rt.state.siblings(&key(&second.address)).contains(&key(&first.address)), "not beside the first");
 }
 
-/// The threads outside every project are in one Other section, each host's under a row
-/// naming it.
+/// The sidebar shows one host's threads at a time, as Rex does: the thread on show's. Its
+/// name over them picks another host, which shows the thread of its opened last, else its
+/// first.
 #[test]
-fn other_threads_are_one_section_by_host() {
+fn the_sidebar_shows_the_host_of_the_thread_on_show() {
     let server = HcServer::new("pother");
     let mut cfg = server.far_config("pb-shed");
     let mut here = Host::new("local", "local");
     here.hc_session = Some(server.session.clone());
     cfg.hosts.insert(0, here);
-    server.run("/", &["lemur.label=here"], &["sleep", "600"]);
+    let here = server.run("/", &["lemur.label=here"], &["sleep", "600"]);
     server.hc(&["run", "--bg", "--on", "pb-shed", "--label", "lemur.label=there", "--", "sleep", "600"]);
     let mut rt = loaded(cfg);
     let listed = refreshing(&mut rt, 10.0, |s| s.snap.hosts.len() == 2 && s.snap.hosts.iter().all(|h| h.other.len() == 1));
     assert!(listed, "{:?}", rt.state.snap.hosts.iter().map(|h| (&h.name, h.other.len(), &h.error)).collect::<Vec<_>>());
+    let there = rt.state.snap.hosts[1].other[0].name.clone();
+    open(&mut rt, &here);
     frames(&mut rt, 20);
-    let top = |rt: &Runtime<Lemur>, k: &str| rt.presented(k).unwrap_or_else(|| panic!("{k}")).0[1];
-    assert!(top(&rt, "other") < top(&rt, "host-local"));
-    assert!(top(&rt, "host-local") < top(&rt, "host-pb-shed"));
-    let here = &rt.state.snap.hosts[0].other[0].name;
-    let there = &rt.state.snap.hosts[1].other[0].name;
-    assert!(top(&rt, "host-local") < top(&rt, &format!("row-local-{here}")));
-    assert!(top(&rt, &format!("row-local-{here}")) < top(&rt, "host-pb-shed"));
-    assert!(top(&rt, "host-pb-shed") < top(&rt, &format!("row-pb-shed-{there}")));
-    assert!(rt.find("host-section-local").is_none() && rt.find("host-section-pb-shed").is_none(), "no section per host");
+    let shows = |rt: &Runtime<Lemur>, k: &str| rt.presented(k).is_some();
+    assert!(shows(&rt, "host-section-local") && shows(&rt, &format!("row-local-{here}")));
+    assert!(!shows(&rt, "host-section-pb-shed") && !shows(&rt, &format!("row-pb-shed-{there}")), "not another host's");
+
+    click(&mut rt, "host-switch");
+    rt.resolve_popup(Some("pb-shed")).expect("the hosts");
+    assert_eq!(rt.state.active, Some(("pb-shed".to_string(), there.clone())), "its thread shows");
+    frames(&mut rt, 20);
+    assert!(shows(&rt, "host-section-pb-shed") && shows(&rt, &format!("row-pb-shed-{there}")));
+    assert!(!shows(&rt, "host-section-local"));
+
+    click(&mut rt, "host-switch");
+    rt.resolve_popup(Some("local")).expect("the hosts");
+    assert_eq!(rt.state.active, Some(key(&here)), "the one opened last there");
+
+    // Its last thread ended, none shows: not another host's.
+    server.hc(&["kill", &here]);
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&here)).is_none()));
+    assert_eq!(rt.state.active, None);
+    assert_eq!(rt.state.shown_host().map(|h| h.name.as_str()), Some("local"));
+}
+
+/// ⌘K starts a thread on the host the sidebar shows, never another's. Picked with none of
+/// its threads to show, a host shows with none on show, and ⌘K starts one there, in a folder
+/// of its own, leaving the other host's thread as it was.
+#[test]
+fn cmd_k_starts_threads_on_the_host_shown() {
+    let server = HcServer::new("pmix");
+    let mut cfg = server.far_config("pb-mix");
+    let mut here = Host::new("local", "local");
+    here.hc_session = Some(server.session.clone());
+    cfg.hosts.insert(0, here);
+    let shown = server.run("/", &["lemur.label=here"], &["sleep", "600"]);
+    let mut rt = loaded(cfg);
+    let ready = |s: &Lemur| s.snap.hosts.len() == 2 && s.snap.hosts.iter().all(|h| !h.home.is_empty()) && s.session_of(&key(&shown)).is_some();
+    assert!(refreshing(&mut rt, 10.0, ready));
+    open(&mut rt, &shown);
+    press(&mut rt, K::Command('k'), cmd());
+    let hosts = |s: &Lemur| s.places(s.prompt.as_ref().unwrap()).into_iter().filter(|p| !p.host.is_empty()).map(|p| p.host).collect::<Vec<_>>();
+    assert_eq!(hosts(&rt.state), ["local"], "its home, not pb-mix's");
+    press(&mut rt, K::Escape, Mods::default());
+
+    frames(&mut rt, 20);
+    click(&mut rt, "host-switch");
+    rt.resolve_popup(Some("pb-mix")).expect("the hosts");
+    assert_eq!(rt.state.active, None, "none of its to show");
+    frames(&mut rt, 20);
+    assert!(rt.presented("host-section-pb-mix").is_some());
+    press(&mut rt, K::Command('k'), cmd());
+    assert_eq!(hosts(&rt.state), ["pb-mix"]);
+    rt.update(|s, _| s.pick_kind(None));
+    press(&mut rt, K::Enter, Mods::default());
+    assert!(refreshing(&mut rt, 10.0, |s| !s.snap.hosts[1].other.is_empty()), "{:?}", rt.state.status);
+    let there = rt.state.snap.hosts[1].other[0].clone();
+    assert_eq!(there.folder, None, "a folder of its own");
+    let mine = server.core().terminals().into_iter().find(|t| t.address == shown).unwrap();
+    assert_eq!(mine.labels.get(snapshot::FOLDER), None, "the other host's thread keeps its own");
 }
 
 /// The status bar says where the thread on show runs: its host, its worktree's branch, and
@@ -1493,96 +1422,3 @@ fn the_shortcuts_page_shows_bound_keys() {
     assert_eq!(pressed, ["mod+,", "mod+w", "mod+1", "mod+9", "mod+enter"]);
 }
 
-/// A thread just started opens before the snapshot lists it: its tab, once there, comes
-/// into view whole, also when it's the one that makes the tabs overflow and the scroll
-/// arrows take their room.
-#[test]
-fn a_new_tab_comes_into_view() {
-    let server = HcServer::new("newtabview");
-    let mut rt = window(server.config());
-    rt.set_viewport((1280.0, 800.0), 2.0);
-    let mut out = vec![];
-    for count in [2, 3, 12] {
-        let names: Vec<String> = (0..count).map(|i| format!("t{i}")).collect();
-        let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
-        apply(&mut rt, &listed);
-        open(&mut rt, "t0");
-        frames(&mut rt, 40);
-        let new = format!("t{count}");
-        rt.update(|s, _| s.open_fresh("local".into(), new.clone()));
-        frames(&mut rt, 10);
-        let mut listed = listed.clone();
-        listed.push((new.as_str(), Activity::Idle));
-        apply(&mut rt, &listed);
-        if !tab_in_view(&mut rt, &new) {
-            out.push(format!("the {}th of {}", count + 1, count + 1));
-        }
-    }
-    assert!(out.is_empty(), "a new tab out of view: {out:?}");
-}
-
-/// Going to another tab, by ⌃Tab, ⌘2 or a click, its status slot (the busy dot's place, painted
-/// in the tab's colour) changes with the tab and never shows as a box of its own.
-#[test]
-fn a_tabs_status_slot_changes_with_it() {
-    // How far a tab's status slot is from its pill at worst, over `ground` (the strip's).
-    fn gap(rt: &Runtime<Lemur>, ground: [f32; 3]) -> f32 {
-        let els = rt.elements();
-        let over = |below: [f32; 3], e: &ElementInfo| {
-            let a = e.fill.a * e.opacity;
-            let c = [e.fill.r, e.fill.g, e.fill.b];
-            [0, 1, 2].map(|i| below[i] * (1.0 - a) + c[i] * a)
-        };
-        let mut worst: f32 = 0.0;
-        for tab in ["t-a", "t-b"] {
-            let Some(t) = els.iter().find(|e| e.key.as_deref() == Some(tab)) else { continue };
-            let under = |key: &str| els.iter().filter(|c| c.path.starts_with(&t.path) && c.key.as_deref() == Some(key)).collect::<Vec<_>>();
-            let Some(pill) = under("pill").into_iter().next() else { continue };
-            let pill = over(ground, pill);
-            let mut slot = pill;
-            for key in ["status", "ground-base", "ground-rest", "ground", "ground-hover"] {
-                for e in under(key) {
-                    slot = over(slot, e);
-                }
-            }
-            worst = (0..3).map(|i| (slot[i] - pill[i]).abs()).fold(worst, f32::max);
-        }
-        worst
-    }
-    let server = HcServer::new("pslot");
-    let mut rt = window(server.config());
-    rt.set_viewport((1200.0, 700.0), 2.0);
-    apply(&mut rt, &[("a", Activity::Idle), ("b", Activity::Idle)]);
-    let mut worst = vec![];
-    let mut go = |rt: &mut Runtime<Lemur>, how: &str, go: &dyn Fn(&mut Runtime<Lemur>)| {
-        open(rt, "a");
-        rt.pointer_move(600.0, 400.0);
-        frames(rt, 90);
-        // The active tab's slot is painted in the strip's ground.
-        let ground = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some("status") && e.path.contains("t-a"))
-            .map(|e| [e.fill.r, e.fill.g, e.fill.b])
-            .expect("the active tab's slot");
-        go(rt);
-        let mut most: f32 = 0.0;
-        for _ in 0..40 {
-            rt.frame(1.0 / 60.0);
-            most = most.max(gap(rt, ground));
-        }
-        assert_eq!(rt.state.active, Some(key("b")), "{how}");
-        worst.push((how.to_string(), most));
-    };
-    go(&mut rt, "⌃Tab", &|rt| rt.key(KeyEvent { key: K::Tab, mods: ctrl() }));
-    rt.key(KeyEvent { key: K::Modifier { modifier: rune::Modifier::ControlLeft, pressed: false }, mods: Mods::default() });
-    go(&mut rt, "⌘2", &|rt| rt.key(KeyEvent { key: K::Command('2'), mods: cmd() }));
-    go(&mut rt, "a click", &|rt| {
-        let (r, _) = rt.presented("t-b").expect("tab b");
-        let (x, y) = (r[0] + 5.0, r[1] + r[3] / 2.0);
-        rt.pointer_move(x, y);
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-    });
-    assert!(worst.iter().all(|(_, gap)| *gap < 1e-4), "the slot shows: {worst:?}");
-}

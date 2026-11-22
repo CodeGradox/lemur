@@ -20,7 +20,7 @@ const PAUSE: Duration = Duration::from_millis(80);
 
 enum Stage {
     Host,
-    Path(HostChoice),
+    Path(Box<HostChoice>),
 }
 
 /// What a row does when picked.
@@ -204,7 +204,7 @@ impl Lemur {
         let Some(row) = p.rows().into_iter().nth(index) else { return };
         match row {
             Row::Host(choice) => {
-                p.stage = Stage::Path(choice);
+                p.stage = Stage::Path(Box::new(choice));
                 self.picker_set_text(HOME);
             }
             Row::Folder(folder) => self.picker_enter(&folder),

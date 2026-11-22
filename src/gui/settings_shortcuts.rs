@@ -69,7 +69,13 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
     (
         "Threads",
         &[
-            told("New terminal", Press::Actions(&[Action::NewTerminal]), "A new tab where the thread on show runs."),
+            told(
+                "New thread",
+                Press::Actions(&[Action::StartThread]),
+                "Claude or a shell in a project you pick on the host the sidebar shows, in the folder of the thread on show.",
+            ),
+            told("New folder", Press::Actions(&[Action::NewFolder]), "A shell in the home of the host the sidebar shows, in a folder of its own."),
+            told("New terminal", Press::Actions(&[Action::NewTerminal]), "Where the thread on show runs, in its folder."),
             told(
                 "New Claude thread or shell, or go to one",
                 Press::Actions(&[Action::NewThreadHere]),
@@ -78,13 +84,17 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             plain("Go to a thread", Press::Actions(&[Action::GoToThread])),
             told("Close the thread on show", Press::Actions(&[Action::CloseThread]), "Asking first while something runs in it."),
             told(
-                "Next thread in the worktree",
+                "Next thread on the host",
                 Press::Actions(&[Action::NextThread]),
                 "In the order set above; hold ⌃ and press Tab again to go further.",
             ),
-            plain("Previous thread in the worktree", Press::Actions(&[Action::PreviousThread])),
-            plain("Move the tab left or right", Press::Actions(&[Action::MoveTabLeft, Action::MoveTabRight])),
-            told("Go to a tab", Press::Keys(&["mod+1", "mod+9"]), "⌘1 shows the first tab, ⌘2 the second, and so on up to the ninth."),
+            plain("Previous thread on the host", Press::Actions(&[Action::PreviousThread])),
+            plain("Move the thread on show up or down its folder", Press::Actions(&[Action::MoveTabLeft, Action::MoveTabRight])),
+            told(
+                "Go to a thread in the folder",
+                Press::Keys(&["mod+1", "mod+9"]),
+                "⌘1 shows the folder's first thread, ⌘2 the second, and so on up to the ninth.",
+            ),
         ],
     ),
     (

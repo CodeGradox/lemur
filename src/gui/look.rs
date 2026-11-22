@@ -6,7 +6,7 @@ use rune_kit::Kit;
 
 /// The greys one appearance uses, by what they're for.
 struct Greys {
-    /// The window around the panes: the tabs.
+    /// The window around the panes: the toolbar.
     window: &'static str,
     sidebar: &'static str,
     /// Panes and cards.
@@ -16,7 +16,7 @@ struct Greys {
     border: &'static str,
     /// Under the pointer.
     hover: &'static str,
-    /// What's picked or pressed: the thread on show, the tab on show.
+    /// What's picked or pressed: the thread on show.
     picked: &'static str,
     /// Tracks and wells: a bar's, a field's.
     track: &'static str,

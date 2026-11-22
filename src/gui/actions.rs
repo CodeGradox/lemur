@@ -8,6 +8,8 @@ use rune::{Chord, Key, KeyEvent, MenuItem, Tx};
 pub enum Action {
     Settings,
     AddProject,
+    StartThread,
+    NewFolder,
     NewTerminal,
     NewThreadHere,
     GoToThread,
@@ -45,6 +47,8 @@ pub enum Action {
 pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
     (Action::UpdateCore, "Update herdr-core", "Lemur", None),
     (Action::AddProject, "Add Project…", "File", Some("mod+o")),
+    (Action::StartThread, "New Thread…", "File", Some("mod+k")),
+    (Action::NewFolder, "New Folder", "File", Some("mod+shift+n")),
     (Action::NewTerminal, "New Terminal", "File", Some("mod+t")),
     (Action::NewThreadHere, "New Thread in Worktree…", "File", Some("mod+j")),
     (Action::GoToThread, "Go to Thread…", "File", Some("mod+p")),
@@ -65,8 +69,8 @@ pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
     (Action::ToggleAgents, "Toggle Agents", "View", Some("mod+shift+a")),
     (Action::NextThread, "Next Thread", "View", Some("ctrl+tab")),
     (Action::PreviousThread, "Previous Thread", "View", Some("ctrl+shift+tab")),
-    (Action::MoveTabLeft, "Move Tab Left", "View", Some("mod+shift+left")),
-    (Action::MoveTabRight, "Move Tab Right", "View", Some("mod+shift+right")),
+    (Action::MoveTabLeft, "Move Thread Up", "View", Some("mod+shift+left")),
+    (Action::MoveTabRight, "Move Thread Down", "View", Some("mod+shift+right")),
     (Action::NextAgent, "Next Agent", "View", None),
     (Action::PreviousAgent, "Previous Agent", "View", None),
     (Action::ZoomIn, "Zoom In", "View", Some("mod+=")),
@@ -75,7 +79,7 @@ pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
 ];
 
 impl Action {
-    /// The action a key does, if any. ⌘1 to ⌘9 show the tabs by their place.
+    /// The action a key does, if any. ⌘1 to ⌘9 show the folder's threads by their place.
     pub fn for_key(ev: &KeyEvent, tx: &Tx) -> Option<Action> {
         if let Key::Command(c @ '1'..='9') = ev.key
             && !ev.mods.shift
@@ -98,12 +102,6 @@ impl Action {
             chord.matches_tx(ev, tx).then_some(*action)
         })
     }
-
-    /// The key that does it, for a pop-up menu to show beside its item (⌘T).
-    pub fn key_equivalent(self) -> Option<rune::Shortcut> {
-        let (_, _, _, key) = ACTIONS.iter().find(|(a, ..)| *a == self)?;
-        (*key)?.replace("mod+", "cmd+").parse().ok()
-    }
 }
 
 /// Runs `action` on the app.
@@ -111,6 +109,8 @@ pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
     match action {
         Action::Settings => s.open_settings(),
         Action::AddProject => s.open_picker(),
+        Action::StartThread => s.start_thread(),
+        Action::NewFolder => s.new_folder(None),
         Action::NewTerminal => s.new_terminal_here(),
         Action::NewThreadHere => s.new_thread_here(),
         Action::GoToThread => s.find_thread(),
@@ -167,6 +167,8 @@ menu_fn! {
     m_settings => Action::Settings;
     m_update_core => Action::UpdateCore;
     m_add_project => Action::AddProject;
+    m_start_thread => Action::StartThread;
+    m_new_folder => Action::NewFolder;
     m_new_terminal => Action::NewTerminal;
     m_new_thread_here => Action::NewThreadHere;
     m_go_to_thread => Action::GoToThread;
@@ -210,8 +212,9 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
         if let Some(shortcut) = key.and_then(|k| k.replace("mod+", "cmd+").parse().ok()) {
             item = item.key_equivalent(shortcut);
         }
-        // Text fields select to the line's ends with ⌘⇧← and ⌘⇧→ first.
-        if title.starts_with("Move Tab") {
+        // Text fields select to the line's ends with ⌘⇧← and ⌘⇧→ first, and the notes
+        // make a link with ⌘K.
+        if title.starts_with("Move Thread") || title == "New Thread…" {
             item = item.keys_first();
         }
         item
@@ -219,6 +222,8 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
     let fns: &[(Action, fn(&mut Lemur, &mut Tx))] = &[
         (Action::UpdateCore, m_update_core),
         (Action::AddProject, m_add_project),
+        (Action::StartThread, m_start_thread),
+        (Action::NewFolder, m_new_folder),
         (Action::NewTerminal, m_new_terminal),
         (Action::NewThreadHere, m_new_thread_here),
         (Action::GoToThread, m_go_to_thread),

@@ -164,15 +164,8 @@ impl Lemur {
         ;
     }
 
-    /// The gone threads of project `index`, to resume all at once.
-    pub(super) fn gone_in(&self, index: usize) -> Vec<ClaudeThread> {
-        self.snap
-            .hosts
-            .iter()
-            .flat_map(|h| h.bases.iter())
-            .filter(|b| b.index == index)
-            .flat_map(|b| b.worktrees.iter())
-            .flat_map(|w| w.gone.iter().cloned())
-            .collect()
+    /// The gone threads of host `host`, to resume all at once.
+    pub(super) fn gone_on(&self, host: &str) -> Vec<ClaudeThread> {
+        self.host_view(host).map(|h| super::folders::listed(h).gone.into_iter().cloned().collect()).unwrap_or_default()
     }
 }

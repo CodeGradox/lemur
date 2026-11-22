@@ -1,7 +1,6 @@
-//! Projects and their worktrees: adding, folding, coloring, ordering,
-//! hiding and removing them.
+//! Projects and their worktrees: adding and removing them.
 
-use super::{Dialog, Lemur, move_item, moved_to};
+use super::{Dialog, Lemur};
 use crate::actions;
 use crate::browse;
 use crate::config::{Base, Config, Host, home};
@@ -57,59 +56,10 @@ impl Lemur {
         self.refresh();
     }
 
-    /// Folds a project away in the sidebar, or opens it again.
-    pub(super) fn toggle_project(&mut self, index: usize) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        base.collapsed = !base.collapsed;
-        self.save_look(index);
-    }
-
-    /// Unfolds what keeps a thread's row out of sight: its project, and its folder.
-    pub(super) fn reveal(&mut self, host: &str, session: &str) {
-        let Some(index) = self.project_of(host, session).map(|(index, _)| index) else {
-            return;
-        };
-        let folder = self.session_of(&(host.to_string(), session.to_string())).and_then(|s| s.folder.clone());
-        let base = &mut self.cfg.bases[index];
-        let folded = base.folders.iter_mut().find(|f| f.collapsed && Some(&f.id) == folder.as_ref());
-        if !base.collapsed && folded.is_none() {
-            return;
-        }
-        if let Some(f) = folded {
-            f.collapsed = false;
-        }
-        base.collapsed = false;
-        self.save_look(index);
-    }
-
-    /// Colours a project's mark in the sidebar, or with `None` makes it gray again.
-    pub(super) fn set_project_color(&mut self, index: usize, color: Option<&str>) {
-        let Some(base) = self.cfg.bases.get_mut(index) else {
-            return;
-        };
-        base.color = color.map(str::to_string);
-        self.save_look(index);
-    }
-
-    /// Moves the project at `from` in the config's bases to `to`: the
-    /// sidebar shows them in that order, and the config file's `[[bases]]`
-    /// keep it.
-    pub(super) fn reorder_projects(&mut self, from: usize, to: usize) {
-        if !move_item(&mut self.cfg.bases, from, to) {
-            return;
-        }
-        // The snapshot, and what a recompose builds the next from, point
-        // into the config's bases by index: renumber their views, and drop
-        // snapshots on their way that use the old numbers.
-        self.renumber_bases(|i| Some(moved_to(i, from, to)));
-        self.changes += 1;
-        if let Some(file) = self.prefs.config_file()
-            && let Err(e) = Config::save_project_order(file, &self.cfg.bases)
-        {
-            self.fail(e);
-        }
+    /// Project `index` as the snapshot has it.
+    pub(super) fn project_view(&self, index: usize) -> Option<&snapshot::BaseView> {
+        let base = self.cfg.bases.get(index)?;
+        self.host_view(&base.host)?.bases.iter().find(|b| b.index == index)
     }
 
     /// Renumbers the views of the config's bases, in the snapshot and in

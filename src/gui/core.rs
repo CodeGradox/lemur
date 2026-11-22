@@ -1,7 +1,7 @@
 //! What the window knows of herdr-core: refreshes, the watch on its changes, the thread on
 //! show, and opening, closing and ordering threads.
 
-use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, Seen, key, move_item, sessions, watched, worktree_label};
+use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, Seen, key, sessions, watched, worktree_label};
 use crate::actions;
 use crate::attach::Active;
 use crate::config::{Agent, ThreadOrder};
@@ -109,6 +109,7 @@ impl Lemur {
                     s.data = data;
                     s.keep_ordered(&mut snap);
                     s.set_snapshot(snap);
+                    s.drop_empty_folders();
                 }
             },
         );
@@ -139,6 +140,7 @@ impl Lemur {
                 if s.changes == changes {
                     s.keep_ordered(&mut snap);
                     s.set_snapshot(snap);
+                    s.drop_empty_folders();
                 }
             },
         );
@@ -197,6 +199,8 @@ impl Lemur {
         if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
             self.active = None;
             instead = self.successor(&gone, self.prefs.thread_order, showable);
+            // With none to follow it there, the sidebar stays on its host.
+            self.host_shown = Some(gone.0.clone());
         }
         // What each thread did last. A host that can't be reached keeps its own.
         let before = std::mem::take(&mut self.seen);
@@ -261,9 +265,9 @@ impl Lemur {
     }
 
     /// What shows once `gone`, the thread on show, has ended: by `order` the one opened last
-    /// among the threads it was with (its worktree's, or its host's outside every worktree);
-    /// else, and along the tabs, its neighbour there, the next tab first; else the one
-    /// opened last anywhere. `live` says what still runs.
+    /// among the threads of its folder; else, and in the sidebar's order, its neighbour there,
+    /// the next first; else the one opened last on its host, never another host's, which
+    /// the sidebar doesn't show. `live` says what still runs.
     pub(super) fn successor(&self, gone: &Key, order: ThreadOrder, live: impl Fn(&Key) -> bool) -> Option<Key> {
         let with = self.siblings(gone);
         let at = with.iter().position(|k| k == gone).unwrap_or(with.len());
@@ -274,7 +278,7 @@ impl Lemur {
             .filter(|k| *k != gone && live(k))
             .find(|k| order == ThreadOrder::Recent && with.contains(k))
             .or_else(|| after.chain(before).find(|k| live(k)))
-            .or_else(|| self.recent.iter().find(|k| *k != gone && live(k)))
+            .or_else(|| self.recent.iter().find(|k| *k != gone && k.0 == gone.0 && live(k)))
             .cloned()
     }
 
@@ -307,7 +311,8 @@ impl Lemur {
         }
         self.bring_back(&key);
         self.active = Some(key.clone());
-        // Its tab scrolls into view, shown again or not (`reveal_tab`).
+        self.host_shown = None;
+        // Its row scrolls into view, shown again or not (`reveal_row`).
         self.revealed = None;
         if let Some(view) = self.terminals.get_mut(&key) {
             view.tell_focus(true);
@@ -417,19 +422,10 @@ impl Lemur {
         }
     }
 
-    /// Moves row `from` of a list to `to`: the sidebar shows the new order at once, and
-    /// herdr-core keeps it. A project's rows are its threads' and its folders'
-    /// (`drop_row`).
-    pub fn reorder(&mut self, list: List, from: usize, to: usize) {
-        if let Some(index) = self.project_at(&list) {
-            return self.drop_row(index, from, to);
-        }
-        let Some(sessions) = self.list_mut(&list) else { return };
-        if !move_item(sessions, from, to) {
-            return;
-        }
-        let names: Vec<(String, String)> = sessions.iter().map(|s| (s.name.clone(), String::new())).collect();
-        self.write_places(list, names);
+    /// Moves row `from` of a host's rows, its threads' and its folders', to `to`: the
+    /// sidebar shows the new order at once, and herdr-core keeps it (`drop_row`).
+    pub fn reorder(&mut self, (host, _): List, from: usize, to: usize) {
+        self.drop_row(&host, from, to);
     }
 
     /// Has herdr-core keep the threads of `list` in `names`' order, each in its folder.
@@ -446,8 +442,8 @@ impl Lemur {
         }
     }
 
-    /// ⌘⇧← or, with `back` false, ⌘⇧→: moves the tab on show one place along the tabs, as
-    /// dragging it there does; at the end it stays.
+    /// ⌘⇧← or, with `back` false, ⌘⇧→: moves the thread on show one place up its folder, or
+    /// down, as dragging its row there does; at the end it stays.
     pub fn move_tab(&mut self, back: bool) {
         if self.overlaid() {
             return;
@@ -457,7 +453,7 @@ impl Lemur {
         let Some(at) = tabs.iter().position(|k| *k == active) else { return };
         let next = if back { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < tabs.len()) };
         let Some(next) = next else { return };
-        let list = self.list_of(&active);
+        let list = Self::host_list(&active.0);
         let (Some(from), Some(to)) = (self.row_of(&list, &active.1), self.row_of(&list, &tabs[next].1)) else { return };
         self.reorder(list, from, to);
     }
@@ -484,16 +480,6 @@ impl Lemur {
                 }
             },
         );
-    }
-
-    pub(super) fn list_mut(&mut self, (host, worktree): &List) -> Option<&mut Vec<Session>> {
-        let h = self.snap.hosts.iter_mut().find(|h| &h.name == host)?;
-        match worktree {
-            None => Some(&mut h.other),
-            Some(path) => {
-                h.bases.iter_mut().flat_map(|b| b.worktrees.iter_mut()).find(|w| &w.path == path).map(|w| &mut w.sessions)
-            }
-        }
     }
 
     /// Writes a change made here to herdr-core with `write`. Refreshes that started before
@@ -684,7 +670,7 @@ impl Lemur {
         });
     }
 
-    /// ⌘1 to ⌘9: shows the tab at `i` of the tab bar, if it has one.
+    /// ⌘1 to ⌘9: shows thread `i` of the folder on show, if it has one.
     pub fn go_to_tab(&mut self, i: usize) {
         if self.overlaid() {
             return;
