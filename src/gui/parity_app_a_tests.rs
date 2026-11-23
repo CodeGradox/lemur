@@ -1499,9 +1499,9 @@ fn a_folder_goes_by_words_of_its_own_or_its_worktree() {
     assert_eq!(label.as_deref(), Some("auth"));
 }
 
-/// A thread's right-click gives it a colour: its icon shows white on a tile of it, in the
-/// sidebar and the terminal's header, and herdr-core keeps it. No colour takes it off; one
-/// Lemur doesn't know shows none.
+/// A thread's right-click → Color… shows the colours as swatches, and gives it one: its icon
+/// shows white on a tile of it, in the sidebar and the terminal's header, and herdr-core
+/// keeps it. No colour takes it off; one Lemur doesn't know shows none.
 #[test]
 fn a_thread_takes_a_colour() {
     let server = HcServer::new("pa-colour");
@@ -1523,9 +1523,19 @@ fn a_thread_takes_a_colour() {
     assert_eq!(rt.state.session_of(&key(&odd)).and_then(|s| s.color.clone()), None, "not one of the colours");
 
     right_click(&mut rt, &row);
-    rt.resolve_popup(Some("color:purple")).unwrap();
+    rt.resolve_popup(Some("color")).unwrap();
     frames(&mut rt, 20);
     let purple = rune::color::hex("#a855f7").unwrap();
+    // Purple, the eighth, shows as a swatch of it beside its name.
+    let swatch = |rt: &Runtime<Lemur>, item: &str| {
+        let els = rt.elements();
+        let at = els.iter().find(|e| e.key.as_deref() == Some(item) && !e.exiting).map(|e| e.path.clone())?;
+        els.into_iter().filter(|e| e.path.starts_with(&at) && e.path != at).find_map(|e| Some(e.fill).filter(|f| *f == purple))
+    };
+    assert_eq!(swatch(&rt, "thread-colors-item7"), Some(purple), "the colour itself");
+    click(&mut rt, "thread-colors-item7");
+    assert!(rt.state.color_menu.is_none(), "it closes");
+    frames(&mut rt, 20);
     assert_eq!(tile(&rt, &row), Some(purple), "at once");
     assert!(wait_for(&mut rt, 5.0, |_| label(&t) == "purple"));
     open(&mut rt, &t);
@@ -1533,7 +1543,9 @@ fn a_thread_takes_a_colour() {
     assert_eq!(tile(&rt, "term-header"), Some(purple), "its header too");
 
     right_click(&mut rt, &row);
-    rt.resolve_popup(Some("color:")).unwrap();
+    rt.resolve_popup(Some("color")).unwrap();
+    // After the line under the ten.
+    click(&mut rt, "thread-colors-item11");
     assert!(wait_for(&mut rt, 5.0, |_| label(&t).is_empty()));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some_and(|x| x.color.is_none())));
     frames(&mut rt, 20);

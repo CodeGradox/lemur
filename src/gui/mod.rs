@@ -204,6 +204,8 @@ pub struct Lemur {
     /// The sidebar lists every agent's thread instead of the session's, as Rex's eye (⌘.)
     /// lists what reports activity.
     pub(super) sidebar_agents: bool,
+    /// The thread whose colours show as swatches, where it was right-clicked (`Color…`).
+    pub(super) color_menu: Option<(Key, rune::PointerPress)>,
     /// Threads by when they were last opened, the latest first.
     recent: Vec<Key>,
     /// ⌃Tab going through a worktree's threads: in which order, and where it's at. It
@@ -354,6 +356,7 @@ impl Lemur {
             space_shown: None,
             session_switch: rune_kit::ComboboxState::default(),
             sidebar_agents: false,
+            color_menu: None,
             recent: vec![],
             cycling: None,
             sidebar: PaneState::new(sidebar_width).range(SIDEBAR.0, SIDEBAR.1),

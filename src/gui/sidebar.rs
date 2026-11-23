@@ -11,7 +11,7 @@ use crate::config::{Agent, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, HOME, HostView, Session};
 use rune::{Color, El, LoopSpec, PointerPress, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
 use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarRow, TOOLBAR_HEIGHT};
-use rune_kit::{Combobox, ComboboxOption, IconButtonVariant, Kit};
+use rune_kit::{Combobox, ComboboxOption, IconButtonVariant, Kit, MenuItem, context_menu};
 
 /// Points between the traffic lights and the sidebar's title, as Herdr leaves.
 const PAST_LIGHTS: f32 = 20.0;
@@ -240,14 +240,21 @@ pub fn status_dot(color: Color, tip: String, breathes: bool) -> El {
 }
 
 
-/// What a right click on a thread offers, and what it runs.
-/// A thread's colours to pick from, `current` checked: those of `COLORS`, or none.
-pub(super) fn thread_colors(current: Option<&str>) -> PopupMenu {
-    let mut colors = PopupMenu::new();
+/// The colours to give the thread right-clicked, each as a swatch beside its name, where it
+/// was clicked (`color_menu`), drawn by Lemur, as macOS's menus can't colour theirs: those
+/// of `COLORS`, its own checked, or none.
+fn color_menu(s: &Lemur, k: &Kit, layer: &mut Vec<El>) -> El {
+    let point = s.color_menu.as_ref().map(|(_, at)| *at);
+    let current = s.color_menu.as_ref().and_then(|(key, _)| s.session_of(key)).and_then(|t| t.color.clone());
+    let mut menu = context_menu("thread-colors", el().key("thread-colors-at"), point).on_close(|s: &mut Lemur| s.color_menu = None);
     for (name, _) in COLORS {
-        colors = colors.item(PopupItem::new(format!("color:{name}"), title_case(name)).checked(current == Some(name)));
+        let swatch = el().size(12.0, 12.0).radius(6.0).fill(color_named(name).unwrap_or(k.c.icon_muted));
+        let pick = name.to_string();
+        let item = MenuItem::new(title_case(name)).lead(swatch).checked(current.as_deref() == Some(name));
+        menu = menu.item(item.on_select(move |s: &mut Lemur| s.pick_color(Some(&pick))));
     }
-    colors.separator().item(PopupItem::new("color:", "No color").checked(current.is_none()))
+    let none = MenuItem::new("No color").checked(current.is_none()).on_select(|s: &mut Lemur| s.pick_color(None));
+    menu.separator().item(none).build(k, layer)
 }
 
 /// A thread's right-click: renaming it, peeking at it, silencing it, putting it away, its
@@ -258,7 +265,7 @@ fn thread_menu(s: &Session, folders: &[(String, String)]) -> PopupMenu {
         .item(PopupItem::new("peek", "Peek"))
         .item(PopupItem::new("silence", silence_label(s.silent)))
         .item(if s.away { PopupItem::new("bring-back", "Bring back") } else { PopupItem::new("put-away", "Put away") })
-        .submenu("Color", thread_colors(s.color.as_deref()));
+        .item(PopupItem::new("color", "Color…"));
     let now = folder_of(s);
     let mut to = PopupMenu::new();
     for (id, name) in folders {
@@ -268,7 +275,8 @@ fn thread_menu(s: &Session, folders: &[(String, String)]) -> PopupMenu {
     menu.separator().submenu("Move to folder", to)
 }
 
-fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {
+/// What thread `key`'s right-click, `at` a place, runs once `picked`.
+fn thread_picked(s: &mut Lemur, picked: &str, key: Key, at: PointerPress) {
     let silent = s.session_of(&key).is_some_and(|t| t.silent);
     match picked {
         "rename" => s.ask_name(Ask::Rename { host: key.0, session: key.1 }),
@@ -277,13 +285,10 @@ fn thread_picked(s: &mut Lemur, picked: &str, key: Key) {
         "bring-back" => s.bring_back(&key),
         "put-away" => s.put_away(key),
         "new-folder" => s.move_to_folder(&key, None),
+        "color" => s.color_menu = Some((key, at)),
         folder if folder.starts_with("folder:") => {
             let id = &folder["folder:".len()..];
             s.move_to_folder(&key, Some(id));
-        }
-        color if color.starts_with("color:") => {
-            let name = &color["color:".len()..];
-            s.set_thread_color(key, Some(name).filter(|n| !n.is_empty()));
         }
         _ => {}
     }
@@ -338,7 +343,7 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
             let key = menu.clone();
             tx.popup_menu(picked_menu.clone(), press, move |s: &mut Lemur, picked, _| {
                 if let Some(p) = picked {
-                    thread_picked(s, p, key);
+                    thread_picked(s, p, key, press);
                 }
             });
         })
@@ -538,7 +543,7 @@ pub fn sidebar(s: &Lemur, k: &Kit, lights: f32, layer: &mut Vec<El>) -> El {
         sb = sb.child(session_section(s, &space, h, true, k, layer));
     }
     let foot = col().key("sidebar-foot").w_full().children(super::panels::sidebar_foot(s, k)).child(s.machines(k));
-    sb.footer(foot).build(k).fill(super::look::sidebar(k.dark)).child(header)
+    sb.footer(foot).build(k).fill(super::look::sidebar(k.dark)).child(header).child(color_menu(s, k, layer))
 }
 
 /// Session `space`'s section, on host `h`: its header, then its folders of threads, or why
@@ -625,6 +630,13 @@ impl Lemur {
 
     /// Colours thread `key`, or with `None` takes its colour off: it shows at once, herdr-core
     /// keeps it on the terminal, and a thread kept to resume keeps it too.
+    /// The colour picked among the swatches of the thread right-clicked, or with `None` none.
+    fn pick_color(&mut self, color: Option<&str>) {
+        if let Some((key, _)) = self.color_menu.take() {
+            self.set_thread_color(key, color);
+        }
+    }
+
     pub(super) fn set_thread_color(&mut self, key: Key, color: Option<&str>) {
         let color = color.map(str::to_string);
         if let Some(s) = self.session_mut(&key) {

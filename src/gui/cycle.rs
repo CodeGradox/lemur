@@ -1,4 +1,5 @@
-//! ⌃Tab: going through the threads of the session of the one on show, in the sidebar's order
+//! ⌃Tab: going through the threads of the session of the one on show, or with ⌘. every
+//! agent's as the sidebar lists them then, in the sidebar's order
 //! or, as Settings can say, the one opened last first, the way ⌘Tab goes through apps. While
 //! ⌃ is held each Tab goes one further; letting go of it settles on the thread on show.
 
@@ -25,15 +26,18 @@ impl Lemur {
         names.into_iter().map(|name| (host.clone(), name)).collect()
     }
 
-    /// Shows the next thread in the session of the one on show, or with `back` the one
-    /// before, in the order Settings says.
+    /// Shows the next thread in the session of the one on show, or with ⌘. the next agent's
+    /// down the sidebar, or with `back` the one before, in the order Settings says.
     pub fn cycle_threads(&mut self, back: bool, tx: &Tx) {
         if self.overlaid() {
             return;
         }
         let Some(active) = self.active.clone() else { return };
         if self.cycling.is_none() {
-            let mut threads = self.space_of(&active).map(|space| self.space_threads(&space)).unwrap_or_default();
+            let mut threads = match self.sidebar_agents {
+                true => self.sidebar_threads(),
+                false => self.space_of(&active).map(|space| self.space_threads(&space)).unwrap_or_default(),
+            };
             // Put away, it's still where it starts from.
             if !threads.contains(&active) {
                 threads.push(active.clone());

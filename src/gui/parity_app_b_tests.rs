@@ -233,6 +233,11 @@ fn cmd_period_lists_every_agent_in_the_sidebar() {
     assert!(rt.find("row-local-shell").is_none(), "not the session's rows");
     press(&mut rt, K::Command('2'), cmd());
     assert_eq!(rt.state.active, Some(key("elsewhere")), "the second there");
+    // ⌃Tab goes down the list as it shows, round at its end.
+    rt.update(|s, tx| s.cycle_threads(false, tx));
+    assert_eq!(rt.state.active, Some(key("claude")));
+    rt.update(|s, tx| s.cycle_threads(false, tx));
+    assert_eq!(rt.state.active, Some(key("elsewhere")));
 
     click(&mut rt, "sidebar-agents");
     frames(&mut rt, 20);
