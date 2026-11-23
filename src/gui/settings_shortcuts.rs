@@ -52,9 +52,13 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         &[
             told("Command palette", Press::Actions(&[Action::CommandPalette]), "Every command by name, with its key."),
             plain("Toggle the sidebar", Press::Actions(&[Action::ToggleSidebar])),
+            told(
+                "Every agent in the sidebar",
+                Press::Actions(&[Action::ToggleSidebarAgents]),
+                "Every Claude thread, in each session and on each host, instead of the session's; again for the session. The eye over the sidebar does it too.",
+            ),
             told("Toggle the right panel", Press::Actions(&[Action::ToggleRightPanel]), "The panel that showed last: the notes at first."),
             plain("Toggle the agents", Press::Actions(&[Action::ToggleAgents])),
-            plain("Add a project", Press::Actions(&[Action::AddProject])),
             told("Zoom in", Press::Actions(&[Action::ZoomIn]), "Everything larger, the terminal's text too. ⌘+ does it as well."),
             plain("Zoom out", Press::Actions(&[Action::ZoomOut])),
             plain("Actual size", Press::Actions(&[Action::ActualSize])),
@@ -70,30 +74,31 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         "Threads",
         &[
             told(
-                "New thread",
-                Press::Actions(&[Action::StartThread]),
-                "Claude or a shell in a project you pick on the host the sidebar shows, in the folder of the thread on show.",
+                "Switch session",
+                Press::Actions(&[Action::SwitchSession]),
+                "A session is a folder on This Mac or a host. Its name at the top of the sidebar switches too.",
             ),
-            told("New folder", Press::Actions(&[Action::NewFolder]), "A shell in the home of the host the sidebar shows, in a folder of its own."),
-            told("New terminal", Press::Actions(&[Action::NewTerminal]), "Where the thread on show runs, in its folder."),
+            told("New session", Press::Actions(&[Action::NewSession]), "Asks for a host and a folder there."),
             told(
                 "New Claude thread or shell, or go to one",
                 Press::Actions(&[Action::NewThreadHere]),
-                "Named, where the thread on show runs; type to find another thread.",
+                "Named, in the session's folder, beside the thread on show; type to find another thread.",
             ),
+            told("New terminal", Press::Actions(&[Action::NewTerminal]), "A shell in the session's folder, beside the thread on show."),
+            told("New folder", Press::Actions(&[Action::NewFolder]), "A shell in the machine's home, in a folder of its own in the session."),
             plain("Go to a thread", Press::Actions(&[Action::GoToThread])),
             told("Close the thread on show", Press::Actions(&[Action::CloseThread]), "Asking first while something runs in it."),
             told(
-                "Next thread on the host",
+                "Next thread in the session",
                 Press::Actions(&[Action::NextThread]),
                 "In the order set above; hold ⌃ and press Tab again to go further.",
             ),
-            plain("Previous thread on the host", Press::Actions(&[Action::PreviousThread])),
+            plain("Previous thread in the session", Press::Actions(&[Action::PreviousThread])),
             plain("Move the thread on show up or down its folder", Press::Actions(&[Action::MoveTabLeft, Action::MoveTabRight])),
             told(
-                "Go to a thread in the folder",
+                "Go to a thread in the sidebar",
                 Press::Keys(&["mod+1", "mod+9"]),
-                "⌘1 shows the folder's first thread, ⌘2 the second, and so on up to the ninth.",
+                "⌘1 shows the sidebar's first thread, ⌘2 the second, and so on up to the ninth; a folded folder's don't count.",
             ),
         ],
     ),
@@ -144,7 +149,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         ],
     ),
     (
-        "Adding a project",
+        "Starting a session",
         &[
             plain("Choose a folder", Press::Keys(&["up", "down"])),
             plain("Go into the folder", Press::Keys(&["tab"])),
@@ -165,7 +170,7 @@ pub(super) fn page(s: &Lemur, k: &Kit) -> Vec<El> {
         |s, id| s.set_thread_order(ThreadOrder::ALL.into_iter().find(|o| o.as_str() == id).unwrap_or_default()),
         k,
     );
-    let help = "The order ⌃Tab goes through the threads on the host of the one on show in, and ⌃⇧Tab back, and which \
+    let help = "The order ⌃Tab goes through the threads of the session of the one on show in, and ⌃⇧Tab back, and which \
                 one shows when you close one. By last opened starts with the thread opened before this one, as ⌘Tab \
                 does with apps.";
     let mut groups = vec![group(None, None, vec![item("thread-order", "Thread order", order, Some(help.into()), k)], k)];

@@ -22,6 +22,17 @@ impl Lemur {
         agents
     }
 
+    /// The agents' threads the sidebar lists with ⌘., every host's and session's, in the
+    /// panel's order: not those only running helpers, nor what they run.
+    pub(super) fn sidebar_agent_threads(&self) -> Vec<(&str, &Session)> {
+        self.agents().into_iter().filter(|(_, s)| s.agent().is_some()).collect()
+    }
+
+    /// ⌘., or the eye over the sidebar: it lists every agent's thread, or the session again.
+    pub fn toggle_sidebar_agents(&mut self) {
+        self.sidebar_agents = !self.sidebar_agents;
+    }
+
     /// The agents as Next Agent goes through them: needing you, done while you
     /// looked away, working, then the rest; the latest first in each.
     pub(super) fn agents_by_urgency(&self) -> Vec<(&str, &Session)> {
@@ -74,7 +85,7 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
         .iter()
         .enumerate()
         .flat_map(|(i, (host, t))| {
-            let mut rows = vec![agent_row(s, i, host, t, k)];
+            let mut rows = vec![agent_row(s, &format!("agent-{i}"), host, t, k)];
             rows.extend(t.helpers.iter().enumerate().map(|(j, h)| helper_row(s, (i, j), host, t, h, k)));
             rows
         })
@@ -99,9 +110,20 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
 }
 
 
-/// An agent's thread: its name, where it runs, and what it's doing, in words
+/// The sidebar's rows with ⌘.: every agent's thread, as the panel lists them, without what
+/// they run to help them; or why there's none.
+pub fn sidebar_rows(s: &Lemur, k: &Kit) -> Vec<El> {
+    let agents = s.sidebar_agent_threads();
+    if agents.is_empty() {
+        let none = text("No agents are running").font(k.ty.ui).color(k.c.text_faint);
+        return vec![col().key("sidebar-agents-none").w_full().py(24.0).center().child(none)];
+    }
+    agents.iter().enumerate().map(|(i, (host, t))| agent_row(s, &format!("sidebar-agent-{i}"), host, t, k)).collect()
+}
+
+/// An agent's thread, keyed `id`: its name, where it runs, and what it's doing, in words
 /// too when that's for you to see to.
-fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
+fn agent_row(s: &Lemur, id: &str, host: &str, t: &Session, k: &Kit) -> El {
     let key = key(host, t);
     let shown = s.active.as_ref() == Some(&key);
     let (color, tip, breathes) = s.activity(&key, t, k);
@@ -126,7 +148,7 @@ fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
             icons::button(&icons::EYE, "Peek at it")
                 .on_press(move |s: &mut Lemur| s.peek(peek.clone()))
                 .build(k)
-                .key(format!("agent-{i}-peek"))
+                .key(format!("{id}-peek"))
                 .group_opacity(0.0, 1.0),
         );
     }
@@ -136,11 +158,11 @@ fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
         let bell = icons::button(if silent { &icons::BELL_OFF } else { &icons::BELL }, silence_label(silent))
             .on_press(move |s: &mut Lemur| s.set_silent(silence.clone(), !silent))
             .build(k)
-            .key(format!("agent-{i}-silence"));
+            .key(format!("{id}-silence"));
         trailing = trailing.child(if silent { bell } else { bell.group_opacity(0.0, 1.0) });
     }
     if let Some(says) = says {
-        trailing = trailing.child(text(says).key(format!("agent-{i}-says")).font(k.ty.small).color(color));
+        trailing = trailing.child(text(says).key(format!("{id}-says")).font(k.ty.small).color(color));
     }
     let open = key.clone();
     SidebarRow::new(t.label.clone())
@@ -151,7 +173,7 @@ fn agent_row(s: &Lemur, i: usize, host: &str, t: &Session, k: &Kit) -> El {
         .selected(shown)
         .on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
         .build(k)
-        .key(format!("agent-{i}"))
+        .key(id.to_string())
         // Put away: still an agent, but out of the way.
         .opacity(if t.away { 0.6 } else { 1.0 })
 }

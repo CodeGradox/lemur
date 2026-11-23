@@ -19,8 +19,10 @@ impl Lemur {
                 *other != k && self.session_of(other).is_some_and(|s| !s.away)
             });
             self.hide_shown(None);
+            if let Some(space) = self.space_of(&k) {
+                self.space_shown = Some(space);
+            }
             self.active = None;
-            self.host_shown = Some(k.0.clone());
             if let Some((host, session)) = next {
                 self.open(host, session);
             }

@@ -43,6 +43,10 @@ pub struct Config {
     /// What the sidebar calls a folder you haven't named.
     #[serde(default)]
     pub folder_names: FolderNames,
+    /// The sidebar lists every session, each in a section of its own, instead of the one
+    /// on show alone.
+    #[serde(default)]
+    pub all_sessions: bool,
     /// The sidebar's width in pixels, as last dragged; unset is lemur's own.
     #[serde(default)]
     pub sidebar_width: Option<f32>,
@@ -728,6 +732,19 @@ impl Config {
         })
     }
 
+    /// Saves whether the sidebar lists every session to the config file at `path`. The one on
+    /// show alone, the default, goes without saying.
+    pub fn save_all_sessions(path: &Path, all: bool) -> Result<()> {
+        edit(path, |doc| {
+            if all {
+                doc["all_sessions"] = toml_edit::value(true);
+            } else {
+                doc.remove("all_sessions");
+            }
+            Ok(())
+        })
+    }
+
     /// Saves the window's zoom to the config file at `path`, to the hundredth: 100% goes
     /// without saying.
     pub fn save_zoom(path: &Path, zoom: f32) -> Result<()> {
@@ -1018,6 +1035,22 @@ mod tests {
         Config::save_folder_names(&path, FolderNames::Random).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("folder_names"), "the default goes without saying: {saved}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_sidebar_shows_one_session_unless_told() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.all_sessions);
+        let cfg: Config = toml::from_str("all_sessions = true").unwrap();
+        assert!(cfg.all_sessions);
+        let path = std::env::temp_dir().join(format!("lemur-all-sessions-{}.toml", std::process::id()));
+        std::fs::write(&path, "# mine\n").unwrap();
+        Config::save_all_sessions(&path, true).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# mine") && saved.contains("all_sessions = true"), "{saved}");
+        Config::save_all_sessions(&path, false).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("all_sessions"));
         let _ = std::fs::remove_file(path);
     }
 

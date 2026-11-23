@@ -44,6 +44,7 @@ mod settings;
 mod sidebar;
 mod silence;
 mod snackbar;
+mod spaces;
 mod term_bar;
 #[cfg(test)]
 mod term_bar_tests;
@@ -77,8 +78,8 @@ use terminal::{Metrics, TermView};
 pub use actions::Action;
 
 pub type Key = (String, String);
-/// The rows a drag moves among: a host's, by its name, its folders' and their threads
-/// (`folders`). The second is `None`: a host has one list.
+/// The rows a drag moves among: a session's, by its host and its folder (`spaces`), its
+/// folders' and their threads (`folders`).
 pub type List = (String, Option<String>);
 
 const REFRESH: Duration = Duration::from_secs(3);
@@ -126,6 +127,8 @@ pub struct Prefs {
     pub thread_order: ThreadOrder,
     /// What the sidebar calls a folder you haven't named.
     pub folder_names: FolderNames,
+    /// The sidebar lists every session, not the one on show alone.
+    pub all_sessions: bool,
     pub terminal: Terminal,
     pub claude_usage: bool,
     /// Milliseconds a notification shows before it goes by itself; 0 keeps it.
@@ -146,6 +149,7 @@ impl Prefs {
             dictation_language: cfg.dictation_language,
             thread_order: cfg.thread_order,
             folder_names: cfg.folder_names,
+            all_sessions: cfg.all_sessions,
             terminal: cfg.terminal.clone(),
             claude_usage: cfg.claude_usage,
             notification_dismiss_ms: cfg.notification_dismiss_ms,
@@ -192,9 +196,14 @@ pub struct Lemur {
     pub loaded: bool,
     pub terminals: HashMap<Key, TermView>,
     pub active: Option<Key>,
-    /// The host the sidebar shows with no thread of its on show: one picked over the
-    /// sidebar with none to open, or whose last one ended. Opening a thread clears it.
-    pub(super) host_shown: Option<String>,
+    /// The session the sidebar shows while no thread of its is on show: one picked, or the
+    /// one the thread last on show was in (`shown_space`).
+    pub(super) space_shown: Option<spaces::Space>,
+    /// The sidebar's dropdown of the sessions to switch to: open or not, and what's typed.
+    pub(super) session_switch: rune_kit::ComboboxState,
+    /// The sidebar lists every agent's thread instead of the session's, as Rex's eye (⌘.)
+    /// lists what reports activity.
+    pub(super) sidebar_agents: bool,
     /// Threads by when they were last opened, the latest first.
     recent: Vec<Key>,
     /// ⌃Tab going through a worktree's threads: in which order, and where it's at. It
@@ -227,6 +236,8 @@ pub struct Lemur {
     pub status: Option<(String, Kind)>,
     /// The session from last time, opened once the first refresh is in.
     restore: Option<Key>,
+    /// The thread on show when Lemur last quit, gone since or not: its session shows first.
+    remembered: Option<Key>,
     /// Each host's last load, and the CPU share between it and the one before.
     loads: HashMap<String, (crate::machine::Load, Option<f32>)>,
     /// Counts changes a snapshot fetched across one would undo (the thread order, a removed
@@ -340,7 +351,9 @@ impl Lemur {
             loaded: false,
             terminals: HashMap::new(),
             active: None,
-            host_shown: None,
+            space_shown: None,
+            session_switch: rune_kit::ComboboxState::default(),
+            sidebar_agents: false,
             recent: vec![],
             cycling: None,
             sidebar: PaneState::new(sidebar_width).range(SIDEBAR.0, SIDEBAR.1),
@@ -355,6 +368,7 @@ impl Lemur {
             resuming: HashSet::new(),
             setting_up: HashSet::new(),
             status: None,
+            remembered: restore.clone(),
             restore,
             loads: HashMap::new(),
             changes: 0,

@@ -288,7 +288,7 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
         toolbar = toolbar.trailing(b);
     }
     let split = SplitView::new(main_pane(s, k))
-        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k, cx.titlebar_inset()))
+        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k, cx.titlebar_inset(), layer))
         .inspector(&s.inspector, |s: &mut Lemur| &mut s.inspector, panels::right(s, k))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())

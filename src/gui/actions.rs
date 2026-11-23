@@ -7,8 +7,8 @@ use rune::{Chord, Key, KeyEvent, MenuItem, Tx};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Settings,
-    AddProject,
-    StartThread,
+    NewSession,
+    SwitchSession,
     NewFolder,
     NewTerminal,
     NewThreadHere,
@@ -22,6 +22,8 @@ pub enum Action {
     FindPrevious,
     CommandPalette,
     ToggleSidebar,
+    ToggleSidebarAgents,
+    ToggleAllSessions,
     ToggleRightPanel,
     ToggleNotes,
     ToggleLinear,
@@ -46,11 +48,11 @@ pub enum Action {
 /// Every action with a name, its menu and its key, as the menus and the palette list them.
 pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
     (Action::UpdateCore, "Update herdr-core", "Lemur", None),
-    (Action::AddProject, "Add Project…", "File", Some("mod+o")),
-    (Action::StartThread, "New Thread…", "File", Some("mod+k")),
+    (Action::NewSession, "New Session…", "File", Some("mod+o")),
+    (Action::SwitchSession, "Switch Session…", "File", Some("mod+k")),
     (Action::NewFolder, "New Folder", "File", Some("mod+shift+n")),
     (Action::NewTerminal, "New Terminal", "File", Some("mod+t")),
-    (Action::NewThreadHere, "New Thread in Worktree…", "File", Some("mod+j")),
+    (Action::NewThreadHere, "New Claude or Shell…", "File", Some("mod+j")),
     (Action::GoToThread, "Go to Thread…", "File", Some("mod+p")),
     (Action::CloseThread, "Close Thread", "File", Some("mod+w")),
     (Action::PutAway, "Put Thread Away", "File", None),
@@ -61,6 +63,8 @@ pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
     (Action::FindPrevious, "Find Previous", "Edit", Some("mod+shift+g")),
     (Action::CommandPalette, "Command Palette…", "View", Some("mod+shift+p")),
     (Action::ToggleSidebar, "Toggle Sidebar", "View", Some("mod+b")),
+    (Action::ToggleSidebarAgents, "Agents in Sidebar", "View", Some("mod+period")),
+    (Action::ToggleAllSessions, "All Sessions in Sidebar", "View", None),
     (Action::ToggleRightPanel, "Toggle Right Panel", "View", Some("mod+r")),
     (Action::ToggleNotes, "Toggle Notes", "View", None),
     (Action::ToggleLinear, "Toggle Linear", "View", None),
@@ -79,7 +83,7 @@ pub const ACTIONS: &[(Action, &str, &str, Option<&str>)] = &[
 ];
 
 impl Action {
-    /// The action a key does, if any. ⌘1 to ⌘9 show the folder's threads by their place.
+    /// The action a key does, if any. ⌘1 to ⌘9 show the sidebar's threads by their place.
     pub fn for_key(ev: &KeyEvent, tx: &Tx) -> Option<Action> {
         if let Key::Command(c @ '1'..='9') = ev.key
             && !ev.mods.shift
@@ -108,9 +112,9 @@ impl Action {
 pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
     match action {
         Action::Settings => s.open_settings(),
-        Action::AddProject => s.open_picker(),
-        Action::StartThread => s.start_thread(),
-        Action::NewFolder => s.new_folder(None),
+        Action::NewSession => s.open_picker(),
+        Action::SwitchSession => s.switch_session(),
+        Action::NewFolder => s.new_folder(),
         Action::NewTerminal => s.new_terminal_here(),
         Action::NewThreadHere => s.new_thread_here(),
         Action::GoToThread => s.find_thread(),
@@ -127,6 +131,8 @@ pub fn run(s: &mut Lemur, action: Action, tx: &mut Tx) {
         Action::FindPrevious => s.find_next(false),
         Action::CommandPalette => s.open_palette(),
         Action::ToggleSidebar => s.sidebar.toggle(),
+        Action::ToggleSidebarAgents => s.toggle_sidebar_agents(),
+        Action::ToggleAllSessions => s.toggle_all_sessions(),
         Action::ToggleRightPanel => s.toggle_right_panel(),
         Action::ToggleNotes => s.toggle_right(Right::Notes),
         Action::ToggleLinear => s.toggle_right(Right::Linear),
@@ -166,8 +172,8 @@ macro_rules! menu_fn {
 menu_fn! {
     m_settings => Action::Settings;
     m_update_core => Action::UpdateCore;
-    m_add_project => Action::AddProject;
-    m_start_thread => Action::StartThread;
+    m_new_session => Action::NewSession;
+    m_switch_session => Action::SwitchSession;
     m_new_folder => Action::NewFolder;
     m_new_terminal => Action::NewTerminal;
     m_new_thread_here => Action::NewThreadHere;
@@ -181,6 +187,8 @@ menu_fn! {
     m_find_previous => Action::FindPrevious;
     m_palette => Action::CommandPalette;
     m_sidebar => Action::ToggleSidebar;
+    m_sidebar_agents => Action::ToggleSidebarAgents;
+    m_all_sessions => Action::ToggleAllSessions;
     m_right => Action::ToggleRightPanel;
     m_notes => Action::ToggleNotes;
     m_linear => Action::ToggleLinear;
@@ -214,15 +222,15 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
         }
         // Text fields select to the line's ends with ⌘⇧← and ⌘⇧→ first, and the notes
         // make a link with ⌘K.
-        if title.starts_with("Move Thread") || title == "New Thread…" {
+        if title.starts_with("Move Thread") || title == "Switch Session…" {
             item = item.keys_first();
         }
         item
     };
     let fns: &[(Action, fn(&mut Lemur, &mut Tx))] = &[
         (Action::UpdateCore, m_update_core),
-        (Action::AddProject, m_add_project),
-        (Action::StartThread, m_start_thread),
+        (Action::NewSession, m_new_session),
+        (Action::SwitchSession, m_switch_session),
         (Action::NewFolder, m_new_folder),
         (Action::NewTerminal, m_new_terminal),
         (Action::NewThreadHere, m_new_thread_here),
@@ -236,6 +244,8 @@ pub fn menus(app: rune::App<Lemur>) -> rune::App<Lemur> {
         (Action::FindPrevious, m_find_previous),
         (Action::CommandPalette, m_palette),
         (Action::ToggleSidebar, m_sidebar),
+        (Action::ToggleSidebarAgents, m_sidebar_agents),
+        (Action::ToggleAllSessions, m_all_sessions),
         (Action::ToggleRightPanel, m_right),
         (Action::ToggleNotes, m_notes),
         (Action::ToggleLinear, m_linear),

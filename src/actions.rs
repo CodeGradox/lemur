@@ -3,7 +3,7 @@ use crate::config::{Agent, ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
 use crate::snapshot::{
-    AWAY, COLOR, FOLDER, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
+    AWAY, COLOR, FOLDER, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SESSION, SHELL, SILENT, WORKTREE,
 };
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
@@ -283,11 +283,13 @@ pub fn start_in(
     label: &str,
     agent: Option<Agent>,
 ) -> Result<Started> {
-    start_in_folder(cfg, host, dir, label, agent, None)
+    start_in_folder(cfg, host, dir, label, agent, None, None)
 }
 
 /// Starts a thread as `start_in` does, in `folder` of its host's, by the
-/// folder's id, or with none in one of its own: it shows there from the first.
+/// folder's id, or with none in one of its own, and in session `space` (a
+/// project's path, or `HOME`), or with none in the one of where it runs: it
+/// shows there from the first.
 pub fn start_in_folder(
     cfg: &Config,
     host: &str,
@@ -295,12 +297,13 @@ pub fn start_in_folder(
     label: &str,
     agent: Option<Agent>,
     folder: Option<&str>,
+    space: Option<&str>,
 ) -> Result<Started> {
     let host = cfg.host_or_err(host)?;
     if let Some(agent) = agent {
         installed(host, agent)?;
     }
-    let kept: Vec<(&str, &str)> = folder.map(|f| (FOLDER, f)).into_iter().collect();
+    let kept: Vec<(&str, &str)> = folder.map(|f| (FOLDER, f)).into_iter().chain(space.map(|s| (SESSION, s))).collect();
     start_on(host, dir, label, agent, &kept)
 }
 

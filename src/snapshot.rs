@@ -60,6 +60,8 @@ pub struct HostView {
 pub struct BaseView {
     /// Index into `Config::bases`.
     pub index: usize,
+    /// Its path as the config has it, which names its session (`Session::space`).
+    pub path: String,
     pub error: Option<String>,
     /// The main checkout comes first, as `git worktree list` prints it.
     pub worktrees: Vec<Worktree>,
@@ -138,6 +140,10 @@ pub struct Session {
     /// The folder of its host's it's in, by its id (`config::Folder`'s); none for one of
     /// its own.
     pub folder: Option<String>,
+    /// The session it's in, as the sidebar shows one at a time: a project's, by its path
+    /// as the config has it, or `HOME`. It's the one it was started in (`SESSION`), else
+    /// the project whose worktree it runs in, else its host's home.
+    pub space: String,
     /// Its colour, one of `config::COLORS`, if it was given one.
     pub color: Option<String>,
 }
@@ -254,6 +260,11 @@ pub const ISSUE: &str = "lemur.issue";
 pub const FOLDER: &str = "lemur.folder";
 /// A thread's colour, one of `config::COLORS`, by its name.
 pub const COLOR: &str = "lemur.color";
+/// The session a thread was started in, by its path as the config has it (a project's
+/// `path`), or `HOME` for its host's home: it stays there wherever it goes.
+pub const SESSION: &str = "lemur.session";
+/// The session of a host's home, as threads outside every project are in.
+pub const HOME: &str = "~";
 /// The pid of the shell a Claude thread's Claude runs in, as lemur last
 /// saw it. herdr-core keeps lemur's terminals: after their host restarts,
 /// each comes back at its address with a fresh shell and another pid.
@@ -542,6 +553,7 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
             {
                 bases.push(BaseView {
                     index,
+                    path: cfg.bases[index].path.clone(),
                     error: None,
                     worktrees: vec![],
                     plain: false,
@@ -642,8 +654,13 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
     let mut bases = data.bases.clone();
     let live: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let mut other = vec![];
-    for s in sessions {
-        match find_worktree(&bases, &s.path) {
+    // The session a thread was started in, if it's still one; else where it runs.
+    let known = |space: &str| space == HOME || bases.iter().any(|b| b.path == space);
+    let started_in: Vec<Option<String>> = sessions.iter().map(|s| s.space.clone()).map(|space| Some(space).filter(|x| known(x))).collect();
+    for (mut s, started) in sessions.into_iter().zip(started_in) {
+        let found = find_worktree(&bases, &s.path);
+        s.space = started.unwrap_or_else(|| found.map_or_else(|| HOME.to_string(), |(bi, _)| bases[bi].path.clone()));
+        match found {
             Some((bi, wi)) => bases[bi].worktrees[wi].sessions.push(s),
             None => other.push(s),
         }
@@ -729,6 +746,8 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         silent: label(SILENT).is_some(),
         issue: label(ISSUE).cloned(),
         folder: label(FOLDER).filter(|f| !f.is_empty()).cloned(),
+        // As started; `view` makes it one of the host's sessions.
+        space: label(SESSION).cloned().unwrap_or_default(),
         color: label(COLOR).filter(|c| crate::config::COLORS.iter().any(|(name, _)| name == c)).cloned(),
     }
 }

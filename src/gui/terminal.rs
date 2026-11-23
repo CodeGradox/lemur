@@ -571,6 +571,7 @@ impl Lemur {
     /// a click elsewhere, which takes the keyboard from it, gives it back to the terminal.
     pub(super) fn editing(&self) -> bool {
         self.prompt.as_ref().is_some_and(|p| p.input.focused || p.branch.as_ref().is_some_and(|b| b.focused))
+            || self.session_switch.search().focused
             || self.panels_editing()
             || self.find_editing()
     }

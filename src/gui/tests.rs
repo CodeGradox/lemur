@@ -68,6 +68,7 @@ pub(super) fn session(name: &str, activity: Activity) -> Session {
         issue: None,
         folder: None,
         color: None,
+        space: crate::snapshot::HOME.into(),
     }
 }
 
@@ -79,7 +80,7 @@ pub(super) fn made_up(sessions: &[(&str, Activity)]) -> Snapshot {
             name: "local".into(),
             error: None,
             needs_you: false,
-            home: String::new(),
+            home: "/home/me".into(),
             machine: Default::default(),
             bases: vec![],
             other: sessions
@@ -272,10 +273,10 @@ fn moving_a_tab_reorders_its_list() {
     let [a, b, c] = ["a", "b", "c"].map(|_| server.run("/", &["lemur.folder=f1"], &["sleep", "600"]));
     let mut rt = loaded(&server);
     open(&mut rt, &a);
-    let shown = |s: &Lemur| super::folders::listed(&s.snap.hosts[0]).placed().into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+    let shown = |s: &Lemur| super::folders::listed(&s.snap.hosts[0], None).placed().into_iter().map(|(t, _)| t).collect::<Vec<_>>();
     press(&mut rt, K::Right, Mods { shift: true, ..cmd() });
     assert_eq!(shown(&rt.state), [b.as_str(), &a, &c]);
-    let list: List = ("local".into(), None);
+    let list: List = ("local".into(), Some("~".into()));
     // Its folder's row first.
     rt.update(|s, _| s.reorder(list, 1, 3));
     assert_eq!(shown(&rt.state), [a.as_str(), &c, &b]);
@@ -312,17 +313,20 @@ fn closing_asks_only_while_something_runs() {
     assert!(rt.state.dialog.is_none());
 }
 
-/// ⌘T starts a terminal where the thread on show runs, and shows it.
+/// ⌘T starts a terminal in the folder of the session of the thread on show, wherever that
+/// one runs, and shows it.
 #[test]
 fn cmd_t_opens_a_terminal_beside_the_thread() {
     let server = HcServer::new("rnewt");
     let t = server.run("/tmp", &[], &["sh"]);
     let mut rt = loaded(&server);
+    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some()));
     open(&mut rt, &t);
+    let home = rt.state.snap.hosts[0].home.clone();
     press(&mut rt, K::Command('t'), cmd());
     assert!(wait_for(&mut rt, 15.0, |s| s.active.as_ref().is_some_and(|k| k.1 != t)), "a new one shows");
     let shown = rt.state.active.clone().unwrap();
-    assert!(wait_for(&mut rt, 10.0, |s| s.session_of(&shown).is_some_and(|x| x.path == "/tmp" || x.path.ends_with("/tmp"))));
+    assert!(wait_for(&mut rt, 10.0, |s| s.session_of(&shown).is_some_and(|x| x.path == home)), "its home's session: home");
 }
 
 /// ⌘P lists the threads; typing narrows them, and ⏎ opens the one picked.
@@ -545,7 +549,7 @@ fn dragging_a_row_reorders_its_list() {
     let (_, a) = rt.find("row-local-a").unwrap();
     let (_, b) = rt.find("row-local-b").unwrap();
     drag(&mut rt, "row-local-a", 2.0 * (b - a));
-    let shown: Vec<String> = super::folders::listed(&rt.state.snap.hosts[0]).placed().into_iter().map(|(t, _)| t).collect();
+    let shown: Vec<String> = super::folders::listed(&rt.state.snap.hosts[0], None).placed().into_iter().map(|(t, _)| t).collect();
     assert_eq!(shown, ["b", "c", "a"]);
     assert!(rt.state.row_drag.dragging().is_none(), "the drag is over");
     // A press that doesn't move is a click.
@@ -811,6 +815,8 @@ fn a_pane_takes_its_width_back_as_the_window_grows() {
 fn the_sidebars_title_is_on_the_title_bars_row() {
     let server = HcServer::new("rtitle");
     let mut rt = window(server.config());
+    rt.state.refresh();
+    assert!(wait_for(&mut rt, 10.0, |s| s.snap.hosts.first().is_some_and(|h| !h.home.is_empty())), "its home");
     for _ in 0..20 {
         rt.frame(1.0 / 60.0);
     }
@@ -826,13 +832,13 @@ fn the_sidebars_title_is_on_the_title_bars_row() {
     press(&mut rt, K::Escape, Mods::default());
     click(&mut rt, "new-thread");
     let asked = rt.state.prompt.as_ref().map(|p| p.what.clone());
-    assert_eq!(asked, Some(super::prompt::Ask::Start { agent: Some(Agent::Claude) }), "New thread opened");
+    assert!(matches!(asked, Some(super::prompt::Ask::NewThread { agent: Some(Agent::Claude), .. })), "Claude or a shell, asked: {asked:?}");
 }
 
-/// The sidebar shows one host at a time: with no thread on show, the first reached. Its name
-/// picks another, which shows though it has no thread to open.
+/// With no thread on show, the sidebar shows This Mac's home session. The list its name opens
+/// has each host's home, and New session…, which asks where.
 #[test]
-fn the_sidebar_shows_one_host_at_a_time() {
+fn the_sidebar_shows_one_session_at_a_time() {
     let server = HcServer::new("rlines");
     let mut cfg = server.config();
     let mut mac = crate::config::Host::new("mac", "local");
@@ -844,14 +850,17 @@ fn the_sidebar_shows_one_host_at_a_time() {
     for _ in 0..20 {
         rt.frame(1.0 / 60.0);
     }
-    let shown = |rt: &Runtime<Lemur>| ["host-section-local", "host-section-mac"].map(|k| rt.find(k).is_some());
+    let shown = |rt: &Runtime<Lemur>| ["session-local-~", "session-mac-~"].map(|k| rt.find(k).is_some());
     assert_eq!(shown(&rt), [true, false], "the first, threads or none");
-    click(&mut rt, "host-switch");
-    rt.resolve_popup(Some("mac")).expect("the hosts");
+    rt.update(|s, _| s.show_space(("mac".into(), "~".into())));
     for _ in 0..20 {
         rt.frame(1.0 / 60.0);
     }
     assert_eq!(shown(&rt), [false, true]);
+    click(&mut rt, "session-switch");
+    type_text(&mut rt, "new");
+    press(&mut rt, K::Enter, Mods::default());
+    assert!(rt.state.panels.picker.is_some(), "where a new one is");
 }
 
 /// The key that works from any app asks which thread to go to.

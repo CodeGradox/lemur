@@ -49,6 +49,11 @@ impl Lemur {
                 return;
             }
         }
+        // It shows, empty, till Claude or a shell starts in it.
+        self.space_shown = Some((host.name.clone(), path));
+        self.hide_shown(None);
+        self.active = None;
+        self.follow_shown();
         if new_host {
             self.cfg.hosts.push(host);
         }

@@ -164,8 +164,8 @@ impl Lemur {
         ;
     }
 
-    /// The gone threads of host `host`, to resume all at once.
-    pub(super) fn gone_on(&self, host: &str) -> Vec<ClaudeThread> {
-        self.host_view(host).map(|h| super::folders::listed(h).gone.into_iter().cloned().collect()).unwrap_or_default()
+    /// The gone threads of session `space`, to resume all at once.
+    pub(super) fn gone_in(&self, (host, path): &super::spaces::Space) -> Vec<ClaudeThread> {
+        self.host_view(host).map(|h| super::folders::listed(h, Some(path)).gone.into_iter().cloned().collect()).unwrap_or_default()
     }
 }

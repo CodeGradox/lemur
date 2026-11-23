@@ -197,10 +197,12 @@ impl Lemur {
         // The thread on show ended: another takes its place.
         let mut instead = None;
         if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
+            // With none to follow it there, the sidebar stays on its session.
+            if let Some(space) = self.space_of(&gone) {
+                self.space_shown = Some(space);
+            }
             self.active = None;
             instead = self.successor(&gone, self.prefs.thread_order, showable);
-            // With none to follow it there, the sidebar stays on its host.
-            self.host_shown = Some(gone.0.clone());
         }
         // What each thread did last. A host that can't be reached keeps its own.
         let before = std::mem::take(&mut self.seen);
@@ -266,8 +268,8 @@ impl Lemur {
 
     /// What shows once `gone`, the thread on show, has ended: by `order` the one opened last
     /// among the threads of its folder; else, and in the sidebar's order, its neighbour there,
-    /// the next first; else the one opened last on its host, never another host's, which
-    /// the sidebar doesn't show. `live` says what still runs.
+    /// the next first; else the one opened last in its session, never another's, which the
+    /// sidebar doesn't show. `live` says what still runs.
     pub(super) fn successor(&self, gone: &Key, order: ThreadOrder, live: impl Fn(&Key) -> bool) -> Option<Key> {
         let with = self.siblings(gone);
         let at = with.iter().position(|k| k == gone).unwrap_or(with.len());
@@ -278,7 +280,10 @@ impl Lemur {
             .filter(|k| *k != gone && live(k))
             .find(|k| order == ThreadOrder::Recent && with.contains(k))
             .or_else(|| after.chain(before).find(|k| live(k)))
-            .or_else(|| self.recent.iter().find(|k| *k != gone && k.0 == gone.0 && live(k)))
+            .or_else(|| {
+                let space = self.space_of(gone);
+                self.recent.iter().find(|k| *k != gone && space.is_some() && self.space_of(k) == space && live(k))
+            })
             .cloned()
     }
 
@@ -311,7 +316,6 @@ impl Lemur {
         }
         self.bring_back(&key);
         self.active = Some(key.clone());
-        self.host_shown = None;
         // Its row scrolls into view, shown again or not (`reveal_row`).
         self.revealed = None;
         if let Some(view) = self.terminals.get_mut(&key) {
@@ -327,12 +331,16 @@ impl Lemur {
     /// A spotlight, the folder picker, the palette, a diff, a dialog or a peek is over the
     /// window: what would open another over it, or move the keyboard from it, waits.
     pub fn overlaid(&self) -> bool {
-        self.prompt.is_some() || self.dialog.is_some() || self.peek.is_some() || self.panels_overlaid()
+        self.prompt.is_some() || self.dialog.is_some() || self.peek.is_some() || self.panels_overlaid() || self.session_switch.is_open()
     }
 
     /// Escape: closes what's over the window, front first. True if something was.
     pub(super) fn close_overlay(&mut self) -> bool {
         if self.dialog.take().is_some() {
+            return true;
+        }
+        if self.session_switch.is_open() {
+            self.session_switch.close();
             return true;
         }
         if self.prompt.take().is_some() {
@@ -424,8 +432,8 @@ impl Lemur {
 
     /// Moves row `from` of a host's rows, its threads' and its folders', to `to`: the
     /// sidebar shows the new order at once, and herdr-core keeps it (`drop_row`).
-    pub fn reorder(&mut self, (host, _): List, from: usize, to: usize) {
-        self.drop_row(&host, from, to);
+    pub fn reorder(&mut self, list: List, from: usize, to: usize) {
+        self.drop_row(&list, from, to);
     }
 
     /// Has herdr-core keep the threads of `list` in `names`' order, each in its folder.
@@ -453,7 +461,8 @@ impl Lemur {
         let Some(at) = tabs.iter().position(|k| *k == active) else { return };
         let next = if back { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < tabs.len()) };
         let Some(next) = next else { return };
-        let list = Self::host_list(&active.0);
+        let Some(space) = self.space_of(&active) else { return };
+        let list = Self::space_list(&space);
         let (Some(from), Some(to)) = (self.row_of(&list, &active.1), self.row_of(&list, &tabs[next].1)) else { return };
         self.reorder(list, from, to);
     }
@@ -670,13 +679,12 @@ impl Lemur {
         });
     }
 
-    /// ⌘1 to ⌘9: shows thread `i` of the folder on show, if it has one.
+    /// ⌘1 to ⌘9: shows the sidebar's thread `i`, from the top, if it has one.
     pub fn go_to_tab(&mut self, i: usize) {
         if self.overlaid() {
             return;
         }
-        let Some(active) = self.active.clone() else { return };
-        if let Some((host, session)) = self.siblings(&active).get(i).cloned() {
+        if let Some((host, session)) = self.sidebar_threads().get(i).cloned() {
             self.open(host, session);
         }
     }

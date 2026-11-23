@@ -1,16 +1,18 @@
-//! Folders of a host's threads, in the sidebar, as Rex keeps a host's sessions: every thread
-//! is in one. A shell started as a new folder (⇧⌘N, a host's +) has one of its own; a thread
-//! started beside another (⌘K, ⌘T, ⌘J) goes in that one's. A folder you haven't named goes
+//! Folders of a session's threads (`spaces`), in the sidebar, as Rex keeps a host's sessions:
+//! every thread is in one. A shell started as a new folder (⇧⌘N, the session's +) has one of
+//! its own; a thread started beside another (⌘T, ⌘J) goes in that one's. Folder ids are the
+//! host's, whichever session. A folder you haven't named goes
 //! by two words of its own, as Rex's sessions do (`calm-heron`), or, as Settings has it, by
 //! the folder of the worktree its Claude works in. Dragged, a thread takes another place, in another folder or, above them all, one
 //! of its own; a folder another place among the folders, its threads with it. herdr-core
 //! keeps which folder each thread is in (`lemur.folder`) and its place (`lemur.order`);
 //! Lemur's config the folders you named or folded.
 
+use super::spaces::Space;
 use super::{Key, Lemur, List};
 use crate::actions::name_from;
 use crate::config::{ClaudeThread, Config, Folder, FolderNames, leaf};
-use crate::snapshot::{HostView, Session, find_worktree, rank};
+use crate::snapshot::{HOME, HostView, Session, find_worktree, rank};
 use std::collections::{HashMap, HashSet};
 
 /// What starts the folder of a thread on its own, before its address: no folder's id does.
@@ -44,10 +46,12 @@ pub enum Item {
     Folder(String),
 }
 
-/// Host `h`'s threads, from every project and none, in their order.
-pub fn listed(h: &HostView) -> Listed<'_> {
+/// Host `h`'s threads in session `space` (a project's path, or `HOME`), or with none in
+/// every one, in their order.
+pub fn listed<'a>(h: &'a HostView, space: Option<&str>) -> Listed<'a> {
     let worktrees = || h.bases.iter().flat_map(|b| &b.worktrees);
-    let mut all: Vec<&Session> = worktrees().flat_map(|w| &w.sessions).chain(&h.other).collect();
+    let in_space = |s: &&Session| space.is_none_or(|p| s.space == p);
+    let mut all: Vec<&Session> = worktrees().flat_map(|w| &w.sessions).chain(&h.other).filter(in_space).collect();
     all.sort_by(|x, y| rank(x).cmp(&rank(y)));
     let (away, shown): (Vec<&Session>, Vec<&Session>) = all.into_iter().partition(|s| s.away);
     let mut groups: Vec<Group> = vec![];
@@ -58,7 +62,11 @@ pub fn listed(h: &HostView) -> Listed<'_> {
             None => groups.push(Group { id, threads: vec![s] }),
         }
     }
-    Listed { groups, away, gone: worktrees().flat_map(|w| &w.gone).chain(&h.gone).collect() }
+    // A thread kept to resume is in the session of where it ran.
+    let gone_in = |p: &str| space.is_none_or(|s| s == p);
+    let gone_there = h.bases.iter().filter(|b| gone_in(&b.path)).flat_map(|b| &b.worktrees).flat_map(|w| &w.gone);
+    let gone_home = h.gone.iter().filter(|_| gone_in(HOME));
+    Listed { groups, away, gone: gone_there.chain(gone_home).collect() }
 }
 
 impl Listed<'_> {
@@ -229,39 +237,9 @@ impl Lemur {
         self.snap.hosts.iter().find(|h| h.name == host)
     }
 
-    /// The host whose folders the sidebar shows, as Rex shows a host's sessions, one at a
-    /// time: the thread on show's, else the one picked or shown last, else the first
-    /// reached.
-    pub(super) fn shown_host(&self) -> Option<&HostView> {
-        let wanted = self.active.as_ref().map(|(h, _)| h).or(self.host_shown.as_ref());
-        wanted
-            .and_then(|h| self.host_view(h))
-            .or_else(|| self.recent.iter().find_map(|(h, _)| self.host_view(h)))
-            .or_else(|| self.snap.hosts.iter().find(|h| h.error.is_none()))
-            .or(self.snap.hosts.first())
-    }
-
-    /// Shows host `host`'s folders in the sidebar, and the thread of its opened last, else
-    /// its first; with none, nothing till one starts.
-    pub(super) fn show_host(&mut self, host: &str) {
-        if self.shown_host().is_some_and(|h| h.name == host) {
-            return;
-        }
-        let Some(h) = self.host_view(host) else { return };
-        let threads: Vec<String> = listed(h).groups.iter().flat_map(|g| g.threads.iter().map(|s| s.name.clone())).collect();
-        let last = self.recent.iter().find(|(x, s)| x == host && threads.contains(s)).map(|(_, s)| s.clone());
-        if let Some(session) = last.or_else(|| threads.first().cloned()) {
-            return self.open(host.to_string(), session);
-        }
-        self.hide_shown(None);
-        self.active = None;
-        self.host_shown = Some(host.to_string());
-        self.follow_shown();
-    }
-
-    /// The list a host's rows are, as dragging keys it.
-    pub(super) fn host_list(host: &str) -> List {
-        (host.to_string(), None)
+    /// The list session `space`'s rows are, as dragging keys it.
+    pub(super) fn space_list((host, path): &Space) -> List {
+        (host.clone(), Some(path.clone()))
     }
 
     /// Whether folder `id` of `host`'s is folded to its row.
@@ -275,7 +253,11 @@ impl Lemur {
     pub(super) fn folder_titles(&self, h: &HostView, groups: &[Group]) -> Vec<String> {
         let kept = self.cfg.host(&h.name).map(|c| c.folders.as_slice()).unwrap_or_default();
         let named = |id: &str| kept.iter().find(|f| f.id == id).and_then(|f| f.name.clone());
-        let titles = groups.iter().zip(word_names(groups)).map(|(g, words)| match self.prefs.folder_names {
+        // Two words none of the host's other folders have, in whichever session.
+        let all = listed(h, None).groups;
+        let mut words: HashMap<String, String> = all.iter().map(|g| g.id.clone()).zip(word_names(&all)).collect();
+        let titles = groups.iter().map(|g| (g, words.remove(&g.id).unwrap_or_else(|| name_from(g.id.trim_start_matches(OWN)))));
+        let titles = titles.map(|(g, words)| match self.prefs.folder_names {
             FolderNames::Random => words,
             FolderNames::Worktree => {
                 let first = g.threads.iter().find(|s| s.runs_claude()).or(g.threads.first());
@@ -288,14 +270,14 @@ impl Lemur {
     /// What folder `id` of `host`'s is called, as the sidebar shows it.
     pub(super) fn folder_name(&self, host: &str, id: &str) -> String {
         let Some(h) = self.host_view(host) else { return String::new() };
-        let groups = listed(h).groups;
+        let groups = listed(h, None).groups;
         let Some(at) = groups.iter().position(|g| g.id == id) else { return String::new() };
         self.folder_titles(h, &groups).swap_remove(at)
     }
 
     /// Thread `name`'s row among the rows a drag moves in `list`, folders' rows counted.
-    pub(super) fn row_of(&self, (host, _): &List, name: &str) -> Option<usize> {
-        let l = listed(self.host_view(host)?);
+    pub(super) fn row_of(&self, (host, space): &List, name: &str) -> Option<usize> {
+        let l = listed(self.host_view(host)?, space.as_deref());
         l.items(|id| self.folded(host, id)).iter().position(|i| *i == Item::Thread(name.to_string()))
     }
 
@@ -303,26 +285,30 @@ impl Lemur {
     pub(super) fn group_of(&self, key: &Key) -> Vec<String> {
         let (Some(h), Some(s)) = (self.host_view(&key.0), self.session_of(key)) else { return vec![] };
         let id = folder_of(s);
-        let l = listed(h);
+        let l = listed(h, Some(&s.space));
         l.groups.iter().find(|g| g.id == id).map(|g| g.threads.iter().map(|s| s.name.clone()).collect()).unwrap_or_default()
     }
 
-    /// Row `from` of `host`'s rows was dragged to `to`: a thread takes its new place, in a
-    /// folder or one of its own, or a folder its place among the folders.
-    pub(super) fn drop_row(&mut self, host: &str, from: usize, to: usize) {
+    /// Row `from` of the rows of `list`, a session's, was dragged to `to`: a thread takes its
+    /// new place, in a folder or one of its own, or a folder its place among the folders.
+    pub(super) fn drop_row(&mut self, list: &List, from: usize, to: usize) {
+        let host = list.0.as_str();
         let Some(h) = self.host_view(host) else { return };
-        let l = listed(h);
+        let l = listed(h, list.1.as_deref());
         let folded = |id: &str| self.folded(host, id);
         let mut threads = moved(&l.items(folded), &l.hidden(folded), from, to);
         threads.extend(l.away.iter().map(|s| (s.name.clone(), folder_of(s))));
-        self.place_threads(host, threads);
+        self.place_threads(list, threads);
     }
 
-    /// Shows `host`'s threads in `threads`' order and folders at once, and has herdr-core
-    /// keep them.
-    fn place_threads(&mut self, host: &str, threads: Vec<(String, String)>) {
+    /// Shows the threads of `list`, a session's, in `threads`' order and folders at once, and
+    /// has herdr-core keep them.
+    fn place_threads(&mut self, list: &List, threads: Vec<(String, String)>) {
+        let host = list.0.as_str();
         let words = self.word_names(host);
-        let mut taken: Vec<String> = threads.iter().map(|(_, f)| f.clone()).collect();
+        // Ids of the host's, in whichever session.
+        let others: Vec<String> = self.host_view(host).map(|h| listed(h, None).placed().into_iter().map(|(_, f)| f).collect()).unwrap_or_default();
+        let mut taken: Vec<String> = threads.iter().map(|(_, f)| f.clone()).chain(others).collect();
         let threads = settled(threads, |own| {
             let words = words.get(own).cloned().unwrap_or_else(|| name_from(own.trim_start_matches(OWN)));
             let id = fresh(&words, |id| taken.iter().any(|f| f == id));
@@ -335,16 +321,15 @@ impl Lemur {
                 s.folder = (!folder.is_empty()).then(|| folder.clone());
             }
         }
-        self.write_places(Self::host_list(host), threads);
+        self.write_places(list.clone(), threads);
     }
 
     /// Puts thread `key` at the end of folder `folder` of its host's, or with `None` in a
     /// folder of its own, last.
     pub(super) fn move_to_folder(&mut self, key: &Key, folder: Option<&str>) {
-        let Some(h) = self.host_view(&key.0) else { return };
-        let threads = refiled(&listed(h).placed(), &key.1, folder);
-        let host = key.0.clone();
-        self.place_threads(&host, threads);
+        let (Some(h), Some(space)) = (self.host_view(&key.0), self.space_of(key)) else { return };
+        let threads = refiled(&listed(h, Some(&space.1)).placed(), &key.1, folder);
+        self.place_threads(&Self::space_list(&space), threads);
         self.reveal(&key.0, &key.1);
     }
 
@@ -358,14 +343,14 @@ impl Lemur {
     /// The two words each folder of `host`'s goes by, by its id.
     fn word_names(&self, host: &str) -> HashMap<String, String> {
         let Some(h) = self.host_view(host) else { return HashMap::new() };
-        let groups = listed(h).groups;
+        let groups = listed(h, None).groups;
         groups.iter().map(|g| g.id.clone()).zip(word_names(&groups)).collect()
     }
 
     /// Gives thread `key`, on its own, a folder of its own, by the two words its folder goes
     /// by already: it shows at once, and herdr-core keeps it.
     fn own_folder(&mut self, key: &Key) -> String {
-        let used: Vec<String> = self.host_view(&key.0).map(|h| listed(h).placed().into_iter().map(|(_, f)| f).collect()).unwrap_or_default();
+        let used: Vec<String> = self.host_view(&key.0).map(|h| listed(h, None).placed().into_iter().map(|(_, f)| f).collect()).unwrap_or_default();
         let own = format!("{OWN}{}", key.1);
         let words = self.word_names(&key.0).remove(&own).unwrap_or_else(|| name_from(&key.1));
         let id = fresh(&words, |id| used.iter().any(|f| f == id));
@@ -443,7 +428,7 @@ impl Lemur {
         let reached: Vec<String> = self.snap.hosts.iter().filter(|h| h.error.is_none()).map(|h| h.name.clone()).collect();
         for host in reached {
             let Some(h) = self.host_view(&host) else { continue };
-            let used: Vec<String> = listed(h).placed().into_iter().map(|(_, f)| f).collect();
+            let used: Vec<String> = listed(h, None).placed().into_iter().map(|(_, f)| f).collect();
             let Some(h) = self.cfg.hosts.iter_mut().find(|h| h.name == host) else { continue };
             let kept = h.folders.len();
             h.folders.retain(|f| used.contains(&f.id));

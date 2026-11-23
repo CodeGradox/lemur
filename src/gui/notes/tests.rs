@@ -478,6 +478,7 @@ fn session(name: &str) -> Session {
         issue: None,
         folder: None,
         color: None,
+        space: crate::snapshot::HOME.into(),
     }
 }
 
@@ -501,7 +502,7 @@ fn snapshot(worktrees: &[(&str, &str, &[&str])]) -> Snapshot {
             needs_you: false,
             home: String::new(),
             machine: Default::default(),
-            bases: vec![BaseView { index: 0, error: None, worktrees, plain: false }],
+            bases: vec![BaseView { index: 0, path: String::new(), error: None, worktrees, plain: false }],
             other: vec![],
             gone: vec![],
         }],

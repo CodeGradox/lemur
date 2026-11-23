@@ -88,7 +88,7 @@ fn core_order(cfg: &Config) -> Vec<String> {
 
 /// The order the sidebar shows the first host's threads in, those put away last.
 fn other(s: &Lemur) -> Vec<String> {
-    s.snap.hosts.first().map(|h| super::folders::listed(h).placed().into_iter().map(|(t, _)| t).collect()).unwrap_or_default()
+    s.snap.hosts.first().map(|h| super::folders::listed(h, None).placed().into_iter().map(|(t, _)| t).collect()).unwrap_or_default()
 }
 
 /// A repository `name` in `dir` on branch `branch`, with a commit, and a worktree for each
@@ -722,7 +722,7 @@ fn gone_threads_resume_their_claude() {
         wait_until(Duration::from_secs(5), || server.hc(&["read", &session]).contains(text))
     };
 
-    rt.update(|s, _| s.ask_name(Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(Agent::Claude), folder: None }));
+    rt.update(|s, _| s.ask_name(Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(Agent::Claude), folder: None, space: path.clone() }));
     frames(&mut rt, 2);
     type_text(&mut rt, "claude");
     press(&mut rt, K::Enter, Mods::default());
@@ -737,6 +737,9 @@ fn gone_threads_resume_their_claude() {
     let resumed = format!("claude --resume {}", thread.claude_session);
 
     restart(&mut rt);
+    // In its project's session, which ⌘K shows.
+    rt.update(|s, _| s.show_space(("local".into(), path.clone())));
+    frames(&mut rt, 20);
     assert!(!shows(&rt, &format!("row-local-{}", thread.session)));
     click(&mut rt, &format!("gone-local-{}", thread.session));
     assert!(wait_for(&mut rt, 10.0, |s| kept(s).first().is_some_and(|t| t.session != thread.session)), "in a new terminal");
@@ -748,7 +751,7 @@ fn gone_threads_resume_their_claude() {
 
     restart(&mut rt);
     rt.update(|s, _| {
-        let gone = s.gone_on("local");
+        let gone = s.gone_in(&("local".into(), path.clone()));
         assert_eq!(gone.len(), 1);
         s.resume(gone);
     });
@@ -769,7 +772,7 @@ fn gone_threads_resume_their_claude() {
     // Forgotten, it's gone for good.
     rt.update(|s, _| s.keep_thread(thread.clone()));
     let gone = format!("gone-local-{}", thread.session);
-    assert!(refreshing(&mut rt, 10.0, |s| !s.gone_on("local").is_empty()), "back as gone");
+    assert!(refreshing(&mut rt, 10.0, |s| !s.gone_in(&("local".into(), path.clone())).is_empty()), "back as gone");
     frames(&mut rt, 20);
     assert!(shows(&rt, &gone));
     rt.update(|s, _| s.forget_threads("local", std::slice::from_ref(&thread.session)));
@@ -810,11 +813,11 @@ fn refreshes_keep_claude_ids_current() {
     assert_eq!(kept(&rt.state), [("c".into(), id(2))], "renamed by hand");
 }
 
-/// v2 `cmd_j_starts_beside_a_thread_outside_every_project`: outside every project, ⌘J
-/// starts where the thread on show runs, as it does in a worktree, with the threads there
-/// first among those to go to.
+/// v2 `cmd_j_starts_beside_a_thread_outside_every_project`, sessions since: outside every
+/// project, ⌘J starts in the folder of the session of the thread on show, its host's home,
+/// wherever that one runs, with the session's threads among those to go to.
 #[test]
-fn cmd_j_starts_beside_a_thread_outside_every_project() {
+fn cmd_j_starts_in_the_folder_of_the_session_on_show() {
     let server = HcServer::new("pa-cmdj");
     let dir = TempDir::new("pa-cmdj");
     let here = path_of(&dir);
@@ -826,10 +829,14 @@ fn cmd_j_starts_beside_a_thread_outside_every_project() {
 
     press(&mut rt, K::Command('j'), cmd());
     let prompt = rt.state.prompt.as_ref().expect("asking");
+    let home = rt.state.snap.hosts[0].home.clone();
     let Ask::NewThread { host, base, dir: at, agent, .. } = &prompt.what else { panic!("not a new thread: {:?}", prompt.what) };
-    assert_eq!((host.as_str(), *base, at.as_str(), *agent), ("local", None, here.as_str(), Some(Agent::Claude)));
-    let listed: Vec<String> = rt.state.matches(prompt).into_iter().map(|m| m.key.1).collect();
-    assert_eq!(listed, [mine.clone(), elsewhere.clone()], "those here first");
+    assert_eq!((host.as_str(), *base, at.as_str(), *agent), ("local", None, home.as_str(), Some(Agent::Claude)));
+    let mut listed: Vec<String> = rt.state.matches(prompt).into_iter().map(|m| m.key.1).collect();
+    listed.sort();
+    let mut both = [mine.clone(), elsewhere.clone()];
+    both.sort();
+    assert_eq!(listed, both, "the session's");
 
     press(&mut rt, K::Down, Mods::default());
     press(&mut rt, K::Down, Mods::default());
@@ -839,7 +846,8 @@ fn cmd_j_starts_beside_a_thread_outside_every_project() {
     assert!(wait_for(&mut rt, 10.0, |_| server.addresses().len() == 3), "{:?}", rt.state.status);
     let terminals = server.core().terminals();
     let new = terminals.iter().find(|t| t.address != mine && t.address != elsewhere).unwrap();
-    assert_eq!(new.cwd, here);
+    assert_eq!(new.cwd, home);
+    assert_eq!(new.labels.get(snapshot::SESSION).map(String::as_str), Some(snapshot::HOME));
     let label = |k: &str| new.labels.get(k).map(String::as_str);
     assert_eq!(label(crate::snapshot::LABEL), Some("beside"));
     assert_eq!(label(crate::snapshot::KIND), Some("shell"));
@@ -869,54 +877,66 @@ fn names_are_asked_for_in_the_spotlight() {
     assert!(rt.state.prompt.is_none());
 }
 
-/// ⌘K starts Claude or a shell in a project picked, or a host's home, as Rex starts a tab:
-/// in the folder of the thread on show, which gets one if it was on its own; with none on
-/// show, in a folder of its own. Typing narrows the projects down.
+/// A session is a folder on a machine: each host's home, and each project. ⌘K switches to
+/// another, the ones shown last first, the one shown last of all; one with no threads shows
+/// none. ⌘J and ⌘T start Claude or a shell in its folder, beside the thread on show; ⇧⌘N a
+/// shell in the machine's home, in a folder of its own, still in the session.
 #[test]
-fn a_new_thread_starts_in_a_project_beside_the_one_on_show() {
+fn cmd_k_switches_sessions_and_threads_start_in_theirs() {
     let server = HcServer::new("pa-start");
     let dir = TempDir::new("pa-start");
     let api = path_of(&repo(&dir, "api", "main", &[]));
     let web = path_of(&repo(&dir, "web", "main", &[]));
+    let t = server.run(&api, &["lemur.label=t"], &["sleep", "600"]);
     let mut cfg = server.config();
     cfg.bases.push(Base::new("local", &api));
     cfg.bases.push(Base::new("local", &web));
     let mut rt = loaded_with(cfg);
-    press(&mut rt, K::Command('k'), cmd());
-    let prompt = rt.state.prompt.as_ref().expect("asking");
-    assert_eq!(prompt.what, Ask::Start { agent: Some(Agent::Claude) });
-    let labels = |s: &Lemur| s.places(s.prompt.as_ref().unwrap()).into_iter().map(|p| p.label).collect::<Vec<_>>();
-    let all = labels(&rt.state);
-    assert_eq!(all[..2], ["api", "web"], "{all:?}");
-    assert_eq!(all.last().map(String::as_str), Some("Add project…"));
-    type_text(&mut rt, "web");
-    assert_eq!(labels(&rt.state), ["web", "Add project…"]);
+    let ready = |s: &Lemur| s.session_of(&key(&t)).is_some() && s.snap.hosts[0].bases.iter().all(|b| !b.worktrees.is_empty());
+    assert!(refreshing(&mut rt, 10.0, ready));
+    open(&mut rt, &t);
+    assert_eq!(rt.state.shown_space(), Some(("local".to_string(), api.clone())), "where it runs");
 
-    rt.update(|s, _| s.pick_kind(None));
-    let before = server.addresses();
+    press(&mut rt, K::Command('k'), cmd());
+    assert_eq!(rt.state.prompt.as_ref().map(|p| p.what.clone()), Some(Ask::Switch));
+    let names = |s: &Lemur| s.switchable(s.prompt.as_ref().unwrap()).into_iter().map(|v| v.map_or("new".to_string(), |v| v.name)).collect::<Vec<_>>();
+    assert_eq!(names(&rt.state), ["Home", "web", "api", "new"], "the one shown last");
+    type_text(&mut rt, "web");
+    assert_eq!(names(&rt.state), ["web", "new"]);
     press(&mut rt, K::Enter, Mods::default());
-    let started = |before: &[String]| server.addresses().into_iter().find(|x| !before.contains(x));
-    assert!(wait_for(&mut rt, 10.0, |_| started(&before).is_some()), "{:?}", rt.state.status);
-    let first = started(&before).unwrap();
-    let terminals = server.core().terminals();
-    let t = terminals.iter().find(|x| x.address == first).unwrap();
-    assert_eq!(t.cwd, web);
-    assert_eq!(t.labels.get("lemur.kind").map(String::as_str), Some("shell"));
-    assert_eq!(t.labels.get("lemur.folder"), None, "none on show: a folder of its own");
-    assert!(wait_for(&mut rt, 10.0, |s| s.active == Some(key(&first))), "it shows");
-    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&first)).is_some()));
+    assert_eq!(rt.state.active, None, "nothing runs in it yet");
+    assert_eq!(rt.state.shown_space(), Some(("local".to_string(), web.clone())));
+
+    let started = |before: &[String]| server.core().terminals().into_iter().find(|x| !before.contains(&x.address));
+    let start = |rt: &mut Runtime<Lemur>, go: &dyn Fn(&mut Runtime<Lemur>)| {
+        let before = server.addresses();
+        go(rt);
+        assert!(wait_for(rt, 10.0, |_| started(&before).is_some()), "{:?}", rt.state.status);
+        let t = started(&before).unwrap();
+        assert!(wait_for(rt, 10.0, |s| s.active == Some(key(&t.address))), "it shows");
+        assert!(refreshing(rt, 10.0, |s| s.session_of(&key(&t.address)).is_some()));
+        t
+    };
+    let first = start(&mut rt, &|rt| {
+        press(rt, K::Command('j'), cmd());
+        rt.update(|s, _| s.pick_kind(None));
+        press(rt, K::Enter, Mods::default());
+    });
+    assert_eq!((first.cwd.as_str(), first.labels.get(snapshot::SESSION).map(String::as_str)), (web.as_str(), Some(web.as_str())));
+    let second = start(&mut rt, &|rt| press(rt, K::Command('t'), cmd()));
+    assert_eq!(second.cwd, web);
+    assert_eq!(folder_of(&server, &second.address), folder_of(&server, &first.address), "beside it");
+    let home = rt.state.snap.hosts[0].home.clone();
+    let third = start(&mut rt, &|rt| press(rt, K::Command('n'), Mods { shift: true, ..cmd() }));
+    assert_eq!(third.cwd, home, "the machine's home");
+    assert_eq!(third.labels.get(snapshot::FOLDER), None, "a folder of its own");
+    assert_eq!(rt.state.shown_space(), Some(("local".to_string(), web.clone())), "still the session's");
+    assert_eq!(rt.state.space_threads(&("local".into(), web.clone())).len(), 3);
 
     press(&mut rt, K::Command('k'), cmd());
     type_text(&mut rt, "api");
-    rt.update(|s, _| s.pick_kind(None));
-    let before = server.addresses();
     press(&mut rt, K::Enter, Mods::default());
-    assert!(wait_for(&mut rt, 10.0, |_| started(&before).is_some()), "{:?}", rt.state.status);
-    let second = started(&before).unwrap();
-    let made = folder_of(&server, &first);
-    assert!(!made.is_empty(), "the one on show got a folder");
-    assert_eq!(folder_of(&server, &second), made, "beside it");
-    assert!(refreshing(&mut rt, 10.0, |s| s.siblings(&key(&first)).contains(&key(&second))), "a tab beside its");
+    assert_eq!(rt.state.active, Some(key(&t)), "its thread opened last");
 }
 
 /// Project `path` on the test's host, and its folder `f1` named `name`, folded or not.
@@ -1313,10 +1333,10 @@ fn a_terminal_started_beside_a_thread_joins_its_folder() {
     assert!(refreshing(&mut rt, 10.0, |s| s.siblings(&key(&b)).contains(&key(&other))));
 }
 
-/// ⌃Tab goes through every thread on the host of the one on show, as the sidebar lists them:
-/// each folder's, folded too, whatever project they run in.
+/// ⌃Tab goes through every thread of the session of the one on show, as the sidebar lists
+/// them: each folder's, folded too, one started in it wherever it runs, and none of another.
 #[test]
-fn ctrl_tab_goes_through_the_whole_host() {
+fn ctrl_tab_goes_through_the_whole_session() {
     let server = HcServer::new("pa-hostcycle");
     let dir = TempDir::new("pa-hostcycle");
     let api = path_of(&repo(&dir, "api", "main", &[]));
@@ -1325,19 +1345,20 @@ fn ctrl_tab_goes_through_the_whole_host() {
     let b = server.run(&api, &["lemur.label=b", "lemur.folder=f1", "lemur.order=1"], &["sleep", "600"]);
     let c = server.run(&web, &["lemur.label=c"], &["sleep", "600"]);
     let d = server.run("/", &["lemur.label=d"], &["sleep", "600"]);
+    let e = server.run("/", &["lemur.label=e", &format!("lemur.session={api}"), "lemur.order=2"], &["sleep", "600"]);
     let mut cfg = with_folder(&server, &api, "work", true);
     cfg.bases.push(Base::new("local", &web));
     let mut rt = loaded_with(cfg);
-    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b, &c, &d].iter().all(|t| s.session_of(&key(t)).is_some())));
-    let order: Vec<String> = rt.state.host_threads("local").into_iter().map(|(_, t)| t).collect();
-    assert_eq!(order, [a.clone(), b.clone(), c.clone(), d.clone()], "a folded folder's too");
+    assert!(refreshing(&mut rt, 10.0, |s| [&a, &b, &c, &d, &e].iter().all(|t| s.session_of(&key(t)).is_some())));
+    let order: Vec<String> = rt.state.space_threads(&("local".into(), api.clone())).into_iter().map(|(_, t)| t).collect();
+    assert_eq!(order, [a.clone(), b.clone(), e.clone()], "a folded folder's too, and one started in it elsewhere");
     open(&mut rt, &a);
     let mut seen = vec![];
-    for _ in 0..4 {
+    for _ in 0..3 {
         rt.update(|s, tx| s.cycle_threads(false, tx));
         seen.push(rt.state.active.clone().unwrap().1);
     }
-    assert_eq!(seen, [b, c, d, a]);
+    assert_eq!(seen, [b, e, a]);
 }
 
 /// A folder dragged below the next takes its threads along.
@@ -1472,6 +1493,7 @@ fn a_folder_goes_by_words_of_its_own_or_its_worktree() {
     let at_home = server.run(&home, &["lemur.label=home"], &["sleep", "600"]);
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&at_home)).is_some()));
     assert_eq!(rt.state.folder_name("local", &format!("={at_home}")), "~");
+    rt.update(|s, _| s.show_space(("local".into(), main.clone())));
     frames(&mut rt, 20);
     let label = info(&rt, "folder-local-f1/label").and_then(|e| e.text);
     assert_eq!(label.as_deref(), Some("auth"));

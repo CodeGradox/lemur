@@ -113,7 +113,8 @@ fn kill_program(server: &HcServer, address: &str) {
 fn project_snapshot(threads: &[&str], machine: crate::machine::Reading) -> Snapshot {
     let sessions = |names: &[&str]| -> Vec<Session> {
         let pairs: Vec<_> = names.iter().map(|n| (*n, Activity::Idle)).collect();
-        made_up(&pairs).hosts.remove(0).other
+        let threads = made_up(&pairs).hosts.remove(0).other;
+        threads.into_iter().map(|s| Session { space: "/srv/api".into(), ..s }).collect()
     };
     let worktree = |path: &str, branch: &str, main: bool, threads: &[&str]| Worktree {
         path: path.into(),
@@ -132,6 +133,7 @@ fn project_snapshot(threads: &[&str], machine: crate::machine::Reading) -> Snaps
             machine,
             bases: vec![BaseView {
                 index: 0,
+                path: "/srv/api".into(),
                 error: None,
                 plain: false,
                 worktrees: vec![
@@ -180,6 +182,105 @@ fn cmd_digits_show_the_folders_threads_by_their_place() {
     frames(&mut rt, 20);
     press(&mut rt, K::Command('9'), cmd());
     assert_eq!(shown(&rt), rows[4], "no ninth thread now");
+}
+
+/// ⌘1 to ⌘9 go down the sidebar's threads, folder after folder; a folded folder's don't
+/// count, as they don't show.
+#[test]
+fn cmd_digits_go_down_the_sidebar_across_folders() {
+    let server = HcServer::new("pdigitsf");
+    let mut rt = window(server.config());
+    let names = ["t0", "t1", "t2", "t3", "t4"];
+    let mut snap = made_up(&names.map(|n| (n, Activity::Idle)));
+    for (i, s) in snap.hosts[0].other.iter_mut().enumerate() {
+        s.folder = Some(["a", "a", "b", "b", "c"][i].into());
+    }
+    rt.state.cfg.hosts[0].folders.push(crate::config::Folder { id: "c".into(), name: None, collapsed: true });
+    rt.update(|s, _| s.set_snapshot(snap));
+    frames(&mut rt, 2);
+    let go = |rt: &mut Runtime<Lemur>, n: char| {
+        press(rt, K::Command(n), cmd());
+        rt.state.active.clone().map(|(_, s)| s)
+    };
+    assert_eq!(go(&mut rt, '1').as_deref(), Some("t0"), "from nothing on show");
+    assert_eq!(go(&mut rt, '3').as_deref(), Some("t2"), "the next folder's first");
+    assert_eq!(go(&mut rt, '4').as_deref(), Some("t3"));
+    assert_eq!(go(&mut rt, '5').as_deref(), Some("t3"), "folded: not a place");
+}
+
+/// ⌘., or the eye over the sidebar, has the sidebar list every agent's thread, whatever its
+/// session, without what it runs to help it; ⌘1 goes down them. Again, the session shows.
+#[test]
+fn cmd_period_lists_every_agent_in_the_sidebar() {
+    let server = HcServer::new("pagentsbar");
+    let mut rt = window(server.config());
+    let mut snap = made_up(&[("claude", Activity::Working), ("shell", Activity::Unknown), ("elsewhere", Activity::Idle)]);
+    let threads = &mut snap.hosts[0].other;
+    threads[0].helpers = vec![snapshot::Helper { id: "sub".into(), label: "a subagent".into(), activity: Activity::Working, terminal: false, depth: 0 }];
+    threads[2].space = "/srv/web".into();
+    rt.update(|s, _| s.set_snapshot(snap));
+    open(&mut rt, "shell");
+    frames(&mut rt, 20);
+    assert!(rt.find("row-local-shell").is_some() && rt.find("sidebar-agent-0").is_none());
+
+    press(&mut rt, K::Command('.'), cmd());
+    frames(&mut rt, 20);
+    assert!(rt.state.sidebar_agents);
+    let listed: Vec<&str> = rt.state.sidebar_agent_threads().into_iter().map(|(_, t)| t.name.as_str()).collect();
+    assert_eq!(listed, ["claude", "elsewhere"], "every session's, no shell");
+    let rows: Vec<bool> = (0..3).map(|i| rt.find(&format!("sidebar-agent-{i}")).is_some()).collect();
+    assert_eq!(rows, [true, true, false], "a row each, none for the subagent");
+    assert!(rt.find("row-local-shell").is_none(), "not the session's rows");
+    press(&mut rt, K::Command('2'), cmd());
+    assert_eq!(rt.state.active, Some(key("elsewhere")), "the second there");
+
+    click(&mut rt, "sidebar-agents");
+    frames(&mut rt, 20);
+    assert!(!rt.state.sidebar_agents);
+    assert_eq!(rt.state.shown_space(), Some(("local".to_string(), "/srv/web".to_string())), "its session");
+}
+
+/// With All Sessions in Sidebar, from the command palette, the sidebar lists every session,
+/// each in a section under its name, a line between them, and ⌘1 to ⌘9 go down them all;
+/// again, the one on show alone. The config keeps it.
+#[test]
+fn every_session_can_show_at_once() {
+    let server = HcServer::new("pallspaces");
+    let dir = TempDir::new("pallspaces");
+    let (api, web) = (dir.join("api"), dir.join("web"));
+    for d in [&api, &web] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let (api, web) = (api.to_string_lossy().into_owned(), web.to_string_lossy().into_owned());
+    let here = server.run("/", &["lemur.label=here"], &["sleep", "600"]);
+    let a = server.run(&api, &["lemur.label=a"], &["sleep", "600"]);
+    let w = server.run(&web, &["lemur.label=w"], &["sleep", "600"]);
+    let mut cfg = server.config();
+    cfg.bases = vec![Base::new("local", &api), Base::new("local", &web)];
+    let mut rt = loaded(cfg);
+    assert!(refreshing(&mut rt, 10.0, |s| [&here, &a, &w].iter().all(|t| s.session_of(&key(t)).is_some())));
+    open(&mut rt, &a);
+    frames(&mut rt, 20);
+    let sections = ["session-local-~".to_string(), format!("session-local-{api}"), format!("session-local-{web}")];
+    let shown = |rt: &Runtime<Lemur>| sections.iter().map(|k| rt.presented(k).map(|p| p.0[1])).collect::<Vec<_>>();
+    assert_eq!(shown(&rt).iter().map(Option::is_some).collect::<Vec<_>>(), [false, true, false], "the one on show");
+
+    press(&mut rt, K::Command('p'), Mods { shift: true, ..cmd() });
+    type_text(&mut rt, "all sessions");
+    press(&mut rt, K::Enter, Mods::default());
+    assert!(rt.state.prefs.all_sessions);
+    frames(&mut rt, 20);
+    let tops: Vec<f32> = shown(&rt).into_iter().map(|t| t.expect("every session's section")).collect();
+    assert!(tops[0] < tops[1] && tops[1] < tops[2], "in the config's order, home first: {tops:?}");
+    assert!(rt.find(&format!("line-local-{api}")).is_some() && rt.find("line-local-~").is_none(), "a line between");
+    let threads: Vec<String> = rt.state.sidebar_threads().into_iter().map(|(_, t)| t).collect();
+    assert_eq!(threads, [here.clone(), a.clone(), w.clone()]);
+    press(&mut rt, K::Command('3'), cmd());
+    assert_eq!(rt.state.active, Some(key(&w)), "the third, in another session");
+
+    rt.update(|s, tx| actions::run(s, Action::ToggleAllSessions, tx));
+    frames(&mut rt, 20);
+    assert_eq!(shown(&rt).iter().map(Option::is_some).collect::<Vec<_>>(), [false, false, true], "the one on show again");
 }
 
 /// Whether the sidebar's row of `name` is wholly in view.
@@ -464,7 +565,7 @@ fn picking_an_agent_the_host_lacks_says_so() {
         assert!(said, "{:?}", rt.state.status);
         rt.state.status.take().unwrap().0
     };
-    let thread = |agent: Agent| super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(agent), folder: None };
+    let thread = |agent: Agent| super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: Some(agent), folder: None, space: path.clone() };
     let said = "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`";
     start(&mut rt, thread(Agent::Claude));
     assert_eq!(failed(&mut rt), said);
@@ -475,7 +576,7 @@ fn picking_an_agent_the_host_lacks_says_so() {
     assert!(rt.state.cfg.threads.is_empty());
 
     // Lemur goes on: a shell starts.
-    start(&mut rt, super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: None, folder: None });
+    start(&mut rt, super::prompt::Ask::NewThread { host: "local".into(), base: Some(0), dir: path.clone(), agent: None, folder: None, space: path.clone() });
     assert!(wait_for(&mut rt, 10.0, |s| s.active.is_some()), "{:?}", rt.state.status);
 }
 
@@ -1198,20 +1299,20 @@ fn the_sidebars_close_asks_as_cmd_w_does() {
     assert!(server.addresses().contains(&a), "cancelled");
 }
 
-/// Every host has a section, threads or none, and its + starts a shell in its home in a
-/// new folder, as ⇧⌘N does on the host of the thread on show: never in that one's.
+/// With nothing on show, the sidebar shows This Mac's home session, threads or none, and its
+/// + starts a shell in the home in a new folder, as ⇧⌘N does: never in the one on show's.
 #[test]
-fn every_host_starts_folders_from_its_section() {
+fn the_session_shown_starts_folders_from_its_header() {
     let server = HcServer::new("phostnew");
     let mut rt = loaded(server.config());
     assert!(refreshing(&mut rt, 5.0, |s| !s.snap.hosts[0].home.is_empty()));
     frames(&mut rt, 20);
-    assert!(rt.find("host-section-local").is_some(), "no threads, still listed");
+    assert!(rt.find("session-local-~").is_some(), "no threads, still listed");
     let home = std::env::var("HOME").unwrap();
     assert_eq!(rt.state.snap.hosts[0].home, home);
 
     let started = |before: &[String]| server.core().terminals().into_iter().find(|t| !before.contains(&t.address));
-    click(&mut rt, "host-plus-local");
+    click(&mut rt, "session-plus");
     let mut first = None;
     assert!(wait_until(Duration::from_secs(5), || {
         rt.frame(1.0 / 60.0);
@@ -1239,11 +1340,12 @@ fn every_host_starts_folders_from_its_section() {
     assert!(!rt.state.siblings(&key(&second.address)).contains(&key(&first.address)), "not beside the first");
 }
 
-/// The sidebar shows one host's threads at a time, as Rex does: the thread on show's. Its
-/// name over them picks another host, which shows the thread of its opened last, else its
-/// first.
+/// The sidebar shows one session at a time, the thread on show's: This Mac's home or another
+/// host's never both. Its name over them opens a list of the sessions, drawn by Lemur, where
+/// typing narrows them and ⏎ shows one: its thread opened last, else its first. Its last
+/// thread ended, the session stays, with none on show.
 #[test]
-fn the_sidebar_shows_the_host_of_the_thread_on_show() {
+fn the_sidebar_shows_the_session_of_the_thread_on_show() {
     let server = HcServer::new("pother");
     let mut cfg = server.far_config("pb-shed");
     let mut here = Host::new("local", "local");
@@ -1258,62 +1360,26 @@ fn the_sidebar_shows_the_host_of_the_thread_on_show() {
     open(&mut rt, &here);
     frames(&mut rt, 20);
     let shows = |rt: &Runtime<Lemur>, k: &str| rt.presented(k).is_some();
-    assert!(shows(&rt, "host-section-local") && shows(&rt, &format!("row-local-{here}")));
-    assert!(!shows(&rt, "host-section-pb-shed") && !shows(&rt, &format!("row-pb-shed-{there}")), "not another host's");
+    assert!(shows(&rt, "session-local-~") && shows(&rt, &format!("row-local-{here}")));
+    assert!(!shows(&rt, "session-pb-shed-~") && !shows(&rt, &format!("row-pb-shed-{there}")), "not another host's");
 
-    click(&mut rt, "host-switch");
-    rt.resolve_popup(Some("pb-shed")).expect("the hosts");
+    click(&mut rt, "session-switch");
+    assert!(rt.state.session_switch.is_open(), "the list");
+    frames(&mut rt, 10);
+    type_text(&mut rt, "pb-shed");
+    press(&mut rt, K::Enter, Mods::default());
+    assert!(!rt.state.session_switch.is_open());
     assert_eq!(rt.state.active, Some(("pb-shed".to_string(), there.clone())), "its thread shows");
     frames(&mut rt, 20);
-    assert!(shows(&rt, "host-section-pb-shed") && shows(&rt, &format!("row-pb-shed-{there}")));
-    assert!(!shows(&rt, "host-section-local"));
+    assert!(shows(&rt, "session-pb-shed-~") && shows(&rt, &format!("row-pb-shed-{there}")));
+    assert!(!shows(&rt, "session-local-~"));
 
-    click(&mut rt, "host-switch");
-    rt.resolve_popup(Some("local")).expect("the hosts");
+    rt.update(|s, _| s.show_space(("local".into(), "~".into())));
     assert_eq!(rt.state.active, Some(key(&here)), "the one opened last there");
-
-    // Its last thread ended, none shows: not another host's.
     server.hc(&["kill", &here]);
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&here)).is_none()));
-    assert_eq!(rt.state.active, None);
-    assert_eq!(rt.state.shown_host().map(|h| h.name.as_str()), Some("local"));
-}
-
-/// ⌘K starts a thread on the host the sidebar shows, never another's. Picked with none of
-/// its threads to show, a host shows with none on show, and ⌘K starts one there, in a folder
-/// of its own, leaving the other host's thread as it was.
-#[test]
-fn cmd_k_starts_threads_on_the_host_shown() {
-    let server = HcServer::new("pmix");
-    let mut cfg = server.far_config("pb-mix");
-    let mut here = Host::new("local", "local");
-    here.hc_session = Some(server.session.clone());
-    cfg.hosts.insert(0, here);
-    let shown = server.run("/", &["lemur.label=here"], &["sleep", "600"]);
-    let mut rt = loaded(cfg);
-    let ready = |s: &Lemur| s.snap.hosts.len() == 2 && s.snap.hosts.iter().all(|h| !h.home.is_empty()) && s.session_of(&key(&shown)).is_some();
-    assert!(refreshing(&mut rt, 10.0, ready));
-    open(&mut rt, &shown);
-    press(&mut rt, K::Command('k'), cmd());
-    let hosts = |s: &Lemur| s.places(s.prompt.as_ref().unwrap()).into_iter().filter(|p| !p.host.is_empty()).map(|p| p.host).collect::<Vec<_>>();
-    assert_eq!(hosts(&rt.state), ["local"], "its home, not pb-mix's");
-    press(&mut rt, K::Escape, Mods::default());
-
-    frames(&mut rt, 20);
-    click(&mut rt, "host-switch");
-    rt.resolve_popup(Some("pb-mix")).expect("the hosts");
-    assert_eq!(rt.state.active, None, "none of its to show");
-    frames(&mut rt, 20);
-    assert!(rt.presented("host-section-pb-mix").is_some());
-    press(&mut rt, K::Command('k'), cmd());
-    assert_eq!(hosts(&rt.state), ["pb-mix"]);
-    rt.update(|s, _| s.pick_kind(None));
-    press(&mut rt, K::Enter, Mods::default());
-    assert!(refreshing(&mut rt, 10.0, |s| !s.snap.hosts[1].other.is_empty()), "{:?}", rt.state.status);
-    let there = rt.state.snap.hosts[1].other[0].clone();
-    assert_eq!(there.folder, None, "a folder of its own");
-    let mine = server.core().terminals().into_iter().find(|t| t.address == shown).unwrap();
-    assert_eq!(mine.labels.get(snapshot::FOLDER), None, "the other host's thread keeps its own");
+    assert_eq!(rt.state.active, None, "not another session's");
+    assert_eq!(rt.state.shown_space(), Some(("local".to_string(), "~".to_string())));
 }
 
 /// The status bar says where the thread on show runs: its host, its worktree's branch, and
@@ -1364,8 +1430,8 @@ fn cmd_j_and_cmd_p_go_to_threads() {
     let listed = |s: &Lemur| s.matches(s.prompt.as_ref().expect("asking")).into_iter().map(|m| m.key.1).collect::<Vec<_>>();
 
     press(&mut rt, K::Command('j'), cmd());
-    // The worktree's own first, untouched by the name it starts with.
-    assert_eq!(listed(&rt.state), ["review", "build", "main-shell"]);
+    // The session's, untouched by the name it starts with.
+    assert_eq!(listed(&rt.state), ["main-shell", "review", "build"]);
     type_text(&mut rt, "bui");
     assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "bui");
     assert_eq!(listed(&rt.state), ["build"]);
