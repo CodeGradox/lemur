@@ -171,10 +171,9 @@ fn two_drags_in_a_row_keep_the_second() {
     let t: Vec<String> = (0..8).map(|_| server.run("/", &["lemur.folder=f1"], &["sleep", "600"])).collect();
     let mut rt = loaded(&server);
     let list: List = ("local".into(), None);
-    // The folder's row first.
     rt.update(|s, _| {
-        s.reorder(list.clone(), 1, 8);
-        s.reorder(list.clone(), 1, 8);
+        s.reorder_threads(&list, "f1", 0, 7);
+        s.reorder_threads(&list, "f1", 0, 7);
     });
     let mut expected = t.clone();
     expected.rotate_left(2);
@@ -1264,38 +1263,41 @@ fn top_of(rt: &Runtime<Lemur>, key: &str) -> f32 {
     rt.find(key).unwrap_or_else(|| panic!("no element keyed {key}")).1
 }
 
-/// Dragged below a folder's row, a thread goes in the folder; dragged above every folder's,
-/// into one of its own. It shows there at once, and herdr-core keeps it.
+/// A thread dragged onto another folder's thread stays in its own folder, last in it: a
+/// drag moves a thread only among its folder's. (Its right-click moves it to another.)
 #[test]
-fn threads_drag_into_folders_and_out() {
+fn a_thread_drags_only_within_its_folder() {
     let server = HcServer::new("pa-fdrag");
     let dir = TempDir::new("pa-fdrag");
     let repo = repo(&dir, "api", "main", &[]);
     let path = path_of(&repo);
-    let a = server.run(&path, &["lemur.label=a", "lemur.order=0"], &["sleep", "600"]);
-    let b = server.run(&path, &["lemur.label=b", "lemur.order=1"], &["sleep", "600"]);
-    let x = server.run(&path, &["lemur.label=x", "lemur.order=2", "lemur.folder=f1"], &["sleep", "600"]);
+    let a = server.run(&path, &["lemur.label=a", "lemur.order=0", "lemur.folder=f1"], &["sleep", "600"]);
+    let b = server.run(&path, &["lemur.label=b", "lemur.order=1", "lemur.folder=f1"], &["sleep", "600"]);
+    let x = server.run(&path, &["lemur.label=x", "lemur.order=2", "lemur.folder=f2"], &["sleep", "600"]);
     let mut rt = loaded_with(with_folder(&server, &path, "work", false));
     assert!(refreshing(&mut rt, 10.0, |s| [&a, &b, &x].iter().all(|t| s.session_of(&key(t)).is_some())));
     frames(&mut rt, 20);
-    let (row_a, row_b) = (format!("row-local-{a}"), format!("row-local-{b}"));
-    // a's folder and a, b's and b, then work and x: a goes onto x's row, under work's.
+    let row_a = format!("row-local-{a}");
+    // work, a, b, then f2 and x: a goes onto x's row. Held there, it shows no further than
+    // its folder's end.
     let dy = top_of(&rt, &format!("row-local-{x}")) - top_of(&rt, &row_a);
-    drag(&mut rt, &row_a, 0.0, dy);
-    assert_eq!(rt.state.session_of(&key(&a)).and_then(|s| s.folder.clone()).as_deref(), Some("f1"), "at once");
-    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &a) == "f1"));
-    assert_eq!(folder_of(&server, &b), "", "b stays on its own");
+    let (px, py) = rt.find(&row_a).expect("a's row");
+    rt.pointer_move(px, py);
+    rt.pointer_down(px, py);
+    for step in 1..=10 {
+        rt.pointer_move(px, py + dy * step as f32 / 10.0);
+        rt.frame(1.0 / 60.0);
+    }
+    frames(&mut rt, 10);
+    assert!(top_of(&rt, &row_a) < top_of(&rt, "folder-local-f2"), "held over x, it stays in its folder");
+    rt.pointer_up(px, py + dy);
+    frames(&mut rt, 4);
+    assert_eq!(rt.state.session_of(&key(&a)).and_then(|s| s.folder.clone()).as_deref(), Some("f1"), "still in its folder");
+    assert!(wait_for(&mut rt, 5.0, |s| s.ordering.is_empty()), "written");
+    assert_eq!(core_order(&server.config()), [b.clone(), a.clone(), x.clone()], "last in it");
+    assert_eq!((folder_of(&server, &a), folder_of(&server, &x)), ("f1".to_string(), "f2".to_string()));
     frames(&mut rt, 20);
-    assert!(top_of(&rt, &row_a) > top_of(&rt, "folder-local-f1"), "under its folder");
-
-    // Above every folder: one of its own, first.
-    let dy = top_of(&rt, &format!("folder-local-={b}")) - top_of(&rt, &row_a);
-    drag(&mut rt, &row_a, 0.0, dy);
-    assert!(wait_for(&mut rt, 5.0, |_| folder_of(&server, &a).is_empty()));
-    assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&a)).is_some_and(|t| t.folder.is_none())));
-    frames(&mut rt, 20);
-    assert!(top_of(&rt, &row_a) < top_of(&rt, &row_b));
-    assert!(shows(&rt, &format!("folder-local-={a}")));
+    assert!(top_of(&rt, &row_a) < top_of(&rt, "folder-local-f2"), "above the next folder");
 }
 
 /// ⌘T starts a terminal in the folder of the thread on show, so it's beside that one; from
@@ -1373,8 +1375,23 @@ fn a_folder_drags_its_threads_along() {
     let mut rt = loaded_with(with_folder(&server, &path, "one", false));
     assert!(refreshing(&mut rt, 10.0, |s| [&x, &y].iter().all(|t| s.session_of(&key(t)).is_some())));
     frames(&mut rt, 20);
-    // one, x, f2, y: one goes two rows down.
+    // one, x, f2, y: one goes two rows down, x with it as it goes.
     let dy = top_of(&rt, "folder-local-f2") - top_of(&rt, "folder-local-f1");
+    let row_x = format!("row-local-{x}");
+    let apart = top_of(&rt, &row_x) - top_of(&rt, "folder-local-f1");
+    let (px, py) = rt.find("folder-local-f1").expect("the folder");
+    rt.pointer_move(px, py);
+    rt.pointer_down(px, py);
+    // A third of the way: not yet past f2's middle.
+    for step in 1..=3 {
+        rt.pointer_move(px, py + dy * step as f32 / 9.0);
+        rt.frame(1.0 / 60.0);
+    }
+    frames(&mut rt, 10);
+    assert!(top_of(&rt, "folder-local-f1") > py, "it follows the pointer");
+    assert!((top_of(&rt, &row_x) - top_of(&rt, "folder-local-f1") - apart).abs() < 0.5, "its thread with it");
+    rt.pointer_up(px, py + dy / 3.0);
+    frames(&mut rt, 20);
     drag(&mut rt, "folder-local-f1", 0.0, dy);
     assert!(!rt.state.folded("local", "f1"), "a drag isn't a click");
     frames(&mut rt, 20);

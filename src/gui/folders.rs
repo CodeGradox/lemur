@@ -3,8 +3,9 @@
 //! its own; a thread started beside another (⌘T, ⌘J) goes in that one's. Folder ids are the
 //! host's, whichever session. A folder you haven't named goes
 //! by two words of its own, as Rex's sessions do (`calm-heron`), or, as Settings has it, by
-//! the folder of the worktree its Claude works in. Dragged, a thread takes another place, in another folder or, above them all, one
-//! of its own; a folder another place among the folders, its threads with it. herdr-core
+//! the folder of the worktree its Claude works in. Dragged, a thread takes another place in
+//! its folder, never out of it (its right-click moves it to another); a folder another place
+//! among the folders, its threads with it (`SidebarDrag`). herdr-core
 //! keeps which folder each thread is in (`lemur.folder`) and its place (`lemur.order`);
 //! Lemur's config the folders you named or folded.
 
@@ -39,13 +40,6 @@ pub struct Listed<'a> {
     pub gone: Vec<&'a ClaudeThread>,
 }
 
-/// A row a drag moves among: a thread's, by its name, or a folder's, by its id.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Item {
-    Thread(String),
-    Folder(String),
-}
-
 /// Host `h`'s threads in session `space` (a project's path, or `HOME`), or with none in
 /// every one, in their order.
 pub fn listed<'a>(h: &'a HostView, space: Option<&str>) -> Listed<'a> {
@@ -70,28 +64,6 @@ pub fn listed<'a>(h: &'a HostView, space: Option<&str>) -> Listed<'a> {
 }
 
 impl Listed<'_> {
-    /// The rows a drag moves among, in order: each folder's row and, unless `folded`, its
-    /// threads.
-    pub fn items(&self, folded: impl Fn(&str) -> bool) -> Vec<Item> {
-        let mut items = vec![];
-        for g in &self.groups {
-            items.push(Item::Folder(g.id.clone()));
-            if !folded(&g.id) {
-                items.extend(g.threads.iter().map(|s| Item::Thread(s.name.clone())));
-            }
-        }
-        items
-    }
-
-    /// The threads of the `folded` folders, by folder: no rows of theirs show.
-    pub fn hidden(&self, folded: impl Fn(&str) -> bool) -> HashMap<String, Vec<String>> {
-        self.groups
-            .iter()
-            .filter(|g| folded(&g.id))
-            .map(|g| (g.id.clone(), g.threads.iter().map(|s| s.name.clone()).collect()))
-            .collect()
-    }
-
     /// Every thread in its order, with its folder: those shown, then those put away, which
     /// keep theirs.
     pub fn placed(&self) -> Vec<(String, String)> {
@@ -104,45 +76,130 @@ impl Listed<'_> {
     }
 }
 
-/// Where the threads go once row `from` of `items` is dragged to `to`: each shown thread in
-/// its order with its folder, `""` above every folder's row, for one of its own. A thread is
-/// in the folder whose row is the nearest above it; `hidden` has those of folded folders,
-/// which keep theirs, after its row. A folder dragged takes its threads along.
-pub fn moved(items: &[Item], hidden: &HashMap<String, Vec<String>>, from: usize, to: usize) -> Vec<(String, String)> {
-    let filed = |rows: &[Item]| {
-        let mut folder = String::new();
-        let mut out: Vec<(String, String)> = vec![];
-        for row in rows {
-            match row {
-                Item::Folder(id) => {
-                    folder = id.clone();
-                    out.extend(hidden.get(id).into_iter().flatten().map(|t| (t.clone(), id.clone())));
+/// `placed` with the `from`th thread of folder `folder` moved to its `to`th place: the others
+/// keep theirs, and every thread its folder.
+fn moved_within(placed: &[(String, String)], folder: &str, from: usize, to: usize) -> Vec<(String, String)> {
+    let at: Vec<usize> = placed.iter().enumerate().filter(|(_, (_, f))| f == folder).map(|(i, _)| i).collect();
+    let mut out = placed.to_vec();
+    if from >= at.len() || to >= at.len() {
+        return out;
+    }
+    let mut threads: Vec<(String, String)> = at.iter().map(|&i| placed[i].clone()).collect();
+    let thread = threads.remove(from);
+    threads.insert(to, thread);
+    for (i, thread) in at.into_iter().zip(threads) {
+        out[i] = thread;
+    }
+    out
+}
+
+/// `groups`' threads, each with its folder (`(id, threads)`), the folders in `order`'s order;
+/// any it doesn't have keep theirs after those it does.
+fn in_order(groups: &[(String, Vec<String>)], order: &[String]) -> Vec<(String, String)> {
+    let mut groups: Vec<&(String, Vec<String>)> = groups.iter().collect();
+    groups.sort_by_key(|(id, _)| order.iter().position(|o| o == id).unwrap_or(usize::MAX));
+    groups.into_iter().flat_map(|(id, threads)| threads.iter().map(move |t| (t.clone(), id.clone()))).collect()
+}
+
+/// Points the pointer goes before a press on a row is a drag, as rune-kit's `Reorder` has it.
+const SLOP: f32 = 4.0;
+
+/// A drag in the sidebar, in `list`, a session's: of a folder among its folders, its threads
+/// with it, or with `folder`, of a thread among that folder's threads, and only there. Unlike
+/// rune-kit's `Reorder`, which takes its rows to be one height, a folder is as tall as its
+/// threads make it; and what's dragged stops at the list's ends, so a thread never shows out
+/// of its folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidebarDrag {
+    pub list: List,
+    pub folder: Option<String>,
+    /// What it's among, by id (a folder's, or a thread's name), in order, and how far each
+    /// starts from the next, as the drag began.
+    ids: Vec<String>,
+    pitches: Vec<f32>,
+    from: usize,
+    /// How far the pointer has gone, once past `SLOP`: till then it's a press.
+    dy: Option<f32>,
+}
+
+impl SidebarDrag {
+    /// A press on the `from`th of `rows` (`(id, pitch)`): folders, or with `folder` its threads.
+    pub fn new(list: List, folder: Option<String>, rows: &[(String, f32)], from: usize) -> SidebarDrag {
+        let (ids, pitches) = rows.iter().cloned().unzip();
+        SidebarDrag { list, folder, ids, pitches, from, dy: None }
+    }
+
+    /// The pointer is `dy` from the press.
+    pub fn follow(&mut self, dy: f32) {
+        if self.dy.is_some() || dy.abs() >= SLOP {
+            self.dy = Some(dy);
+        }
+    }
+
+    /// Whether it's a drag, not a press.
+    pub fn moved(&self) -> bool {
+        self.dy.is_some()
+    }
+
+    /// Whether `id` is the one dragged, lifted off the others.
+    pub fn lifts(&self, id: &str) -> bool {
+        self.moved() && self.ids.get(self.from).is_some_and(|f| f == id)
+    }
+
+    /// Where it lands if let go now: past every folder whose middle it has passed.
+    fn target(&self) -> usize {
+        let Some(dy) = self.dy else { return self.from };
+        let (mut to, mut passed) = (self.from, 0.0);
+        let passes = |pitch: f32, passed: f32| dy.abs() > passed + pitch / 2.0;
+        if dy > 0.0 {
+            for j in self.from + 1..self.pitches.len() {
+                if !passes(self.pitches[j], passed) {
+                    break;
                 }
-                Item::Thread(name) => out.push((name.clone(), folder.clone())),
+                (to, passed) = (j, passed + self.pitches[j]);
+            }
+        } else {
+            for j in (0..self.from).rev() {
+                if !passes(self.pitches[j], passed) {
+                    break;
+                }
+                (to, passed) = (j, passed + self.pitches[j]);
             }
         }
-        out
-    };
-    let mut after = items.to_vec();
-    if from >= after.len() || to >= after.len() {
-        return filed(items);
+        to
     }
-    let row = after.remove(from);
-    let folder_moved = matches!(row, Item::Folder(_));
-    after.insert(to, row);
-    if !folder_moved {
-        return filed(&after);
+
+    /// How far `id` sits from its place: the one dragged with the pointer, as far as the
+    /// list's ends, and those it passed a step toward the room it left.
+    pub fn shift(&self, id: &str) -> f32 {
+        let (Some(dy), Some(i)) = (self.dy, self.ids.iter().position(|f| f == id)) else { return 0.0 };
+        let (from, to, step) = (self.from, self.target(), self.pitches[self.from]);
+        if i == from {
+            let (above, below) = (self.pitches[..from].iter().sum::<f32>(), self.pitches[from + 1..].iter().sum::<f32>());
+            dy.clamp(-above, below)
+        } else if from < i && i <= to {
+            -step
+        } else if to <= i && i < from {
+            step
+        } else {
+            0.0
+        }
     }
-    // Its threads go with it, wherever they showed.
-    let before = filed(items);
-    let mut threads: Vec<(String, String)> = before.iter().filter(|(_, f)| f.is_empty()).cloned().collect();
-    for id in after.iter().filter_map(|r| match r {
-        Item::Folder(id) => Some(id),
-        Item::Thread(_) => None,
-    }) {
-        threads.extend(before.iter().filter(|(_, f)| f == id).cloned());
+
+    /// Where it goes once let go, if it moved: from its place to another.
+    pub fn moves(&self) -> Option<(usize, usize)> {
+        let to = self.target();
+        (to != self.from).then_some((self.from, to))
     }
-    threads
+
+    /// The order once let go, by id, if it's another.
+    pub fn dropped(&self) -> Option<Vec<String>> {
+        let (from, to) = self.moves()?;
+        let mut ids = self.ids.clone();
+        let id = ids.remove(from);
+        ids.insert(to, id);
+        Some(ids)
+    }
 }
 
 /// `placed` with thread `name` moved to the end of folder `folder`, or with `None` to a
@@ -275,12 +332,6 @@ impl Lemur {
         self.folder_titles(h, &groups).swap_remove(at)
     }
 
-    /// Thread `name`'s row among the rows a drag moves in `list`, folders' rows counted.
-    pub(super) fn row_of(&self, (host, space): &List, name: &str) -> Option<usize> {
-        let l = listed(self.host_view(host)?, space.as_deref());
-        l.items(|id| self.folded(host, id)).iter().position(|i| *i == Item::Thread(name.to_string()))
-    }
-
     /// The threads of the folder thread `key` is in, none put away.
     pub(super) fn group_of(&self, key: &Key) -> Vec<String> {
         let (Some(h), Some(s)) = (self.host_view(&key.0), self.session_of(key)) else { return vec![] };
@@ -289,14 +340,20 @@ impl Lemur {
         l.groups.iter().find(|g| g.id == id).map(|g| g.threads.iter().map(|s| s.name.clone()).collect()).unwrap_or_default()
     }
 
-    /// Row `from` of the rows of `list`, a session's, was dragged to `to`: a thread takes its
-    /// new place, in a folder or one of its own, or a folder its place among the folders.
-    pub(super) fn drop_row(&mut self, list: &List, from: usize, to: usize) {
-        let host = list.0.as_str();
-        let Some(h) = self.host_view(host) else { return };
+    /// The `from`th thread of folder `folder` of `list`, a session's, was dragged to its `to`th
+    /// place: the folder's others keep theirs, and the other folders' theirs.
+    pub(super) fn reorder_threads(&mut self, list: &List, folder: &str, from: usize, to: usize) {
+        let Some(h) = self.host_view(&list.0) else { return };
+        let threads = moved_within(&listed(h, list.1.as_deref()).placed(), folder, from, to);
+        self.place_threads(list, threads);
+    }
+
+    /// The folders of `list`, a session's, go in `order`, by id, each with its threads.
+    pub(super) fn reorder_folders(&mut self, list: &List, order: &[String]) {
+        let Some(h) = self.host_view(&list.0) else { return };
         let l = listed(h, list.1.as_deref());
-        let folded = |id: &str| self.folded(host, id);
-        let mut threads = moved(&l.items(folded), &l.hidden(folded), from, to);
+        let groups: Vec<(String, Vec<String>)> = l.groups.iter().map(|g| (g.id.clone(), g.threads.iter().map(|s| s.name.clone()).collect())).collect();
+        let mut threads = in_order(&groups, order);
         threads.extend(l.away.iter().map(|s| (s.name.clone(), folder_of(s))));
         self.place_threads(list, threads);
     }
@@ -443,39 +500,64 @@ impl Lemur {
 mod tests {
     use super::*;
 
-    fn t(name: &str) -> Item {
-        Item::Thread(name.into())
-    }
-
-    fn f(id: &str) -> Item {
-        Item::Folder(id.into())
-    }
-
     fn placed(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(n, f)| (n.to_string(), f.to_string())).collect()
     }
 
-    /// A thread dragged below a folder's row is in it; above every folder's, in one of its
-    /// own. A folded folder's threads keep theirs.
+    /// A thread dragged takes another place in its folder, never out of it, and the other
+    /// threads keep theirs: a folder's, put away too, and other folders'.
     #[test]
-    fn a_thread_is_in_the_folder_above_it() {
-        // A: a b | B: c d | C (folded: e)
-        let items = [f("A"), t("a"), t("b"), f("B"), t("c"), t("d"), f("C")];
-        let hidden = HashMap::from([("C".to_string(), vec!["e".to_string()])]);
-        let threads = moved(&items, &hidden, 1, 4);
-        assert_eq!(threads, placed(&[("b", "A"), ("c", "B"), ("a", "B"), ("d", "B"), ("e", "C")]));
-        let threads = moved(&items, &hidden, 5, 0);
-        assert_eq!(threads, placed(&[("d", ""), ("a", "A"), ("b", "A"), ("c", "B"), ("e", "C")]), "one of its own");
-        let threads = moved(&items, &hidden, 2, 6);
-        assert_eq!(threads, placed(&[("a", "A"), ("c", "B"), ("d", "B"), ("e", "C"), ("b", "C")]), "into a folded one, last");
+    fn a_thread_moves_only_within_its_folder() {
+        // A: a b c | B: d | put away: e of A.
+        let now = placed(&[("a", "A"), ("b", "A"), ("c", "A"), ("d", "B"), ("e", "A")]);
+        assert_eq!(moved_within(&now, "A", 0, 2), placed(&[("b", "A"), ("c", "A"), ("a", "A"), ("d", "B"), ("e", "A")]));
+        assert_eq!(moved_within(&now, "A", 2, 0), placed(&[("c", "A"), ("a", "A"), ("b", "A"), ("d", "B"), ("e", "A")]));
+        assert_eq!(moved_within(&now, "A", 0, 9), now, "nowhere past its folder");
     }
 
-    /// A folder dragged takes its threads along, wherever it's dropped.
+    /// Folders dropped in a new order take their threads along; one the order lacks stays
+    /// after.
     #[test]
-    fn a_folder_takes_its_threads_along() {
-        let items = [f("A"), t("a"), f("B"), t("c"), f("C"), t("e")];
-        let threads = moved(&items, &HashMap::new(), 2, 0);
-        assert_eq!(threads, placed(&[("c", "B"), ("a", "A"), ("e", "C")]));
+    fn folders_take_their_threads_along() {
+        let groups = vec![("A".to_string(), vec!["a".to_string(), "b".to_string()]), ("B".to_string(), vec!["c".to_string()]), ("C".to_string(), vec!["e".to_string()])];
+        let order = |ids: &[&str]| ids.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+        assert_eq!(in_order(&groups, &order(&["B", "A", "C"])), placed(&[("c", "B"), ("a", "A"), ("b", "A"), ("e", "C")]));
+        assert_eq!(in_order(&groups, &order(&["C", "A"])), placed(&[("e", "C"), ("a", "A"), ("b", "A"), ("c", "B")]));
+    }
+
+    /// A folder dragged passes another once past its middle, however tall each is; those it
+    /// passes step aside by its height, toward the room it left. It goes no further than the
+    /// list's ends.
+    #[test]
+    fn a_folder_drags_past_others_by_their_heights() {
+        let list: List = ("local".into(), Some("~".into()));
+        // A is short, B tall, C short.
+        let folders = [("A".to_string(), 30.0), ("B".to_string(), 120.0), ("C".to_string(), 30.0)];
+        let mut d = SidebarDrag::new(list, None, &folders, 0);
+        d.follow(3.0);
+        assert!(!d.moved(), "inside the slop it's a press");
+        assert_eq!(d.dropped(), None);
+        d.follow(59.0);
+        assert_eq!(d.dropped(), None, "not yet past B's middle");
+        assert_eq!(d.shift("B"), 0.0);
+        d.follow(61.0);
+        assert_eq!(d.dropped(), Some(vec!["B".into(), "A".into(), "C".into()]));
+        assert_eq!((d.shift("A"), d.shift("B"), d.shift("C")), (61.0, -30.0, 0.0));
+        assert!(d.lifts("A") && !d.lifts("B"));
+        d.follow(136.0);
+        assert_eq!(d.dropped(), Some(vec!["B".into(), "C".into(), "A".into()]), "past C's middle too");
+        d.follow(400.0);
+        assert_eq!(d.shift("A"), 150.0, "no further than the last place");
+        d.follow(-40.0);
+        assert_eq!(d.dropped(), None, "nothing above the first");
+        assert_eq!(d.shift("A"), 0.0, "nor shows above it");
+
+        let mut d = SidebarDrag::new(("local".into(), None), None, &folders, 2);
+        d.follow(-14.0);
+        assert_eq!(d.dropped(), None);
+        d.follow(-61.0);
+        assert_eq!(d.dropped(), Some(vec!["A".into(), "C".into(), "B".into()]));
+        assert_eq!(d.shift("B"), 30.0, "it steps down by C's height");
     }
 
     /// Moved to a folder, a thread goes last in it; to one of its own, last of all.

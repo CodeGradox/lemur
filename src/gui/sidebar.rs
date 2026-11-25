@@ -2,16 +2,21 @@
 //! in folders (`folders`), as rows to open, fold, drag and right-click; the session's name
 //! over them switches to another, as ⌘K does. The hosts' load at the foot.
 
-use super::folders::{Group, folder_of, listed};
+use super::folders::{Group, SidebarDrag, folder_of, listed};
 use super::prompt::{Ask, agent_glyph, thread_icon};
 use super::silence::silence_label;
 use super::spaces::{Space, space_id, space_of_id};
 use super::{Key, Lemur, List, icons, key, worktree_label};
 use crate::config::{Agent, COLORS, ClaudeThread};
 use crate::snapshot::{Activity, HOME, HostView, Session};
-use rune::{Color, El, LoopSpec, PointerPress, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
-use rune_kit::shell::{Reorder, RowStatus, Sidebar, SidebarRow, TOOLBAR_HEIGHT};
+use rune::{Anim, Color, Drag, El, LoopSpec, Phase, PointerPress, PopupItem, PopupMenu, Shadow, Tx, col, el, icon, row, text};
+use rune_kit::shell::{ROW_HEIGHT, RowStatus, Sidebar, SidebarRow, TOOLBAR_HEIGHT};
 use rune_kit::{Combobox, ComboboxOption, IconButtonVariant, Kit, MenuItem, context_menu};
+
+/// Points between the sidebar's rows.
+const GAP: f32 = 2.0;
+/// A folder's row, which is smaller than a thread's (`ROW_HEIGHT`).
+const FOLDER_ROW: f32 = 24.0;
 
 /// Points between the traffic lights and the sidebar's title, as Herdr leaves.
 const PAST_LIGHTS: f32 = 20.0;
@@ -27,10 +32,85 @@ fn named(k: &Kit) -> Kit {
     k
 }
 
+/// `row` as Rex has the thread on show's, when `on`: a pill of glass, lit from above and
+/// raised a little off the sidebar. Rune has the system's Liquid Glass only in a see-through
+/// window, which Lemur's isn't, so this draws its look.
+pub(super) fn glass(row: El, on: bool, k: &Kit) -> El {
+    if !on {
+        return row;
+    }
+    let (white, black) = (Color::WHITE, Color::BLACK);
+    // Its fill, top to bottom; its rim, top to bottom; the edge the glass bends, inside the
+    // rim; its shadow; the pointer over it.
+    let ((top, bottom), (lit, unlit), edge, shade, hover) = if k.dark {
+        let grey = |hex: &str| rune::color::hex(hex).expect("a colour");
+        ((grey("#242424"), grey("#1a1a1a")), (white.alpha(0.16), white.alpha(0.05)), white.alpha(0.04), black.alpha(0.6), white.alpha(0.03))
+    } else {
+        ((white, white), (black.alpha(0.09), black.alpha(0.15)), black.alpha(0.04), black.alpha(0.07), black.alpha(0.02))
+    };
+    row.radius(ROW_HEIGHT / 2.0)
+        .continuous_corners()
+        .fill(bottom)
+        .gradient(top, bottom)
+        .border_gradient(1.0, lit, unlit)
+        .box_shadow(Shadow { blur: 6.0, color: edge, inset: true, ..Shadow::default() })
+        .shadow(1.0, 3.0, shade)
+        .hover(hover)
+}
+
 /// One of `COLORS`, by its name.
 pub(super) fn color_named(name: &str) -> Option<Color> {
     let (_, hex) = COLORS.iter().find(|(n, _)| *n == name)?;
     rune::color::hex(&format!("#{hex:06x}"))
+}
+
+/// `row`, `rows[at]` of `list` (a session's folders, or with `folder` that folder's threads),
+/// dragged to another place there: it follows the pointer, as far as the list's ends, and
+/// the others step aside. Let go, they keep the new order (`reorder_threads`,
+/// `reorder_folders`).
+fn draggable(row: El, list: &List, folder: Option<&str>, rows: &[(String, f32)], at: usize) -> El {
+    let (list, folder, rows) = (list.clone(), folder.map(str::to_string), rows.to_vec());
+    row.on_drag(move |s: &mut Lemur, d: &mut Drag, tx: &mut Tx| match d.phase {
+        Phase::Down => s.sidebar_drag = Some(SidebarDrag::new(list.clone(), folder.clone(), &rows, at)),
+        Phase::Move => {
+            if let Some(drag) = &mut s.sidebar_drag {
+                drag.follow(d.dy);
+                tx.animated();
+            }
+        }
+        Phase::Up => {
+            let Some(drag) = s.sidebar_drag.take() else { return };
+            if drag.moved() && drag.folder.is_none() {
+                s.folder_dropped = Some(std::time::Instant::now());
+            }
+            if d.cancelled() {
+                return;
+            }
+            match &drag.folder {
+                Some(id) => {
+                    if let Some((from, to)) = drag.moves() {
+                        s.reorder_threads(&drag.list, id, from, to);
+                    }
+                }
+                None => {
+                    if let Some(order) = drag.dropped() {
+                        s.reorder_folders(&drag.list, &order);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// `row`, `id` of the list `drag` is in, where the drag puts it: lifted off the others, over
+/// them, following the pointer exactly, or stepped aside on a spring.
+fn dragged(row: El, id: &str, drag: Option<&SidebarDrag>, k: &Kit) -> El {
+    let Some(drag) = drag else { return row };
+    let row = row.offset(0.0, drag.shift(id));
+    if !drag.lifts(id) {
+        return row;
+    }
+    k.elevate(row.raise().offset_motion(Anim::INSTANT), &k.elevation.raised)
 }
 
 /// What sets a session apart from the next, when the sidebar lists them all: a line.
@@ -294,13 +374,18 @@ fn thread_picked(s: &mut Lemur, picked: &str, key: Key, at: PointerPress) {
     }
 }
 
+/// Where a thread's row is, to drag it among its folder's: its place, its session's list,
+/// its folder's id, and its folder's threads, each with how far it starts from the next.
+type Place<'a> = (usize, &'a List, &'a str, &'a [(String, f32)]);
+
 /// A thread's row, `depth` in: its agent's icon, its name, then the issue pinned to it, what
 /// helps it and its age; its dot, a × under the pointer. Its right-click moves it among
 /// `folders`, its host's.
-fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &List)>, folders: &[(String, String)], k: &Kit) -> El {
+fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<Place>, folders: &[(String, String)], k: &Kit) -> El {
     let c = &k.c;
     let key = key(host, t);
     let (dot, tip, breathes) = s.activity(&key, t, k);
+    let shown = s.active.as_ref() == Some(&key);
     let mut said = vec![];
     if let Some(issue) = &t.issue {
         said.push(issue.clone());
@@ -313,32 +398,30 @@ fn thread_row(s: &Lemur, host: &str, t: &Session, place: Option<(usize, usize, &
         .avatar(thread_icon(t.agent(), t.color.as_deref(), k))
         .detail(said.join(" · "))
         .status(RowStatus::Other(status_dot(dot, tip, breathes)))
-        .selected(s.active.as_ref() == Some(&key));
+        .selected(shown);
     if t.silent {
         r = r.trailing(icon(&icons::BELL_OFF, 12.0).color(c.icon_faint).help("Makes no notifications"));
     }
-    // The `index`th of `count` in `list`: dragged, it takes another place there.
-    if let Some((index, count, list)) = place {
-        let state = if s.row_drag_list == *list { s.row_drag } else { Reorder::new().gap(1.0) };
-        let list = list.clone();
-        r = r.reorder(&state, index, count, |s: &mut Lemur| &mut s.row_drag, move |s, from, to| s.reorder(list.clone(), from, to));
-    }
     let (open, close, rename, menu) = (key.clone(), key.clone(), key.clone(), key.clone());
     let picked_menu = thread_menu(t, folders);
-    let hovered = place.map(|(.., list)| list.clone());
-    r.on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
+    let r = r
+        .on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
         .on_close(move |s: &mut Lemur, _| s.confirm_close_of(close.clone()))
-        .on_double_click(move |s: &mut Lemur, _| s.ask_name(Ask::Rename { host: rename.0.clone(), session: rename.1.clone() }))
-        .build(&named(k))
-        .key(format!("row-{}-{}", key.0, key.1))
+        .on_double_click(move |s: &mut Lemur, _| s.ask_name(Ask::Rename { host: rename.0.clone(), session: rename.1.clone() }));
+    let mut r = glass(r.build(&named(k)), shown, k);
+    // The `at`th of folder `folder`'s threads in `list`: dragged, it takes another place among
+    // them, and only there.
+    if let Some((at, list, folder, threads)) = place {
+        let drag = s.sidebar_drag.as_ref().filter(|d| d.list == *list && d.folder.as_deref() == Some(folder));
+        // Opaque, as it's lifted, so the rows it passes don't show through.
+        let lifted = drag.is_some_and(|d| d.lifts(&t.name)) && !shown;
+        if lifted {
+            r = r.fill(super::look::sidebar(k.dark));
+        }
+        r = dragged(draggable(r, list, Some(folder), threads, at).position_in_set(at + 1, threads.len()), &t.name, drag, k);
+    }
+    r.key(format!("row-{}-{}", key.0, key.1))
         .opacity(if t.away { 0.6 } else { 1.0 })
-        // The lists share one drag: it goes to the one under the pointer as it starts.
-        .on_hover_change(move |s: &mut Lemur, inside, tx: &mut Tx| {
-            if let Some(list) = hovered.clone().filter(|_| inside && s.row_drag.dragging().is_none()) {
-                s.row_drag_list = list;
-                tx.live_only();
-            }
-        })
         .on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
             let key = menu.clone();
             tx.popup_menu(picked_menu.clone(), press, move |s: &mut Lemur, picked, _| {
@@ -395,26 +478,42 @@ fn away_rows(s: &Lemur, host: &str, list: &List, away: &[&Session], folders: &[(
 }
 
 /// Session `space`'s rows, on host `h`: each folder with its threads, then those put away
-/// and those gone. Dragged, a thread or a folder takes another place among them
-/// (`folders::moved`).
+/// and those gone. Dragged, a thread takes another place in its folder, and a folder, its
+/// threads with it, among the folders (`SidebarDrag`).
 fn space_rows(s: &Lemur, h: &HostView, space: &Space, k: &Kit) -> Vec<El> {
     let host = h.name.as_str();
     let l = listed(h, Some(&space.1));
-    let folded = |id: &str| s.folded(host, id);
-    let count = l.items(folded).len();
     let list = Lemur::space_list(space);
     let folders: Vec<(String, String)> = l.groups.iter().map(|g| g.id.clone()).zip(s.folder_titles(h, &l.groups)).collect();
+    // How far each folder starts from the next: its row, and its threads unless it's folded.
+    let pitches: Vec<(String, f32)> = l
+        .groups
+        .iter()
+        .map(|g| {
+            let shown = if s.folded(host, &g.id) { 0 } else { g.threads.len() };
+            (g.id.clone(), FOLDER_ROW + shown as f32 * (ROW_HEIGHT + GAP) + GAP)
+        })
+        .collect();
+    let drag = s.sidebar_drag.as_ref().filter(|d| d.list == list && d.folder.is_none());
     let mut rows = vec![];
-    let mut at = 0;
-    for (g, (_, name)) in l.groups.iter().zip(&folders) {
-        rows.push(folder_row(s, host, g, name.clone(), (at, count, &list), k));
-        at += 1;
-        if !folded(&g.id) {
-            for t in &g.threads {
-                rows.push(thread_row(s, host, t, Some((at, count, &list)), &folders, k));
-                at += 1;
+    for (at, (g, (_, name))) in l.groups.iter().zip(&folders).enumerate() {
+        let mut group = col()
+            .key(format!("group-{host}-{}", g.id))
+            .w_full()
+            .gap(GAP)
+            .motion(k.motion.control)
+            .child(folder_row(s, host, g, name.clone(), (at, &list, &pitches), k));
+        if !s.folded(host, &g.id) {
+            let threads: Vec<(String, f32)> = g.threads.iter().map(|t| (t.name.clone(), ROW_HEIGHT + GAP)).collect();
+            for (i, t) in g.threads.iter().enumerate() {
+                group = group.child(thread_row(s, host, t, Some((i, &list, &g.id, &threads)), &folders, k));
             }
         }
+        // Opaque, as it's lifted, so the folders it passes don't show through.
+        if drag.is_some_and(|d| d.lifts(&g.id)) {
+            group = group.fill(super::look::sidebar(k.dark)).radius(k.radius.md);
+        }
+        rows.push(dragged(group, &g.id, drag, k));
     }
     rows.extend(away_rows(s, host, &list, &l.away, &folders, k));
     rows.extend(l.gone.iter().map(|t| gone_row(t, k)));
@@ -424,40 +523,29 @@ fn space_rows(s: &Lemur, h: &HostView, space: &Space, k: &Kit) -> Vec<El> {
 /// A folder's row, as Rex's session headings are: its name, small and muted, and, folded, how many of
 /// each kind run in it. A click folds or opens it, a right-click renames it; dragged, it
 /// takes another place among the folders, its threads with it.
-fn folder_row(s: &Lemur, host: &str, g: &Group, name: String, (at, count, list): (usize, usize, &List), k: &Kit) -> El {
+fn folder_row(s: &Lemur, host: &str, g: &Group, name: String, (at, list, pitches): (usize, &List, &[(String, f32)]), k: &Kit) -> El {
     let folded = s.folded(host, &g.id);
     let counts = (folded && !g.threads.is_empty()).then(|| counts(&g.threads, k));
     let trailing = row().gap(6.0).center_y().children(counts).child(super::meter::chevron(folded, k).key("fold"));
     // Small, as Rex's session names are: it says where the threads under it are, not more.
-    let mut r = SidebarRow::new(name).title_style(k.ty.small).height(24.0).trailing(trailing);
+    let mut r = SidebarRow::new(name).title_style(k.ty.small).height(FOLDER_ROW).trailing(trailing);
     if folded && g.threads.iter().any(|t| t.activity == Activity::NeedsInput) {
         r = r.status(RowStatus::Attention);
     }
-    let state = if s.row_drag_list == *list { s.row_drag } else { Reorder::new().gap(1.0) };
-    let dropped = list.clone();
-    r = r.reorder(&state, at, count, |s: &mut Lemur| &mut s.row_drag, move |s, from, to| {
-        s.folder_dropped = Some(std::time::Instant::now());
-        s.reorder(dropped.clone(), from, to);
-    });
     let (toggle, menu_id, host) = (g.id.clone(), g.id.clone(), host.to_string());
     let (fold_host, menu_host) = (host.clone(), host.clone());
-    let hovered = list.clone();
-    r.on_select(move |s: &mut Lemur, _| {
-        // Let go after a drag, it isn't a click.
-        if s.folder_dropped.take().is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(500)) {
-            s.toggle_folder(&fold_host, &toggle);
-        }
-    })
-    .build(k)
-    .key(format!("folder-{host}-{}", g.id))
-    .expanded(!folded)
-    .on_hover_change(move |s: &mut Lemur, inside, tx: &mut Tx| {
-        if inside && s.row_drag.dragging().is_none() {
-            s.row_drag_list = hovered.clone();
-            tx.live_only();
-        }
-    })
-    .on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
+    let r = r
+        .on_select(move |s: &mut Lemur, _| {
+            // Let go after a drag, it isn't a click.
+            if s.folder_dropped.take().is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(500)) {
+                s.toggle_folder(&fold_host, &toggle);
+            }
+        })
+        .build(k)
+        .key(format!("folder-{host}-{}", g.id))
+        .expanded(!folded);
+    // Dragged, it takes its threads along: the group it heads moves (`space_rows`).
+    draggable(r, list, None, pitches, at).on_secondary_press(move |_: &mut Lemur, press: PointerPress, tx: &mut Tx| {
         let (host, id) = (menu_host.clone(), menu_id.clone());
         let menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…"));
         tx.popup_menu(menu, press, move |s: &mut Lemur, picked, _| {

@@ -208,16 +208,20 @@ fn cmd_digits_go_down_the_sidebar_across_folders() {
     assert_eq!(go(&mut rt, '5').as_deref(), Some("t3"), "folded: not a place");
 }
 
-/// ⌘., or the eye over the sidebar, has the sidebar list every agent's thread, whatever its
-/// session, without what it runs to help it; ⌘1 goes down them. Again, the session shows.
+/// ⌘., or the eye over the sidebar, has the sidebar list every agent's thread, without what
+/// it runs to help it, by session as Rex lists activity: under each session's name, in the
+/// sidebar's order. ⌘1 and ⌃Tab go down them as they show. Again, the session shows.
 #[test]
 fn cmd_period_lists_every_agent_in_the_sidebar() {
     let server = HcServer::new("pagentsbar");
-    let mut rt = window(server.config());
-    let mut snap = made_up(&[("claude", Activity::Working), ("shell", Activity::Unknown), ("elsewhere", Activity::Idle)]);
+    let mut cfg = server.config();
+    cfg.bases = vec![Base::new("local", "/srv/api"), Base::new("local", "/srv/web")];
+    let mut rt = window(cfg);
+    let mut snap = made_up(&[("claude", Activity::Working), ("shell", Activity::Unknown), ("elsewhere", Activity::Idle), ("api", Activity::Idle)]);
     let threads = &mut snap.hosts[0].other;
     threads[0].helpers = vec![snapshot::Helper { id: "sub".into(), label: "a subagent".into(), activity: Activity::Working, terminal: false, depth: 0 }];
     threads[2].space = "/srv/web".into();
+    threads[3].space = "/srv/api".into();
     rt.update(|s, _| s.set_snapshot(snap));
     open(&mut rt, "shell");
     frames(&mut rt, 20);
@@ -227,17 +231,22 @@ fn cmd_period_lists_every_agent_in_the_sidebar() {
     frames(&mut rt, 20);
     assert!(rt.state.sidebar_agents);
     let listed: Vec<&str> = rt.state.sidebar_agent_threads().into_iter().map(|(_, t)| t.name.as_str()).collect();
-    assert_eq!(listed, ["claude", "elsewhere"], "every session's, no shell");
-    let rows: Vec<bool> = (0..3).map(|i| rt.find(&format!("sidebar-agent-{i}")).is_some()).collect();
-    assert_eq!(rows, [true, true, false], "a row each, none for the subagent");
+    assert_eq!(listed, ["claude", "api", "elsewhere"], "by session: home, then the projects in the config's order; no shell");
+    let rows: Vec<bool> = (0..4).map(|i| rt.find(&format!("sidebar-agent-{i}")).is_some()).collect();
+    assert_eq!(rows, [true, true, true, false], "a row each, none for the subagent");
+    let heads: Vec<bool> = (0..4).map(|i| rt.find(&format!("sidebar-agents-session-{i}")).is_some()).collect();
+    assert_eq!(heads, [true, true, true, false], "each session's name over its own");
+    let top = |k: &str| rt.find(k).unwrap().1;
+    assert!(top("sidebar-agents-session-1") < top("sidebar-agent-1") && top("sidebar-agent-1") < top("sidebar-agents-session-2"));
     assert!(rt.find("row-local-shell").is_none(), "not the session's rows");
-    press(&mut rt, K::Command('2'), cmd());
-    assert_eq!(rt.state.active, Some(key("elsewhere")), "the second there");
+    press(&mut rt, K::Command('3'), cmd());
+    assert_eq!(rt.state.active, Some(key("elsewhere")), "the third there");
     // ⌃Tab goes down the list as it shows, round at its end.
     rt.update(|s, tx| s.cycle_threads(false, tx));
     assert_eq!(rt.state.active, Some(key("claude")));
     rt.update(|s, tx| s.cycle_threads(false, tx));
-    assert_eq!(rt.state.active, Some(key("elsewhere")));
+    assert_eq!(rt.state.active, Some(key("api")));
+    press(&mut rt, K::Command('3'), cmd());
 
     click(&mut rt, "sidebar-agents");
     frames(&mut rt, 20);
@@ -330,6 +339,34 @@ fn the_row_on_show_stays_in_view() {
     apply(&mut rt, &listed);
     check(&mut rt, "t40", "just started");
     assert!(out.is_empty(), "the row on show out of view: {out:?}");
+}
+
+/// With every agent in the sidebar (⌘.) too, the row of the one on show scrolls into view:
+/// as ⌘. turns to them, and as ⌃Tab or a key goes down them.
+#[test]
+fn the_agent_on_show_stays_in_view() {
+    let server = HcServer::new("pagentview");
+    let mut rt = window(server.config());
+    rt.set_viewport((1000.0, 600.0), 2.0);
+    let names: Vec<String> = (0..40).map(|i| format!("t{i}")).collect();
+    let listed: Vec<(&str, Activity)> = names.iter().map(|n| (n.as_str(), Activity::Idle)).collect();
+    apply(&mut rt, &listed);
+    open(&mut rt, "t30");
+    press(&mut rt, K::Command('.'), cmd());
+    let in_view = |rt: &mut Runtime<Lemur>, name: &str| {
+        frames(rt, 40);
+        let at = rt.state.sidebar_agent_threads().iter().position(|(_, t)| t.name == name).unwrap_or_else(|| panic!("{name} listed"));
+        let e = info(rt, &format!("sidebar-agent-{at}")).unwrap_or_else(|| panic!("{name}'s row"));
+        e.rect[3] > 0.0 && e.visible[3] >= e.rect[3] - 1.0
+    };
+    assert!(in_view(&mut rt, "t30"), "as ⌘. turns to them");
+    press(&mut rt, K::Command('1'), cmd());
+    assert!(in_view(&mut rt, "t0"), "by key");
+    assert!(!in_view(&mut rt, "t39"), "more rows than fit");
+    press(&mut rt, K::Tab, Mods { shift: true, ..ctrl() });
+    rt.key(KeyEvent { key: K::Modifier { modifier: rune::Modifier::ControlLeft, pressed: false }, mods: Mods::default() });
+    assert_eq!(rt.state.active, Some(key("t39")));
+    assert!(in_view(&mut rt, "t39"), "the previous one, round the end");
 }
 
 /// The status bar doesn't count the agents; it says how many need you, when any do.

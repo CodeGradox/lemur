@@ -3,7 +3,9 @@
 //! order whatever they're doing, each with what it runs to help it under it, as
 //! Herdr's agents list. A click opens one.
 
+use super::folders::listed;
 use super::prompt::{agent_icon, thread_icon};
+use super::spaces::SpaceView;
 use super::sidebar::status_dot;
 use super::silence::silence_label;
 use super::{Key, Lemur, icons, key, sessions, worktree_label};
@@ -22,15 +24,34 @@ impl Lemur {
         agents
     }
 
-    /// The agents' threads the sidebar lists with ⌘., every host's and session's, in the
-    /// panel's order: not those only running helpers, nor what they run.
+    /// The agents' threads the sidebar lists with ⌘., by session, as Rex lists activity by
+    /// session: the sessions in the sidebar's order (host by host, its home, then its
+    /// projects), each one's threads in its folders' order, those put away last. Not threads
+    /// only running helpers, nor what they run.
+    pub(super) fn sidebar_agent_groups(&self) -> Vec<(SpaceView, Vec<(&str, &Session)>)> {
+        let mut groups = vec![];
+        for v in self.spaces() {
+            let Some(h) = self.host_view(&v.space.0) else { continue };
+            let l = listed(h, Some(&v.space.1));
+            let shown = l.groups.iter().flat_map(|g| g.threads.iter().copied());
+            let threads: Vec<(&str, &Session)> = shown.chain(l.away.iter().copied()).filter(|s| s.agent().is_some()).map(|s| (h.name.as_str(), s)).collect();
+            if !threads.is_empty() {
+                groups.push((v, threads));
+            }
+        }
+        groups
+    }
+
+    /// The agents' threads the sidebar lists with ⌘., from the top (`sidebar_agent_groups`).
     pub(super) fn sidebar_agent_threads(&self) -> Vec<(&str, &Session)> {
-        self.agents().into_iter().filter(|(_, s)| s.agent().is_some()).collect()
+        self.sidebar_agent_groups().into_iter().flat_map(|(_, threads)| threads).collect()
     }
 
     /// ⌘., or the eye over the sidebar: it lists every agent's thread, or the session again.
     pub fn toggle_sidebar_agents(&mut self) {
         self.sidebar_agents = !self.sidebar_agents;
+        // The thread on show's row, in the list now shown (`reveal_row`).
+        self.revealed = None;
     }
 
     /// The agents as Next Agent goes through them: needing you, done while you
@@ -85,7 +106,7 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
         .iter()
         .enumerate()
         .flat_map(|(i, (host, t))| {
-            let mut rows = vec![agent_row(s, &format!("agent-{i}"), host, t, k)];
+            let mut rows = vec![agent_row(s, &format!("agent-{i}"), host, t, panel_place(s, host, t), k)];
             rows.extend(t.helpers.iter().enumerate().map(|(j, h)| helper_row(s, (i, j), host, t, h, k)));
             rows
         })
@@ -110,20 +131,52 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
 }
 
 
-/// The sidebar's rows with ⌘.: every agent's thread, as the panel lists them, without what
-/// they run to help them; or why there's none.
+/// The sidebar's rows with ⌘.: every agent's thread, as the panel's are but without what
+/// they run to help them, under the name of its session, small as a folder's; or why
+/// there's none.
 pub fn sidebar_rows(s: &Lemur, k: &Kit) -> Vec<El> {
-    let agents = s.sidebar_agent_threads();
-    if agents.is_empty() {
+    let groups = s.sidebar_agent_groups();
+    if groups.is_empty() {
         let none = text("No agents are running").font(k.ty.ui).color(k.c.text_faint);
         return vec![col().key("sidebar-agents-none").w_full().py(24.0).center().child(none)];
     }
-    agents.iter().enumerate().map(|(i, (host, t))| agent_row(s, &format!("sidebar-agent-{i}"), host, t, k)).collect()
+    let mut rows = vec![];
+    let mut i = 0;
+    for (g, (v, threads)) in groups.into_iter().enumerate() {
+        let heading = SidebarRow::new(format!("{} · {}", v.name, v.host)).title_style(k.ty.small).height(24.0).build(k).key(format!("sidebar-agents-session-{g}"));
+        rows.push(heading);
+        for (host, t) in threads {
+            // Its session says where already: its worktree, or its folder, `~` for the home.
+            let home = s.host_view(host).is_some_and(|h| h.home.trim_end_matches('/') == t.path.trim_end_matches('/'));
+            let folder = || if home { "~".to_string() } else { crate::config::leaf(&t.path).to_string() };
+            let mut place = s.project_of(host, &t.name).map_or_else(folder, |(_, w)| worktree_label(w));
+            if let Some(issue) = &t.issue {
+                place = format!("{place} · {issue}");
+            }
+            let shown = s.active.as_ref() == Some(&key(host, t));
+            rows.push(super::sidebar::glass(agent_row(s, &format!("sidebar-agent-{i}"), host, t, place, k), shown, k));
+            i += 1;
+        }
+    }
+    rows
 }
 
-/// An agent's thread, keyed `id`: its name, where it runs, and what it's doing, in words
-/// too when that's for you to see to.
-fn agent_row(s: &Lemur, id: &str, host: &str, t: &Session, k: &Kit) -> El {
+/// Where the panel says agent `t` of `host`'s runs: its project and worktree, else its host,
+/// and the issue pinned to it.
+fn panel_place(s: &Lemur, host: &str, t: &Session) -> String {
+    let mut place = match s.project_of(host, &t.name) {
+        Some((base, w)) => format!("{} · {}", s.cfg.bases[base].name(), worktree_label(w)),
+        None => host.to_string(),
+    };
+    if let Some(issue) = &t.issue {
+        place = format!("{place} · {issue}");
+    }
+    place
+}
+
+/// An agent's thread, keyed `id`: its name, `place`, where it runs, and what it's doing, in
+/// words too when that's for you to see to.
+fn agent_row(s: &Lemur, id: &str, host: &str, t: &Session, place: String, k: &Kit) -> El {
     let key = key(host, t);
     let shown = s.active.as_ref() == Some(&key);
     let (color, tip, breathes) = s.activity(&key, t, k);
@@ -133,13 +186,6 @@ fn agent_row(s: &Lemur, id: &str, host: &str, t: &Session, k: &Kit) -> El {
         _ if s.done.contains(&key) => Some("Done"),
         _ => None,
     };
-    let mut place = match s.project_of(host, &t.name) {
-        Some((base, w)) => format!("{} · {}", s.cfg.bases[base].name(), worktree_label(w)),
-        None => host.to_string(),
-    };
-    if let Some(issue) = &t.issue {
-        place = format!("{place} · {issue}");
-    }
     let mut trailing = row().gap(2.0).center_y();
     // On hover; not the one on show, which there's no peeking at.
     if !shown {

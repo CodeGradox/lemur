@@ -430,12 +430,6 @@ impl Lemur {
         }
     }
 
-    /// Moves row `from` of a host's rows, its threads' and its folders', to `to`: the
-    /// sidebar shows the new order at once, and herdr-core keeps it (`drop_row`).
-    pub fn reorder(&mut self, list: List, from: usize, to: usize) {
-        self.drop_row(&list, from, to);
-    }
-
     /// Has herdr-core keep the threads of `list` in `names`' order, each in its folder.
     pub(super) fn write_places(&mut self, list: List, names: Vec<(String, String)>) {
         self.changes += 1;
@@ -461,10 +455,10 @@ impl Lemur {
         let Some(at) = tabs.iter().position(|k| *k == active) else { return };
         let next = if back { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < tabs.len()) };
         let Some(next) = next else { return };
-        let Some(space) = self.space_of(&active) else { return };
-        let list = Self::space_list(&space);
-        let (Some(from), Some(to)) = (self.row_of(&list, &active.1), self.row_of(&list, &tabs[next].1)) else { return };
-        self.reorder(list, from, to);
+        // One put away isn't among its folder's rows.
+        let Some(s) = self.session_of(&active).filter(|s| !s.away) else { return };
+        let (folder, space) = (super::folders::folder_of(s), (active.0.clone(), s.space.clone()));
+        self.reorder_threads(&Self::space_list(&space), &folder, at, next);
     }
 
     /// Writes the order dragged into `list` to herdr-core, a label a thread, then the one

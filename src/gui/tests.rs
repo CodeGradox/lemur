@@ -277,8 +277,7 @@ fn moving_a_tab_reorders_its_list() {
     press(&mut rt, K::Right, Mods { shift: true, ..cmd() });
     assert_eq!(shown(&rt.state), [b.as_str(), &a, &c]);
     let list: List = ("local".into(), Some("~".into()));
-    // Its folder's row first.
-    rt.update(|s, _| s.reorder(list, 1, 3));
+    rt.update(|s, _| s.reorder_threads(&list, "f1", 0, 2));
     assert_eq!(shown(&rt.state), [a.as_str(), &c, &b]);
     // The second order is written once the first is: the window has to run for that.
     let cfg = server.config();
@@ -551,7 +550,7 @@ fn dragging_a_row_reorders_its_list() {
     drag(&mut rt, "row-local-a", 2.0 * (b - a));
     let shown: Vec<String> = super::folders::listed(&rt.state.snap.hosts[0], None).placed().into_iter().map(|(t, _)| t).collect();
     assert_eq!(shown, ["b", "c", "a"]);
-    assert!(rt.state.row_drag.dragging().is_none(), "the drag is over");
+    assert!(rt.state.sidebar_drag.is_none(), "the drag is over");
     // A press that doesn't move is a click.
     click(&mut rt, "row-local-c");
     assert_eq!(rt.state.active, Some(key("c")));

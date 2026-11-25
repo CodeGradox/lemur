@@ -260,10 +260,8 @@ pub struct Lemur {
     pub metrics: Metrics,
     /// The terminal's area in the window, which its grid fits.
     term_area: (f32, f32),
-    /// The sidebar's drag.
-    pub row_drag: rune_kit::shell::Reorder,
-    /// The list `row_drag` is for: the one under the pointer as a drag starts.
-    pub row_drag_list: List,
+    /// The sidebar's drag: of a thread in its folder, or of a folder with its threads.
+    pub sidebar_drag: Option<folders::SidebarDrag>,
     /// When a folder's row was last let go after a drag: the press that ends it isn't a click.
     pub folder_dropped: Option<Instant>,
     /// When the sidebar's width was last saved.
@@ -383,8 +381,7 @@ impl Lemur {
             dark: true,
             metrics,
             term_area: (900.0, 600.0),
-            row_drag: rune_kit::shell::Reorder::new().gap(1.0),
-            row_drag_list: (String::new(), None),
+            sidebar_drag: None,
             folder_dropped: None,
             saved_widths: (sidebar_width, notes_width),
             diffs: changes::Changes::default(),
@@ -512,14 +509,23 @@ impl Lemur {
     }
 
     /// The sidebar's row of the thread on show scrolls into view when another thread shows,
-    /// however it was picked, or the window's width changes. Scrolled away by hand, it stays
-    /// put till then.
+    /// however it was picked, or the window's width changes, or the sidebar turns to every
+    /// agent (⌘.) or back. Scrolled away by hand, it stays put till then.
     fn reveal_row(&mut self, tx: &mut Tx) {
         // A thread just started shows before the snapshot lists it, and its row with it.
         let now = self.active.clone().filter(|k| self.session_of(k).is_some()).map(|k| (k, self.window_w));
         if now != self.revealed {
             if let Some(((host, session), _)) = &now {
-                tx.scroll_into_view_in("sidebar-scroll", format!("row-{host}-{session}"));
+                // ⌘.'s rows go by their place in its list.
+                let row = if self.sidebar_agents {
+                    let at = self.sidebar_agent_threads().iter().position(|(h, t)| h == host && t.name == *session);
+                    at.map(|i| format!("sidebar-agent-{i}"))
+                } else {
+                    Some(format!("row-{host}-{session}"))
+                };
+                if let Some(row) = row {
+                    tx.scroll_into_view_in("sidebar-scroll", row);
+                }
             }
             self.revealed = now;
         }
