@@ -4,9 +4,9 @@
 //! versions, and every shortcut. Changes apply at once and are saved to the
 //! config file.
 //!
-//! It's a page over the whole window, not a window of its own as it was: Rune gives each
-//! window a state of its own, and what Settings changes is this one's, which the terminals
-//! follow at once.
+//! It's a modal over the window, not a window of its own as it was: Rune gives each window a
+//! state of its own, and what Settings changes is this one's, which the terminals follow at
+//! once.
 
 use super::palette::{Palette, Rgb, SLOTS, Slot, hex, rgb, set_color};
 use super::terminal::Metrics;
@@ -318,12 +318,18 @@ impl Lemur {
     }
 }
 
-/// Settings over the window, while it's open: its pages on the left, the one picked beside
-/// them, and why a change couldn't be saved under both.
-pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
+/// How big Settings is at most, as its window was: in a smaller window, the window less a
+/// margin round it.
+const WIDTH: f32 = 760.0;
+const HEIGHT: f32 = 560.0;
+
+/// Settings in `layer` while it's open, a modal over the dimmed window: its pages on the
+/// left, the one picked beside them, and why a change couldn't be saved under both. Escape or
+/// a click outside it closes it, as Done does.
+pub fn overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
     let st = &s.panels.settings;
     if !st.open {
-        return None;
+        return;
     }
     let c = &k.c;
     let mut nav = col().key("settings-nav").w(200.0).h_full().padding(8.0).gap(2.0);
@@ -373,7 +379,7 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
         .border_sides([0.0, 0.0, 0.0, 1.0], c.border_weak)
         .scroll(ScrollSpec { stick_bottom: false })
         .child(content);
-    let mut body = col().w_full().h_full().min_h(0.0).child(row().w_full().grow(1.0).min_h(0.0).child(nav).child(pane));
+    let mut body = col().w_full().grow(1.0).min_h(0.0).child(row().w_full().grow(1.0).min_h(0.0).child(nav).child(pane));
     if let Some(error) = &st.error {
         body = body.child(
             row()
@@ -391,8 +397,34 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
         .on_press(|s: &mut Lemur| s.close_settings())
         .build(k)
         .key("settings-done");
-    let page = rune_kit::Page::new(body).title("Settings").trailing(done).frame_inset(6.0).build(k);
-    Some(el().key("settings").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).child(page))
+    let head = row()
+        .key("settings-head")
+        .w_full()
+        .h(44.0)
+        .px(16.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
+        .child(text("Settings").font(k.ty.ui_medium).color(c.text_base).grow(1.0))
+        .child(done);
+    // As the cards over the window look.
+    let panel = col()
+        .key("settings")
+        .role("dialog")
+        .label("Settings")
+        .w_full()
+        .max_w(WIDTH)
+        .h_full()
+        .max_h(HEIGHT)
+        .radius(k.radius.lg)
+        .fill(c.surface_raised)
+        .border(1.0, c.border_base)
+        .shadow(12.0, 40.0, c.scrim)
+        .clip_rounded(k.radius.lg)
+        .child(head)
+        .child(body)
+        .modal(true, |s: &mut Lemur| s.close_settings());
+    layer.push(el().key("settings-scrim").absolute(0.0, 0.0).w_full().h_full().fill(c.scrim).a11y_hidden());
+    layer.push(el().key("settings-layer").absolute(0.0, 0.0).w_full().h_full().padding(32.0).center().child(panel));
 }
 
 /// A setting: its name beside what sets it, and its help under both, across the page, so it

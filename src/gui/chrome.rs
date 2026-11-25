@@ -301,9 +301,7 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
     if let Some(card) = peek::card(s, k) {
         root = root.child(card);
     }
-    for over in panels::overlays(s, k, layer) {
-        root = root.child(over);
-    }
+    panels::overlays(s, k, layer);
     if let Some(p) = &s.prompt {
         card::over_window("spotlight", prompt::card(s, p, k), |s: &mut Lemur| s.close_prompt(), k, layer);
     }

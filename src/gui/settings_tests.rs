@@ -47,8 +47,8 @@ fn update_says_why_theres_nothing_to_do() {
     assert_eq!(update_summary(&ours), "Updates this Mac 0.1.15, agent 0.1.15.");
 }
 
-/// ⌘, opens Settings over the window, once: again leaves it as it is. ⌘W closes it, not the
-/// thread on show, and so does Esc.
+/// ⌘, opens Settings over the window, a modal, once: again leaves it as it is. ⌘W closes it,
+/// not the thread on show, and so do Esc and a click outside it.
 #[test]
 fn settings_open_once_over_the_window() {
     let mut rt = window(no_config());
@@ -57,6 +57,8 @@ fn settings_open_once_over_the_window() {
     assert!(!rt.state.keyboard_on_terminal(), "the terminal under it doesn't take keys");
     frames(&mut rt, 20);
     assert!(rt.find("settings").is_some() && rt.find("settings-nav").is_some());
+    let (panel, _) = rt.presented("settings").expect("Settings");
+    assert!(panel[2] <= 760.5 && panel[3] <= 560.5 && panel[0] > 0.0, "a modal in the window, not all of it: {panel:?}");
     press(&mut rt, K::Command(','), cmd());
     assert!(rt.state.panels.settings.open);
 
@@ -67,6 +69,14 @@ fn settings_open_once_over_the_window() {
     assert!(rt.state.panels.settings.open);
     press(&mut rt, K::Escape, Mods::default());
     assert!(!rt.state.panels.settings.open);
+
+    press(&mut rt, K::Command(','), cmd());
+    frames(&mut rt, 20);
+    rt.pointer_move(20.0, 400.0);
+    rt.pointer_down(20.0, 400.0);
+    rt.pointer_up(20.0, 400.0);
+    frames(&mut rt, 4);
+    assert!(!rt.state.panels.settings.open, "a click outside it");
 }
 
 /// Help text goes under its item, across the page, so it leaves what the item sets the room

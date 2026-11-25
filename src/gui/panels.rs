@@ -155,11 +155,11 @@ pub fn right(s: &Lemur, k: &Kit) -> El {
 }
 
 /// What shows over the window besides the spotlight, a dialog and a peek: front last.
-pub fn overlays(s: &Lemur, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
+pub fn overlays(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
     changes_panel::diff_overlay(s, k, layer);
     picker::overlay(s, k, layer);
     commands::overlay(s, k, layer);
-    settings::overlay(s, k).into_iter().collect()
+    settings::overlay(s, k, layer);
 }
 
 /// Under the terminal, over the status bar: the dictation bar while dictating.
