@@ -76,17 +76,14 @@ impl Listed<'_> {
     }
 }
 
-/// `placed` with the `from`th thread of folder `folder` moved to its `to`th place: the others
-/// keep theirs, and every thread its folder.
-fn moved_within(placed: &[(String, String)], folder: &str, from: usize, to: usize) -> Vec<(String, String)> {
+/// `placed` with folder `folder`'s threads in `order`'s order, by name, in the places its
+/// threads have: one `order` lacks, there since, after those it has; one gone since is no
+/// matter. The others keep theirs, and every thread its folder.
+fn ordered_within(placed: &[(String, String)], folder: &str, order: &[String]) -> Vec<(String, String)> {
     let at: Vec<usize> = placed.iter().enumerate().filter(|(_, (_, f))| f == folder).map(|(i, _)| i).collect();
     let mut out = placed.to_vec();
-    if from >= at.len() || to >= at.len() {
-        return out;
-    }
     let mut threads: Vec<(String, String)> = at.iter().map(|&i| placed[i].clone()).collect();
-    let thread = threads.remove(from);
-    threads.insert(to, thread);
+    threads.sort_by_key(|(name, _)| order.iter().position(|o| o == name).unwrap_or(usize::MAX));
     for (i, thread) in at.into_iter().zip(threads) {
         out[i] = thread;
     }
@@ -141,9 +138,14 @@ impl SidebarDrag {
         self.dy.is_some()
     }
 
+    /// What's dragged, by id: a folder's, or a thread's name.
+    pub fn dragged(&self) -> &str {
+        self.ids.get(self.from).map_or("", String::as_str)
+    }
+
     /// Whether `id` is the one dragged, lifted off the others.
     pub fn lifts(&self, id: &str) -> bool {
-        self.moved() && self.ids.get(self.from).is_some_and(|f| f == id)
+        self.moved() && self.dragged() == id
     }
 
     /// Where it lands if let go now: past every folder whose middle it has passed.
@@ -340,12 +342,28 @@ impl Lemur {
         l.groups.iter().find(|g| g.id == id).map(|g| g.threads.iter().map(|s| s.name.clone()).collect()).unwrap_or_default()
     }
 
-    /// The `from`th thread of folder `folder` of `list`, a session's, was dragged to its `to`th
-    /// place: the folder's others keep theirs, and the other folders' theirs.
-    pub(super) fn reorder_threads(&mut self, list: &List, folder: &str, from: usize, to: usize) {
+    /// The threads of folder `folder` of `list`, a session's, go in `order`, by name, as a
+    /// thread dragged there leaves them: the other folders' keep theirs.
+    pub(super) fn reorder_threads(&mut self, list: &List, folder: &str, order: &[String]) {
         let Some(h) = self.host_view(&list.0) else { return };
-        let threads = moved_within(&listed(h, list.1.as_deref()).placed(), folder, from, to);
+        let threads = ordered_within(&listed(h, list.1.as_deref()).placed(), folder, order);
         self.place_threads(list, threads);
+    }
+
+    /// Ends a drag in the sidebar whose row went, a thread's that ended say: Rune tells of no
+    /// release then, and the rows would stay stepped aside.
+    pub(super) fn end_lost_drag(&mut self) {
+        let Some(drag) = &self.sidebar_drag else { return };
+        let there = self.host_view(&drag.list.0).is_some_and(|h| {
+            let groups = listed(h, drag.list.1.as_deref()).groups;
+            match &drag.folder {
+                Some(folder) => groups.iter().any(|g| g.id == *folder && g.threads.iter().any(|s| s.name == drag.dragged())),
+                None => groups.iter().any(|g| g.id == drag.dragged()),
+            }
+        });
+        if !there {
+            self.sidebar_drag = None;
+        }
     }
 
     /// The folders of `list`, a session's, go in `order`, by id, each with its threads.
@@ -480,12 +498,17 @@ impl Lemur {
         }
     }
 
-    /// Forgets the folders no thread is in any more, put away or not, on the hosts reached.
+    /// Forgets the folders no thread is in any more, put away or not, on the hosts reached;
+    /// not one whose threads are to resume there, nor while a write to herdr-core is under
+    /// way, a thread's folder say, which the snapshot may not show yet.
     pub(super) fn drop_empty_folders(&mut self) {
+        if self.writes > 0 {
+            return;
+        }
         let reached: Vec<String> = self.snap.hosts.iter().filter(|h| h.error.is_none()).map(|h| h.name.clone()).collect();
         for host in reached {
             let Some(h) = self.host_view(&host) else { continue };
-            let used: Vec<String> = listed(h, None).placed().into_iter().map(|(_, f)| f).collect();
+            let used: Vec<String> = listed(h, None).placed().into_iter().map(|(_, f)| f).chain(h.resuming_in.iter().cloned()).collect();
             let Some(h) = self.cfg.hosts.iter_mut().find(|h| h.name == host) else { continue };
             let kept = h.folders.len();
             h.folders.retain(|f| used.contains(&f.id));
@@ -505,14 +528,18 @@ mod tests {
     }
 
     /// A thread dragged takes another place in its folder, never out of it, and the other
-    /// threads keep theirs: a folder's, put away too, and other folders'.
+    /// threads keep theirs: a folder's, put away too, and other folders'. The order goes by
+    /// name: a thread gone while it was dragged moves no other, and one there since stays
+    /// after those it has.
     #[test]
     fn a_thread_moves_only_within_its_folder() {
         // A: a b c | B: d | put away: e of A.
         let now = placed(&[("a", "A"), ("b", "A"), ("c", "A"), ("d", "B"), ("e", "A")]);
-        assert_eq!(moved_within(&now, "A", 0, 2), placed(&[("b", "A"), ("c", "A"), ("a", "A"), ("d", "B"), ("e", "A")]));
-        assert_eq!(moved_within(&now, "A", 2, 0), placed(&[("c", "A"), ("a", "A"), ("b", "A"), ("d", "B"), ("e", "A")]));
-        assert_eq!(moved_within(&now, "A", 0, 9), now, "nowhere past its folder");
+        let order = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(ordered_within(&now, "A", &order(&["b", "c", "a"])), placed(&[("b", "A"), ("c", "A"), ("a", "A"), ("d", "B"), ("e", "A")]));
+        assert_eq!(ordered_within(&now, "A", &order(&["c", "a", "b"])), placed(&[("c", "A"), ("a", "A"), ("b", "A"), ("d", "B"), ("e", "A")]));
+        assert_eq!(ordered_within(&now, "A", &order(&["x", "b", "a", "c"])), placed(&[("b", "A"), ("a", "A"), ("c", "A"), ("d", "B"), ("e", "A")]), "x gone");
+        assert_eq!(ordered_within(&now, "A", &order(&["b", "a"])), placed(&[("b", "A"), ("a", "A"), ("c", "A"), ("d", "B"), ("e", "A")]), "c there since");
     }
 
     /// Folders dropped in a new order take their threads along; one the order lacks stays

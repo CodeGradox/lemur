@@ -244,6 +244,7 @@ impl Lemur {
             self.close_popup(&k);
         }
         self.snap = snap;
+        self.end_lost_drag();
         self.bring_back_needed();
         self.reconnect_terminals();
         self.note_agents();
@@ -458,7 +459,9 @@ impl Lemur {
         // One put away isn't among its folder's rows.
         let Some(s) = self.session_of(&active).filter(|s| !s.away) else { return };
         let (folder, space) = (super::folders::folder_of(s), (active.0.clone(), s.space.clone()));
-        self.reorder_threads(&Self::space_list(&space), &folder, at, next);
+        let mut order: Vec<String> = tabs.into_iter().map(|(_, name)| name).collect();
+        order.swap(at, next);
+        self.reorder_threads(&Self::space_list(&space), &folder, &order);
     }
 
     /// Writes the order dragged into `list` to herdr-core, a label a thread, then the one
@@ -489,11 +492,13 @@ impl Lemur {
     /// herdr-core had it are stale; the one after shows what herdr-core keeps.
     pub(super) fn write_core(&mut self, write: impl FnOnce(&crate::config::Config) -> anyhow::Result<()> + Send + 'static) {
         self.changes += 1;
+        self.writes += 1;
         let cfg = self.cfg.clone();
         self.in_background(
             move || write(&cfg),
             |s, saved| {
                 s.changes += 1;
+                s.writes -= 1;
                 if let Err(e) = saved {
                     s.fail(e);
                 }

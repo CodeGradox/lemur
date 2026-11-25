@@ -204,8 +204,6 @@ pub struct Lemur {
     /// The sidebar lists every agent's thread instead of the session's, as Rex's eye (⌘.)
     /// lists what reports activity.
     pub(super) sidebar_agents: bool,
-    /// The thread whose colours show as swatches, where it was right-clicked (`Color…`).
-    pub(super) color_menu: Option<(Key, rune::PointerPress)>,
     /// Threads by when they were last opened, the latest first.
     recent: Vec<Key>,
     /// ⌃Tab going through a worktree's threads: in which order, and where it's at. It
@@ -228,6 +226,9 @@ pub struct Lemur {
     /// Lists whose dragged order is being written to herdr-core, and the order dragged
     /// meanwhile, written next.
     ordering: HashMap<List, Option<Vec<(String, String)>>>,
+    /// Writes to herdr-core under way (`write_core`): till they're done, a snapshot may not
+    /// show them yet.
+    writes: usize,
     /// Terminals setting up a host (`hc machine add`), and the host each sets up.
     setups: HashMap<Key, Host>,
     /// Gone threads being resumed, by host and session.
@@ -354,7 +355,6 @@ impl Lemur {
             space_shown: None,
             session_switch: rune_kit::ComboboxState::default(),
             sidebar_agents: false,
-            color_menu: None,
             recent: vec![],
             cycling: None,
             sidebar: PaneState::new(sidebar_width).range(SIDEBAR.0, SIDEBAR.1),
@@ -365,6 +365,7 @@ impl Lemur {
             seen: HashMap::new(),
             agent_walk: vec![],
             ordering: HashMap::new(),
+            writes: 0,
             setups: HashMap::new(),
             resuming: HashSet::new(),
             setting_up: HashSet::new(),
@@ -661,6 +662,7 @@ fn poll(s: &mut Lemur, now: f64, tx: &mut Tx) -> bool {
     }
     changed |= s.expire_popups(now, tx);
     changed |= s.panels_poll(tx);
+    changed |= s.close_unseen_switch();
     changed
 }
 

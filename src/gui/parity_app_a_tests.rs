@@ -171,12 +171,14 @@ fn two_drags_in_a_row_keep_the_second() {
     let t: Vec<String> = (0..8).map(|_| server.run("/", &["lemur.folder=f1"], &["sleep", "600"])).collect();
     let mut rt = loaded(&server);
     let list: List = ("local".into(), None);
-    rt.update(|s, _| {
-        s.reorder_threads(&list, "f1", 0, 7);
-        s.reorder_threads(&list, "f1", 0, 7);
-    });
+    let mut once = t.clone();
+    once.rotate_left(1);
     let mut expected = t.clone();
     expected.rotate_left(2);
+    rt.update(|s, _| {
+        s.reorder_threads(&list, "f1", &once);
+        s.reorder_threads(&list, "f1", &expected);
+    });
     assert!(wait_for(&mut rt, 20.0, |s| s.ordering.is_empty()), "written");
     assert_eq!(core_order(&server.config()), expected);
 }
@@ -814,7 +816,7 @@ fn refreshes_keep_claude_ids_current() {
 
 /// v2 `cmd_j_starts_beside_a_thread_outside_every_project`, sessions since: outside every
 /// project, ⌘J starts in the folder of the session of the thread on show, its host's home,
-/// wherever that one runs, with the session's threads among those to go to.
+/// wherever that one runs.
 #[test]
 fn cmd_j_starts_in_the_folder_of_the_session_on_show() {
     let server = HcServer::new("pa-cmdj");
@@ -831,13 +833,7 @@ fn cmd_j_starts_in_the_folder_of_the_session_on_show() {
     let home = rt.state.snap.hosts[0].home.clone();
     let Ask::NewThread { host, base, dir: at, agent, .. } = &prompt.what else { panic!("not a new thread: {:?}", prompt.what) };
     assert_eq!((host.as_str(), *base, at.as_str(), *agent), ("local", None, home.as_str(), Some(Agent::Claude)));
-    let mut listed: Vec<String> = rt.state.matches(prompt).into_iter().map(|m| m.key.1).collect();
-    listed.sort();
-    let mut both = [mine.clone(), elsewhere.clone()];
-    both.sort();
-    assert_eq!(listed, both, "the session's");
 
-    press(&mut rt, K::Down, Mods::default());
     press(&mut rt, K::Down, Mods::default());
     type_text(&mut rt, "beside");
     assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "beside");
@@ -1335,8 +1331,9 @@ fn a_terminal_started_beside_a_thread_joins_its_folder() {
     assert!(refreshing(&mut rt, 10.0, |s| s.siblings(&key(&b)).contains(&key(&other))));
 }
 
-/// ⌃Tab goes through every thread of the session of the one on show, as the sidebar lists
-/// them: each folder's, folded too, one started in it wherever it runs, and none of another.
+/// ⌃Tab goes through the threads of the session of the one on show, as the sidebar lists
+/// them: one started in it wherever it runs, none of another, and none of a folded folder,
+/// which stays folded.
 #[test]
 fn ctrl_tab_goes_through_the_whole_session() {
     let server = HcServer::new("pa-hostcycle");
@@ -1360,7 +1357,8 @@ fn ctrl_tab_goes_through_the_whole_session() {
         rt.update(|s, tx| s.cycle_threads(false, tx));
         seen.push(rt.state.active.clone().unwrap().1);
     }
-    assert_eq!(seen, [b, e, a]);
+    assert_eq!(seen, [e.clone(), a, e], "not b, in folded f1");
+    assert!(rt.state.folded("local", "f1"), "still folded");
 }
 
 /// A folder dragged below the next takes its threads along.
@@ -1516,9 +1514,9 @@ fn a_folder_goes_by_words_of_its_own_or_its_worktree() {
     assert_eq!(label.as_deref(), Some("auth"));
 }
 
-/// A thread's right-click → Color… shows the colours as swatches, and gives it one: its icon
-/// shows white on a tile of it, in the sidebar and the terminal's header, and herdr-core
-/// keeps it. No colour takes it off; one Lemur doesn't know shows none.
+/// A thread's right-click → Color, a submenu of macOS's own, gives it one by name, its own
+/// checked: its icon shows white on a tile of it, in the sidebar and the terminal's header,
+/// and herdr-core keeps it. No color takes it off; one Lemur doesn't know shows none.
 #[test]
 fn a_thread_takes_a_colour() {
     let server = HcServer::new("pa-colour");
@@ -1536,22 +1534,14 @@ fn a_thread_takes_a_colour() {
         let terminals = server.core().terminals();
         terminals.iter().find(|x| x.address == t).and_then(|x| x.labels.get("lemur.color").cloned()).unwrap_or_default()
     };
+    let checked = |rt: &Runtime<Lemur>, id: &str| rt.popup_menu().expect("its menu").find(id).is_some_and(|i| i.is_checked());
     assert!(tile(&rt, &row).is_none());
     assert_eq!(rt.state.session_of(&key(&odd)).and_then(|s| s.color.clone()), None, "not one of the colours");
 
     right_click(&mut rt, &row);
-    rt.resolve_popup(Some("color")).unwrap();
-    frames(&mut rt, 20);
+    assert!(checked(&rt, "no-color") && !checked(&rt, "color:purple"), "none yet");
+    rt.resolve_popup(Some("color:purple")).unwrap();
     let purple = rune::color::hex("#a855f7").unwrap();
-    // Purple, the eighth, shows as a swatch of it beside its name.
-    let swatch = |rt: &Runtime<Lemur>, item: &str| {
-        let els = rt.elements();
-        let at = els.iter().find(|e| e.key.as_deref() == Some(item) && !e.exiting).map(|e| e.path.clone())?;
-        els.into_iter().filter(|e| e.path.starts_with(&at) && e.path != at).find_map(|e| Some(e.fill).filter(|f| *f == purple))
-    };
-    assert_eq!(swatch(&rt, "thread-colors-item7"), Some(purple), "the colour itself");
-    click(&mut rt, "thread-colors-item7");
-    assert!(rt.state.color_menu.is_none(), "it closes");
     frames(&mut rt, 20);
     assert_eq!(tile(&rt, &row), Some(purple), "at once");
     assert!(wait_for(&mut rt, 5.0, |_| label(&t) == "purple"));
@@ -1560,9 +1550,8 @@ fn a_thread_takes_a_colour() {
     assert_eq!(tile(&rt, "term-header"), Some(purple), "its header too");
 
     right_click(&mut rt, &row);
-    rt.resolve_popup(Some("color")).unwrap();
-    // After the line under the ten.
-    click(&mut rt, "thread-colors-item11");
+    assert!(checked(&rt, "color:purple") && !checked(&rt, "no-color"), "its own checked");
+    rt.resolve_popup(Some("no-color")).unwrap();
     assert!(wait_for(&mut rt, 5.0, |_| label(&t).is_empty()));
     assert!(refreshing(&mut rt, 10.0, |s| s.session_of(&key(&t)).is_some_and(|x| x.color.is_none())));
     frames(&mut rt, 20);

@@ -143,6 +143,7 @@ fn project_snapshot(threads: &[&str], machine: crate::machine::Reading) -> Snaps
             }],
             other: vec![],
             gone: vec![],
+            resuming_in: vec![],
         }],
     }
 }
@@ -1458,10 +1459,10 @@ fn the_status_bar_links_the_worktrees_servers() {
     assert!(rt.find("port-3020").is_none(), "the other worktree's");
 }
 
-/// ⌘J lists the threads to go to under the new one's name: typing narrows them, ↓ goes past
-/// Claude and Shell to them, and ⏎ opens the one picked. ⌘P lists them all.
+/// ⌘J only starts a thread: it lists none to go to, and ↓ goes between Claude and Shell. ⌘P
+/// lists the threads to go to: typing narrows them, and ⏎ opens the one picked.
 #[test]
-fn cmd_j_and_cmd_p_go_to_threads() {
+fn cmd_j_starts_and_cmd_p_goes_to_threads() {
     let server = HcServer::new("pgoto");
     let mut cfg = server.config();
     cfg.bases.push(Base::new("local", "/srv/api"));
@@ -1472,18 +1473,21 @@ fn cmd_j_and_cmd_p_go_to_threads() {
     let listed = |s: &Lemur| s.matches(s.prompt.as_ref().expect("asking")).into_iter().map(|m| m.key.1).collect::<Vec<_>>();
 
     press(&mut rt, K::Command('j'), cmd());
-    // The session's, untouched by the name it starts with.
-    assert_eq!(listed(&rt.state), ["main-shell", "review", "build"]);
+    frames(&mut rt, 20);
+    assert!(listed(&rt.state).is_empty() && rt.find("go-0").is_none(), "no threads to go to");
     type_text(&mut rt, "bui");
-    assert_eq!(rt.state.prompt.as_ref().unwrap().input.text, "bui");
-    assert_eq!(listed(&rt.state), ["build"]);
-    for _ in 0..2 {
-        press(&mut rt, K::Down, Mods::default());
-    }
-    assert_eq!(rt.state.prompt.as_ref().unwrap().go, Some(0));
-    press(&mut rt, K::Enter, Mods::default());
-    assert_eq!(rt.state.active, Some(key("build")));
-    assert!(rt.state.prompt.is_none());
+    assert!(listed(&rt.state).is_empty());
+    let picked = |s: &Lemur| match &s.prompt.as_ref().unwrap().what {
+        super::prompt::Ask::NewThread { agent, .. } => *agent,
+        what => panic!("not a new thread: {what:?}"),
+    };
+    press(&mut rt, K::Down, Mods::default());
+    assert_eq!(picked(&rt.state), None, "Shell");
+    press(&mut rt, K::Down, Mods::default());
+    assert_eq!(picked(&rt.state), Some(Agent::Claude), "Claude again, nothing past them");
+    assert_eq!(rt.state.prompt.as_ref().unwrap().go, None);
+    press(&mut rt, K::Escape, Mods::default());
+    open(&mut rt, "build");
 
     press(&mut rt, K::Command('p'), cmd());
     // Those opened last first, the one on show at the end.

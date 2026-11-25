@@ -505,6 +505,7 @@ fn snapshot(worktrees: &[(&str, &str, &[&str])]) -> Snapshot {
             bases: vec![BaseView { index: 0, path: String::new(), error: None, worktrees, plain: false }],
             other: vec![],
             gone: vec![],
+            resuming_in: vec![],
         }],
     }
 }

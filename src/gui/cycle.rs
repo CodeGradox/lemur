@@ -1,5 +1,5 @@
-//! ⌃Tab: going through the threads of the session of the one on show, or with ⌘. every
-//! agent's as the sidebar lists them then, in the sidebar's order
+//! ⌃Tab: going through the threads of the session of the one on show, but a folded folder's,
+//! or with ⌘. every agent's as the sidebar lists them then, in the sidebar's order
 //! or, as Settings can say, the one opened last first, the way ⌘Tab goes through apps. While
 //! ⌃ is held each Tab goes one further; letting go of it settles on the thread on show.
 
@@ -36,7 +36,12 @@ impl Lemur {
         if self.cycling.is_none() {
             let mut threads = match self.sidebar_agents {
                 true => self.sidebar_threads(),
-                false => self.space_of(&active).map(|space| self.space_threads(&space)).unwrap_or_default(),
+                // Not a folded folder's, as ⌘1–9 go: showing one would unfold it.
+                false => {
+                    let threads = self.space_of(&active).map(|space| self.space_threads(&space)).unwrap_or_default();
+                    let folded = |k: &Key| self.session_of(k).is_some_and(|s| self.folded(&k.0, &super::folders::folder_of(s)));
+                    threads.into_iter().filter(|k| !folded(k)).collect()
+                }
             };
             // Put away, it's still where it starts from.
             if !threads.contains(&active) {

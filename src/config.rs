@@ -658,8 +658,6 @@ impl Config {
         })
     }
 
-    /// Saves the side panels' widths, as dragged, to the config file at
-    /// `path`. A panel at lemur's own width is left out of the file.
     /// Saves the folders of `host`'s threads you named or folded to its entry in the config
     /// file at `path`; none leaves the key out.
     pub fn save_host_folders(path: &Path, host: &Host) -> Result<()> {
@@ -692,6 +690,8 @@ impl Config {
         })
     }
 
+    /// Saves the side panels' widths, as dragged, to the config file at
+    /// `path`. A panel at lemur's own width is left out of the file.
     pub fn save_panel_widths(path: &Path, sidebar: Option<f32>, notes: Option<f32>) -> Result<()> {
         edit(path, |doc| {
             for (key, width) in [("sidebar_width", sidebar), ("notes_width", notes)] {

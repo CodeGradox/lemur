@@ -19,6 +19,7 @@ fn apply(rt: &mut Runtime<Lemur>, sessions: &[(&str, Activity)]) {
             bases: vec![],
             other: sessions.iter().map(|(n, a)| session(n, *a)).collect(),
             gone: vec![],
+            resuming_in: vec![],
         }],
     };
     rt.update(|s, _| s.set_snapshot(snap));
@@ -242,6 +243,7 @@ fn a_shells_command_notifies_once_it_has_run_a_while() {
                 bases: vec![],
                 other: vec![session("shown", Activity::Unknown), sh],
                 gone: vec![],
+                resuming_in: vec![],
             }],
         };
         rt.update(|s, _| s.set_snapshot(snap));

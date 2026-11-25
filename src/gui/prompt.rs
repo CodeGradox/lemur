@@ -1,6 +1,5 @@
 //! The spotlight: names asked for a new worktree, a new thread or a rename, and threads to
-//! go to (⌘J lists them under the new thread's name, the session's first; ⌘P lists them
-//! all); and ⌘K's sessions, to switch to (`spaces`). What's typed narrows
+//! go to (⌘P); and ⌘K's sessions, to switch to (`spaces`). What's typed narrows
 //! them down; ↑↓ picks one and ⏎ opens it. Also what starts at once, without a name: a
 //! terminal (⌘T) or an agent, and the menu offering them.
 
@@ -234,7 +233,7 @@ impl Lemur {
         }
     }
 
-    /// ⏎: a thread picked to go to opens; otherwise the name starts or renames.
+    /// ⏎: a thread or session picked opens; otherwise the name starts or renames.
     pub(super) fn prompt_enter(&mut self) {
         let Some(prompt) = &self.prompt else { return };
         match (&prompt.what, prompt.go) {
@@ -242,35 +241,28 @@ impl Lemur {
                 self.go_to(go);
             }
             (Ask::Switch, go) => self.switch_pick(go.unwrap_or(0)),
-            (_, Some(i)) => {
-                self.go_to(Some(i));
-            }
             _ => self.submit(),
         }
     }
 
-    /// The threads to go to for what's typed: each word of it is in a thread's name, place or
-    /// host. ⌘J lists the threads of its session first; ⌘P those opened last, the one on show
-    /// at the end.
+    /// The threads ⌘P lists to go to for what's typed: each word of it is in a thread's
+    /// name, place or host; those opened last first, the one on show at the end. Nothing
+    /// else lists them.
     pub fn matches(&self, prompt: &Prompt) -> Vec<Match> {
+        if prompt.what != Ask::Find {
+            return vec![];
+        }
         let typed = prompt.input.text.to_lowercase();
-        let query = match &prompt.what {
-            // The name it starts with isn't something you searched for.
-            Ask::NewThread { agent, .. } if typed == default_label(*agent) => "",
-            _ => typed.trim(),
-        };
-        let words: Vec<&str> = query.split_whitespace().collect();
+        let words: Vec<&str> = typed.split_whitespace().collect();
         let mut found: Vec<(usize, Match)> = sessions(&self.snap)
             .map(|(host, s)| {
                 let key: Key = (host.to_string(), s.name.clone());
                 let (place, label) = self.titles(host, &s.name);
                 let place = place.unwrap_or_else(|| host.to_string());
-                let rank = match &prompt.what {
-                    // The session's own first.
-                    Ask::NewThread { host: here, space, .. } => usize::from(host != here || s.space != *space),
+                let rank = match self.active.as_ref() == Some(&key) {
                     // The one on show last: ⏎ goes to the one before it.
-                    _ if self.active.as_ref() == Some(&key) => usize::MAX,
-                    _ => self.recent.iter().position(|k| *k == key).unwrap_or(usize::MAX - 1),
+                    true => usize::MAX,
+                    false => self.recent.iter().position(|k| *k == key).unwrap_or(usize::MAX - 1),
                 };
                 (rank, Match { key, label, place })
             })
@@ -284,13 +276,12 @@ impl Lemur {
         found.into_iter().map(|(_, m)| m).take(SHOWN).collect()
     }
 
-    /// Moves the pick one down (or with `back` up): for a new thread, through what it can
-    /// run, then the threads to go to.
+    /// Moves the pick one down (or with `back` up): for a new thread or worktree, through
+    /// what it can run; else through what's listed.
     pub fn step(&mut self, back: bool) {
         let Some(prompt) = &self.prompt else { return };
         let (kinds, count) = match prompt.what {
-            Ask::NewWorktree { .. } => (KINDS.len(), 0),
-            Ask::NewThread { .. } => (KINDS.len(), self.matches(prompt).len()),
+            Ask::NewWorktree { .. } | Ask::NewThread { .. } => (KINDS.len(), 0),
             Ask::Switch => (0, self.switchable(prompt).len()),
             Ask::RenameFolder { .. } => return,
             _ => (0, self.matches(prompt).len()),
@@ -365,6 +356,16 @@ impl Lemur {
             return;
         }
         let Some(Prompt { what, .. }) = self.prompt.take() else { return };
+        // The sidebar stays on the session it starts in till it shows there, as `start_now`
+        // has it.
+        match &what {
+            Ask::NewThread { host, space, .. } => self.space_shown = Some((host.clone(), space.clone())),
+            Ask::NewWorktree { base, .. } => {
+                let b = &self.cfg.bases[*base];
+                self.space_shown = Some((b.host.clone(), b.path.clone()));
+            }
+            _ => {}
+        }
         let cfg = self.cfg.clone();
         let doing = match what {
             Ask::Rename { .. } => "renaming",
@@ -514,14 +515,8 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
             (&icons::FOLDER, format!("New worktree in {}", s.cfg.bases[*base].name()), "↑↓ Claude or shell · ⏎ start · esc cancel")
         }
         Ask::NewThread { host, dir, agent, .. } => {
-            // While a thread is picked, what to start isn't.
-            kind = Some(*agent).filter(|_| prompt.go.is_none());
-            listed = true;
-            (
-                &icons::PLUS,
-                format!("New in {}, or go to", s.worktree_name(host, dir)),
-                "↑↓ Claude, shell or a thread · ⏎ start or go · esc cancel",
-            )
+            kind = Some(*agent);
+            (&icons::PLUS, format!("New in {}", s.worktree_name(host, dir)), "↑↓ Claude or shell · ⏎ start · esc cancel")
         }
         Ask::Find => {
             listed = true;
@@ -581,10 +576,7 @@ pub fn card(s: &Lemur, prompt: &Prompt, k: &Kit) -> El {
     if listed {
         let matches = s.matches(prompt);
         if !matches.is_empty() {
-            let picked = match prompt.what {
-                Ask::Find => Some(prompt.go.unwrap_or(0)),
-                _ => prompt.go,
-            };
+            let picked = Some(prompt.go.unwrap_or(0));
             let mut rows = col().key("matches").padding(4.0).gap(2.0);
             for (i, m) in matches.into_iter().enumerate() {
                 let agent = s.session_of(&m.key).and_then(|s| s.agent());

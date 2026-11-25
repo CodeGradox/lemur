@@ -10,7 +10,7 @@ use super::sidebar::status_dot;
 use super::silence::silence_label;
 use super::{Key, Lemur, icons, key, sessions, worktree_label};
 use crate::snapshot::{Activity, Helper, Session};
-use rune::{El, ScrollSpec, col, row, text};
+use rune::{Anim, El, ScrollSpec, TextStyle, col, row, text};
 use rune_kit::shell::{RowStatus, SidebarRow};
 use rune_kit::Kit;
 
@@ -174,8 +174,13 @@ fn panel_place(s: &Lemur, host: &str, t: &Session) -> String {
     place
 }
 
+/// An agent's thread's row, of two lines: as tall as rune-kit has a sidebar row of two.
+const TWO_LINES: f32 = 40.0;
+
 /// An agent's thread, keyed `id`: its name, `place`, where it runs, and what it's doing, in
-/// words too when that's for you to see to.
+/// words too when that's for you to see to. Its icon is centred beside both lines, as Rex has
+/// it: a sidebar row's own two lines put it by the name alone, high up, the place under it
+/// leaving a gap.
 fn agent_row(s: &Lemur, id: &str, host: &str, t: &Session, place: String, k: &Kit) -> El {
     let key = key(host, t);
     let shown = s.active.as_ref() == Some(&key);
@@ -210,15 +215,47 @@ fn agent_row(s: &Lemur, id: &str, host: &str, t: &Session, place: String, k: &Ki
     if let Some(says) = says {
         trailing = trailing.child(text(says).key(format!("{id}-says")).font(k.ty.small).color(color));
     }
+    let c = &k.c;
+    let lines = col()
+        .key("lines")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(1.0)
+        .child(
+            text(t.label.clone())
+                .key("label")
+                .font(TextStyle { weight: 500.0, ..k.ty.ui_compact })
+                .color(if shown { c.text_base } else { c.text_muted })
+                .truncate()
+                .a11y_hidden(),
+        )
+        .child(text(place.clone()).key("subtitle").font(k.ty.caption()).color(c.text_faint).truncate().a11y_hidden());
+    let mut r = row()
+        .label(format!("{}, {place}", t.label))
+        .w_full()
+        .h(TWO_LINES)
+        .px(8.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.md)
+        .motion(k.motion.control)
+        .hover_group()
+        .hover_motion(Anim::INSTANT, Anim::INSTANT)
+        .focusable(true)
+        .focus_selected(shown);
+    r = k.interactive(r);
+    if shown {
+        r = r.fill(c.pressed);
+    }
     let open = key.clone();
-    SidebarRow::new(t.label.clone())
-        .avatar(thread_icon(t.agent(), t.color.as_deref(), k))
-        .subtitle(place)
-        .trailing(trailing)
-        .status(RowStatus::Other(status_dot(color, tip, breathes)))
-        .selected(shown)
-        .on_select(move |s: &mut Lemur, _| s.open(open.0.clone(), open.1.clone()))
-        .build(k)
+    r.child(row().key("avatar").size(20.0, 20.0).center().child(thread_icon(t.agent(), t.color.as_deref(), k)).a11y_hidden())
+        .child(lines)
+        .child(trailing)
+        .child(row().key("status").size(20.0, 20.0).center().child(status_dot(color, tip, breathes)).a11y_hidden())
+        .on_press(move |s: &mut Lemur| s.open(open.0.clone(), open.1.clone()))
+        // After the handler, which would make it a button.
+        .role("listitem")
         .key(id.to_string())
         // Put away: still an agent, but out of the way.
         .opacity(if t.away { 0.6 } else { 1.0 })

@@ -54,6 +54,10 @@ pub struct HostView {
     /// Threads kept to resume whose session is gone, outside every base's
     /// worktrees.
     pub gone: Vec<ClaudeThread>,
+    /// The folders of threads kept to resume that came back as fresh shells,
+    /// their host having restarted: not listed till they're resumed, back in
+    /// them.
+    pub resuming_in: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +416,7 @@ fn failed(host: &Host, error: String, needs_you: bool) -> HostView {
         bases: vec![],
         other: vec![],
         gone: vec![],
+        resuming_in: vec![],
     }
 }
 
@@ -644,13 +649,19 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
 
     // A Claude thread whose host restarted is back at its address as a
     // fresh shell: gone, as far as resuming it goes, which happens there.
-    sessions.retain(|s| {
-        !(s.came_back()
+    let came_back = |s: &Session| {
+        s.came_back()
             && cfg
                 .threads
                 .iter()
-                .any(|t| t.host == host.name && t.session == s.name))
-    });
+                .any(|t| t.host == host.name && t.session == s.name)
+    };
+    let resuming_in = sessions
+        .iter()
+        .filter(|s| came_back(s))
+        .filter_map(|s| s.folder.clone())
+        .collect();
+    sessions.retain(|s| !came_back(s));
     let mut bases = data.bases.clone();
     let live: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let mut other = vec![];
@@ -696,6 +707,7 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
         bases,
         other,
         gone,
+        resuming_in,
     }
 }
 

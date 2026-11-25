@@ -152,6 +152,18 @@ impl Lemur {
         }
     }
 
+    /// The session dropdown closes once the sidebar doesn't show it: with every agent (⌘.),
+    /// every session, or the sidebar away, it would stay open out of sight, its search taking
+    /// the keys. True if it closed.
+    pub(super) fn close_unseen_switch(&mut self) -> bool {
+        let seen = self.sidebar.is_open() && !self.sidebar_agents && !self.prefs.all_sessions;
+        if seen || !self.session_switch.is_open() {
+            return false;
+        }
+        self.session_switch.close();
+        true
+    }
+
     /// Where Claude or a shell started in session `space` starts: its project's own checkout,
     /// or its host's home; none until the host has said.
     pub(super) fn space_dir(&self, (host, path): &Space) -> Option<String> {

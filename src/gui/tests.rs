@@ -89,6 +89,7 @@ pub(super) fn made_up(sessions: &[(&str, Activity)]) -> Snapshot {
                 .map(|(i, (n, a))| Session { folder: Some("f".into()), started: i as u64, ..session(n, *a) })
                 .collect(),
             gone: vec![],
+            resuming_in: vec![],
         }],
     }
 }
@@ -277,7 +278,8 @@ fn moving_a_tab_reorders_its_list() {
     press(&mut rt, K::Right, Mods { shift: true, ..cmd() });
     assert_eq!(shown(&rt.state), [b.as_str(), &a, &c]);
     let list: List = ("local".into(), Some("~".into()));
-    rt.update(|s, _| s.reorder_threads(&list, "f1", 0, 2));
+    let order = [a.clone(), c.clone(), b.clone()];
+    rt.update(|s, _| s.reorder_threads(&list, "f1", &order));
     assert_eq!(shown(&rt.state), [a.as_str(), &c, &b]);
     // The second order is written once the first is: the window has to run for that.
     let cfg = server.config();
@@ -554,6 +556,116 @@ fn dragging_a_row_reorders_its_list() {
     // A press that doesn't move is a click.
     click(&mut rt, "row-local-c");
     assert_eq!(rt.state.active, Some(key("c")));
+}
+
+/// A drag goes by name: a thread of its folder gone while one is held moves no other once
+/// it's let go. The thread held gone, the drag is over, though Rune tells of no release.
+#[test]
+fn a_drag_outlasts_rows_going() {
+    let server = HcServer::new("rdraggone");
+    let mut rt = window(server.config());
+    let idle = Activity::Idle;
+    apply(&mut rt, &[("a", idle), ("b", idle), ("c", idle)]);
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    let (x, a) = rt.find("row-local-a").unwrap();
+    let (_, b) = rt.find("row-local-b").unwrap();
+    let hold = |rt: &mut Runtime<Lemur>, from: f32, dy: f32| {
+        rt.pointer_move(x, from);
+        rt.pointer_down(x, from);
+        for step in 1..=10 {
+            rt.pointer_move(x, from + dy * step as f32 / 10.0);
+            rt.frame(1.0 / 60.0);
+        }
+    };
+    let shown = |rt: &Runtime<Lemur>| super::folders::listed(&rt.state.snap.hosts[0], None).placed().into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+
+    // b held over a, and a ends meanwhile.
+    hold(&mut rt, b, 1.2 * (a - b));
+    apply(&mut rt, &[("b", idle), ("c", idle)]);
+    rt.pointer_up(x, b + 1.2 * (a - b));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(shown(&rt), ["b", "c"], "c not moved for a");
+    assert!(rt.state.sidebar_drag.is_none());
+
+    for _ in 0..20 {
+        rt.frame(1.0 / 60.0);
+    }
+    let (_, c) = rt.find("row-local-c").unwrap();
+    hold(&mut rt, c, -20.0);
+    assert!(rt.state.sidebar_drag.as_ref().is_some_and(|d| d.moved()), "held");
+    apply(&mut rt, &[("b", idle)]);
+    assert!(rt.state.sidebar_drag.is_none(), "c gone, the drag is over");
+}
+
+/// The session dropdown closes once the sidebar doesn't show it, listing every agent (⌘.)
+/// or put away (⌘B): open out of sight, it would keep the keys from the terminal.
+#[test]
+fn the_session_dropdown_closes_once_out_of_sight() {
+    let server = HcServer::new("rswitch");
+    let mut rt = window(server.config());
+    apply(&mut rt, &[("a", Activity::Idle)]);
+    open(&mut rt, "a");
+    let hides: [fn(&mut Lemur); 2] = [|s| s.toggle_sidebar_agents(), |s| s.sidebar.toggle()];
+    for hide in hides {
+        click(&mut rt, "session-switch");
+        assert!(rt.state.session_switch.is_open(), "open");
+        rt.update(|s, _| hide(s));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.session_switch.is_open(), "closed");
+        assert!(!rt.state.overlaid() && !rt.state.session_switch.search().focused, "the keys free");
+        rt.update(|s, _| hide(s));
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+}
+
+/// ⌘J keeps the sidebar on the session it starts in till the thread started shows there,
+/// not on one shown before.
+#[test]
+fn cmd_j_keeps_the_sidebar_on_its_session() {
+    let server = HcServer::new("rcmdjspace");
+    let mut cfg = server.config();
+    cfg.bases.push(crate::config::Base::new("local", "/srv/api"));
+    let mut rt = window(cfg);
+    apply(&mut rt, &[("a", Activity::Idle)]);
+    rt.update(|s, _| s.space_shown = Some(("local".into(), "/srv/api".into())));
+    open(&mut rt, "a");
+    press(&mut rt, K::Command('j'), cmd());
+    press(&mut rt, K::Enter, Mods::default());
+    assert_eq!(rt.state.space_shown, Some(("local".into(), snapshot::HOME.into())));
+}
+
+/// A folder's name and fold are forgotten once no thread is in it, but not while its threads
+/// are to resume there, back as shells from their host restarting, nor while a write to
+/// herdr-core is under way, which the snapshot may not show yet.
+#[test]
+fn a_folder_is_kept_while_its_threads_are_away_for_a_while() {
+    let server = HcServer::new("rfolderkeep");
+    let mut cfg = server.config();
+    cfg.hosts[0].folders.push(crate::config::Folder { id: "billing".into(), name: Some("Billing".into()), collapsed: false });
+    let mut rt = window(cfg);
+    let kept = |rt: &Runtime<Lemur>| rt.state.cfg.hosts[0].folders.iter().map(|f| f.id.clone()).collect::<Vec<_>>();
+    let mut resuming = made_up(&[("a", Activity::Idle)]);
+    resuming.hosts[0].resuming_in = vec!["billing".into()];
+    rt.update(|s, _| {
+        s.set_snapshot(resuming);
+        s.drop_empty_folders();
+    });
+    assert_eq!(kept(&rt), ["billing"], "its threads to resume there");
+    rt.update(|s, _| {
+        s.set_snapshot(made_up(&[("a", Activity::Idle)]));
+        s.writes += 1;
+        s.drop_empty_folders();
+    });
+    assert_eq!(kept(&rt), ["billing"], "a write under way");
+    rt.update(|s, _| {
+        s.writes -= 1;
+        s.drop_empty_folders();
+    });
+    assert!(kept(&rt).is_empty(), "no thread in it");
 }
 
 /// A click outside a peek closes it; one on it doesn't.
