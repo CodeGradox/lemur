@@ -54,12 +54,18 @@ pub struct HostView {
     /// Threads kept to resume whose session is gone, outside every base's
     /// worktrees.
     pub gone: Vec<ClaudeThread>,
+    /// The folders of threads kept to resume that came back as fresh shells,
+    /// their host having restarted: not listed till they're resumed, back in
+    /// them.
+    pub resuming_in: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BaseView {
     /// Index into `Config::bases`.
     pub index: usize,
+    /// Its path as the config has it, which names its session (`Session::space`).
+    pub path: String,
     pub error: Option<String>,
     /// The main checkout comes first, as `git worktree list` prints it.
     pub worktrees: Vec<Worktree>,
@@ -104,8 +110,6 @@ pub struct Session {
     pub waiting_for: Option<String>,
     /// lemur started it for Claude rather than as a plain shell.
     pub started_claude: bool,
-    /// Started for Codex, or Codex found running in it.
-    pub codex: bool,
     /// Its place in its worktree once threads were dragged into an order.
     pub order: Option<u32>,
     /// When it started, in ms since the epoch: threads never placed follow
@@ -137,6 +141,15 @@ pub struct Session {
     pub silent: bool,
     /// The Linear issue pinned to it, by its key.
     pub issue: Option<String>,
+    /// The folder of its host's it's in, by its id (`config::Folder`'s); none for one of
+    /// its own.
+    pub folder: Option<String>,
+    /// The session it's in, as the sidebar shows one at a time: a project's, by its path
+    /// as the config has it, or `HOME`. It's the one it was started in (`SESSION`), else
+    /// the project whose worktree it runs in, else its host's home.
+    pub space: String,
+    /// Its colour, one of `config::COLORS`, if it was given one.
+    pub color: Option<String>,
 }
 
 /// Something a thread runs to help it: one of Claude Code's subagents, as
@@ -166,9 +179,7 @@ pub struct ClaudeRun {
 impl Session {
     /// The agent it was started for, or found running in it.
     pub fn agent(&self) -> Option<Agent> {
-        if self.codex {
-            Some(Agent::Codex)
-        } else if self.started_claude || self.activity != Activity::Unknown {
+        if self.started_claude || self.activity != Activity::Unknown {
             Some(Agent::Claude)
         } else {
             None
@@ -208,10 +219,6 @@ impl Session {
     /// back from its host restarting once Claude runs in it again. Until
     /// then it's still to resume.
     pub fn shell_to_note(&self) -> Option<u32> {
-        // Only Claude's conversations are kept to resume.
-        if self.codex {
-            return None;
-        }
         let pid = self.pid?;
         let claude_runs = self.activity != Activity::Unknown || self.claude.is_some();
         match self.shell {
@@ -241,7 +248,7 @@ pub const HERDR_TAB: &str = "herdr.tab";
 pub const LABEL: &str = "lemur.label";
 /// The labels a thread starts with until you name it: not names of yours, so
 /// what its program calls it shows instead.
-pub const DEFAULT_LABELS: [&str; 3] = ["claude", "codex", "shell"];
+pub const DEFAULT_LABELS: [&str; 2] = ["claude", "shell"];
 pub const KIND: &str = "lemur.kind";
 pub const WORKTREE: &str = "lemur.worktree";
 pub const ORDER: &str = "lemur.order";
@@ -252,6 +259,16 @@ pub const AWAY: &str = "lemur.away";
 pub const SILENT: &str = "lemur.silent";
 /// The Linear issue pinned to a thread, by its key (`LAFT-3184`).
 pub const ISSUE: &str = "lemur.issue";
+/// The folder of its host's a thread is in, by the folder's id
+/// (`config::Folder`); none for one of its own.
+pub const FOLDER: &str = "lemur.folder";
+/// A thread's colour, one of `config::COLORS`, by its name.
+pub const COLOR: &str = "lemur.color";
+/// The session a thread was started in, by its path as the config has it (a project's
+/// `path`), or `HOME` for its host's home: it stays there wherever it goes.
+pub const SESSION: &str = "lemur.session";
+/// The session of a host's home, as threads outside every project are in.
+pub const HOME: &str = "~";
 /// The pid of the shell a Claude thread's Claude runs in, as lemur last
 /// saw it. herdr-core keeps lemur's terminals: after their host restarts,
 /// each comes back at its address with a fresh shell and another pid.
@@ -301,14 +318,6 @@ pub struct HostData {
 }
 
 impl HostData {
-    /// Puts project `index`'s worktrees in the order dragged, as the next
-    /// refresh would: a recompose builds from this.
-    pub fn sort_worktrees(&mut self, index: usize, order: &[String]) {
-        for b in self.bases.iter_mut().filter(|b| b.index == index) {
-            sort_worktrees(b, order);
-        }
-    }
-
     /// Renumbers its projects' views as the config's bases move, dropping
     /// those `renumber` says are gone: they point into the bases by index.
     pub fn renumber_bases(&mut self, renumber: impl Fn(usize) -> Option<usize>) {
@@ -407,6 +416,7 @@ fn failed(host: &Host, error: String, needs_you: bool) -> HostView {
         bases: vec![],
         other: vec![],
         gone: vec![],
+        resuming_in: vec![],
     }
 }
 
@@ -548,6 +558,7 @@ fn parse(cfg: &Config, host: &Host, out: &str) -> HostData {
             {
                 bases.push(BaseView {
                     index,
+                    path: cfg.bases[index].path.clone(),
                     error: None,
                     worktrees: vec![],
                     plain: false,
@@ -631,7 +642,6 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
                 && let Some(f) = found
             {
                 (s.activity, s.waiting_for) = (f.activity, f.waiting_for.clone());
-                s.codex = false;
             }
             s.claude = found.and_then(|f| f.run.clone()).map(|(_, run)| run);
         }
@@ -639,18 +649,29 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
 
     // A Claude thread whose host restarted is back at its address as a
     // fresh shell: gone, as far as resuming it goes, which happens there.
-    sessions.retain(|s| {
-        !(s.came_back()
+    let came_back = |s: &Session| {
+        s.came_back()
             && cfg
                 .threads
                 .iter()
-                .any(|t| t.host == host.name && t.session == s.name))
-    });
+                .any(|t| t.host == host.name && t.session == s.name)
+    };
+    let resuming_in = sessions
+        .iter()
+        .filter(|s| came_back(s))
+        .filter_map(|s| s.folder.clone())
+        .collect();
+    sessions.retain(|s| !came_back(s));
     let mut bases = data.bases.clone();
     let live: HashSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
     let mut other = vec![];
-    for s in sessions {
-        match find_worktree(&bases, &s.path) {
+    // The session a thread was started in, if it's still one; else where it runs.
+    let known = |space: &str| space == HOME || bases.iter().any(|b| b.path == space);
+    let started_in: Vec<Option<String>> = sessions.iter().map(|s| s.space.clone()).map(|space| Some(space).filter(|x| known(x))).collect();
+    for (mut s, started) in sessions.into_iter().zip(started_in) {
+        let found = find_worktree(&bases, &s.path);
+        s.space = started.unwrap_or_else(|| found.map_or_else(|| HOME.to_string(), |(bi, _)| bases[bi].path.clone()));
+        match found {
             Some((bi, wi)) => bases[bi].worktrees[wi].sessions.push(s),
             None => other.push(s),
         }
@@ -671,15 +692,22 @@ fn view(cfg: &Config, host: &Host, data: &HostData, terminals: &[Terminal]) -> H
             None => gone.push(t.clone()),
         }
     }
+    // Claude Code listens on a port of its own: not a server it started.
+    let claudes = claude_pids(&data.agents);
+    let mut machine = data.machine.clone();
+    machine
+        .servers
+        .retain(|s| s.pid.is_none_or(|pid| !claudes.contains(&pid)));
     HostView {
         name: host.name.clone(),
         error: None,
         needs_you: false,
         home: data.home.clone(),
-        machine: data.machine.clone(),
+        machine,
         bases,
         other,
         gone,
+        resuming_in,
     }
 }
 
@@ -690,6 +718,8 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         // With its shell back at its prompt, what a program said is over:
         // a Claude killed outright never says it stopped.
         Some(_) if !busy(t) => (Activity::Unknown, None),
+        // Codex says what it does too, and Lemur leaves it to its shell.
+        Some(status) if status.app == "codex" => (Activity::Unknown, None),
         Some(status) => {
             let activity = activity(&status.state);
             let asks = activity == Activity::NeedsInput && !status.msg.is_empty();
@@ -698,12 +728,6 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         None => (Activity::Unknown, None),
     };
     let since = t.status_ms.unwrap_or(t.created_ms);
-    // What runs says what it is, whatever the thread was started for.
-    let reported = t
-        .status
-        .as_ref()
-        .filter(|s| !s.app.is_empty() && busy(t))
-        .map(|s| s.app.as_str());
     Session {
         name: t.address.clone(),
         label: match label(LABEL) {
@@ -717,10 +741,6 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         activity,
         waiting_for,
         started_claude: label(KIND).is_some_and(|k| k == "claude"),
-        codex: match reported {
-            Some(app) => app == "codex",
-            None => label(KIND).is_some_and(|k| k == "codex"),
-        },
         order: label(ORDER).and_then(|o| o.parse().ok()),
         started: t.created_ms,
         claude: None,
@@ -737,6 +757,10 @@ fn session(t: &Terminal, now_ms: u64) -> Session {
         away: label(AWAY).is_some(),
         silent: label(SILENT).is_some(),
         issue: label(ISSUE).cloned(),
+        folder: label(FOLDER).filter(|f| !f.is_empty()).cloned(),
+        // As started; `view` makes it one of the host's sessions.
+        space: label(SESSION).cloned().unwrap_or_default(),
+        color: label(COLOR).filter(|c| crate::config::COLORS.iter().any(|(name, _)| name == c)).cloned(),
     }
 }
 
@@ -817,8 +841,8 @@ const SHELLS: [&str; 12] = [
 ];
 
 /// Programs you work in rather than wait on, as the OS names their
-/// processes: open, they aren't a command at work. Claude and Codex say what
-/// they do themselves.
+/// processes: open, they aren't a command at work. Claude says what it does
+/// itself.
 const WAITS_ON_YOU: [&str; 24] = [
     "vi", "vim", "nvim", "nano", "emacs", "micro", "hx", "kak", "less", "more", "most", "man",
     "top", "htop", "btop", "watch", "fzf", "ssh", "mosh-client", "tmux", "screen", "zellij",
@@ -870,11 +894,11 @@ fn telling_title(t: &Terminal) -> Option<String> {
 
 /// What a thread you haven't named shows in place of what it started as: its
 /// program's title, while it runs, if that says more than the program's name or
-/// the folder it's in. Codex's is the folder until told otherwise.
+/// the folder it's in.
 fn followed_title(t: &Terminal) -> Option<String> {
     let title = telling_title(t).filter(|_| busy(t))?;
     let foreground = t.foreground.as_ref();
-    let dull = ["claude code", "claude", "codex"]
+    let dull = ["claude code", "claude"]
         .into_iter()
         .chain(foreground.map(|f| f.name.as_str()))
         .chain(foreground.map(|f| crate::config::leaf(&f.cwd)))
@@ -884,19 +908,16 @@ fn followed_title(t: &Terminal) -> Option<String> {
     (!dull.into_iter().any(|d| d.to_lowercase() == said)).then_some(title)
 }
 
+/// Where `s` goes among the threads of its list, as `sort` puts them.
+pub fn rank(s: &Session) -> (bool, bool, Option<u32>, u64, &str) {
+    (s.away, s.order.is_none(), s.order, s.started, &s.name)
+}
+
 /// Threads in the order they were dragged into; ones never placed follow,
 /// oldest first. Those put away go last, so the rest are the first in a
 /// list, as the sidebar and the tabs show and drag them.
 fn sort(sessions: &mut [Session]) {
-    sessions.sort_by(|a, b| {
-        (a.away, a.order.is_none(), a.order, a.started, &a.name).cmp(&(
-            b.away,
-            b.order.is_none(),
-            b.order,
-            b.started,
-            &b.name,
-        ))
-    });
+    sessions.sort_by(|a, b| rank(a).cmp(&rank(b)));
 }
 
 fn parse_worktree_line(base: &mut BaseView, line: &str) {
@@ -1010,6 +1031,12 @@ fn claude_activity(
         }
     }
     Some(found)
+}
+
+/// The pids of the Claudes `claude agents --json` lists.
+fn claude_pids(agents: &str) -> HashSet<u32> {
+    let agents: Vec<RunningClaude> = serde_json::from_str(agents.trim()).unwrap_or_default();
+    agents.into_iter().filter_map(|a| a.pid).collect()
 }
 
 /// The worktree containing `path`, preferring the deepest match: linked
@@ -1307,6 +1334,22 @@ mod tests {
         );
     }
 
+    /// A Claude's own port isn't one of its worktree's servers; the dev
+    /// server it started is.
+    #[test]
+    fn claudes_own_port_is_no_server() {
+        let cfg = cfg();
+        let data = parse(
+            &cfg,
+            &cfg.hosts[0],
+            "@@ports\n50437\t127.0.0.1\t200\t2.1.325\t/srv/api\n3000\t0.0.0.0\t300\tnode\t/srv/api\n\
+             @@agents\n[{\"kind\":\"interactive\",\"pid\":200,\"status\":\"busy\"}]\n",
+        );
+        let h = view(&cfg, &cfg.hosts[0], &data, &[]);
+        let ports: Vec<u16> = h.machine.servers.iter().map(|s| s.port).collect();
+        assert_eq!(ports, [3000]);
+    }
+
     /// What a program said is over once its shell is back at its prompt: a
     /// Claude killed outright never says it stopped.
     #[test]
@@ -1353,12 +1396,8 @@ mod tests {
         );
         let plain = session(&[("lemur.kind", "shell")]);
         assert_eq!(plain.shell_to_note(), None, "only a shell");
-        let codex = Session {
-            activity: Activity::Working,
-            ..session(&[("lemur.kind", "codex")])
-        };
-        assert_eq!(codex.agent(), Some(Agent::Codex));
-        assert_eq!(codex.shell_to_note(), None, "not kept to resume");
+        // Started for Codex, before Lemur dropped it: a shell.
+        assert_eq!(session(&[("lemur.kind", "codex")]).agent(), None);
         let typed = Session {
             claude: run(),
             ..plain
@@ -1478,8 +1517,6 @@ mod tests {
             shown(claude, "✳ Claude Code", "claude"),
             is("claude", "claude")
         );
-        assert_eq!(shown(Some("codex"), "api", "codex"), is("codex", "codex"));
-        assert_eq!(shown(Some("codex"), "⠋ api", "codex"), is("codex", "codex"));
         assert_eq!(shown(Some("shell"), "~/src", "node"), is("shell", "shell"));
         assert_eq!(
             shown(Some("shell"), "npm run dev", "node"),
@@ -1515,6 +1552,7 @@ mod tests {
             claude_session: "0fdfabeb-ca80-4916-a103-275bbb5e8614".into(),
             label: None,
             issue: None,
+            color: None,
         };
         let auth = "/home/agent/projects/api/.claude/worktrees/auth";
         cfg.threads = vec![
@@ -1661,7 +1699,7 @@ mod tests {
         // d and b were placed; a and c never were, so they follow, oldest
         // first.
         let (a, b, c, d) = (&names[0], &names[1], &names[2], &names[3]);
-        crate::actions::set_order(&cfg, "local", &[d.clone(), b.clone()]).unwrap();
+        crate::actions::set_order(&cfg, "local", &[(d.clone(), String::new()), (b.clone(), String::new())]).unwrap();
         let placed = [d, b, a, c].map(String::clone);
         assert!(wait_until(Duration::from_secs(5), || shown(&cfg) == placed));
         // One put away goes last, whatever its place, and is marked so.

@@ -1,12 +1,11 @@
-//! How much of each agent's plan is used, above the hosts' load at the foot
-//! of the sidebar: each limit it lists, asked every few minutes (see
-//! `crate::usage`), or that it couldn't be asked; with no plan to measure
-//! against, the tokens used. Off until turned on in Settings.
+//! How much of Claude's plan is used, above the hosts' load at the foot of the
+//! sidebar: each limit it lists, asked every few minutes (see `crate::usage`),
+//! or that it couldn't be asked. Off until turned on in Settings.
 
 use super::prompt::agent_icon;
 use super::{Lemur, Prefs, icons, sessions};
 use crate::config::Agent;
-use crate::usage::{self, Tokens, Usage};
+use crate::usage::{self, Usage};
 use rune::{El, col, el, icon, row, text};
 use rune_kit::Kit;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -38,23 +37,19 @@ impl Meter {
     }
 }
 
-/// Claude's meter and Codex's, and what Settings needs to offer them.
+/// Claude's meter, and what Settings needs to offer it.
 #[derive(Default)]
 pub struct Meters {
     claude: Meter,
-    codex: Meter,
     /// Whether Lemur has seen Claude Code on a host: running there, or kept
     /// to resume. Settings offers the meter once it has.
     claude_found: bool,
-    /// The same of Codex: running on a host.
-    codex_found: bool,
 }
 
 /// Whether Settings has `agent`'s meter on.
 fn setting(prefs: &Prefs, agent: Agent) -> bool {
     match agent {
         Agent::Claude => prefs.claude_usage,
-        Agent::Codex => prefs.codex_usage,
     }
 }
 
@@ -63,13 +58,12 @@ fn epoch_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
+const AGENTS: [Agent; 1] = [Agent::Claude];
 
 impl Lemur {
     fn meter_of(&mut self, agent: Agent) -> &mut Meter {
         match agent {
             Agent::Claude => &mut self.panels.meters.claude,
-            Agent::Codex => &mut self.panels.meters.codex,
         }
     }
 
@@ -92,8 +86,8 @@ impl Lemur {
         }
     }
 
-    /// Follows Settings once it has changed `prefs.claude_usage` or `codex_usage`: turned
-    /// on, a meter asks at once; off, it's gone.
+    /// Follows Settings once it has changed `prefs.claude_usage`: turned on, the meter asks
+    /// at once; off, it's gone.
     pub(super) fn follow_meter_setting(&mut self) {
         self.tick_meter();
     }
@@ -104,16 +98,10 @@ impl Lemur {
         self.panels.meters.claude_found
     }
 
-    /// The same of Codex: running on a host.
-    pub(super) fn codex_found(&self) -> bool {
-        self.panels.meters.codex_found
-    }
-
     /// Tells Settings whether the agents are around, after every snapshot.
     pub(super) fn note_agents(&mut self) {
         let found = !self.cfg.threads.is_empty() || sessions(&self.snap).any(|(_, s)| s.runs_claude());
         self.panels.meters.claude_found = found;
-        self.panels.meters.codex_found = sessions(&self.snap).any(|(_, s)| s.agent() == Some(Agent::Codex));
     }
 
     /// Asks `agent` how much of the plan is used, in the background.
@@ -126,7 +114,7 @@ impl Lemur {
         meter.asking = true;
         let cfg = self.cfg.clone();
         self.in_background(
-            move || usage::fetch(&cfg, agent, &order),
+            move || usage::fetch(&cfg, &order),
             move |s, answer| {
                 let meter = s.meter_of(agent);
                 meter.asking = false;
@@ -160,7 +148,6 @@ impl Lemur {
     pub(super) fn toggle_usage_minimized(&mut self, agent: Agent) {
         let minimized = match agent {
             Agent::Claude => &mut self.cfg.minimized_usage,
-            Agent::Codex => &mut self.cfg.minimized_codex_usage,
         };
         *minimized = !*minimized;
         self.save_minimized();
@@ -181,22 +168,22 @@ impl Lemur {
     /// Keeps what's minimized at the sidebar's foot in the config.
     fn save_minimized(&mut self) {
         if let Some(file) = self.prefs.config_file()
-            && let Err(e) = crate::config::Config::save_minimized(file, self.cfg.minimized_usage, self.cfg.minimized_codex_usage, &self.cfg.minimized_hosts)
+            && let Err(e) = crate::config::Config::save_minimized(file, self.cfg.minimized_usage, &self.cfg.minimized_hosts)
         {
             self.fail(e);
         }
     }
 }
 
-/// How much of each agent's plan is used, at the sidebar's foot: Claude's, then Codex's.
+/// How much of each agent's plan is used, at the sidebar's foot: Claude's.
 pub fn meters(s: &Lemur, k: &Kit) -> Vec<El> {
     AGENTS.into_iter().filter_map(|agent| usage_meter(s, agent, k)).collect()
 }
 
 /// The agent's name and when its next limit starts over, then a bar for
 /// each limit, or that it couldn't be asked; what each says on hover. A
-/// click on the bars asks again; on its name, it minimizes the meter to
-/// that line, the most used limit beside it.
+/// click on the bars asks again, as the ↻ beside "unavailable" does; on its
+/// name, it minimizes the meter to that line, the most used limit beside it.
 fn usage_meter(s: &Lemur, agent: Agent, k: &Kit) -> Option<El> {
     // As Settings has it, even before the meter has followed: it asks at the next tick.
     if !setting(&s.prefs, agent) {
@@ -205,7 +192,6 @@ fn usage_meter(s: &Lemur, agent: Agent, k: &Kit) -> Option<El> {
     let c = &k.c;
     let (meter, minimized, name, id) = match agent {
         Agent::Claude => (&s.panels.meters.claude, s.cfg.minimized_usage, "Claude", "usage"),
-        Agent::Codex => (&s.panels.meters.codex, s.cfg.minimized_codex_usage, "Codex", "codex-usage"),
     };
     let shown = describe(agent, meter.shown.as_ref(), epoch_now());
     let open = !minimized;
@@ -217,31 +203,34 @@ fn usage_meter(s: &Lemur, agent: Agent, k: &Kit) -> Option<El> {
         _ => shown.tip,
     };
     let rows: Vec<El> = shown.rows.into_iter().map(|(label, percent)| bar(label, Some(percent as f32), format!("{percent:.0}%"), (76.0, 36.0), k)).collect();
-    let totals: Vec<El> = shown
-        .totals
-        .into_iter()
-        .map(|(label, used)| {
-            row()
-                .gap(8.0)
-                .center_y()
-                .child(text(label).font(k.ty.small).color(c.text_faint))
-                // Narrow, its end goes first: the hover says it all.
-                .child(text(used).font(k.ty.small).color(c.text_muted).truncate().grow(1.0).align(rune::Align::End))
-        })
-        .collect();
-    let right = if minimized { shown.brief } else { shown.right };
+    let right = match () {
+        _ if failed && meter.asking => "asking…".to_string(),
+        _ if minimized => shown.brief,
+        _ => shown.right,
+    };
+    // Unavailable, it can be asked again from its line, minimized too. Asking, it stays put,
+    // faint: disabled, a press would go through to the line, which minimizes.
+    let again = failed.then(|| {
+        icons::button(&icons::REFRESH, "Try again")
+            .control_size(rune_kit::ControlSize::Mini)
+            .on_press(move |s: &mut Lemur| s.ask_usage(agent))
+            .build(k)
+            .key(format!("{id}-again"))
+            .opacity(if meter.asking { 0.4 } else { 1.0 })
+    });
     let header = minimizable_header(format!("{id}-header"), k)
         .on_press(move |s: &mut Lemur| s.toggle_usage_minimized(agent))
         .child(agent_icon(Some(agent), k))
         .child(text(name).font(k.ty.ui_medium).color(c.text_base).truncate().grow(1.0))
         .child(text(right).font(k.ty.small).color(c.text_muted))
+        .children(again)
         .child(chevron(minimized, k));
-    let body = (open && (failed || !rows.is_empty() || !totals.is_empty())).then(|| {
+    let body = (open && (failed || !rows.is_empty())).then(|| {
         let mut body = col().key(format!("{id}-bars")).gap(6.0).cursor(rune::Cursor::Pointer).on_press(move |s: &mut Lemur| s.ask_usage(agent));
         if failed {
             body = body.child(text(format!("Couldn't fetch usage from {name}.")).font(k.ty.small).color(c.text_muted));
         }
-        body.children(rows).children(totals)
+        body.children(rows)
     });
     Some(col().key(id).w_full().px(8.0).pt(8.0).pb(4.0).gap(6.0).help(tip).child(header).children(body))
 }
@@ -292,12 +281,11 @@ fn by_last_claude(mut hosts: Vec<(String, Option<u64>)>) -> Vec<String> {
 }
 
 /// What the meter shows: beside the agent's name, open and minimized, a bar
-/// for each limit, a total for what was used with no limits, and on hover.
+/// for each limit, and on hover.
 struct Shown {
     right: String,
     brief: String,
     rows: Vec<(String, f64)>,
-    totals: Vec<(String, String)>,
     tip: String,
 }
 
@@ -305,7 +293,6 @@ struct Shown {
 fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Shown {
     let (name, source) = match agent {
         Agent::Claude => ("Claude", "Claude Code's /usage"),
-        Agent::Codex => ("Codex", "Codex's app server"),
     };
     let u = match shown {
         None => {
@@ -313,7 +300,6 @@ fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Sh
                 right: "asking…".into(),
                 brief: "asking…".into(),
                 rows: vec![],
-                totals: vec![],
                 tip: format!("Asking {} how much of your plan is used…", agent.name()),
             };
         }
@@ -322,32 +308,11 @@ fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Sh
                 right: "unavailable".into(),
                 brief: "unavailable".into(),
                 rows: vec![],
-                totals: vec![],
                 tip: format!("Couldn't fetch usage from {name}: {why}."),
             };
         }
         Some(Ok(u)) => u,
     };
-    if let Some(first) = u.spent.first() {
-        let line = |label: &str, t: Tokens| {
-            format!(
-                "{label}: {} tokens, {} input (+ {} cached) and {} output",
-                short(t.total()),
-                short(t.fresh()),
-                short(t.cached),
-                short(t.output)
-            )
-        };
-        let mut lines: Vec<String> = u.spent.iter().map(|s| line(s.label, s.tokens)).collect();
-        lines.push(format!("From {name}'s session logs on {}, every 10 minutes. An API key has no plan limits to show.", u.host));
-        return Shown {
-            right: "API key".into(),
-            brief: format!("{} {}", first.label, short(first.tokens.total())),
-            rows: vec![],
-            totals: u.spent.iter().map(|s| (s.label.to_string(), used(s.tokens))).collect(),
-            tip: lines.join("\n"),
-        };
-    }
     let mut lines = vec![];
     let mut soonest: Option<i64> = None;
     for l in &u.limits {
@@ -372,30 +337,7 @@ fn describe(agent: Agent, shown: Option<&Result<Usage, String>>, now: i64) -> Sh
             None => String::new(),
         },
         rows: u.limits.iter().map(|l| (l.label.clone(), l.percent)).collect(),
-        totals: vec![],
         tip: lines.join("\n"),
-    }
-}
-
-/// What a row says of tokens used: those worked through anew, and those from
-/// the cache, which are usually billed too, and so aren't left to the hover.
-fn used(t: Tokens) -> String {
-    match t.cached {
-        0 => short(t.total()),
-        cached => format!("{} + {} cached", short(t.total()), short(cached)),
-    }
-}
-
-/// A count, roughly: "950", "1.2k", "229k", "4.6M", "21M", "1.3B".
-fn short(n: u64) -> String {
-    let n = n as f64;
-    match n {
-        ..1e3 => format!("{n:.0}"),
-        ..1e4 => format!("{:.1}k", n / 1e3),
-        ..1e6 => format!("{:.0}k", n / 1e3),
-        ..1e7 => format!("{:.1}M", n / 1e6),
-        ..1e9 => format!("{:.0}M", n / 1e6),
-        _ => format!("{:.1}B", n / 1e9),
     }
 }
 

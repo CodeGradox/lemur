@@ -751,7 +751,9 @@ fn a_commit_message_keeps_the_keyboard_only_in_its_worktree() {
     assert!(rt.state.committing(), "in the same worktree, typing goes on");
 
     server.hc(&["kill", &c]);
-    assert!(refreshing(&mut rt, 5.0, |s| s.active == Some(key(&b))), "b shows instead");
+    assert!(refreshing(&mut rt, 5.0, |s| s.session_of(&key(&c)).is_none()), "c ended");
+    assert_eq!(rt.state.active, None, "nothing of another session shows instead");
+    open(&mut rt, &b);
     rt.frame(1.0 / 60.0);
     assert!(!rt.state.committing(), "in another, it doesn't");
     assert!(rt.state.keyboard_on_terminal());

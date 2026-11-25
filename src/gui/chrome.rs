@@ -1,251 +1,25 @@
-//! The window's frame: the sidebar beside the main pane, the tabs and the panels' buttons
-//! in the toolbar, the terminal in its frame with its header, the status bar under it, and
+//! The window's frame: the sidebar beside the main pane, the panels' buttons in the
+//! toolbar, the terminal in its frame with its header, the status bar under it, and
 //! what shows over the window (the spotlight, a dialog, a peek, snackbars).
 
 use super::card;
-use super::prompt::{Ask, agent_icon, new_menu, new_picked};
-use super::silence::silence_label;
+use super::prompt::thread_icon;
 use super::snackbar;
-use super::{Action, Key, Lemur, Right, icons, panels, peek, prompt, sessions, sidebar, terminal};
+use super::{Key, Lemur, Right, icons, panels, peek, prompt, sessions, sidebar, terminal};
 use crate::config::Agent;
 use crate::machine;
 use crate::snapshot::Activity;
-use rune::{Cx, El, PopupItem, PopupMenu, Tx, col, el, icon, row, text};
-use rune_kit::shell::{SplitView, TabItem, TabItemStatus, TabOrientation, TabOverflow, TabReorder, TabStrip, Toolbar};
+use rune::{Cx, El, Tx, col, el, icon, row, text};
+use rune_kit::shell::{SplitView, Toolbar};
 use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, Kit};
 
-/// How many tabs have a key (⌘1 to ⌘9).
-const NUMBERED_TABS: usize = 9;
-/// Points between the tab bar's scroll arrows and its tabs.
-const ARROW_GAP: f32 = 2.0;
-/// Points between the tabs and +, as the strip keeps before its own trailing action.
-const TAB_GAP: f32 = 6.0;
-/// A tab's width: its agent's icon and its number, as Herdr's tabs, since the sidebar and
-/// the terminal's header name the thread. Past 64 points the strip shows a tab's title.
-const TAB_WIDTH: f32 = 72.0;
 /// Points of window around the main pane, and between it and the sidebar: the sidebar's
 /// resize grip, as wide, so the gap shows where to drag.
 const FRAME: f32 = 6.0;
 
-/// A tab's right-click menu, as Herdr's: rename it, start a terminal beside it, put it away,
-/// close it.
-fn tab_menu(s: &Lemur, key: &Key) -> PopupMenu {
-    let mut menu = PopupMenu::new().item(PopupItem::new("rename", "Rename…"));
-    if s.place_of(key).is_some() {
-        let mut new = PopupItem::new("new-terminal", "New terminal");
-        if let Some(k) = Action::NewTerminal.key_equivalent() {
-            new = new.key_equivalent(k);
-        }
-        menu = menu.item(new);
-    }
-    menu = menu.separator();
-    if let Some(t) = s.session_of(key) {
-        menu = menu.item(PopupItem::new("silence", silence_label(t.silent)));
-    }
-    let mut close = PopupItem::new("close", "Close");
-    if let Some(k) = Action::CloseThread.key_equivalent() {
-        close = close.key_equivalent(k);
-    }
-    menu.item(PopupItem::new("put-away", "Put away")).item(close)
-}
-
-fn tab_picked(s: &mut Lemur, picked: &str, key: Key) {
-    match picked {
-        "rename" => s.ask_name(Ask::Rename { host: key.0, session: key.1 }),
-        "new-terminal" => {
-            if let Some((dir, _)) = s.place_of(&key) {
-                s.start_now(key.0, dir, None);
-            }
-        }
-        "silence" => {
-            let silent = s.session_of(&key).is_some_and(|t| t.silent);
-            s.set_silent(key, !silent);
-        }
-        "put-away" => s.put_away(key),
-        "close" => s.confirm_close_of(key),
-        _ => {}
-    }
-}
-
-/// The tabs of the threads where the one on show runs: its worktree's, or its host's
-/// outside every worktree. + offers what starts there. Dragged, they move in the sidebar
-/// too: it's one order.
-fn tabs(s: &Lemur, k: &Kit) -> Option<El> {
-    let active = s.active.clone()?;
-    let siblings = s.siblings(&active);
-    let numbered: Vec<String> = siblings.iter().map(|(_, n)| n.clone()).collect();
-    let mut ids: Vec<String> = Vec::new();
-    let items: Vec<TabItem<'_, Lemur>> = siblings
-        .iter()
-        .enumerate()
-        .filter_map(|(i, key)| {
-            let t = s.session_of(key)?;
-            ids.push(key.1.clone());
-            let shown = s.active.as_ref() == Some(key);
-            let status = match t.doing() {
-                Activity::NeedsInput => Some(TabItemStatus::Attention),
-                Activity::Working => Some(TabItemStatus::Busy),
-                _ if s.done.contains(key) => Some(TabItemStatus::Unread),
-                _ => None,
-            };
-            let number = (i < NUMBERED_TABS).then(|| format!("{}", i + 1));
-            let issue = t.issue.clone();
-            let menu = tab_menu(s, key);
-            let menu_key = key.clone();
-            let label = t.label.clone();
-            let mut item = TabItem::new(key.1.as_str(), (i + 1).to_string())
-                .avatar(agent_icon(t.agent(), k))
-                .status(status.filter(|st| !shown || *st == TabItemStatus::Busy));
-            item = item.decorate(move |tab, _| {
-                let label_tip = label;
-                let tab = tab.on_secondary_press(move |_: &mut Lemur, press, tx: &mut Tx| {
-                    let key = menu_key.clone();
-                    tx.popup_menu(menu.clone(), press, move |s: &mut Lemur, picked, _| {
-                        if let Some(p) = picked {
-                            tab_picked(s, p, key);
-                        }
-                    });
-                });
-                // Its name, its key and the issue pinned to it on hover, and its name to a
-                // screen reader: the tab shows its number.
-                let tab = tab.label(label_tip.clone());
-                let mut tip = label_tip;
-                if let Some(n) = number {
-                    tip = format!("{tip}  ⌘{n}");
-                }
-                if let Some(issue) = issue {
-                    tip = format!("{tip}  · {issue}");
-                }
-                tab.help(tip)
-            });
-            Some(item)
-        })
-        .collect();
-    let host = active.0.clone();
-    let place = s.place_of(&active);
-    let plus = place.map(|(dir, base)| {
-        let (host, dir) = (host.clone(), dir);
-        icons::button(&icons::PLUS, "New terminal or Claude here")
-            .on_press_tx(move |_: &mut Lemur, tx: &mut Tx| {
-                let (host, dir) = (host.clone(), dir.clone());
-                tx.popup_menu(new_menu(), "new-tab", move |s: &mut Lemur, picked, _| {
-                    if let Some(p) = picked {
-                        new_picked(s, p, &host, &dir, base);
-                    }
-                });
-            })
-            .build(k)
-            .key("new-tab")
-    });
-    let list = s.list_of(&active);
-    let mut strip = TabStrip::new("tabs", TabOrientation::Horizontal)
-        .label("Threads in this worktree")
-        .tabs(items)
-        .active(Some(active.1.as_str()))
-        .overflow(TabOverflow::ShrinkThenScroll { min_width: TAB_WIDTH, max_width: TAB_WIDTH, pinned_width: 36.0, fade_width: 24.0 })
-        .drag_state(&s.tab_drag, |s: &mut Lemur| &mut s.tab_drag)
-        .close_icon(&icons::X)
-        .on_select(move |s: &mut Lemur, id, _| s.open(host.clone(), id.to_string()))
-        .on_close({
-            let host = active.0.clone();
-            move |s: &mut Lemur, id, _| s.confirm_close_of((host.clone(), id.to_string()))
-        })
-        .on_double_click({
-            let host = active.0.clone();
-            move |s: &mut Lemur, id, _| s.ask_name(Ask::Rename { host: host.clone(), session: id.to_string() })
-        })
-        .on_reorder(move |s: &mut Lemur, r: TabReorder, _| {
-            // The tabs leave out what's put away; the list has it, at its end.
-            let Some(sessions) = s.list_mut(&list) else { return };
-            let at = |name: &str| sessions.iter().position(|t| t.name == name);
-            let (Some(from), Some(to)) = (at(&numbered[r.from]), at(&numbered[r.to])) else { return };
-            s.reorder(list.clone(), from, to);
-        });
-    // A working tab has the sidebar's dot, not the kit's ring: breathing, and holding still
-    // in the background, as the sidebar's does.
-    let working: fn(&Kit) -> El = if s.looking {
-        |k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), true)
-    } else {
-        |k| super::sidebar::status_dot(k.c.success.icon, "Working".into(), false)
-    };
-    strip = strip.busy_indicator(working);
-    // + after the arrows, as the strip's own trailing action would sit inside them.
-    Some(row().key("tab-row").shrink().min_w(0.0).gap(TAB_GAP).center_y().child(scroll_arrows(strip.build(k), &ids, s.tab_aim.as_deref(), k)).children(plus))
-}
-
-/// Where a tab is in the tab bar's view: cut off at its start or end, by more than half or
-/// less, or wholly in it.
-#[derive(Clone, Copy, PartialEq)]
-enum InView {
-    Before,
-    PartBefore,
-    In,
-    PartAfter,
-    After,
-}
-
-/// The tab bar between ‹ and ›, while its tabs (`ids`) don't all fit: each scrolls it a tab
-/// that way, and dims with none left there. Shortcuts go through the tabs; these show there
-/// are more. `aim` is the tab an arrow last scrolled to: pressed again before it's there, an
-/// arrow goes on from it.
-fn scroll_arrows(strip: El, ids: &[String], aim: Option<&str>, k: &Kit) -> El {
-    use rune::memo::{layout_size, window_layout, window_layout_with};
-    let width = |key: &str| layout_size(key).map_or(0.0, |[w, _]| w);
-    let (list, view) = (width("tabs-list"), width("tabs-scroll"));
-    // Judged as if there were none: the arrows take their room from the view, and mustn't
-    // be what makes the tabs not fit.
-    let arrows = match (layout_size("tabs-back"), layout_size("tabs-forward")) {
-        (Some([back, _]), Some([forward, _])) => back + forward + 2.0 * ARROW_GAP,
-        _ => 0.0,
-    };
-    let bar = row().key("tab-bar").shrink().min_w(0.0).gap(ARROW_GAP).center_y();
-    if list <= view + arrows + 0.5 {
-        return bar.child(strip);
-    }
-    let [sx, _, sw, _] = window_layout("tabs-scroll").unwrap_or_default();
-    let places: Vec<(&String, InView)> = ids
-        .iter()
-        .filter_map(|id| {
-            let at = window_layout_with(&format!("t-{id}"), move |[x, _, w, _]| match () {
-                _ if x + w / 2.0 < sx => InView::Before,
-                _ if x < sx - 0.5 => InView::PartBefore,
-                _ if x + w / 2.0 > sx + sw => InView::After,
-                _ if x + w > sx + sw + 0.5 => InView::PartAfter,
-                _ => InView::In,
-            })?;
-            Some((id, at))
-        })
-        .collect();
-    // A tab that way: the first mostly out of view, as one nearly in would scroll the bar a
-    // point or two; else one a little out.
-    let first = |tabs: &mut dyn Iterator<Item = &(&String, InView)>, most: InView, part: InView| {
-        let tabs: Vec<_> = tabs.filter(|(_, at)| *at == most || *at == part).collect();
-        tabs.iter().find(|(_, at)| *at == most).or(tabs.first()).map(|(id, _)| (*id).clone())
-    };
-    let arriving = places.iter().position(|(id, _)| Some(id.as_str()) == aim).map(|i| (i, places[i].1));
-    let back = match arriving {
-        Some((i, InView::Before | InView::PartBefore)) => i.checked_sub(1).map(|i| places[i].0.clone()),
-        _ => first(&mut places.iter().rev(), InView::Before, InView::PartBefore),
-    };
-    let forward = match arriving {
-        Some((i, InView::After | InView::PartAfter)) => places.get(i + 1).map(|(id, _)| (*id).clone()),
-        _ => first(&mut places.iter(), InView::After, InView::PartAfter),
-    };
-    let arrow = |key: &'static str, glyph: &'static rune::Icon, label: &str, to: Option<String>| {
-        icons::button(glyph, label)
-            .disabled(to.is_none())
-            .on_press_tx(move |s: &mut Lemur, tx: &mut Tx| {
-                if let Some(id) = &to {
-                    tx.scroll_into_view_in("tabs-scroll", format!("t-{id}"));
-                    s.tab_aim = Some(id.clone());
-                }
-            })
-            .build(k)
-            .key(key)
-    };
-    bar.child(arrow("tabs-back", &icons::CHEVRON_LEFT, "Scroll the tabs back", back))
-        .child(strip)
-        .child(arrow("tabs-forward", &icons::CHEVRON_RIGHT, "Scroll the tabs on", forward))
+/// Another thread is on show: it lands at once.
+pub(super) fn switched(tx: &mut Tx) {
+    tx.instant();
 }
 
 /// The panels' buttons, at the toolbar's end: each shows its panel, or hides it.
@@ -286,7 +60,7 @@ fn pane_header(s: &Lemur, key: &Key, k: &Kit) -> Option<El> {
             .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
             // On the terminal's own background, as if part of it.
             .fill(rune::color::hex(&super::palette::hex(s.palette().background)).unwrap_or(c.bg_base))
-            .child(agent_icon(t.agent(), k))
+            .child(thread_icon(t.agent(), t.color.as_deref(), k))
             .child(text(what).font(k.ty.ui).color(c.text_muted))
             .child(text(t.label.clone()).key("header-name").font(k.ty.ui_medium).color(c.text_base).truncate())
             .child(text(t.path.clone()).font(k.ty.small).color(c.text_faint).truncate_head().grow(1.0)),
@@ -401,8 +175,8 @@ fn status_bar(s: &Lemur, k: &Kit) -> El {
     bar
 }
 
-/// The worktree's servers, by port: a link to each one that can be reached from here.
-/// Another host's is reached by its tailnet name.
+/// The worktree's servers, and those the thread on show started, by port: a link to each
+/// one that can be reached from here. Another host's is reached by its tailnet name.
 fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec<El> {
     let c = &k.c;
     let Some(view) = s.snap.hosts.iter().find(|h| h.name == host) else { return vec![] };
@@ -416,12 +190,11 @@ fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec
         .filter(|p| *p != w.path && p.starts_with(&format!("{}/", w.path)))
         .collect();
     let local = h.ssh == "local";
-    let name = match &view.machine.tailnet {
-        _ if local => "localhost".to_string(),
-        Some(tailnet) => tailnet.clone(),
-        None => h.name.clone(),
-    };
-    machine::servers_in(&view.machine.servers, &w.path, &deeper)
+    let name = reach(s, h);
+    // And those the thread on show started, in whichever worktree: its core calls its
+    // terminal `t7`, lemur `agent/t7`.
+    let terminal = s.active.as_ref().and_then(|(_, a)| a.rsplit('/').next()).unwrap_or_default();
+    machine::servers_in(&view.machine.servers, &w.path, &deeper, terminal)
         .into_iter()
         .map(|server| {
             let url = format!("http://{name}:{}", server.port);
@@ -445,6 +218,17 @@ fn servers(s: &Lemur, host: &str, w: &crate::snapshot::Worktree, k: &Kit) -> Vec
             }
         })
         .collect()
+}
+
+/// The name that reaches host `h`'s servers from here: `localhost` for this Mac's, else its
+/// tailnet name, else its own.
+pub(super) fn reach(s: &Lemur, h: &crate::config::Host) -> String {
+    let tailnet = s.snap.hosts.iter().find(|v| v.name == h.name).and_then(|v| v.machine.tailnet.clone());
+    match tailnet {
+        _ if h.ssh == "local" => "localhost".to_string(),
+        Some(tailnet) => tailnet,
+        None => h.name.clone(),
+    }
 }
 
 /// A question over the window, as an alert.
@@ -500,14 +284,11 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
     if !s.sidebar.is_open() {
         toolbar = toolbar.leading(sidebar::toggle(false, k));
     }
-    if let Some(tabs) = tabs(s, k) {
-        toolbar = toolbar.leading(tabs);
-    }
     for b in panel_buttons(s, k) {
         toolbar = toolbar.trailing(b);
     }
     let split = SplitView::new(main_pane(s, k))
-        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k, cx.titlebar_inset()))
+        .sidebar(&s.sidebar, |s: &mut Lemur| &mut s.sidebar, sidebar::sidebar(s, k, cx.titlebar_inset(), layer))
         .inspector(&s.inspector, |s: &mut Lemur| &mut s.inspector, panels::right(s, k))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
@@ -520,9 +301,7 @@ pub fn window(s: &Lemur, cx: &mut Cx<Lemur>, k: &Kit, layer: &mut Vec<El>) -> El
     if let Some(card) = peek::card(s, k) {
         root = root.child(card);
     }
-    for over in panels::overlays(s, k, layer) {
-        root = root.child(over);
-    }
+    panels::overlays(s, k, layer);
     if let Some(p) = &s.prompt {
         card::over_window("spotlight", prompt::card(s, p, k), |s: &mut Lemur| s.close_prompt(), k, layer);
     }

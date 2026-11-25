@@ -1,7 +1,7 @@
 //! What the window knows of herdr-core: refreshes, the watch on its changes, the thread on
 //! show, and opening, closing and ordering threads.
 
-use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, Seen, key, move_item, sessions, watched, worktree_label};
+use super::{BURST, JOBS, Key, Lemur, List, REFRESH, Right, Seen, key, sessions, watched, worktree_label};
 use crate::actions;
 use crate::attach::Active;
 use crate::config::{Agent, ThreadOrder};
@@ -109,6 +109,7 @@ impl Lemur {
                     s.data = data;
                     s.keep_ordered(&mut snap);
                     s.set_snapshot(snap);
+                    s.drop_empty_folders();
                 }
             },
         );
@@ -139,6 +140,7 @@ impl Lemur {
                 if s.changes == changes {
                     s.keep_ordered(&mut snap);
                     s.set_snapshot(snap);
+                    s.drop_empty_folders();
                 }
             },
         );
@@ -195,6 +197,10 @@ impl Lemur {
         // The thread on show ended: another takes its place.
         let mut instead = None;
         if let Some(gone) = self.active.clone().filter(|a| !live(a)) {
+            // With none to follow it there, the sidebar stays on its session.
+            if let Some(space) = self.space_of(&gone) {
+                self.space_shown = Some(space);
+            }
             self.active = None;
             instead = self.successor(&gone, self.prefs.thread_order, showable);
         }
@@ -238,6 +244,7 @@ impl Lemur {
             self.close_popup(&k);
         }
         self.snap = snap;
+        self.end_lost_drag();
         self.bring_back_needed();
         self.reconnect_terminals();
         self.note_agents();
@@ -261,9 +268,9 @@ impl Lemur {
     }
 
     /// What shows once `gone`, the thread on show, has ended: by `order` the one opened last
-    /// among the threads it was with (its worktree's, or its host's outside every worktree);
-    /// else, and along the tabs, its neighbour there, the next tab first; else the one
-    /// opened last anywhere. `live` says what still runs.
+    /// among the threads of its folder; else, and in the sidebar's order, its neighbour there,
+    /// the next first; else the one opened last in its session, never another's, which the
+    /// sidebar doesn't show. `live` says what still runs.
     pub(super) fn successor(&self, gone: &Key, order: ThreadOrder, live: impl Fn(&Key) -> bool) -> Option<Key> {
         let with = self.siblings(gone);
         let at = with.iter().position(|k| k == gone).unwrap_or(with.len());
@@ -274,7 +281,10 @@ impl Lemur {
             .filter(|k| *k != gone && live(k))
             .find(|k| order == ThreadOrder::Recent && with.contains(k))
             .or_else(|| after.chain(before).find(|k| live(k)))
-            .or_else(|| self.recent.iter().find(|k| *k != gone && live(k)))
+            .or_else(|| {
+                let space = self.space_of(gone);
+                self.recent.iter().find(|k| *k != gone && space.is_some() && self.space_of(k) == space && live(k))
+            })
             .cloned()
     }
 
@@ -307,7 +317,7 @@ impl Lemur {
         }
         self.bring_back(&key);
         self.active = Some(key.clone());
-        // Its tab scrolls into view, shown again or not (`reveal_tab`).
+        // Its row scrolls into view, shown again or not (`reveal_row`).
         self.revealed = None;
         if let Some(view) = self.terminals.get_mut(&key) {
             view.tell_focus(true);
@@ -322,12 +332,16 @@ impl Lemur {
     /// A spotlight, the folder picker, the palette, a diff, a dialog or a peek is over the
     /// window: what would open another over it, or move the keyboard from it, waits.
     pub fn overlaid(&self) -> bool {
-        self.prompt.is_some() || self.dialog.is_some() || self.peek.is_some() || self.panels_overlaid()
+        self.prompt.is_some() || self.dialog.is_some() || self.peek.is_some() || self.panels_overlaid() || self.session_switch.is_open()
     }
 
     /// Escape: closes what's over the window, front first. True if something was.
     pub(super) fn close_overlay(&mut self) -> bool {
         if self.dialog.take().is_some() {
+            return true;
+        }
+        if self.session_switch.is_open() {
+            self.session_switch.close();
             return true;
         }
         if self.prompt.take().is_some() {
@@ -417,14 +431,8 @@ impl Lemur {
         }
     }
 
-    /// Moves a thread within its list: the sidebar shows the new order at once, and
-    /// herdr-core keeps it.
-    pub fn reorder(&mut self, list: List, from: usize, to: usize) {
-        let Some(sessions) = self.list_mut(&list) else { return };
-        if !move_item(sessions, from, to) {
-            return;
-        }
-        let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+    /// Has herdr-core keep the threads of `list` in `names`' order, each in its folder.
+    pub(super) fn write_places(&mut self, list: List, names: Vec<(String, String)>) {
         self.changes += 1;
         match self.ordering.get_mut(&list) {
             // One order at a time, the latest next: two written at once would interleave
@@ -437,8 +445,8 @@ impl Lemur {
         }
     }
 
-    /// ⌘⇧← or, with `back` false, ⌘⇧→: moves the tab on show one place along the tabs, as
-    /// dragging it there does; at the end it stays.
+    /// ⌘⇧← or, with `back` false, ⌘⇧→: moves the thread on show one place up its folder, or
+    /// down, as dragging its row there does; at the end it stays.
     pub fn move_tab(&mut self, back: bool) {
         if self.overlaid() {
             return;
@@ -448,16 +456,17 @@ impl Lemur {
         let Some(at) = tabs.iter().position(|k| *k == active) else { return };
         let next = if back { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < tabs.len()) };
         let Some(next) = next else { return };
-        let list: List = (active.0.clone(), self.project_of(&active.0, &active.1).map(|(_, w)| w.path.clone()));
-        // In the list, with what's put away among it.
-        let place = |this: &mut Self, name: &str| this.list_mut(&list)?.iter().position(|s| s.name == name);
-        let (Some(from), Some(to)) = (place(self, &active.1), place(self, &tabs[next].1)) else { return };
-        self.reorder(list, from, to);
+        // One put away isn't among its folder's rows.
+        let Some(s) = self.session_of(&active).filter(|s| !s.away) else { return };
+        let (folder, space) = (super::folders::folder_of(s), (active.0.clone(), s.space.clone()));
+        let mut order: Vec<String> = tabs.into_iter().map(|(_, name)| name).collect();
+        order.swap(at, next);
+        self.reorder_threads(&Self::space_list(&space), &folder, &order);
     }
 
     /// Writes the order dragged into `list` to herdr-core, a label a thread, then the one
     /// dragged meanwhile, if any.
-    fn write_order(&mut self, list: List, names: Vec<String>) {
+    fn write_order(&mut self, list: List, names: Vec<(String, String)>) {
         let cfg = self.cfg.clone();
         let host = list.0.clone();
         self.in_background(
@@ -479,25 +488,17 @@ impl Lemur {
         );
     }
 
-    pub(super) fn list_mut(&mut self, (host, worktree): &List) -> Option<&mut Vec<Session>> {
-        let h = self.snap.hosts.iter_mut().find(|h| &h.name == host)?;
-        match worktree {
-            None => Some(&mut h.other),
-            Some(path) => {
-                h.bases.iter_mut().flat_map(|b| b.worktrees.iter_mut()).find(|w| &w.path == path).map(|w| &mut w.sessions)
-            }
-        }
-    }
-
     /// Writes a change made here to herdr-core with `write`. Refreshes that started before
     /// herdr-core had it are stale; the one after shows what herdr-core keeps.
     pub(super) fn write_core(&mut self, write: impl FnOnce(&crate::config::Config) -> anyhow::Result<()> + Send + 'static) {
         self.changes += 1;
+        self.writes += 1;
         let cfg = self.cfg.clone();
         self.in_background(
             move || write(&cfg),
             |s, saved| {
                 s.changes += 1;
+                s.writes -= 1;
                 if let Err(e) = saved {
                     s.fail(e);
                 }
@@ -559,7 +560,6 @@ impl Lemur {
             Some(Agent::Claude) => {
                 "Claude quits, and its terminal ends. Lemur forgets the conversation, as it does for a thread killed."
             }
-            Some(Agent::Codex) => "Codex quits, and its terminal ends.",
             None => "The terminal ends, and whatever runs in it.",
         };
         self.ask_close(key, label, description);
@@ -671,20 +671,19 @@ impl Lemur {
     pub fn about(&mut self) {
         self.dialog = Some(super::Dialog {
             title: format!("Lemur {}", env!("CARGO_PKG_VERSION")),
-            description: "Claude Code and Codex sessions on your hosts, in herdr-core.".into(),
+            description: "Claude Code sessions on your hosts, in herdr-core.".into(),
             ok: "OK",
             check: None,
             on_ok: Box::new(|_, _| {}),
         });
     }
 
-    /// ⌘1 to ⌘9: shows the tab at `i` of the tab bar, if it has one.
+    /// ⌘1 to ⌘9: shows the sidebar's thread `i`, from the top, if it has one.
     pub fn go_to_tab(&mut self, i: usize) {
         if self.overlaid() {
             return;
         }
-        let Some(active) = self.active.clone() else { return };
-        if let Some((host, session)) = self.siblings(&active).get(i).cloned() {
+        if let Some((host, session)) = self.sidebar_threads().get(i).cloned() {
             self.open(host, session);
         }
     }

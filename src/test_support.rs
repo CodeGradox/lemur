@@ -20,6 +20,8 @@ pub struct HcServer {
 
 impl HcServer {
     pub fn new(tag: &str) -> HcServer {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(stop_left_behind);
         // The core's socket goes in its state folder, and macOS allows a
         // socket path only 104 bytes.
         let dir = PathBuf::from(format!("/tmp/lhc-{}-{tag}", std::process::id()));
@@ -35,24 +37,12 @@ impl HcServer {
     }
 
     fn env(&self) -> Vec<(String, String)> {
-        let at = |sub: &str| self.dir.join(sub).to_string_lossy().into_owned();
-        vec![
-            ("XDG_STATE_HOME".into(), at("state")),
-            ("XDG_CONFIG_HOME".into(), at("config")),
-            ("HC_SESSION".into(), self.session.clone()),
-            ("CLAUDE_CONFIG_DIR".into(), at("claude")),
-            ("CODEX_HOME".into(), at("codex")),
-        ]
+        env_in(&self.dir, &self.session)
     }
 
     /// Where Claude Code's logs are, as scripts this core runs find them.
     pub fn claude_config(&self) -> PathBuf {
         self.dir.join("claude")
-    }
-
-    /// Where Codex's logs are, as scripts this core runs find them.
-    pub fn codex_home(&self) -> PathBuf {
-        self.dir.join("codex")
     }
 
     /// lemur's connection to this core.
@@ -144,6 +134,8 @@ impl HcServer {
 
 impl Drop for HcServer {
     fn drop(&mut self) {
+        // Before it's stopped: a window still dialing it would start it again.
+        hc::stop_dialing(&self.session);
         // This core first: it would dial the stand-in hosts' again. Never
         // a panic here: in a test already failing, that aborts the run.
         let _ = Command::new(hc::binary())
@@ -159,6 +151,58 @@ impl Drop for HcServer {
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The environment the core of `session` runs in, its folders in `dir`.
+fn env_in(dir: &Path, session: &str) -> Vec<(String, String)> {
+    let at = |sub: &str| dir.join(sub).to_string_lossy().into_owned();
+    vec![
+        ("XDG_STATE_HOME".into(), at("state")),
+        ("XDG_CONFIG_HOME".into(), at("config")),
+        ("HC_SESSION".into(), session.to_string()),
+        ("CLAUDE_CONFIG_DIR".into(), at("claude")),
+    ]
+}
+
+/// Stops the cores of test runs that ended before their tests did, killed say, and removes
+/// their folders: a run's are `lhc-<its pid>-<tag>`. A run still going, in another worktree
+/// say, keeps its own.
+fn stop_left_behind() {
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name
+            .strip_prefix("lhc-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || running(pid) {
+            continue;
+        }
+        let dir = entry.path();
+        // Its own core and its stand-in hosts', by their state folders.
+        let states = std::fs::read_dir(dir.join("state/herdr-core"));
+        for session in states.into_iter().flatten().flatten() {
+            let _ = Command::new(hc::binary())
+                .args(["server", "stop"])
+                .envs(env_in(&dir, &session.file_name().to_string_lossy()))
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Whether process `pid` runs.
+fn running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// A fresh folder in the temp dir, removed when dropped, so a failing
@@ -367,6 +411,28 @@ fn test_cores_have_tags_of_their_own() {
         }
         assert!(!seen.is_empty(), "found no {call}");
     }
+}
+
+/// Once a test is over, its core stays stopped: what still dials it then, as a window does
+/// in the background from the start, gets no core, rather than one started anew that runs
+/// on with nothing to stop it.
+#[test]
+fn a_test_core_stays_stopped_once_the_test_is_over() {
+    let server = HcServer::new("stays-stopped");
+    let dir = server.dir.clone();
+    let dialing = std::thread::spawn(|| {
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut reached = true;
+        while Instant::now() < until {
+            reached = hc::core(Some("stays-stopped")).is_ok();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reached
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    drop(server);
+    assert!(!dialing.join().unwrap(), "dials after the test are refused");
+    assert!(!dir.exists(), "no core came up again to make its folder");
 }
 
 /// Polls `done` until it holds or `timeout` passes; returns whether it held.

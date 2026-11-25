@@ -14,7 +14,8 @@ fi
 "#;
 
 /// Reads the servers listening (`ss` and /proc on Linux, `lsof` on macOS):
-/// port, address, pid, program and folder, a tab between each. Herdr's
+/// port, address, pid, program, folder and the herdr-core terminal it was
+/// started from (`HC_TERMINAL_ID` in its environment), a tab between each. Herdr's
 /// projects mod reads them the same way. `lsof` takes a moment of CPU, so
 /// it's asked less often than the load.
 pub const PORTS: &str = r#"echo '@@ports'
@@ -22,16 +23,18 @@ if [ "$(uname -s)" = Linux ]; then
   ss -ltnpH 2>/dev/null | while read -r st rq sq local peer users; do
     [ -n "$users" ] || continue
     for pid in $(printf '%s' "$users" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
-      printf '%s\t%s\t%s\t%s\t%s\n' "${local##*:}" "${local%:*}" "$pid" "$(cat /proc/$pid/comm 2>/dev/null)" "$(readlink /proc/$pid/cwd 2>/dev/null)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${local##*:}" "${local%:*}" "$pid" "$(cat /proc/$pid/comm 2>/dev/null)" "$(readlink /proc/$pid/cwd 2>/dev/null)" "$(cat /proc/$pid/environ 2>/dev/null | tr '\0' '\n' | sed -n 's/^HC_TERMINAL_ID=//p')"
     done
   done
 else
   L=$(lsof -nP -iTCP -sTCP:LISTEN -Fpcn 2>/dev/null | awk '/^p/{p=substr($0,2)} /^c/{c=substr($0,2)} /^n/{a=substr($0,2); port=a; sub(/.*:/,"",port); addr=a; sub(/:[^:]*$/,"",addr); print port "\t" addr "\t" p "\t" c}' | sort -u)
   P=$(printf '%s\n' "$L" | cut -f3 | sort -u | paste -sd, -)
   C=""
+  E=""
   [ -n "$P" ] && C=$(lsof -a -d cwd -p "$P" -Fpn 2>/dev/null | awk '/^p/{p=substr($0,2)} /^n/{print p "\t" substr($0,2)}')
-  { printf '%s\n' "$C" | awk '{print "C\t" $0}'; printf '%s\n' "$L" | awk '{print "L\t" $0}'; } |
-    awk -F'\t' -v OFS='\t' '$1=="C"{cwd[$2]=$3; next} $1=="L" && $2!=""{print $2,$3,$4,$5,cwd[$4]}'
+  [ -n "$P" ] && E=$(ps -E -ww -o pid=,command= -p "$P" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^HC_TERMINAL_ID=/) {print $1 "\t" substr($i, 16); break}}')
+  { printf '%s\n' "$C" | awk '{print "C\t" $0}'; printf '%s\n' "$E" | awk '{print "E\t" $0}'; printf '%s\n' "$L" | awk '{print "L\t" $0}'; } |
+    awk -F'\t' -v OFS='\t' '$1=="C"{cwd[$2]=$3; next} $1=="E"{term[$2]=$3; next} $1=="L" && $2!=""{print $2,$3,$4,$5,cwd[$4],term[$4]}'
 fi
 "#;
 
@@ -78,6 +81,12 @@ pub struct Server {
     /// Its program's name, and the folder it runs in.
     pub name: String,
     pub cwd: String,
+    /// Its program's pid, when the script said.
+    pub pid: Option<u32>,
+    /// The herdr-core terminal it was started from, as its host's core
+    /// calls it (`t7`), when it was: its environment says, even once the
+    /// shell that started it is gone.
+    pub terminal: Option<String>,
 }
 
 impl Server {
@@ -156,28 +165,36 @@ fn parse_server(line: &str) -> Option<Server> {
     let mut f = line.split('\t');
     let port = f.next()?.trim().parse().ok().filter(|p| *p > 0)?;
     let addr = f.next().unwrap_or_default().to_string();
-    let _pid = f.next();
+    let pid = f.next().and_then(|p| p.trim().parse().ok());
     Some(Server {
         port,
         addr,
         name: f.next().unwrap_or_default().to_string(),
         cwd: f.next().unwrap_or_default().to_string(),
+        pid,
+        terminal: f.next().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
     })
 }
 
 /// The servers whose folder is in `worktree` and in none of `deeper`
 /// (worktrees inside it, as `.claude/worktrees/` sits in the main
-/// checkout), by port, each port once.
-pub fn servers_in<'a>(servers: &'a [Server], worktree: &str, deeper: &[&str]) -> Vec<&'a Server> {
+/// checkout), and those started from `terminal` wherever they run (an
+/// agent's, in a worktree it made itself), by port, each port once.
+pub fn servers_in<'a>(servers: &'a [Server], worktree: &str, deeper: &[&str], terminal: &str) -> Vec<&'a Server> {
     let inside = |path: &str, dir: &str| {
         path.strip_prefix(dir)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     };
     let mut found: Vec<&Server> = servers
         .iter()
-        // A deleted folder keeps no worktree's servers.
-        .filter(|s| !s.cwd.is_empty() && !s.cwd.ends_with(" (deleted)"))
-        .filter(|s| inside(&s.cwd, worktree) && !deeper.iter().any(|d| inside(&s.cwd, d)))
+        .filter(|s| {
+            s.terminal.as_deref() == Some(terminal)
+                // A deleted folder keeps no worktree's servers.
+                || (!s.cwd.is_empty()
+                    && !s.cwd.ends_with(" (deleted)")
+                    && inside(&s.cwd, worktree)
+                    && !deeper.iter().any(|d| inside(&s.cwd, d)))
+        })
         .collect();
     found.sort_by_key(|s| s.port);
     found.dedup_by_key(|s| s.port);
@@ -256,6 +273,8 @@ mod tests {
             addr: "0.0.0.0".into(),
             name: "ruby".into(),
             cwd: cwd.into(),
+            pid: None,
+            terminal: None,
         };
         let servers = [
             server(3021, "/srv/api/.claude/worktrees/auth/web"),
@@ -266,7 +285,7 @@ mod tests {
             server(9000, "/srv/apis"),
         ];
         let ports = |wt: &str, deeper: &[&str]| -> Vec<u16> {
-            servers_in(&servers, wt, deeper)
+            servers_in(&servers, wt, deeper, "t1")
                 .iter()
                 .map(|s| s.port)
                 .collect()
@@ -274,6 +293,28 @@ mod tests {
         let auth = "/srv/api/.claude/worktrees/auth";
         assert_eq!(ports(auth, &[]), [3020, 3021]);
         assert_eq!(ports("/srv/api", &[auth]), [3000]);
+    }
+
+    /// A server an agent started in a worktree it made itself goes with the
+    /// agent's terminal, wherever that's filed, and its folder's worktree.
+    #[test]
+    fn a_terminals_servers_go_with_it() {
+        let r = read(
+            "@@ports\n\
+             3020\t0.0.0.0\t41\truby\t/srv/api/.worktrees/auth\tt7\n\
+             3000\t0.0.0.0\t42\tnode\t/srv/api/.worktrees/web (deleted)\tt7\n\
+             4000\t0.0.0.0\t43\tnode\t/srv/api/.worktrees/web\tt8\n\
+             5000\t0.0.0.0\t44\tnode\t/srv/api/.worktrees/web\n",
+        );
+        assert_eq!(r.servers[0].terminal.as_deref(), Some("t7"));
+        assert_eq!(r.servers[3].terminal, None, "started outside herdr-core");
+        let (auth, web) = ("/srv/api/.worktrees/auth", "/srv/api/.worktrees/web");
+        let ports = |wt: &str, deeper: &[&str], terminal: &str| -> Vec<u16> {
+            servers_in(&r.servers, wt, deeper, terminal).iter().map(|s| s.port).collect()
+        };
+        assert_eq!(ports("/srv/api", &[auth, web], "t7"), [3000, 3020]);
+        assert_eq!(ports("/srv/api", &[auth, web], "t9"), [0u16; 0]);
+        assert_eq!(ports(web, &[], "t9"), [4000, 5000]);
     }
 
     /// The script runs, here too, and succeeds without Tailscale.

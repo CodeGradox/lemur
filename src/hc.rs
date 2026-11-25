@@ -1029,18 +1029,17 @@ pub fn core(session: Option<&str>) -> Result<Arc<Core>> {
         session.is_some(),
         "a test reached herdr-core's default session: use an HcServer's"
     );
-    type Slot = Arc<Mutex<Option<Arc<Core>>>>;
-    static CORES: OnceLock<Mutex<HashMap<Option<String>, Slot>>> = OnceLock::new();
-    let slot = CORES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .entry(session.map(str::to_owned))
-        .or_default()
-        .clone();
+    let slot = slot(session);
     // Each session has a lock of its own, held while connecting, so two
     // threads connect once, and a core slow to answer holds up only its own.
     let mut slot = slot.lock().unwrap();
+    // Dialing a test's core once the test is over would start it again.
+    #[cfg(test)]
+    if let Some(session) = session
+        && stopped(session)
+    {
+        bail!("the test core {session} is stopped: its test is over");
+    }
     if let Some(core) = &*slot
         && !core.is_lost()
     {
@@ -1049,6 +1048,45 @@ pub fn core(session: Option<&str>) -> Result<Arc<Core>> {
     let core = Core::connect(session)?;
     *slot = Some(core.clone());
     Ok(core)
+}
+
+type Slot = Arc<Mutex<Option<Arc<Core>>>>;
+
+/// Where the connection to the core of `session` is kept.
+fn slot(session: Option<&str>) -> Slot {
+    static CORES: OnceLock<Mutex<HashMap<Option<String>, Slot>>> = OnceLock::new();
+    CORES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(session.map(str::to_owned))
+        .or_default()
+        .clone()
+}
+
+/// The test sessions whose tests are over.
+#[cfg(test)]
+static STOPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn stopped(session: &str) -> bool {
+    STOPPED.lock().unwrap().iter().any(|s| s == session)
+}
+
+/// Lemur dials the core of `session` no more, its test being over: a window
+/// still dialing it in the background, as one does from the start, would
+/// start it again once the test stopped it, and it would run on. Waits for a
+/// dial on its way, so the core that starts is there to stop. Never a panic:
+/// it's for a test that may be failing already.
+#[cfg(test)]
+pub fn stop_dialing(session: &str) {
+    let slot = slot(Some(session));
+    let mut slot = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    STOPPED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(session.to_string());
+    slot.take();
 }
 
 /// `name` as herdr-core takes a machine's: 1-32 of a-z 0-9 - _ ., starting
@@ -1139,6 +1177,8 @@ static TEST_ENV: Mutex<Vec<(String, Env)>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub fn set_test_env(session: &str, env: Env) {
     TEST_ENV.lock().unwrap().push((session.to_string(), env));
+    // A session used again is dialled again.
+    STOPPED.lock().unwrap().retain(|s| s != session);
 }
 
 /// The session of the test core each stand-in host is reached through.

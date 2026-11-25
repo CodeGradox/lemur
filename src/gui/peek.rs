@@ -2,7 +2,7 @@
 //! live, without switching to it. ↗ shows it instead; × or a click outside puts the one on
 //! show back. Setting up a host shows its terminal the same way.
 
-use super::prompt::agent_icon;
+use super::prompt::thread_icon;
 use super::sidebar::status_dot;
 use super::{Key, Lemur, icons, terminal, worktree_label};
 use crate::actions;
@@ -140,7 +140,7 @@ pub fn card(s: &Lemur, k: &Kit) -> Option<El> {
         .gap(8.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
-        .children(session.map(|t| agent_icon(t.agent(), k)))
+        .children(session.map(|t| thread_icon(t.agent(), t.color.as_deref(), k)))
         .child(text(label).font(k.ty.ui_medium).color(c.text_base))
         .child(text(place).font(k.ty.small).color(c.text_muted).truncate().grow(1.0));
     if let Some(t) = session {

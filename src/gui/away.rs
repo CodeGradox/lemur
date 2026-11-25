@@ -1,5 +1,5 @@
-//! Putting a thread away, as Herdr puts a tab away: out of the sidebar's
-//! lists and the tabs, still running, under its list's "Put away". It
+//! Putting a thread away, as Herdr puts a tab away: out of its folder in
+//! the sidebar, still running, under its host's "Put away". It
 //! comes back when it needs you, or when you open it. herdr-core keeps
 //! it as a label on the terminal (`lemur.away`), so it stays away across
 //! restarts, and from any Mac.
@@ -19,6 +19,9 @@ impl Lemur {
                 *other != k && self.session_of(other).is_some_and(|s| !s.away)
             });
             self.hide_shown(None);
+            if let Some(space) = self.space_of(&k) {
+                self.space_shown = Some(space);
+            }
             self.active = None;
             if let Some((host, session)) = next {
                 self.open(host, session);

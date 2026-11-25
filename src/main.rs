@@ -55,9 +55,6 @@ enum Cmd {
         /// Start just a shell instead of Claude (in an existing worktree)
         #[arg(long, requires = "worktree")]
         shell: bool,
-        /// Start Codex instead of Claude
-        #[arg(long, conflicts_with = "shell")]
-        codex: bool,
         /// Branch to create for a new worktree; without one it's detached
         #[arg(long, conflicts_with = "worktree")]
         branch: Option<String>,
@@ -109,7 +106,6 @@ fn main() -> Result<()> {
             name,
             worktree,
             shell,
-            codex,
             branch,
             from,
         } => {
@@ -117,11 +113,7 @@ fn main() -> Result<()> {
                 .base_by_name(&base)
                 .with_context(|| format!("unknown base {base}"))?;
             actions::validate_name(&name)?;
-            let agent = match (shell, codex) {
-                (true, _) => None,
-                (_, true) => Some(config::Agent::Codex),
-                _ => Some(config::Agent::Claude),
-            };
+            let agent = (!shell).then_some(config::Agent::Claude);
             let started = match worktree {
                 Some(w) => actions::new_thread_in(&cfg, b, &w, &name, agent)?,
                 None => {

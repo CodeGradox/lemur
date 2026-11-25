@@ -219,7 +219,7 @@ pub(super) mod tests {
     fn every_word_typed_narrows_the_commands() {
         let names = |typed: &str| matching(typed).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(names("toggle ag"), ["Toggle Agents"]);
-        assert_eq!(names("AGENT"), ["Toggle Agents", "Next Agent", "Previous Agent"]);
+        assert_eq!(names("AGENT"), ["Agents in Sidebar", "Toggle Agents", "Next Agent", "Previous Agent"]);
         assert!(names("").len() > 10, "all of them");
         assert!(names("nothing like it").is_empty());
         assert!(!names("").contains(&"Command Palette…"), "not itself");
@@ -271,7 +271,7 @@ pub(super) mod tests {
         let mut rt = window(toml::from_str("").unwrap());
         press(&mut rt, K::Command('p'), Mods { shift: true, ..cmd() });
         // Their menu items' keys reach them whatever has the keyboard.
-        rt.update(|s, tx| actions::run(s, Action::AddProject, tx));
+        rt.update(|s, tx| actions::run(s, Action::NewSession, tx));
         rt.update(|s, tx| actions::run(s, Action::Dictate, tx));
         rt.frame(1.0 / 60.0);
         assert!(rt.state.panels.commands.is_some());

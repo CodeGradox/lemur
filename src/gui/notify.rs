@@ -3,8 +3,9 @@
 //! Do Not Disturb, and System Settings › Notifications › Lemur says whether they show as
 //! banners or alerts.
 //!
-//! The window keeps which notifications are out; Notification Center shows them. Only the
-//! app bundle can post (`rune_notify::available`), and the first post asks for permission.
+//! The window keeps which notifications are out; Notification Center shows them, and the
+//! Dock icon how many. Only the app bundle can post (`rune_notify::available`), and the first
+//! post asks for permission.
 
 use super::{Key, Lemur};
 use crate::snapshot::Activity;
@@ -32,12 +33,14 @@ pub struct Notify {
     popups: Vec<Popup>,
     /// The window is the active one.
     looking: bool,
+    /// How many the Dock icon says are out.
+    badge: usize,
 }
 
 impl Default for Notify {
     fn default() -> Self {
         // Lemur opens in front.
-        Notify { popups: vec![], looking: true }
+        Notify { popups: vec![], looking: true, badge: 0 }
     }
 }
 
@@ -45,6 +48,15 @@ impl Notify {
     /// The threads whose notification is out.
     pub fn shown(&self) -> Vec<Key> {
         self.popups.iter().map(|p| p.key.clone()).collect()
+    }
+
+    /// Has the Dock icon say how many notifications are out, once that changed.
+    fn count(&mut self) {
+        let n = self.popups.len();
+        if n != self.badge {
+            self.badge = n;
+            show_count(n);
+        }
     }
 }
 
@@ -118,6 +130,7 @@ impl Lemur {
         if posted {
             ask_attention();
         }
+        self.panels.notify.count();
     }
 
     /// Takes down the notifications that have been out as long as Settings say, `now` on the
@@ -139,6 +152,7 @@ impl Lemur {
             tx.wake_after(Duration::from_secs_f64(next - now));
         }
         take_down(&gone.iter().map(|p| p.key.clone()).collect::<Vec<_>>());
+        self.panels.notify.count();
         !gone.is_empty()
     }
 
@@ -149,6 +163,7 @@ impl Lemur {
         if popups.len() != before {
             take_down(std::slice::from_ref(key));
         }
+        self.panels.notify.count();
     }
 
     /// A click on a notification: its thread comes on show, which takes it down.
@@ -175,6 +190,17 @@ fn ask_attention() {
     {
         let app = objc2_app_kit::NSApplication::sharedApplication(main);
         app.requestUserAttention(objc2_app_kit::NSRequestUserAttentionType::InformationalRequest);
+    }
+}
+
+/// Shows `n` on Lemur's Dock icon, as Mail shows what's unread; nothing for none.
+fn show_count(n: usize) {
+    if LIVE.get().is_some()
+        && let Some(main) = objc2::MainThreadMarker::new()
+    {
+        let app = objc2_app_kit::NSApplication::sharedApplication(main);
+        let label = (n > 0).then(|| objc2_foundation::NSString::from_str(&n.to_string()));
+        app.dockTile().setBadgeLabel(label.as_deref());
     }
 }
 

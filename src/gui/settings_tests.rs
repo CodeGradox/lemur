@@ -47,8 +47,8 @@ fn update_says_why_theres_nothing_to_do() {
     assert_eq!(update_summary(&ours), "Updates this Mac 0.1.15, agent 0.1.15.");
 }
 
-/// ⌘, opens Settings over the window, once: again leaves it as it is. ⌘W closes it, not the
-/// thread on show, and so does Esc.
+/// ⌘, opens Settings over the window, a modal, once: again leaves it as it is. ⌘W closes it,
+/// not the thread on show, and so do Esc and a click outside it.
 #[test]
 fn settings_open_once_over_the_window() {
     let mut rt = window(no_config());
@@ -57,6 +57,8 @@ fn settings_open_once_over_the_window() {
     assert!(!rt.state.keyboard_on_terminal(), "the terminal under it doesn't take keys");
     frames(&mut rt, 20);
     assert!(rt.find("settings").is_some() && rt.find("settings-nav").is_some());
+    let (panel, _) = rt.presented("settings").expect("Settings");
+    assert!(panel[2] <= 760.5 && panel[3] <= 560.5 && panel[0] > 0.0, "a modal in the window, not all of it: {panel:?}");
     press(&mut rt, K::Command(','), cmd());
     assert!(rt.state.panels.settings.open);
 
@@ -67,6 +69,14 @@ fn settings_open_once_over_the_window() {
     assert!(rt.state.panels.settings.open);
     press(&mut rt, K::Escape, Mods::default());
     assert!(!rt.state.panels.settings.open);
+
+    press(&mut rt, K::Command(','), cmd());
+    frames(&mut rt, 20);
+    rt.pointer_move(20.0, 400.0);
+    rt.pointer_down(20.0, 400.0);
+    rt.pointer_up(20.0, 400.0);
+    frames(&mut rt, 4);
+    assert!(!rt.state.panels.settings.open, "a click outside it");
 }
 
 /// Help text goes under its item, across the page, so it leaves what the item sets the room
@@ -175,8 +185,8 @@ fn the_notification_dismiss_is_set_and_kept() {
     assert!(rt.state.panels.settings.error.is_none());
 }
 
-/// Claude's, Codex's and shells' notifications go on and off one by one, all on at first,
-/// and the config keeps only those off.
+/// Claude's and shells' notifications go on and off one by one, both on at first, and the
+/// config keeps only those off.
 #[test]
 fn which_threads_notify_is_set_and_kept() {
     let dir = TempDir::new("settings-notifies");
@@ -187,18 +197,17 @@ fn which_threads_notify_is_set_and_kept() {
     rt.state.prefs = Prefs::new(&cfg, Some(file.clone()));
     rt.update(|s, _| s.open_settings());
     click(&mut rt, "settings-page-notifications");
-    let all = |s: &Lemur| (s.prefs.claude_notifications, s.prefs.codex_notifications, s.prefs.shell_notifications);
-    assert_eq!(all(&rt.state), (true, true, true));
+    let all = |s: &Lemur| (s.prefs.claude_notifications, s.prefs.shell_notifications);
+    assert_eq!(all(&rt.state), (true, true));
     click(&mut rt, "settings-notify-shell");
-    assert_eq!(all(&rt.state), (true, true, false));
-    click(&mut rt, "settings-notify-codex");
-    assert_eq!(all(&rt.state), (true, false, false));
+    assert_eq!(all(&rt.state), (true, false));
+    click(&mut rt, "settings-notify-claude");
+    assert_eq!(all(&rt.state), (false, false));
     let kept = std::fs::read_to_string(&file).unwrap();
-    assert!(kept.contains("codex_notifications = false") && kept.contains("shell_notifications = false"), "{kept}");
-    assert!(!kept.contains("claude_notifications"), "{kept}");
+    assert!(kept.contains("claude_notifications = false") && kept.contains("shell_notifications = false"), "{kept}");
     click(&mut rt, "settings-notify-shell");
-    click(&mut rt, "settings-notify-codex");
-    assert_eq!(all(&rt.state), (true, true, true));
+    click(&mut rt, "settings-notify-claude");
+    assert_eq!(all(&rt.state), (true, true));
     let kept = std::fs::read_to_string(&file).unwrap();
     assert!(kept.contains("# mine") && !kept.contains("notifications"), "{kept}");
     assert!(rt.state.panels.settings.error.is_none());
@@ -268,6 +277,16 @@ fn the_thread_order_is_picked_on_the_shortcuts_page() {
     click(&mut rt, "settings-thread-order-trigger");
     rt.resolve_popup(Some("recent")).expect("the order menu");
     assert_eq!(rt.state.prefs.thread_order, crate::config::ThreadOrder::Recent);
+}
+
+/// What the sidebar calls a folder you haven't named is picked on the appearance page.
+#[test]
+fn folder_names_are_picked_on_the_appearance_page() {
+    let mut rt = settings_on(no_config(), "appearance");
+    assert_eq!(rt.state.prefs.folder_names, crate::config::FolderNames::Random);
+    click(&mut rt, "settings-folder-names-trigger");
+    rt.resolve_popup(Some("worktree")).expect("the names menu");
+    assert_eq!(rt.state.prefs.folder_names, crate::config::FolderNames::Worktree);
 }
 
 /// A first host added through the picker counts for Settings' herdr-core page at once, not

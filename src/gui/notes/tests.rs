@@ -464,7 +464,6 @@ fn session(name: &str) -> Session {
         activity: Activity::Idle,
         waiting_for: None,
         started_claude: false,
-        codex: false,
         order: None,
         started: 0,
         claude: None,
@@ -477,6 +476,9 @@ fn session(name: &str) -> Session {
         away: false,
         silent: false,
         issue: None,
+        folder: None,
+        color: None,
+        space: crate::snapshot::HOME.into(),
     }
 }
 
@@ -500,9 +502,10 @@ fn snapshot(worktrees: &[(&str, &str, &[&str])]) -> Snapshot {
             needs_you: false,
             home: String::new(),
             machine: Default::default(),
-            bases: vec![BaseView { index: 0, error: None, worktrees, plain: false }],
+            bases: vec![BaseView { index: 0, path: String::new(), error: None, worktrees, plain: false }],
             other: vec![],
             gone: vec![],
+            resuming_in: vec![],
         }],
     }
 }
@@ -519,8 +522,8 @@ fn api_window(server: &HcServer) -> Runtime<Lemur> {
 }
 
 /// Opening a thread points the notes at its worktree without opening the
-/// panel; Notes in a worktree's menu opens it on that one, and opening the
-/// thread again takes them back.
+/// panel; opening another worktree's notes opens it on that one, and opening
+/// the thread again takes them back.
 #[test]
 fn notes_follow_the_opened_thread() {
     let server = HcServer::new("rnotes");

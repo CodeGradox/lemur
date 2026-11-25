@@ -1,9 +1,10 @@
 //! The Links panel, on the right as the notes and the changes are: the
 //! worktree on show's pull requests, those of its branch and those agents
-//! linked to, with what `gh` says of them; and the Claude artifacts agents
-//! used or posted there, the latest first (see `links`). A click opens one;
-//! its × takes it off the list for good, and leaves what it links to alone.
-//! An artifact's pencil gives it a name of your own.
+//! or you linked to, with what `gh` says of them; the Claude artifacts
+//! agents or you used or posted there; and every other link you or they
+//! wrote, the latest first (see `links`). A click opens one; its × takes it
+//! off the list for good, and leaves what it links to alone. A link's pencil
+//! gives it a name of your own.
 
 use super::{Lemur, Right, icons, worktree_label};
 use crate::config::{Host, leaf};
@@ -350,9 +351,11 @@ fn pr_row(i: usize, pr: &PullRequest, k: &Kit) -> El {
     k.interactive(r)
 }
 
-/// An artifact's row: its name, a pencil to give it one and its ×; or, being named, a
-/// field for the name.
-fn artifact_row(p: &LinksPanel, i: usize, artifact: &Artifact, k: &Kit) -> El {
+/// An artifact's row, or another link's: its name, a pencil to give it one and its ×; or,
+/// being named, a field for the name. Said on another host, a link to its `localhost` goes
+/// to `remote`, the name that reaches it.
+fn artifact_row(p: &LinksPanel, i: usize, artifact: &Artifact, remote: Option<&str>, k: &Kit) -> El {
+    let glyph = if artifact.is_artifact() { &icons::SHAPES } else { &icons::LINK };
     if let Some(r) = p.renaming.as_ref().filter(|r| r.url == artifact.url) {
         // A field of its own rather than the sidebar row's: that one hands the keyboard to
         // the sidebar when it goes, and here it goes back to the thread on show.
@@ -379,11 +382,12 @@ fn artifact_row(p: &LinksPanel, i: usize, artifact: &Artifact, k: &Kit) -> El {
             .center_y()
             .radius(k.radius.md)
             .fill(k.c.pressed)
-            .child(icon(&icons::SHAPES, 16.0).color(k.c.icon_muted))
+            .child(icon(glyph, 16.0).color(k.c.icon_muted))
             .child(field.grow(1.0).shrink());
     }
-    let line = SidebarRow::new(p.name_of(artifact)).icon(&icons::SHAPES);
-    let (open, rename, remove) = (artifact.url.clone(), artifact.url.clone(), artifact.url.clone());
+    let line = SidebarRow::new(p.name_of(artifact)).icon(glyph);
+    let open = remote.map_or_else(|| artifact.url.clone(), |host| links::reached(&artifact.url, host));
+    let (rename, remove, tip) = (artifact.url.clone(), artifact.url.clone(), open.clone());
     let buttons = row()
         .gap(2.0)
         .center_y()
@@ -397,7 +401,7 @@ fn artifact_row(p: &LinksPanel, i: usize, artifact: &Artifact, k: &Kit) -> El {
         })
         .build(k)
         .key(format!("links-artifact-{i}"))
-        .help(artifact.url.clone())
+        .help(tip)
 }
 
 pub fn view(s: &Lemur, k: &Kit) -> El {
@@ -410,7 +414,7 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
         (_, Some(e)) => Some(e.clone()),
         _ if count == 0 && p.loading.is_some() => Some("Looking for links…".into()),
         _ if count == 0 => Some(
-            "No links here yet. This branch's pull requests, and the artifacts and pull requests agents use or post, show up here."
+            "No links here yet. This branch's pull requests, the artifacts and pull requests agents or you use or post, and the links you or they write, show up here."
                 .into(),
         ),
         _ => None,
@@ -428,10 +432,19 @@ pub fn view(s: &Lemur, k: &Kit) -> El {
     if let Some(note) = gh_note {
         list = list.child(text(note).key("links-gh-note").font(k.ty.small).color(c.text_muted).wrap().padding(4.0));
     }
-    if !links.is_empty() {
-        list = list.child(section("Artifacts", k));
+    let remote = p.place.as_ref().filter(|(h, _, _)| h.ssh != "local").map(|(h, _, _)| super::chrome::reach(s, h));
+    // By their place in the list, whichever section they're in, as their keys go.
+    for (name, artifacts) in [("Artifacts", true), ("Links", false)] {
+        let rows: Vec<El> = links
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.is_artifact() == artifacts)
+            .map(|(i, a)| artifact_row(p, i, a, remote.as_deref(), k))
+            .collect();
+        if !rows.is_empty() {
+            list = list.child(section(name, k)).children(rows);
+        }
     }
-    list = list.children(links.iter().enumerate().map(|(i, a)| artifact_row(p, i, a, k)));
     if let Some(e) = empty {
         list = list.child(text(e).key("links-empty").font(k.ty.ui).color(c.text_muted).wrap().padding(4.0));
     }

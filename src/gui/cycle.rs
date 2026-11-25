@@ -1,10 +1,10 @@
-//! ⌃Tab: going through the threads of the worktree on show, along the tabs or, as Settings
-//! can say, the one opened last first, the way ⌘Tab goes through apps. While ⌃ is held each
-//! Tab goes one further; letting go of it settles on the thread on show.
+//! ⌃Tab: going through the threads of the session of the one on show, but a folded folder's,
+//! or with ⌘. every agent's as the sidebar lists them then, in the sidebar's order
+//! or, as Settings can say, the one opened last first, the way ⌘Tab goes through apps. While
+//! ⌃ is held each Tab goes one further; letting go of it settles on the thread on show.
 
 use super::{Key, Lemur};
 use crate::config::ThreadOrder;
-use crate::snapshot::Session;
 use rune::Tx;
 
 /// `threads` by when they were last opened (`recent`, the latest first); ones never opened
@@ -15,34 +15,38 @@ pub(super) fn by_recent(mut threads: Vec<Key>, recent: &[Key]) -> Vec<Key> {
 }
 
 impl Lemur {
-    /// The threads of the worktree `active` runs in, or of its host's threads outside every
-    /// worktree.
+    /// The threads of the folder `active` is in, as ⌘1 to ⌘9 go through them: those put away
+    /// aren't, unless on show.
     pub fn siblings(&self, active: &Key) -> Vec<Key> {
         let (host, session) = active;
-        // Those put away aren't tabs, unless on show.
-        let shown = |s: &&Session| !s.away || s.name == *session;
-        let names: Vec<String> = match self.snap.worktrees(host).find(|w| w.sessions.iter().any(|s| s.name == *session)) {
-            Some(w) => w.sessions.iter().filter(shown).map(|s| s.name.clone()).collect(),
-            None => self
-                .snap
-                .hosts
-                .iter()
-                .filter(|h| h.name == *host)
-                .flat_map(|h| h.other.iter().filter(shown).map(|s| s.name.clone()))
-                .collect(),
-        };
+        let mut names = self.group_of(active);
+        if !names.contains(session) {
+            names.push(session.clone());
+        }
         names.into_iter().map(|name| (host.clone(), name)).collect()
     }
 
-    /// Shows the next thread of the worktree on show, or with `back` the one before, in the
-    /// order Settings says.
+    /// Shows the next thread in the session of the one on show, or with ⌘. the next agent's
+    /// down the sidebar, or with `back` the one before, in the order Settings says.
     pub fn cycle_threads(&mut self, back: bool, tx: &Tx) {
         if self.overlaid() {
             return;
         }
         let Some(active) = self.active.clone() else { return };
         if self.cycling.is_none() {
-            let threads = self.siblings(&active);
+            let mut threads = match self.sidebar_agents {
+                true => self.sidebar_threads(),
+                // Not a folded folder's, as ⌘1–9 go: showing one would unfold it.
+                false => {
+                    let threads = self.space_of(&active).map(|space| self.space_threads(&space)).unwrap_or_default();
+                    let folded = |k: &Key| self.session_of(k).is_some_and(|s| self.folded(&k.0, &super::folders::folder_of(s)));
+                    threads.into_iter().filter(|k| !folded(k)).collect()
+                }
+            };
+            // Put away, it's still where it starts from.
+            if !threads.contains(&active) {
+                threads.push(active.clone());
+            }
             let order = match self.prefs.thread_order {
                 ThreadOrder::Tabs => threads,
                 ThreadOrder::Recent => by_recent(threads, &self.recent),

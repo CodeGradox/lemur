@@ -1,18 +1,18 @@
 //! Settings (lemur → Settings…, ⌘,): the theme, how long notifications show, the terminal's font,
 //! scrollback and colors, the language dictation listens for, whether to
-//! show Claude's and Codex's plan usage, Lemur's Linear sign-in, herdr-core's
+//! show Claude's plan usage, Lemur's Linear sign-in, herdr-core's
 //! versions, and every shortcut. Changes apply at once and are saved to the
 //! config file.
 //!
-//! It's a page over the whole window, not a window of its own as it was: Rune gives each
-//! window a state of its own, and what Settings changes is this one's, which the terminals
-//! follow at once.
+//! It's a modal over the window, not a window of its own as it was: Rune gives each window a
+//! state of its own, and what Settings changes is this one's, which the terminals follow at
+//! once.
 
 use super::palette::{Palette, Rgb, SLOTS, Slot, hex, rgb, set_color};
 use super::terminal::Metrics;
 use super::core::COMMAND_NEWS;
 use super::{Lemur, icons};
-use crate::config::{Agent, Config, FONT_SIZES, Language, SCROLLBACKS, ThemeChoice, ThreadOrder, parse_hex};
+use crate::config::{Agent, Config, FONT_SIZES, FolderNames, Language, SCROLLBACKS, ThemeChoice, ThreadOrder, parse_hex};
 use crate::core_update::{self, Versions};
 use rune::{El, Icon, Key as K, PopupMenu, ScrollSpec, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Select, SelectAppearance, Switch, TextInput};
@@ -27,21 +27,19 @@ pub enum Page {
     Colors,
     Dictation,
     Claude,
-    Codex,
     Core,
     Shortcuts,
     Linear,
 }
 
 /// Each page with its key, its name and its icon.
-static PAGES: [(Page, &str, &str, &Icon); 10] = [
+static PAGES: [(Page, &str, &str, &Icon); 9] = [
     (Page::Appearance, "appearance", "Appearance", &icons::SUN),
     (Page::Notifications, "notifications", "Notifications", &icons::BELL),
     (Page::Terminal, "terminal", "Terminal", &icons::SQUARE_TERMINAL),
     (Page::Colors, "colors", "Terminal colors", &icons::PALETTE),
     (Page::Dictation, "dictation", "Dictation", &icons::MIC),
     (Page::Claude, "claude", "Claude", &icons::CLAUDE),
-    (Page::Codex, "codex", "Codex", &icons::CODE_XML),
     (Page::Core, "core", "herdr-core", &icons::SERVER),
     (Page::Shortcuts, "shortcuts", "Shortcuts", &icons::KEYBOARD),
     (Page::Linear, "linear", "Linear", &icons::TICKET),
@@ -114,7 +112,7 @@ impl Lemur {
     fn save_settings(&mut self) {
         let p = &self.prefs;
         let saved = p.config_file().map(|file| {
-            Config::save_settings(file, p.theme, p.dictation_language, p.thread_order, &p.terminal, p.claude_usage, p.codex_usage)
+            Config::save_settings(file, p.theme, p.dictation_language, p.thread_order, &p.terminal, p.claude_usage)
         });
         self.panels.settings.error = match saved {
             Some(Err(e)) => Some(format!("{e:#}")),
@@ -138,6 +136,16 @@ impl Lemur {
         self.save_settings();
     }
 
+    /// The sidebar's folders you haven't named go by it at once.
+    fn set_folder_names(&mut self, names: FolderNames) {
+        self.prefs.folder_names = names;
+        let saved = self.prefs.config_file().map(|file| Config::save_folder_names(file, names));
+        self.panels.settings.error = match saved {
+            Some(Err(e)) => Some(format!("{e:#}")),
+            _ => None,
+        };
+    }
+
     /// Notifications go by themselves once they've shown `ms`, or with 0 stay till they're
     /// answered: the ones showing too.
     fn set_dismiss(&mut self, ms: u32) {
@@ -155,10 +163,9 @@ impl Lemur {
         let p = &mut self.prefs;
         match agent {
             Some(Agent::Claude) => p.claude_notifications = on,
-            Some(Agent::Codex) => p.codex_notifications = on,
             None => p.shell_notifications = on,
         }
-        let saved = p.config_file().map(|file| Config::save_notifications(file, p.claude_notifications, p.codex_notifications, p.shell_notifications));
+        let saved = p.config_file().map(|file| Config::save_notifications(file, p.claude_notifications, p.shell_notifications));
         self.panels.settings.error = match saved {
             Some(Err(e)) => Some(format!("{e:#}")),
             _ => None,
@@ -224,7 +231,6 @@ impl Lemur {
     fn set_usage(&mut self, agent: Agent, on: bool) {
         match agent {
             Agent::Claude => self.prefs.claude_usage = on,
-            Agent::Codex => self.prefs.codex_usage = on,
         }
         self.save_settings();
         self.follow_meter_setting();
@@ -312,12 +318,18 @@ impl Lemur {
     }
 }
 
-/// Settings over the window, while it's open: its pages on the left, the one picked beside
-/// them, and why a change couldn't be saved under both.
-pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
+/// How big Settings is at most, as its window was: in a smaller window, the window less a
+/// margin round it.
+const WIDTH: f32 = 760.0;
+const HEIGHT: f32 = 560.0;
+
+/// Settings in `layer` while it's open, a modal over the dimmed window: its pages on the
+/// left, the one picked beside them, and why a change couldn't be saved under both. Escape or
+/// a click outside it closes it, as Done does.
+pub fn overlay(s: &Lemur, k: &Kit, layer: &mut Vec<El>) {
     let st = &s.panels.settings;
     if !st.open {
-        return None;
+        return;
     }
     let c = &k.c;
     let mut nav = col().key("settings-nav").w(200.0).h_full().padding(8.0).gap(2.0);
@@ -347,7 +359,6 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
         Page::Colors => vec![color_group(s, true, k), color_group(s, false, k)],
         Page::Dictation => dictation(s, k),
         Page::Claude => usage(s, Agent::Claude, k),
-        Page::Codex => usage(s, Agent::Codex, k),
         Page::Core => core(s, k),
         Page::Shortcuts => shortcuts::page(s, k),
         Page::Linear => linear(s, k),
@@ -368,7 +379,7 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
         .border_sides([0.0, 0.0, 0.0, 1.0], c.border_weak)
         .scroll(ScrollSpec { stick_bottom: false })
         .child(content);
-    let mut body = col().w_full().h_full().min_h(0.0).child(row().w_full().grow(1.0).min_h(0.0).child(nav).child(pane));
+    let mut body = col().w_full().grow(1.0).min_h(0.0).child(row().w_full().grow(1.0).min_h(0.0).child(nav).child(pane));
     if let Some(error) = &st.error {
         body = body.child(
             row()
@@ -386,8 +397,34 @@ pub fn overlay(s: &Lemur, k: &Kit) -> Option<El> {
         .on_press(|s: &mut Lemur| s.close_settings())
         .build(k)
         .key("settings-done");
-    let page = rune_kit::Page::new(body).title("Settings").trailing(done).frame_inset(6.0).build(k);
-    Some(el().key("settings").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).child(page))
+    let head = row()
+        .key("settings-head")
+        .w_full()
+        .h(44.0)
+        .px(16.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], c.border_weak)
+        .child(text("Settings").font(k.ty.ui_medium).color(c.text_base).grow(1.0))
+        .child(done);
+    // As the cards over the window look.
+    let panel = col()
+        .key("settings")
+        .role("dialog")
+        .label("Settings")
+        .w_full()
+        .max_w(WIDTH)
+        .h_full()
+        .max_h(HEIGHT)
+        .radius(k.radius.lg)
+        .fill(c.surface_raised)
+        .border(1.0, c.border_base)
+        .shadow(12.0, 40.0, c.scrim)
+        .clip_rounded(k.radius.lg)
+        .child(head)
+        .child(body)
+        .modal(true, |s: &mut Lemur| s.close_settings());
+    layer.push(el().key("settings-scrim").absolute(0.0, 0.0).w_full().h_full().fill(c.scrim).a11y_hidden());
+    layer.push(el().key("settings-layer").absolute(0.0, 0.0).w_full().h_full().padding(32.0).center().child(panel));
 }
 
 /// A setting: its name beside what sets it, and its help under both, across the page, so it
@@ -492,7 +529,33 @@ fn appearance(s: &Lemur, k: &Kit) -> Vec<El> {
         |s, id| s.set_theme(ThemeChoice::ALL.into_iter().find(|t| t.as_str() == id).unwrap_or_default()),
         k,
     );
-    vec![group(None, None, vec![item("theme", "Theme", theme, Some("System follows macOS's light or dark mode.".into()), k)], k)]
+    let names = FolderNames::ALL.iter().map(|n| (n.as_str().to_owned(), folder_names_label(*n).to_owned())).collect();
+    let folder_names = picker(
+        "folder-names",
+        "Folder names",
+        names,
+        s.prefs.folder_names.as_str(),
+        |s, id| s.set_folder_names(FolderNames::ALL.into_iter().find(|n| n.as_str() == id).unwrap_or_default()),
+        k,
+    );
+    let help = "What the sidebar calls a folder until you rename it, with a right-click. Random words gives each its own, \
+                as calm-heron. Worktree names it after the worktree its Claude works in, or else its first thread.";
+    vec![group(
+        None,
+        None,
+        vec![
+            item("theme", "Theme", theme, Some("System follows macOS's light or dark mode.".into()), k),
+            item("folder-names", "Folder names", folder_names, Some(help.into()), k),
+        ],
+        k,
+    )]
+}
+
+fn folder_names_label(names: FolderNames) -> &'static str {
+    match names {
+        FolderNames::Random => "Random words",
+        FolderNames::Worktree => "Worktree",
+    }
 }
 
 fn notifications(s: &Lemur, k: &Kit) -> Vec<El> {
@@ -500,7 +563,7 @@ fn notifications(s: &Lemur, k: &Kit) -> Vec<El> {
     let ok = st.dismiss.text.trim().parse::<u32>().is_ok();
     let after = stepper("dismiss", &st.dismiss, |s| &mut s.panels.settings.dismiss, Lemur::dismiss_typed, Lemur::step_dismiss, !ok, k);
     let help = "Milliseconds before Lemur takes a notification away, from Notification Center too. 0 leaves it until you clear it or open its thread. System Settings › Notifications › Lemur says whether it shows as a banner or an alert. Silence a thread to have none from it.";
-    let which = [Some(Agent::Claude), Some(Agent::Codex), None].map(|agent| notifies(s, agent, k)).into();
+    let which = [Some(Agent::Claude), None].map(|agent| notifies(s, agent, k)).into();
     vec![
         group(Some("Notify of"), None, which, k),
         group(None, None, vec![item("dismiss", "Dismiss after (ms)", after, Some(help.into()), k)], k),
@@ -512,7 +575,6 @@ fn notifies(s: &Lemur, agent: Option<Agent>, k: &Kit) -> El {
     let on = s.prefs.notifies(agent);
     let (id, title, help) = match agent {
         Some(Agent::Claude) => ("notify-claude", "Claude", "A Claude thread finishing or needing input.".to_string()),
-        Some(Agent::Codex) => ("notify-codex", "Codex", "A Codex thread finishing or needing input.".to_string()),
         None => (
             "notify-shell",
             "Shell commands",
@@ -676,13 +738,8 @@ fn dictation(s: &Lemur, k: &Kit) -> Vec<El> {
 /// Whether the sidebar shows how much of `agent`'s plan is used. Offered once Lemur has seen
 /// it; turned on, it can be turned off whatever happens.
 fn usage(s: &Lemur, agent: Agent, k: &Kit) -> Vec<El> {
-    let (on, found) = match agent {
-        Agent::Claude => (s.prefs.claude_usage, s.claude_found()),
-        Agent::Codex => (s.prefs.codex_usage, s.codex_found()),
-    };
-    let id = match agent {
-        Agent::Claude => "claude-usage",
-        Agent::Codex => "codex-usage",
+    let (on, found, id) = match agent {
+        Agent::Claude => (s.prefs.claude_usage, s.claude_found(), "claude-usage"),
     };
     let switch = Switch::new(on)
         .label("Show plan usage")
@@ -698,13 +755,6 @@ fn usage(s: &Lemur, agent: Agent, k: &Kit) -> Vec<El> {
              asks, with its own sign-in."
         }
         (Agent::Claude, false) => "Lemur hasn't seen Claude Code on your hosts yet. Start a Claude thread, then turn this on.",
-        (Agent::Codex, true) => {
-            "How much of your ChatGPT plan's Codex use is used, above the hosts' load in the sidebar. Lemur asks \
-             Codex's app server every 10 minutes (30 while Lemur isn't in front) on the host where Codex ran last; \
-             Codex asks, with its own sign-in. Signed in with an API key there's no plan: it shows the tokens Codex \
-             used there, from Codex's session logs."
-        }
-        (Agent::Codex, false) => "Lemur hasn't seen Codex on your hosts yet. Start a Codex thread, then turn this on.",
     };
     vec![group(None, None, vec![item(id, "Show plan usage", switch, Some(help.into()), k)], k)]
 }

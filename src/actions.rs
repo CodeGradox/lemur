@@ -3,7 +3,7 @@ use crate::config::{Agent, ClaudeThread, Config, Host};
 use crate::hc::{self, Stream};
 use crate::remote::{Remote, quote, sh_path};
 use crate::snapshot::{
-    AWAY, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SHELL, SILENT, WORKTREE,
+    AWAY, COLOR, FOLDER, HERDR_SPACE, HERDR_TAB, ISSUE, KIND, LABEL, ORDER, SESSION, SHELL, SILENT, WORKTREE,
 };
 use anyhow::{Context, Result, bail};
 use futures::channel::mpsc::TryRecvError;
@@ -61,6 +61,21 @@ pub fn random_name(taken: impl Fn(&str) -> bool) -> String {
         }
     }
     name
+}
+
+/// The `adjective-noun` name `seed` makes, like `calm-heron`: always the same one for it,
+/// from one run of Lemur to the next (FNV-1a, which doesn't change as Rust's hasher may).
+pub fn name_from(seed: &str) -> String {
+    let mut n: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.bytes() {
+        n = (n ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    let n = (n ^ (n >> 32)) as usize;
+    format!(
+        "{}-{}",
+        ADJECTIVES[n % ADJECTIVES.len()],
+        NOUNS[(n / ADJECTIVES.len()) % NOUNS.len()]
+    )
 }
 
 /// A random version 4 UUID, as Claude Code's `--session-id` takes one.
@@ -215,7 +230,7 @@ pub fn new_worktree_thread(
         quote(&from),
     ))?;
     let dir = out.lines().last().unwrap_or_default();
-    let started = start_on(host, dir, label, agent)?;
+    let started = start_on(host, dir, label, agent, &[])?;
     let note = (!fetched)
         .then(|| format!("couldn't fetch {from}; the worktree starts where it was last fetched"));
     Ok((started, note))
@@ -268,24 +283,37 @@ pub fn start_in(
     label: &str,
     agent: Option<Agent>,
 ) -> Result<Started> {
+    start_in_folder(cfg, host, dir, label, agent, None, None)
+}
+
+/// Starts a thread as `start_in` does, in `folder` of its host's, by the
+/// folder's id, or with none in one of its own, and in session `space` (a
+/// project's path, or `HOME`), or with none in the one of where it runs: it
+/// shows there from the first.
+pub fn start_in_folder(
+    cfg: &Config,
+    host: &str,
+    dir: &str,
+    label: &str,
+    agent: Option<Agent>,
+    folder: Option<&str>,
+    space: Option<&str>,
+) -> Result<Started> {
     let host = cfg.host_or_err(host)?;
     if let Some(agent) = agent {
         installed(host, agent)?;
     }
-    start_on(host, dir, label, agent)
+    let kept: Vec<(&str, &str)> = folder.map(|f| (FOLDER, f)).into_iter().chain(space.map(|s| (SESSION, s))).collect();
+    start_on(host, dir, label, agent, &kept)
 }
 
-fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>) -> Result<Started> {
+fn start_on(host: &Host, dir: &str, label: &str, agent: Option<Agent>, kept: &[(&str, &str)]) -> Result<Started> {
     if agent == Some(Agent::Claude) {
-        return start_claude(host, dir, label);
+        return start_claude(host, dir, label, kept);
     }
-    let (kind, command) = match agent {
-        Some(agent) => ("codex", Some(host.command(agent))),
-        None => ("shell", None),
-    };
     Ok(Started {
         host: host.name.clone(),
-        session: start_thread(host, dir, label, kind, command, None)?,
+        session: start_thread(host, dir, label, "shell", None, kept)?,
         claude: None,
     })
 }
@@ -340,11 +368,12 @@ fn find_program(program: &str) -> String {
 }
 
 /// Starts Claude in a thread labelled `label`, in `dir` on `host`, with a
-/// session ID of lemur's, and returns the thread with what resumes it.
-fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
+/// session ID of lemur's and `kept`'s labels, and returns the thread with what
+/// resumes it.
+fn start_claude(host: &Host, dir: &str, label: &str, kept: &[(&str, &str)]) -> Result<Started> {
     let id = random_uuid();
     let command = format!("{} --session-id {id}", host.claude);
-    let address = start_thread(host, dir, label, "claude", Some(&command), None)?;
+    let address = start_thread(host, dir, label, "claude", Some(&command), kept)?;
     Ok(Started {
         host: host.name.clone(),
         session: address.clone(),
@@ -355,6 +384,7 @@ fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
             claude_session: id,
             label: Some(label.to_string()),
             issue: None,
+            color: None,
         }),
     })
 }
@@ -362,14 +392,15 @@ fn start_claude(host: &Host, dir: &str, label: &str) -> Result<Started> {
 /// Starts a thread labelled `label` in `dir` on `host`: the host's shell,
 /// and with `command`, what starts its agent typed into it, so the shell has
 /// set up PATH first. The terminal's labels file it under `dir`, say what it
-/// was started for (`kind`), and pin `issue` to it. Returns its address.
+/// was started for (`kind`), and give it `kept`'s (the issue pinned to it, its
+/// colour). Returns its address.
 fn start_thread(
     host: &Host,
     dir: &str,
     label: &str,
     kind: &str,
     command: Option<&str>,
-    issue: Option<&str>,
+    kept: &[(&str, &str)],
 ) -> Result<String> {
     validate_name(label)?;
     let (core, on) = hc::for_host(host)?;
@@ -378,8 +409,8 @@ fn start_thread(
         (KIND.to_string(), kind.to_string()),
         (WORKTREE.to_string(), dir.to_string()),
     ]);
-    if let Some(issue) = issue {
-        labels.insert(ISSUE.to_string(), issue.to_string());
+    for (name, value) in kept {
+        labels.insert(name.to_string(), value.to_string());
     }
     let terminals = core.terminals();
     let on_host = terminals.iter().filter(|t| hc::on_host(t, on.as_deref()));
@@ -477,14 +508,11 @@ pub fn resume_thread(cfg: &Config, thread: &ClaudeThread) -> Result<String> {
         wait_for_program(&core, &thread.session);
         return Ok(thread.session.clone());
     }
-    start_thread(
-        host,
-        &thread.path,
-        &label,
-        "claude",
-        Some(&resume),
-        thread.issue.as_deref(),
-    )
+    let kept: Vec<(&str, &str)> = [(ISSUE, &thread.issue), (COLOR, &thread.color)]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value.as_deref()?)))
+        .collect();
+    start_thread(host, &thread.path, &label, "claude", Some(&resume), &kept)
 }
 
 /// Waits a moment for what was typed into the shell of terminal `address`
@@ -545,10 +573,25 @@ pub fn set_issue(cfg: &Config, host: &str, session: &str, issue: Option<&str>) -
     core.label(session, &[(ISSUE, issue.unwrap_or_default())])
 }
 
-pub fn set_order(cfg: &Config, host: &str, sessions: &[String]) -> Result<()> {
+/// Gives a thread colour `color`, one of `COLORS` by its name, or with `None`
+/// takes its colour off.
+pub fn set_color(cfg: &Config, host: &str, session: &str, color: Option<&str>) -> Result<()> {
     let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
-    for (i, s) in sessions.iter().enumerate() {
-        core.label(s, &[(ORDER, &i.to_string())])?;
+    core.label(session, &[(COLOR, color.unwrap_or_default())])
+}
+
+/// Puts thread `session` in folder `folder` of its host's, by its id: one of its own with "".
+pub fn set_folder(cfg: &Config, host: &str, session: &str, folder: &str) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    core.label(session, &[(FOLDER, folder)])
+}
+
+/// Puts threads in their order, each in its folder of their host's, by
+/// the folder's id: one of its own with "".
+pub fn set_order(cfg: &Config, host: &str, sessions: &[(String, String)]) -> Result<()> {
+    let (core, _) = hc::for_host(cfg.host_or_err(host)?)?;
+    for (i, (s, folder)) in sessions.iter().enumerate() {
+        core.label(s, &[(ORDER, &i.to_string()), (FOLDER, folder)])?;
     }
     Ok(())
 }
@@ -1439,9 +1482,10 @@ mod tests {
         assert!(wait_until(Duration::from_secs(5), || !server
             .addresses()
             .contains(&started.session)));
-        // Resumed with the Linear issue pinned to it.
+        // Resumed with the Linear issue pinned to it, and its colour.
         let pinned = ClaudeThread {
             issue: Some("LAFT-3184".into()),
+            color: Some("teal".into()),
             ..claude.clone()
         };
         let again = resume_thread(&cfg, &pinned).unwrap();
@@ -1454,6 +1498,7 @@ mod tests {
         assert_eq!(t.labels.get(KIND).map(String::as_str), Some("claude"));
         assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("claude"));
         assert_eq!(t.labels.get(ISSUE).map(String::as_str), Some("LAFT-3184"));
+        assert_eq!(t.labels.get(COLOR).map(String::as_str), Some("teal"));
 
         // Nothing starts where its folder was, or with an ID that isn't one.
         let before = server.addresses().len();
@@ -1673,6 +1718,7 @@ mod tests {
             claude_session: random_uuid(),
             label: None,
             issue: None,
+            color: None,
         };
         let before = server.addresses().len();
         let err = resume_thread(&cfg, &thread).unwrap_err();
@@ -1846,6 +1892,16 @@ mod tests {
     }
 
     #[test]
+    fn a_seed_always_makes_the_same_two_words() {
+        let name = name_from("agent/t7");
+        assert_eq!(name, name_from("agent/t7"));
+        let (adjective, noun) = name.split_once('-').unwrap();
+        assert!(ADJECTIVES.contains(&adjective) && NOUNS.contains(&noun), "{name}");
+        let names: std::collections::HashSet<String> = (0..50).map(|i| name_from(&format!("agent/t{i}"))).collect();
+        assert!(names.len() > 40, "spread out: {names:?}");
+    }
+
+    #[test]
     fn names_are_restricted() {
         assert!(validate_name("auth-ui_2").is_ok());
         assert!(validate_name("").is_err());
@@ -1875,14 +1931,14 @@ mod tests {
 
     #[test]
     fn the_program_of_a_hosts_command_is_found_in_it() {
-        assert_eq!(program_of("codex"), Some("codex"));
-        assert_eq!(program_of("  codex --full-auto"), Some("codex"));
+        assert_eq!(program_of("claude"), Some("claude"));
+        assert_eq!(program_of("  claude --verbose"), Some("claude"));
         assert_eq!(
             program_of("FOO=1 BAR=2 ~/bin/claude -x"),
             Some("~/bin/claude")
         );
-        assert_eq!(program_of("$(which codex)"), None);
-        assert_eq!(program_of("\"my codex\""), None);
+        assert_eq!(program_of("$(which claude)"), None);
+        assert_eq!(program_of("\"my claude\""), None);
         assert_eq!(program_of("FOO=1"), None);
         assert_eq!(program_of(""), None);
     }
@@ -1901,28 +1957,18 @@ mod tests {
         let path = repo.canonicalize().unwrap().to_string_lossy().into_owned();
         let mut cfg = server.config();
         cfg.bases.push(crate::config::Base::new("local", &path));
-        cfg.hosts[0].claude = "lemur-has-no-claude".into();
-        cfg.hosts[0].codex = "lemur-has-no-codex --flag".into();
+        cfg.hosts[0].claude = "lemur-has-no-claude --flag".into();
 
-        let cases = [
-            (Agent::Claude, "Claude Code", "lemur-has-no-claude"),
-            (Agent::Codex, "Codex", "lemur-has-no-codex"),
-        ];
-        for (agent, name, program) in cases {
-            let said = format!("{name} isn't installed on local: its shell can't find `{program}`");
-            let e = new_thread_in(&cfg, 0, &path, "x", Some(agent))
-                .err()
-                .unwrap();
-            assert_eq!(format!("{e:#}"), said);
-            let e = new_worktree_thread(&cfg, 0, "x", "x", Some(agent), None, None)
-                .err()
-                .unwrap();
-            assert_eq!(format!("{e:#}"), said);
-            let e = start_in(&cfg, "local", &path, "x", Some(agent))
-                .err()
-                .unwrap();
-            assert_eq!(format!("{e:#}"), said);
-        }
+        let agent = Some(Agent::Claude);
+        let said = "Claude Code isn't installed on local: its shell can't find `lemur-has-no-claude`";
+        let e = new_thread_in(&cfg, 0, &path, "x", agent).err().unwrap();
+        assert_eq!(format!("{e:#}"), said);
+        let e = new_worktree_thread(&cfg, 0, "x", "x", agent, None, None)
+            .err()
+            .unwrap();
+        assert_eq!(format!("{e:#}"), said);
+        let e = start_in(&cfg, "local", &path, "x", agent).err().unwrap();
+        assert_eq!(format!("{e:#}"), said);
         assert!(server.addresses().is_empty(), "no terminal");
         assert!(!repo.join(".claude/worktrees/x").exists(), "no worktree");
 
@@ -1933,6 +1979,7 @@ mod tests {
             claude_session: random_uuid(),
             label: None,
             issue: None,
+            color: None,
         };
         let e = resume_thread(&cfg, &thread).err().unwrap();
         assert!(format!("{e:#}").contains("isn't installed"), "{e:#}");
@@ -1940,28 +1987,6 @@ mod tests {
 
         let shell = new_thread_in(&cfg, 0, &path, "sh", None).unwrap();
         assert_eq!(server.addresses(), [shell.session]);
-    }
-
-    /// Codex starts as the host says, typed into the thread's shell; there's
-    /// no conversation of Claude's to keep.
-    #[test]
-    fn codex_starts_in_a_thread_of_its_own() {
-        let server = HcServer::new("codex-start");
-        let dir = TempDir::new("codex-start");
-        let path = dir.canonicalize().unwrap().to_string_lossy().into_owned();
-        let mut cfg = server.config();
-        cfg.hosts[0].codex = r#"sh -c 'echo "codex was started $*"' codex"#.into();
-        let started = start_in(&cfg, "local", &path, "codex", Some(Agent::Codex)).unwrap();
-        assert!(started.claude.is_none());
-        let t = server.core().terminals();
-        let t = t.iter().find(|t| t.address == started.session).unwrap();
-        assert_eq!(t.labels.get(KIND).map(String::as_str), Some("codex"));
-        assert_eq!(t.labels.get(LABEL).map(String::as_str), Some("codex"));
-        assert!(wait_until(Duration::from_secs(10), || {
-            server
-                .hc(&["read", &started.session])
-                .contains("codex was started")
-        }));
     }
 
     /// A download never overwrites what's in the folder: it takes the next free
